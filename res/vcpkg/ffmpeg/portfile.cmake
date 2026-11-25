@@ -45,6 +45,26 @@ if(NOT VCPKG_TARGET_ARCHITECTURE STREQUAL "wasm32")
     vcpkg_add_to_path("${NASM_EXE_PATH}")
 endif()
 
+# ZeroDesk HEVC_OS_HW_ONLY compliance control:
+# - ZeroDesk NEVER bundles libx265 or any software HEVC encoder, and runtime
+#   software HEVC decoding fallback is disabled in libs/scrap/src/common/hwcodec.rs.
+# - FFmpeg's hwaccel architecture (d3d11va/nvdec/vaapi/videotoolbox) requires
+#   `--enable-decoder=hevc` solely to parse HEVC slice headers before handing
+#   off decoding to the OS hardware decoder.
+# - Set ZERODESK_DISABLE_SW_HEVC=ON (via CMake cache or environment variable)
+#   to strip `--enable-decoder=hevc` from the static FFmpeg build entirely for
+#   strict zero-SW-HEVC binary audits. In that mode, clients either use native
+#   OS decode APIs directly (Windows MediaFoundation/D3D11, macOS/iOS
+#   VideoToolbox, Android NDK MediaCodec) or negotiate patent-free AV1/VP9.
+if(NOT DEFINED ZERODESK_DISABLE_SW_HEVC AND DEFINED ENV{ZERODESK_DISABLE_SW_HEVC})
+    set(ZERODESK_DISABLE_SW_HEVC "$ENV{ZERODESK_DISABLE_SW_HEVC}")
+endif()
+if(ZERODESK_DISABLE_SW_HEVC)
+    set(ZERODESK_FFMPEG_HEVC_DECODER_OPT "--disable-decoder=hevc")
+else()
+    set(ZERODESK_FFMPEG_HEVC_DECODER_OPT "--enable-decoder=hevc")
+endif()
+
 set(OPTIONS "\
 --disable-shared \
 --enable-static \
@@ -77,7 +97,7 @@ set(OPTIONS "\
 --disable-swscale \
 --disable-postproc \
 --enable-decoder=h264 \
---enable-decoder=hevc \
+${ZERODESK_FFMPEG_HEVC_DECODER_OPT} \
 --enable-parser=h264 \
 --enable-parser=hevc \
 --enable-bsf=h264_mp4toannexb \

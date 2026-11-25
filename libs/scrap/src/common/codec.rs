@@ -80,6 +80,22 @@ pub trait EncoderApi {
     fn is_hardware(&self) -> bool;
 
     fn disable(&self);
+
+    fn force_idr(&mut self) -> ResultType<()> {
+        Err(anyhow!("force_idr unsupported by this encoder"))
+    }
+
+    fn set_target_bitrate_kbps(&mut self, _kbps: u32) -> ResultType<()> {
+        Err(anyhow!("set_target_bitrate_kbps unsupported by this encoder"))
+    }
+
+    fn set_intra_refresh(&mut self, _enable: bool) -> ResultType<()> {
+        Err(anyhow!("set_intra_refresh unsupported by this encoder"))
+    }
+
+    fn supports_ltr(&self) -> bool {
+        false
+    }
 }
 
 pub struct Encoder {
@@ -451,7 +467,10 @@ impl Decoder {
             } else {
                 0
             };
-            decoding.ability_h265 |= if HwRamDecoder::try_get(CodecFormat::H265).is_some() {
+            // ZeroDesk HEVC_OS_HW_ONLY: advertise HEVC decode only when an OS hardware decoder is present.
+            decoding.ability_h265 |= if enable_hwcodec_option()
+                && HwRamDecoder::try_get(CodecFormat::H265).is_some()
+            {
                 1
             } else {
                 0

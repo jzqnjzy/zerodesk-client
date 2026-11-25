@@ -323,9 +323,7 @@ impl HwRamDecoder {
                 }
             }
             CodecFormat::H265 => {
-                if let Some(v) = soft.h265 {
-                    info = Some(v);
-                }
+                // ZeroDesk HEVC_OS_HW_ONLY: never fall back to FFmpeg software HEVC decoding.
             }
             _ => {}
         }
@@ -339,13 +337,20 @@ impl HwRamDecoder {
                 }
                 CodecFormat::H265 => {
                     if let Some(v) = best.h265 {
-                        info = Some(v);
+                        if Self::is_os_hw_hevc_decoder(&v) {
+                            info = Some(v);
+                        }
                     }
                 }
                 _ => {}
             }
         }
         info
+    }
+
+    fn is_os_hw_hevc_decoder(info: &CodecInfo) -> bool {
+        info.hwdevice != hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
+            || info.name.contains("mediacodec")
     }
 
     pub fn new(format: CodecFormat) -> ResultType<Self> {

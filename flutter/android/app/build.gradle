@@ -82,6 +82,8 @@ protobuf {
 }
 
 android {
+    // Keep namespace aligned with existing Kotlin sources; ffi.FFI (`Java_ffi_FFI_*`)
+    // JNI exports remain untouched per Android JNI compatibility rules.
     namespace "com.carriez.flutter_hbb"
     compileSdkVersion 36
     sourceSets {
@@ -98,8 +100,7 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId "com.carriez.flutter_hbb"
+        applicationId "com.zerodesk.app"
         minSdkVersion 22
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()

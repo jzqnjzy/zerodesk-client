@@ -51,7 +51,15 @@ pub enum GrabState {
 pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
 
 // the executable name of the portable version
-pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+pub const ZERODESK_APP_NAME: &str = "ZeroDesk";
+pub const ZERODESK_URI_PREFIX: &str = "zerodesk://";
+pub const ZERODESK_PUBLIC_ROOT_DOMAIN: &str = "zerodesk.app";
+pub const ZERODESK_DEFAULT_API_SERVER: &str = "https://control.zerodesk.app";
+pub const ZERODESK_UPDATE_CHECK_URL: &str = "https://api.zerodesk.app/v2/version/latest";
+pub const ZERODESK_DEFAULT_RENDEZVOUS_SERVERS: &[&str] = &["control.zerodesk.app"];
+pub const ZERODESK_RS_PUB_KEY_PLACEHOLDER: &str = "";
+
+pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "ZERODESK_APPNAME";
 
 pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
@@ -825,10 +833,17 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, boo
 #[inline]
 #[cfg(any(target_os = "android", target_os = "ios"))]
 fn get_rendezvous_server_(_ms_timeout: u64) -> (String, Vec<String>) {
-    (
-        Config::get_rendezvous_server(),
-        Config::get_rendezvous_servers(),
-    )
+    let custom = Config::get_rendezvous_server();
+    let servers = Config::get_rendezvous_servers();
+    if custom.is_empty() && servers.is_empty() {
+        let defaults: Vec<String> = ZERODESK_DEFAULT_RENDEZVOUS_SERVERS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        (defaults.first().cloned().unwrap_or_default(), defaults)
+    } else {
+        (custom, servers)
+    }
 }
 
 #[inline]
@@ -1106,10 +1121,10 @@ pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String>
     };
     let segments = segments.collect::<Vec<_>>();
     let release_id = match segments.as_slice() {
-        ["rustdesk", "rustdesk", "releases", "tag", release_id] => *release_id,
-        ["rustdesk", "rustdesk", "releases", "tag", release_id, ""] => *release_id,
+        ["zerodesk", "zerodesk", "releases", "tag", release_id] => *release_id,
+        ["zerodesk", "zerodesk", "releases", "tag", release_id, ""] => *release_id,
         _ => bail!(
-            "Update URL is not a RustDesk release tag URL: {}",
+            "Update URL is not a ZeroDesk release tag URL: {}",
             update_url
         ),
     };
@@ -1182,12 +1197,12 @@ fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
     Ok(())
 }
 
-// No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
+// Uses ZeroDesk update endpoint placeholder; zero outbound calls to upstream domains.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    let (request, url) =
+    let (request, _upstream_url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
+    let url = ZERODESK_UPDATE_CHECK_URL.to_owned();
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(&url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
@@ -1233,17 +1248,27 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
 
 #[inline]
 pub fn get_app_name() -> String {
-    hbb_common::config::APP_NAME.read().unwrap().clone()
+    let name = hbb_common::config::APP_NAME.read().unwrap().clone();
+    if name.is_empty() || name == "RustDesk" {
+        ZERODESK_APP_NAME.to_owned()
+    } else {
+        name
+    }
 }
 
 #[inline]
 pub fn is_rustdesk() -> bool {
-    hbb_common::config::APP_NAME.read().unwrap().eq("RustDesk")
+    get_app_name() == ZERODESK_APP_NAME
 }
 
 #[inline]
 pub fn get_uri_prefix() -> String {
-    format!("{}://", get_app_name().to_lowercase())
+    let app = get_app_name();
+    if app == ZERODESK_APP_NAME {
+        ZERODESK_URI_PREFIX.to_owned()
+    } else {
+        format!("{}://", app.to_lowercase())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1317,7 +1342,7 @@ fn get_api_server_(api: String, custom: String) -> String {
             return format!("http://{}", s);
         }
     }
-    "https://admin.rustdesk.com".to_owned()
+    ZERODESK_DEFAULT_API_SERVER.to_owned()
 }
 
 #[inline]
@@ -1330,7 +1355,8 @@ pub fn is_public(url: &str) -> bool {
         return false;
     };
     let host = host.strip_suffix('.').unwrap_or(host);
-    host == "rustdesk.com" || host.ends_with(".rustdesk.com")
+    host == ZERODESK_PUBLIC_ROOT_DOMAIN
+        || host.ends_with(&format!(".{ZERODESK_PUBLIC_ROOT_DOMAIN}"))
 }
 
 pub fn get_tcp_punch_enabled() -> bool {
@@ -2181,7 +2207,7 @@ pub async fn get_key(sync: bool) -> String {
         options.remove("key").unwrap_or_default()
     };
     if key.is_empty() {
-        key = config::RS_PUB_KEY.to_owned();
+        key = ZERODESK_RS_PUB_KEY_PLACEHOLDER.to_owned();
     }
     key
 }
@@ -2716,7 +2742,7 @@ pub fn get_builtin_option(key: &str) -> String {
 
 #[inline]
 pub fn is_custom_client() -> bool {
-    get_app_name() != "RustDesk"
+    get_app_name() != ZERODESK_APP_NAME
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {
@@ -3128,8 +3154,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_stable_rustdesk_release_url() {
-        let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6";
+    fn parses_stable_zerodesk_release_url() {
+        let update_url = "https://github.com/zerodesk/zerodesk/releases/tag/v1.4.6";
 
         assert_eq!(release_id_from_update_url(update_url).unwrap(), "v1.4.6");
         assert_eq!(display_version_from_release_id("v1.4.6").unwrap(), "1.4.6");
@@ -3142,19 +3168,19 @@ mod tests {
     #[test]
     fn rejects_untrusted_release_urls_and_unstable_versions() {
         for update_url in [
-            "http://github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://github.com:8443/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://github.com:443/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://user@github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://example.com/rustdesk/rustdesk/releases/tag/v1.4.6",
-            "https://github.com/other/rustdesk/releases/tag/v1.4.6",
-            "https://github.com/rustdesk/other/releases/tag/v1.4.6",
-            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6?x=1",
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6#asset",
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6/extra",
-            "https://github.com/rustdesk/rustdesk/releases/tag/v1%2F4%2F6",
-            "https://github.com/rustdesk/rustdesk/releases/tag/%2e%2e",
+            "http://github.com/zerodesk/zerodesk/releases/tag/v1.4.6",
+            "https://github.com:8443/zerodesk/zerodesk/releases/tag/v1.4.6",
+            "https://github.com:443/zerodesk/zerodesk/releases/tag/v1.4.6",
+            "https://user@github.com/zerodesk/zerodesk/releases/tag/v1.4.6",
+            "https://example.com/zerodesk/zerodesk/releases/tag/v1.4.6",
+            "https://github.com/other/zerodesk/releases/tag/v1.4.6",
+            "https://github.com/zerodesk/other/releases/tag/v1.4.6",
+            "https://github.com/zerodesk/zerodesk/releases/download/v1.4.6/zerodesk.exe",
+            "https://github.com/zerodesk/zerodesk/releases/tag/v1.4.6?x=1",
+            "https://github.com/zerodesk/zerodesk/releases/tag/v1.4.6#asset",
+            "https://github.com/zerodesk/zerodesk/releases/tag/v1.4.6/extra",
+            "https://github.com/zerodesk/zerodesk/releases/tag/v1%2F4%2F6",
+            "https://github.com/zerodesk/zerodesk/releases/tag/%2e%2e",
         ] {
             assert!(release_id_from_update_url(update_url).is_err());
         }
@@ -3274,13 +3300,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_public_matches_rustdesk_root_domain() {
-        assert!(is_public("rustdesk.com/"));
-        assert!(is_public("rustdesk.com:21117"));
-        assert!(is_public("api.rustdesk.com:21117"));
-        assert!(!is_public("hello-rustdesk.com"));
-        assert!(!is_public("api.rustdesk.com.evil.test"));
-        assert!(!is_public("https://rustdesk.com@evil.test"));
+    fn test_is_public_matches_zerodesk_root_domain() {
+        assert!(is_public("zerodesk.app/"));
+        assert!(is_public("zerodesk.app:21117"));
+        assert!(is_public("api.zerodesk.app:21117"));
+        assert!(!is_public("hello-zerodesk.app"));
+        assert!(!is_public("api.zerodesk.app.evil.test"));
+        assert!(!is_public("https://zerodesk.app@evil.test"));
     }
 
     #[test]
@@ -3306,8 +3332,8 @@ mod tests {
             "https://admin.example.com"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
-            "https://admin.rustdesk.com/api/login",
-            "https://admin.rustdesk.com"
+            "https://control.zerodesk.app/api/login",
+            "https://control.zerodesk.app"
         ));
         assert!(!should_use_tcp_proxy_for_api_url(
             "https://admin.example.com/api/login",
