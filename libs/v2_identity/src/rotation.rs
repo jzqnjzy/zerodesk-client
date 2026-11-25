@@ -1,8 +1,12 @@
 use crate::{certs::DelegationStatement, error::IdentityError, keystore::DeviceKeyStore};
 use rand_core::OsRng;
-use std::collections::{HashMap, VecDeque};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+};
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// 12-hour static key rotation slice per V2 spec §4.1.
 pub const X25519_SLICE_SECS: u64 = 12 * 3600;
@@ -10,6 +14,147 @@ pub const X25519_SLICE_SECS: u64 = 12 * 3600;
 pub const X25519_MIN_RETENTION_SECS: u64 = 48 * 3600;
 pub const X25519_RETAINED_GENERATIONS: usize = 2;
 pub const STATIC_KEY_HINT_MAX_RETRIES: u8 = 1;
+pub const STATIC_KEY_HINT_MAX_SESSIONS: usize = 4096;
+
+const ROTATOR_STATE_MAGIC: &[u8; 6] = b"ZDROT1";
+const ROTATOR_STATE_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedKeyMetadata {
+    pub public_key: [u8; 32],
+    pub slice_index: u64,
+    pub delegation_seq: u64,
+    pub created_unix: u64,
+    pub retain_until_unix: u64,
+    pub delegation: DelegationStatement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotatorPersistedState {
+    pub device_id: [u8; 16],
+    pub prefer_chacha: bool,
+    pub last_delegation_seq: u64,
+    pub retained_metadata: Vec<RetainedKeyMetadata>,
+}
+
+impl RotatorPersistedState {
+    pub fn encode_bytes(&self) -> Result<Vec<u8>, IdentityError> {
+        let count = u8::try_from(self.retained_metadata.len())
+            .map_err(|_| IdentityError::InvalidFraming("too many retained metadata items".into()))?;
+        let mut out = Vec::with_capacity(6 + 1 + 16 + 1 + 8 + 1 + self.retained_metadata.len() * 192);
+        out.extend_from_slice(ROTATOR_STATE_MAGIC);
+        out.push(ROTATOR_STATE_VERSION);
+        out.extend_from_slice(&self.device_id);
+        out.push(u8::from(self.prefer_chacha));
+        out.extend_from_slice(&self.last_delegation_seq.to_be_bytes());
+        out.push(count);
+        for meta in &self.retained_metadata {
+            let deleg_wire = meta.delegation.encode_wire()?;
+            let deleg_len = u16::try_from(deleg_wire.len())
+                .map_err(|_| IdentityError::InvalidFraming("delegation exceeds u16::MAX".into()))?;
+            out.extend_from_slice(&meta.public_key);
+            out.extend_from_slice(&meta.slice_index.to_be_bytes());
+            out.extend_from_slice(&meta.delegation_seq.to_be_bytes());
+            out.extend_from_slice(&meta.created_unix.to_be_bytes());
+            out.extend_from_slice(&meta.retain_until_unix.to_be_bytes());
+            out.extend_from_slice(&deleg_len.to_be_bytes());
+            out.extend_from_slice(&deleg_wire);
+        }
+        Ok(out)
+    }
+
+    pub fn decode_bytes(bytes: &[u8]) -> Result<Self, IdentityError> {
+        const HDR_LEN: usize = 6 + 1 + 16 + 1 + 8 + 1;
+        if bytes.len() < HDR_LEN {
+            return Err(IdentityError::InvalidFraming(
+                "persisted rotator state truncated".into(),
+            ));
+        }
+        if &bytes[0..6] != ROTATOR_STATE_MAGIC || bytes[6] != ROTATOR_STATE_VERSION {
+            return Err(IdentityError::InvalidFraming(
+                "invalid persisted rotator state magic or version".into(),
+            ));
+        }
+        let mut device_id = [0u8; 16];
+        device_id.copy_from_slice(&bytes[7..23]);
+        let prefer_chacha = match bytes[23] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(IdentityError::InvalidFraming(
+                    "invalid prefer_chacha byte in rotator state".into(),
+                ));
+            }
+        };
+        let last_delegation_seq = u64::from_be_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+        let count = bytes[32] as usize;
+        if count > X25519_RETAINED_GENERATIONS {
+            return Err(IdentityError::InvalidFraming(
+                "retained metadata count exceeds maximum".into(),
+            ));
+        }
+        let mut pos = HDR_LEN;
+        let mut retained_metadata = Vec::with_capacity(count);
+        for _ in 0..count {
+            if pos + 32 + 8 * 4 + 2 > bytes.len() {
+                return Err(IdentityError::InvalidFraming(
+                    "persisted rotator metadata truncated".into(),
+                ));
+            }
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+            let read_u64 = |slice: &[u8]| -> u64 {
+                u64::from_be_bytes([
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+                ])
+            };
+            let slice_index = read_u64(&bytes[pos..pos + 8]);
+            pos += 8;
+            let delegation_seq = read_u64(&bytes[pos..pos + 8]);
+            pos += 8;
+            let created_unix = read_u64(&bytes[pos..pos + 8]);
+            pos += 8;
+            let retain_until_unix = read_u64(&bytes[pos..pos + 8]);
+            pos += 8;
+            let deleg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+            pos += 2;
+            if pos + deleg_len > bytes.len() {
+                return Err(IdentityError::InvalidFraming(
+                    "persisted delegation truncated".into(),
+                ));
+            }
+            let delegation = DelegationStatement::decode_wire(&bytes[pos..pos + deleg_len])?;
+            pos += deleg_len;
+            retained_metadata.push(RetainedKeyMetadata {
+                public_key,
+                slice_index,
+                delegation_seq,
+                created_unix,
+                retain_until_unix,
+                delegation,
+            });
+        }
+        if pos != bytes.len() {
+            return Err(IdentityError::InvalidFraming(
+                "trailing bytes in persisted rotator state".into(),
+            ));
+        }
+        let max_meta_seq = retained_metadata
+            .iter()
+            .map(|m| m.delegation_seq)
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            device_id,
+            prefer_chacha,
+            last_delegation_seq: last_delegation_seq.max(max_meta_seq),
+            retained_metadata,
+        })
+    }
+}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct X25519KeyGeneration {
@@ -33,10 +178,22 @@ impl X25519KeyGeneration {
         &self.secret_bytes
     }
 
-    pub fn diffie_hellman(&self, peer_public: [u8; 32]) -> [u8; 32] {
+    pub fn metadata(&self) -> RetainedKeyMetadata {
+        RetainedKeyMetadata {
+            public_key: self.public_key,
+            slice_index: self.slice_index,
+            delegation_seq: self.delegation_seq,
+            created_unix: self.created_unix,
+            retain_until_unix: self.retain_until_unix,
+            delegation: self.delegation.clone(),
+        }
+    }
+
+    pub fn diffie_hellman(&self, peer_public: [u8; 32]) -> Zeroizing<[u8; 32]> {
         let secret = StaticSecret::from(self.secret_bytes);
         let peer = PublicKey::from(peer_public);
-        *secret.diffie_hellman(&peer).as_bytes()
+        let shared = secret.diffie_hellman(&peer);
+        Zeroizing::new(*shared.as_bytes())
     }
 }
 
@@ -44,12 +201,15 @@ impl X25519KeyGeneration {
 ///
 /// Retains the latest 2 generations (`>= 48h` retention window) so the
 /// responder can attempt decryption against the current and previous static
-/// keys during slice rollover.
+/// keys during slice rollover. Non-secret metadata (`last_delegation_seq` and
+/// generation metadata) can be persisted across restarts so `delegation_seq`
+/// remains strictly monotonic without writing X25519 private keys to disk.
 pub struct X25519StaticKeyRotator {
     device_id: [u8; 16],
     prefer_chacha: bool,
     last_delegation_seq: u64,
     generations: VecDeque<X25519KeyGeneration>,
+    prior_metadata: Vec<RetainedKeyMetadata>,
 }
 
 impl X25519StaticKeyRotator {
@@ -59,7 +219,88 @@ impl X25519StaticKeyRotator {
             prefer_chacha,
             last_delegation_seq: initial_delegation_seq,
             generations: VecDeque::with_capacity(X25519_RETAINED_GENERATIONS),
+            prior_metadata: Vec::new(),
         }
+    }
+
+    pub fn last_delegation_seq(&self) -> u64 {
+        self.last_delegation_seq
+    }
+
+    pub fn retained_metadata(&self) -> Vec<RetainedKeyMetadata> {
+        let mut out: Vec<RetainedKeyMetadata> =
+            self.generations.iter().map(X25519KeyGeneration::metadata).collect();
+        for meta in &self.prior_metadata {
+            if out.len() >= X25519_RETAINED_GENERATIONS {
+                break;
+            }
+            if !out.iter().any(|m| m.delegation_seq == meta.delegation_seq) {
+                out.push(meta.clone());
+            }
+        }
+        out
+    }
+
+    pub fn to_persisted_state(&self) -> RotatorPersistedState {
+        RotatorPersistedState {
+            device_id: self.device_id,
+            prefer_chacha: self.prefer_chacha,
+            last_delegation_seq: self.last_delegation_seq,
+            retained_metadata: self.retained_metadata(),
+        }
+    }
+
+    pub fn from_persisted_state(state: RotatorPersistedState) -> Self {
+        let max_meta_seq = state
+            .retained_metadata
+            .iter()
+            .map(|m| m.delegation_seq)
+            .max()
+            .unwrap_or(0);
+        Self {
+            device_id: state.device_id,
+            prefer_chacha: state.prefer_chacha,
+            last_delegation_seq: state.last_delegation_seq.max(max_meta_seq),
+            generations: VecDeque::with_capacity(X25519_RETAINED_GENERATIONS),
+            prior_metadata: state
+                .retained_metadata
+                .into_iter()
+                .take(X25519_RETAINED_GENERATIONS)
+                .collect(),
+        }
+    }
+
+    pub fn save_state(&self, path: &Path) -> Result<(), IdentityError> {
+        let bytes = self.to_persisted_state().encode_bytes()?;
+        #[cfg(unix)]
+        {
+            use std::{
+                fs::{OpenOptions, Permissions},
+                io::Write,
+                os::unix::fs::{OpenOptionsExt, PermissionsExt},
+            };
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            file.write_all(&bytes)
+                .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            std::fs::set_permissions(path, Permissions::from_mode(0o600))
+                .map_err(|e| IdentityError::Storage(e.to_string()))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, &bytes).map_err(|e| IdentityError::Storage(e.to_string()))
+        }
+    }
+
+    pub fn load_state(path: &Path) -> Result<Self, IdentityError> {
+        let bytes = std::fs::read(path).map_err(|e| IdentityError::Storage(e.to_string()))?;
+        let state = RotatorPersistedState::decode_bytes(&bytes)?;
+        Ok(Self::from_persisted_state(state))
     }
 
     pub fn slice_for(now_unix: u64) -> u64 {
@@ -226,30 +467,42 @@ impl DelegationCache {
 
 /// Validates a responder `StaticKeyHint{latest DelegationStatement}` after an
 /// expired-static-key `Noise_IK` failure: verifies P-256 signature, requires
-/// strictly increasing `delegation_seq`, and allows at most 1 retry.
+/// strictly increasing `delegation_seq`, and allows at most 1 retry per
+/// handshake session (`handshake_id` / `session_id`).
 #[derive(Debug, Default)]
 pub struct StaticKeyHintRetry {
-    retries_used: u8,
+    per_session: HashMap<[u8; 16], u8>,
+    order: VecDeque<[u8; 16]>,
 }
 
 impl StaticKeyHintRetry {
     pub fn new() -> Self {
-        Self { retries_used: 0 }
+        Self::default()
     }
 
-    pub fn retries_used(&self) -> u8 {
-        self.retries_used
+    pub fn retries_used(&self, handshake_id: &[u8; 16]) -> u8 {
+        self.per_session.get(handshake_id).copied().unwrap_or(0)
+    }
+
+    pub fn clear_session(&mut self, handshake_id: &[u8; 16]) {
+        if self.per_session.remove(handshake_id).is_some() {
+            if let Some(pos) = self.order.iter().position(|id| id == handshake_id) {
+                self.order.remove(pos);
+            }
+        }
     }
 
     pub fn accept_hint(
         &mut self,
+        handshake_id: [u8; 16],
         cache: &mut DelegationCache,
         hint: &DelegationStatement,
         device_spki_der: &[u8],
         device_cert_exp_unix: u64,
         now_unix: u64,
     ) -> Result<(), IdentityError> {
-        if self.retries_used >= STATIC_KEY_HINT_MAX_RETRIES {
+        let used = self.retries_used(&handshake_id);
+        if used >= STATIC_KEY_HINT_MAX_RETRIES {
             return Err(IdentityError::RetryLimitExceeded);
         }
         if let Some(prev) = cache.get(&hint.device_id) {
@@ -258,7 +511,17 @@ impl StaticKeyHintRetry {
             }
         }
         cache.verify_and_record(hint, device_spki_der, device_cert_exp_unix, now_unix)?;
-        self.retries_used += 1;
+        if !self.per_session.contains_key(&handshake_id) {
+            while self.per_session.len() >= STATIC_KEY_HINT_MAX_SESSIONS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.per_session.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(handshake_id);
+        }
+        self.per_session.insert(handshake_id, used + 1);
         Ok(())
     }
 }

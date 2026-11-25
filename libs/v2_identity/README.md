@@ -17,5 +17,8 @@ Clean-room implementation of ZeroDesk V2 (`v1.2-FROZEN`) identity primitives:
 Because `libs/hbb_common` is an uninitialized upstream submodule during Phase 0, this crate declares its own `[workspace]` table so it can be built and tested completely offline/standalone:
 
 ```sh
-cargo test --manifest-path libs/v2_identity/Cargo.toml
+ZERODESK_VECTORS_DIR=/path/to/protocol-spec/vectors \
+  cargo test --manifest-path libs/v2_identity/Cargo.toml
 ```
+
+If `ZERODESK_VECTORS_DIR` is unset, tests default to `/Volumes/data/github/zerodesk/protocol-spec/vectors`.

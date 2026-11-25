@@ -14,7 +14,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::{BTreeMap, VecDeque};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -389,7 +389,7 @@ struct PrecomputedEpochKey {
 /// `{cur-1, cur, cur+1}` `access_epoch` promotion and `grace = max(2s, 4*RTT)`.
 pub struct AccessEpochState {
     route_cid: [u8; 8],
-    hs_hash: [u8; 32],
+    hs_hash: Zeroizing<[u8; 32]>,
     transport: u8,
     dir: u8,
     cur_epoch: u32,
@@ -408,6 +408,7 @@ impl AccessEpochState {
         initial_epoch: u32,
         rtt_ms: u64,
     ) -> Result<Self, TransportError> {
+        let hs_hash = Zeroizing::new(hs_hash);
         let key = derive_access_key(&route_cid, &hs_hash, transport, dir, initial_epoch)?;
         let prev_key = if initial_epoch > 0 {
             let pk = derive_access_key(&route_cid, &hs_hash, transport, dir, initial_epoch - 1)?;
@@ -440,6 +441,41 @@ impl AccessEpochState {
 
     pub fn cur_key(&self) -> &[u8; 32] {
         &self.cur_key.key
+    }
+
+    /// Returns the precomputed directional MAC key for `epoch` (`cur` or `cur-1`).
+    pub fn key_for_epoch(&self, epoch: u32) -> Option<&[u8; 32]> {
+        if epoch == self.cur_key.epoch {
+            return Some(&self.cur_key.key);
+        }
+        if let Some(prev) = &self.prev_key {
+            if epoch == prev.epoch {
+                return Some(&prev.key);
+            }
+        }
+        None
+    }
+
+    /// Advances sender-side directional key to `new_epoch`, keeping the old key
+    /// in `prev_key` for `grace_ms` so in-flight `LEG_NACK` retransmissions can
+    /// still compute valid old-epoch MACs.
+    pub fn advance_epoch(&mut self, new_epoch: u32, now_ms: u64) -> Result<(), TransportError> {
+        if new_epoch <= self.cur_epoch {
+            return Err(TransportError::AccessEpochRejected);
+        }
+        let next_key =
+            derive_access_key(&self.route_cid, &self.hs_hash, self.transport, self.dir, new_epoch)?;
+        let old_cur = std::mem::replace(
+            &mut self.cur_key,
+            PrecomputedEpochKey {
+                epoch: new_epoch,
+                key: next_key,
+            },
+        );
+        self.prev_key = Some(old_cur);
+        self.prev_expire_ms = Some(now_ms.saturating_add(self.grace_ms));
+        self.cur_epoch = new_epoch;
+        Ok(())
     }
 
     /// Verifies a v1.1 UDP packet's `mac_64`.
@@ -744,13 +780,17 @@ impl EdgeCtrlFrame {
 
 #[derive(Debug, Clone)]
 pub struct CachedLegPacket {
-    pub leg_seq: u32,
-    pub access_epoch: u32,
-    pub pp: u8,
+    pub header: AccessHeaderV11,
+    pub l3_payload: Vec<u8>,
     pub inserted_ms: u64,
     pub last_rtx_ms: Option<u64>,
     pub rtx_count: u8,
-    pub wire_bytes: Vec<u8>,
+}
+
+impl CachedLegPacket {
+    pub fn wire_len(&self) -> usize {
+        ACCESS_HDR_V11_LEN + self.l3_payload.len()
+    }
 }
 
 /// 150ms / 512KB per-session ciphertext cache for `LEG_NACK` local recovery.
@@ -759,8 +799,11 @@ pub struct CachedLegPacket {
 /// - `d=1` discardable packets are never cached (0 RTX).
 /// - `p0/p1/p2` max 2 retransmissions (total <= 3 wire emissions); `p3` max 1 RTX.
 /// - 2nd RTX spaced by `>= 1 * rtt_ms`.
-/// - Entries older than 100ms are never retransmitted; entries older than 150ms evicted.
+/// - Video (`p2`) entries older than 100ms are never retransmitted; all entries older than 150ms evicted.
 /// - Old-epoch entries honored only within 150ms grace; hard rekey clears cache immediately.
+/// - Every `LEG_NACK` retransmission sets `flags.rtx = true` (`x = 1`) and recomputes `mac_64`
+///   with the precomputed directional key for `entry.header.access_epoch`.
+/// - When the 512KB cache is full, lower-priority packets (larger `pp`) NEVER evict higher-priority packets.
 /// - 100% of original + retransmitted bytes counted in `billed_bytes`.
 #[derive(Debug)]
 pub struct LegCiphertextCache {
@@ -788,42 +831,82 @@ impl LegCiphertextCache {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn contains_seq(&self, leg_seq: u32) -> bool {
+        self.entries.contains_key(&leg_seq)
+    }
+
     pub fn record_original(
         &mut self,
         hdr: &AccessHeaderV11,
-        wire_bytes: Vec<u8>,
+        l3_payload: Vec<u8>,
         now_ms: u64,
     ) {
-        let len = wire_bytes.len() as u64;
+        let wire_len = ACCESS_HDR_V11_LEN + l3_payload.len();
+        let len = wire_len as u64;
         self.billed_bytes = self.billed_bytes.saturating_add(len);
         self.orig_emitted_bytes = self.orig_emitted_bytes.saturating_add(len);
         if hdr.flags.is_ctrl_edge || hdr.flags.discardable {
             return;
         }
         self.evict_expired(now_ms);
-        while self.total_bytes + wire_bytes.len() > LEG_CACHE_MAX_BYTES {
-            if !self.evict_lowest_priority() {
-                break;
+        if wire_len > LEG_CACHE_MAX_BYTES {
+            return;
+        }
+        let existing_len = self
+            .entries
+            .get(&hdr.leg_seq)
+            .map(CachedLegPacket::wire_len)
+            .unwrap_or(0);
+        let projected = self.total_bytes.saturating_sub(existing_len) + wire_len;
+        if projected > LEG_CACHE_MAX_BYTES {
+            let needed = projected - LEG_CACHE_MAX_BYTES;
+            // Lower priority (larger pp) MUST NEVER evict higher priority (smaller pp).
+            let evictable_bytes: usize = self
+                .entries
+                .values()
+                .filter(|e| e.header.leg_seq != hdr.leg_seq && e.header.flags.pp >= hdr.flags.pp)
+                .map(CachedLegPacket::wire_len)
+                .sum();
+            if evictable_bytes < needed {
+                return;
+            }
+            while self.total_bytes.saturating_sub(existing_len) + wire_len > LEG_CACHE_MAX_BYTES {
+                if !self.evict_lowest_priority(hdr.flags.pp, hdr.leg_seq) {
+                    break;
+                }
             }
         }
-        if self.total_bytes + wire_bytes.len() > LEG_CACHE_MAX_BYTES {
+        if self.total_bytes.saturating_sub(existing_len) + wire_len > LEG_CACHE_MAX_BYTES {
             return;
         }
         if let Some(old) = self.entries.remove(&hdr.leg_seq) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.wire_bytes.len());
+            self.total_bytes = self.total_bytes.saturating_sub(old.wire_len());
+            if let Some(pos) = self.order.iter().position(|&s| s == hdr.leg_seq) {
+                self.order.remove(pos);
+            }
         }
-        self.total_bytes += wire_bytes.len();
+        self.total_bytes += wire_len;
         self.order.push_back(hdr.leg_seq);
         self.entries.insert(
             hdr.leg_seq,
             CachedLegPacket {
-                leg_seq: hdr.leg_seq,
-                access_epoch: hdr.access_epoch,
-                pp: hdr.flags.pp,
+                header: *hdr,
+                l3_payload,
                 inserted_ms: now_ms,
                 last_rtx_ms: None,
                 rtx_count: 0,
-                wire_bytes,
             },
         );
     }
@@ -848,6 +931,7 @@ impl LegCiphertextCache {
         now_ms: u64,
         rtt_ms: u64,
         rtx_budget_bytes: Option<usize>,
+        epoch_state: &AccessEpochState,
     ) -> Vec<Vec<u8>> {
         self.evict_expired(now_ms);
         let mut candidates = Vec::new();
@@ -860,7 +944,7 @@ impl LegCiphertextCache {
                 if !self.is_eligible_for_rtx(entry, now_ms, rtt_ms) {
                     continue;
                 }
-                candidates.push((entry.pp, seq));
+                candidates.push((entry.header.flags.pp, seq));
             }
         }
         // Serve highest priority (smallest pp) first when token bucket is tight.
@@ -870,35 +954,47 @@ impl LegCiphertextCache {
         let mut out = Vec::new();
         for (_, seq) in candidates {
             if let Some(entry) = self.entries.get_mut(&seq) {
-                if entry.wire_bytes.len() > remaining_budget {
+                let wire_len = entry.wire_len();
+                if wire_len > remaining_budget {
                     continue;
                 }
-                remaining_budget -= entry.wire_bytes.len();
+                let Some(key_dir) = epoch_state.key_for_epoch(entry.header.access_epoch) else {
+                    continue;
+                };
+                let mut rtx_hdr = entry.header;
+                rtx_hdr.flags.rtx = true;
+                rtx_hdr.mac_64 = [0; 8];
+                let Ok(pkt) = seal_udp_v11(key_dir, rtx_hdr, &entry.l3_payload) else {
+                    continue;
+                };
+                remaining_budget -= wire_len;
                 entry.rtx_count += 1;
                 entry.last_rtx_ms = Some(now_ms);
-                let mut pkt = entry.wire_bytes.clone();
-                // Mark rtx flag bit 9 (`x=1`) in cached copy? Wait: per V2 §2.2
-                // "期内用原纪元原 mac_64 重传" for soft rekey grace; caller re-seals if needed.
                 let len = pkt.len() as u64;
                 self.billed_bytes = self.billed_bytes.saturating_add(len);
                 self.rtx_emitted_bytes = self.rtx_emitted_bytes.saturating_add(len);
-                out.push(std::mem::take(&mut pkt));
+                out.push(pkt);
             }
         }
         out
     }
 
     fn is_eligible_for_rtx(&self, entry: &CachedLegPacket, now_ms: u64, rtt_ms: u64) -> bool {
-        if now_ms.saturating_sub(entry.inserted_ms) > LEG_NACK_VIDEO_MAX_AGE_MS {
-            return false;
-        }
-        if entry.access_epoch != self.cur_epoch {
+        if entry.header.access_epoch != self.cur_epoch {
             match self.rekey_at_ms {
                 Some(t) if now_ms.saturating_sub(t) <= LEG_REKEY_GRACE_MS => {}
                 _ => return false,
             }
         }
-        let max_rtx = if entry.pp == 3 { 1 } else { 2 };
+        let max_age_ms = if entry.header.flags.pp == 2 {
+            LEG_NACK_VIDEO_MAX_AGE_MS
+        } else {
+            LEG_CACHE_TTL_MS
+        };
+        if now_ms.saturating_sub(entry.inserted_ms) > max_age_ms {
+            return false;
+        }
+        let max_rtx = if entry.header.flags.pp == 3 { 1 } else { 2 };
         if entry.rtx_count >= max_rtx {
             return false;
         }
@@ -920,7 +1016,7 @@ impl LegCiphertextCache {
             if expired {
                 self.order.pop_front();
                 if let Some(removed) = self.entries.remove(&front) {
-                    self.total_bytes = self.total_bytes.saturating_sub(removed.wire_bytes.len());
+                    self.total_bytes = self.total_bytes.saturating_sub(removed.wire_len());
                 }
             } else {
                 break;
@@ -928,15 +1024,19 @@ impl LegCiphertextCache {
         }
     }
 
-    fn evict_lowest_priority(&mut self) -> bool {
+    fn evict_lowest_priority(&mut self, incoming_pp: u8, exclude_seq: u32) -> bool {
         let victim = self
             .entries
             .values()
-            .max_by_key(|e| (e.pp, std::cmp::Reverse(e.inserted_ms)))
-            .map(|e| e.leg_seq);
+            .filter(|e| e.header.leg_seq != exclude_seq && e.header.flags.pp >= incoming_pp)
+            .max_by_key(|e| (e.header.flags.pp, std::cmp::Reverse(e.inserted_ms)))
+            .map(|e| e.header.leg_seq);
         if let Some(seq) = victim {
             if let Some(removed) = self.entries.remove(&seq) {
-                self.total_bytes = self.total_bytes.saturating_sub(removed.wire_bytes.len());
+                self.total_bytes = self.total_bytes.saturating_sub(removed.wire_len());
+                if let Some(pos) = self.order.iter().position(|&s| s == seq) {
+                    self.order.remove(pos);
+                }
                 return true;
             }
         }

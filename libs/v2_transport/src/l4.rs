@@ -6,8 +6,12 @@ use crate::{
     error::TransportError,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use v2_identity::ControlPreemptToken;
+
+pub const STREAM_SEQ_DEDUP_CAPACITY: usize = 4096;
+pub const VIDEO_REASSEMBLER_MAX_PARTIALS: usize = 64;
+pub const VIDEO_REASSEMBLER_MAX_AGE_MS: u16 = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L4Header {
@@ -96,15 +100,53 @@ pub fn effective_p3_credit(rwnd_bytes: u32, cwnd_bytes: u32) -> u32 {
     rwnd_bytes.min(cwnd_bytes)
 }
 
-/// Tracks `(chan_id, stream_seq)` deduplication across ARQ retransmits & 5ms dual-send.
-#[derive(Debug, Default)]
+/// Tracks `(chan_id, stream_seq)` deduplication across ARQ retransmits & 5ms dual-send
+/// with a hard bounded entry cap (`STREAM_SEQ_DEDUP_CAPACITY`).
+#[derive(Debug)]
 pub struct StreamSeqDedup {
+    max_entries: usize,
     seen: BTreeSet<(u8, u32)>,
+    order: VecDeque<(u8, u32)>,
+}
+
+impl Default for StreamSeqDedup {
+    fn default() -> Self {
+        Self::with_capacity(STREAM_SEQ_DEDUP_CAPACITY)
+    }
 }
 
 impl StreamSeqDedup {
+    pub fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            seen: BTreeSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
     pub fn mark_if_new(&mut self, chan_id: u8, stream_seq: u32) -> bool {
-        self.seen.insert((chan_id, stream_seq))
+        let key = (chan_id, stream_seq);
+        if self.seen.contains(&key) {
+            return false;
+        }
+        while self.seen.len() >= self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.seen.insert(key);
+        self.order.push_back(key);
+        true
     }
 }
 
@@ -291,7 +333,8 @@ struct PartialFrame {
     slices: BTreeMap<u16, Vec<u8>>,
 }
 
-/// Receive-side video slice reassembler with `max_age_ms` stale-frame eviction.
+/// Receive-side video slice reassembler with bounded partial-frame capacity
+/// (`VIDEO_REASSEMBLER_MAX_PARTIALS = 64`) and clamped `max_age_ms <= 500ms`.
 #[derive(Default)]
 pub struct VideoReassembler {
     partials: BTreeMap<u32, PartialFrame>,
@@ -299,8 +342,28 @@ pub struct VideoReassembler {
 }
 
 impl VideoReassembler {
+    pub fn partial_count(&self) -> usize {
+        self.partials.len()
+    }
+
     pub fn push_slice(&mut self, slice: VideoSlice, now_ms: u64) -> Option<ReassembledVideoFrame> {
         self.evict_expired(now_ms);
+        if !self.partials.contains_key(&slice.frame_id) {
+            while self.partials.len() >= VIDEO_REASSEMBLER_MAX_PARTIALS {
+                let oldest_fid = self
+                    .partials
+                    .iter()
+                    .min_by_key(|(&fid, pf)| (pf.first_recv_ms, fid))
+                    .map(|(&fid, _)| fid);
+                if let Some(fid) = oldest_fid {
+                    self.partials.remove(&fid);
+                    self.expired_frames = self.expired_frames.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+        }
+        let clamped_max_age_ms = slice.max_age_ms.min(VIDEO_REASSEMBLER_MAX_AGE_MS);
         let entry = self
             .partials
             .entry(slice.frame_id)
@@ -310,11 +373,14 @@ impl VideoReassembler {
                 ltr_slot: slice.ltr_slot,
                 is_idr: slice.is_idr,
                 is_ref: slice.is_ref,
-                max_age_ms: slice.max_age_ms,
+                max_age_ms: clamped_max_age_ms,
                 first_recv_ms: now_ms,
                 slice_cnt: slice.slice_cnt,
                 slices: BTreeMap::new(),
             });
+        if slice.slice_cnt != entry.slice_cnt {
+            return None;
+        }
         entry.slices.insert(slice.slice_idx, slice.data);
         if entry.slices.len() == entry.slice_cnt as usize {
             if let Some(done) = self.partials.remove(&slice.frame_id) {

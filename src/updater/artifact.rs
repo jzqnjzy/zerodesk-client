@@ -13,6 +13,15 @@ use std::{
 
 const UPDATE_SIDECAR_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_METADATA_SIDECAR_MAX_BYTES: u64 = 1024 * 1024;
+const ZERODESK_UPDATE_OWNER: &str = match option_env!("ZERODESK_UPDATE_GITHUB_OWNER") {
+    Some(v) => v,
+    None => "zerodesk",
+};
+const ZERODESK_UPDATE_REPO: &str = match option_env!("ZERODESK_UPDATE_GITHUB_REPO") {
+    Some(v) => v,
+    None => "zerodesk",
+};
+const ZERODESK_UPDATE_METADATA_FILE: &str = "zerodesk-update.json";
 
 lazy_static::lazy_static! {
     static ref VERIFIED_UPDATE_ARTIFACT: Mutex<Option<VerifiedUpdateArtifact>> = Mutex::new(None);
@@ -106,9 +115,10 @@ pub(super) fn verified_update_artifact_from_release_page_url(
 ) -> ResultType<VerifiedUpdateArtifact> {
     let release_id = release_id_from_update_url(update_url)?;
     let display_version = display_version_from_release_id(&release_id)?;
-    let expected_artifact_url_prefix =
-        format!("https://github.com/rustdesk/rustdesk/releases/download/{release_id}/");
-    let metadata_url = format!("{expected_artifact_url_prefix}rustdesk-update.json");
+    let expected_artifact_url_prefix = format!(
+        "https://github.com/{ZERODESK_UPDATE_OWNER}/{ZERODESK_UPDATE_REPO}/releases/download/{release_id}/"
+    );
+    let metadata_url = format!("{expected_artifact_url_prefix}{ZERODESK_UPDATE_METADATA_FILE}");
     let signature_url = format!("{metadata_url}.sig");
     let metadata_bytes = fetch_update_sidecar_bytes(&metadata_url)?;
     let signature_bytes = fetch_update_sidecar_bytes(&signature_url)?;
@@ -177,8 +187,8 @@ pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
     let tag = segments.next()?;
     let filename = segments.next()?;
 
-    if owner != "rustdesk"
-        || repo != "rustdesk"
+    if owner != ZERODESK_UPDATE_OWNER
+        || repo != ZERODESK_UPDATE_REPO
         || releases != "releases"
         || download != "download"
         || tag.is_empty()
@@ -214,29 +224,30 @@ mod tests {
     #[test]
     fn update_download_file_accepts_expected_github_asset_urls() {
         let file = get_update_download_file_from_url(
-            "https://github.com/rustdesk/rustdesk/releases/download/1.4.0/rustdesk-1.4.0-x86_64.dmg",
+            "https://github.com/zerodesk/zerodesk/releases/download/1.4.0/zerodesk-1.4.0-x86_64.dmg",
         )
         .expect("valid GitHub release asset URL");
 
         assert_eq!(
             file.file_name().and_then(|name| name.to_str()),
-            Some("rustdesk-1.4.0-x86_64.dmg")
+            Some("zerodesk-1.4.0-x86_64.dmg")
         );
     }
 
     #[test]
     fn update_download_file_rejects_untrusted_or_malformed_urls() {
         for url in [
-            "http://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
-            "https://example.com/rustdesk.exe",
-            "https://github.com/other/project/releases/download/1/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/nested/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/C:rustdesk.exe",
-            "https://user@github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
-            "https://github.com:443/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe?download=1",
-            "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe#download",
+            "http://github.com/zerodesk/zerodesk/releases/download/1/zerodesk.exe",
+            "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe",
+            "https://example.com/zerodesk.exe",
+            "https://github.com/other/project/releases/download/1/zerodesk.exe",
+            "https://github.com/zerodesk/zerodesk/releases/download/1/",
+            "https://github.com/zerodesk/zerodesk/releases/download/1/nested/zerodesk.exe",
+            "https://github.com/zerodesk/zerodesk/releases/download/1/C:zerodesk.exe",
+            "https://user@github.com/zerodesk/zerodesk/releases/download/1/zerodesk.exe",
+            "https://github.com:443/zerodesk/zerodesk/releases/download/1/zerodesk.exe",
+            "https://github.com/zerodesk/zerodesk/releases/download/1/zerodesk.exe?download=1",
+            "https://github.com/zerodesk/zerodesk/releases/download/1/zerodesk.exe#download",
             "not a url",
         ] {
             assert!(get_update_download_file_from_url(url).is_none(), "{url}");

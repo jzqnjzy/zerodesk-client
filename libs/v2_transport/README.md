@@ -13,5 +13,8 @@ Clean-room Rust implementation of the ZeroDesk V2 (`v1.2-FROZEN`) client transpo
 Because `libs/hbb_common` is an uninitialized upstream submodule during Phase 0, this crate declares its own `[workspace]` table so it compiles and passes all unit + cross-repo conformance vector tests independently:
 
 ```sh
-cargo test --manifest-path libs/v2_transport/Cargo.toml
+ZERODESK_VECTORS_DIR=/path/to/protocol-spec/vectors \
+  cargo test --manifest-path libs/v2_transport/Cargo.toml
 ```
+
+If `ZERODESK_VECTORS_DIR` is unset, tests default to `/Volumes/data/github/zerodesk/protocol-spec/vectors`.

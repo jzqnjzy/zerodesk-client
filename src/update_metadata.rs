@@ -20,21 +20,15 @@ use artifact::{validate_artifact, validate_artifact_file_name, ArtifactUrlPolicy
 #[cfg(target_os = "macos")]
 pub(crate) use offline::{verify_offline_update_metadata, OfflineUpdateMetadataRequirements};
 
-const UPDATE_METADATA_SIGNATURE_CONTEXT: &[u8] = b"RustDesk update metadata v1\n";
-const UPDATE_APP: &str = "rustdesk";
-pub(crate) const PUBLIC_UPDATE_PACKAGE_ID: &str = "rustdesk";
+const UPDATE_METADATA_SIGNATURE_CONTEXT: &[u8] = b"ZeroDesk update metadata v1\n";
+const UPDATE_APP: &str = "zerodesk";
+pub(crate) const PUBLIC_UPDATE_PACKAGE_ID: &str = "zerodesk";
 const METADATA_SCHEMA_VERSION: u32 = 1;
 const SIGNATURE_SCHEMA_VERSION: u32 = 1;
 const SIGNATURE_ALGORITHM: &str = "ed25519";
 
-const TRUSTED_UPDATE_KEYS: &[TrustedUpdateKey] = &[TrustedUpdateKey {
-    key_id: "2026-ed25519-main",
-    algorithm: SIGNATURE_ALGORITHM,
-    public_key: [
-        52, 214, 32, 65, 191, 134, 137, 75, 157, 74, 67, 221, 150, 161, 118, 215, 218, 35, 236,
-        156, 127, 120, 133, 156, 197, 141, 37, 22, 47, 106, 181, 177,
-    ],
-}];
+// Fail closed until ZeroDesk release signing Ed25519 public keys are provisioned.
+const TRUSTED_UPDATE_KEYS: &[TrustedUpdateKey] = &[];
 
 #[derive(Deserialize)]
 struct UpdateMetadata {

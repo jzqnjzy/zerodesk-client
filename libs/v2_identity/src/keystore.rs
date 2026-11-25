@@ -74,8 +74,30 @@ impl SoftwareDeviceKeyStore {
 
     pub fn save_pkcs8_der(&self, path: &Path) -> Result<(), IdentityError> {
         let der = self.to_pkcs8_der()?;
-        std::fs::write(path, der.as_slice())
-            .map_err(|e| IdentityError::Storage(e.to_string()))
+        #[cfg(unix)]
+        {
+            use std::{
+                fs::{OpenOptions, Permissions},
+                io::Write,
+                os::unix::fs::{OpenOptionsExt, PermissionsExt},
+            };
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            file.write_all(der.as_slice())
+                .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            std::fs::set_permissions(path, Permissions::from_mode(0o600))
+                .map_err(|e| IdentityError::Storage(e.to_string()))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, der.as_slice())
+                .map_err(|e| IdentityError::Storage(e.to_string()))
+        }
     }
 
     pub fn load_pkcs8_der(path: &Path) -> Result<Self, IdentityError> {

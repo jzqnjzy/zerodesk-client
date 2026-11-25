@@ -8,8 +8,8 @@ use crate::{
     error::TransportError,
     l3::{L3Receiver, L3Sender},
     l4::{
-        decode_l4_frame, encode_l4_frame, ActuatorCmd, L4Header, TelemetryFrame, VideoReassembler,
-        VideoSlice,
+        decode_l4_frame, encode_l4_frame, ActuatorCmd, ActuatorReceiver, L4Header, TelemetryFrame,
+        VideoReassembler, VideoSlice,
     },
     path::TransportMode,
     policy::VerifiedTenantPolicy,
@@ -21,6 +21,7 @@ use std::sync::{
     Mutex,
 };
 use tokio::sync::mpsc;
+use v2_identity::ControlPreemptToken;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrameMeta {
@@ -139,13 +140,16 @@ struct WireEnvelope {
 }
 
 /// In-memory L3-encrypted `TransportV2` endpoint pair for local/CI verification
-/// of channel dispatch, video MTU slicing/reassembly, and `VerifiedTenantPolicy` enforcement.
+/// of channel dispatch, video MTU slicing/reassembly, actuator safety checks,
+/// and `VerifiedTenantPolicy` enforcement.
 pub struct LoopbackTransportV2 {
     policy: VerifiedTenantPolicy,
     l3_mtu: usize,
     sender: Mutex<L3Sender>,
     receiver: Mutex<L3Receiver>,
     reassembler: Mutex<VideoReassembler>,
+    actuator_receiver: Mutex<ActuatorReceiver>,
+    now_ms: AtomicU64,
     tx_wire: mpsc::UnboundedSender<WireEnvelope>,
     rx_wire: mpsc::UnboundedReceiver<WireEnvelope>,
     stream_seq: AtomicU32,
@@ -163,14 +167,35 @@ impl LoopbackTransportV2 {
         key_b2a: [u8; 32],
         policy: VerifiedTenantPolicy,
     ) -> (Self, Self) {
+        Self::pair_with_device_ids(
+            cipher_suite,
+            key_a2b,
+            key_b2a,
+            policy,
+            [0x01; 16],
+            [0x02; 16],
+        )
+    }
+
+    pub fn pair_with_device_ids(
+        cipher_suite: u16,
+        key_a2b: [u8; 32],
+        key_b2a: [u8; 32],
+        policy: VerifiedTenantPolicy,
+        device_id_a: [u8; 16],
+        device_id_b: [u8; 16],
+    ) -> (Self, Self) {
         let (tx_a2b, rx_a2b) = mpsc::unbounded_channel();
         let (tx_b2a, rx_b2a) = mpsc::unbounded_channel();
+        let tenant_id = policy.tenant_id;
         let a = Self {
             policy: policy.clone(),
             l3_mtu: L3_MTU_DEFAULT,
             sender: Mutex::new(L3Sender::new(cipher_suite, 1, key_a2b)),
             receiver: Mutex::new(L3Receiver::new(cipher_suite, 1, key_b2a)),
             reassembler: Mutex::new(VideoReassembler::default()),
+            actuator_receiver: Mutex::new(ActuatorReceiver::new(tenant_id, device_id_a, 1)),
+            now_ms: AtomicU64::new(0),
             tx_wire: tx_a2b,
             rx_wire: rx_b2a,
             stream_seq: AtomicU32::new(0),
@@ -186,6 +211,8 @@ impl LoopbackTransportV2 {
             sender: Mutex::new(L3Sender::new(cipher_suite, 1, key_b2a)),
             receiver: Mutex::new(L3Receiver::new(cipher_suite, 1, key_a2b)),
             reassembler: Mutex::new(VideoReassembler::default()),
+            actuator_receiver: Mutex::new(ActuatorReceiver::new(tenant_id, device_id_b, 1)),
+            now_ms: AtomicU64::new(0),
             tx_wire: tx_b2a,
             rx_wire: rx_a2b,
             stream_seq: AtomicU32::new(0),
@@ -196,6 +223,26 @@ impl LoopbackTransportV2 {
             policy_denied_drops: AtomicU64::new(0),
         };
         (a, b)
+    }
+
+    pub fn set_now_ms(&self, now_ms: u64) {
+        self.now_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn apply_actuator_preempt(
+        &self,
+        token: &ControlPreemptToken,
+        ca_spki_der: &[u8],
+        now_unix: u64,
+    ) -> Result<u32, TransportError> {
+        self.actuator_receiver
+            .lock()
+            .unwrap()
+            .apply_preempt_token(token, ca_spki_der, now_unix)
     }
 
     fn send_l4(
@@ -295,6 +342,10 @@ impl TransportV2 for LoopbackTransportV2 {
     }
 
     async fn send_actuator(&self, cmd: ActuatorCmd) -> Result<(), TransportError> {
+        if let Err(e) = self.policy.enforce_channel(CHAN_REALTIME_ACTUATOR, false) {
+            self.policy_denied_drops.fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
         let body = cmd.encode();
         self.send_l4(CHAN_REALTIME_ACTUATOR, 0x01, 0, &body)
     }
@@ -307,11 +358,12 @@ impl TransportV2 for LoopbackTransportV2 {
     async fn recv(&mut self) -> Result<TransportEvent, TransportError> {
         loop {
             let env = self.rx_wire.recv().await.ok_or(TransportError::Closed)?;
+            let now_ms = self.now_ms.load(Ordering::Relaxed);
             let wire_len = env.l3_packet.len() as u64;
             let (l3_hdr, pt) = self.receiver.lock().unwrap().decrypt_and_verify(
                 &env.l3_packet,
                 Some(env.outer_pp),
-                0,
+                now_ms,
             )?;
             self.rx_packets.fetch_add(1, Ordering::Relaxed);
             self.rx_bytes.fetch_add(wire_len, Ordering::Relaxed);
@@ -344,7 +396,7 @@ impl TransportV2 for LoopbackTransportV2 {
                 }
                 CHAN_VIDEO => {
                     let slice = VideoSlice::decode(body)?;
-                    if let Some(frame) = self.reassembler.lock().unwrap().push_slice(slice, 0) {
+                    if let Some(frame) = self.reassembler.lock().unwrap().push_slice(slice, now_ms) {
                         return Ok(TransportEvent::VideoFrame(AssembledVideoFrame {
                             codec_id: frame.codec_id,
                             frame_id: frame.frame_id,
@@ -386,7 +438,21 @@ impl TransportV2 for LoopbackTransportV2 {
                     return Ok(TransportEvent::Diagnostics(snap));
                 }
                 CHAN_REALTIME_ACTUATOR => {
+                    if let Err(e) = self.policy.enforce_channel(CHAN_REALTIME_ACTUATOR, false) {
+                        self.policy_denied_drops.fetch_add(1, Ordering::Relaxed);
+                        return Err(e);
+                    }
                     let cmd = ActuatorCmd::decode(body)?;
+                    if !self
+                        .actuator_receiver
+                        .lock()
+                        .unwrap()
+                        .accept_cmd(&cmd, now_ms)
+                    {
+                        return Err(TransportError::InvalidFraming(
+                            "0x07 RealtimeActuator command rejected by safety validator".into(),
+                        ));
+                    }
                     return Ok(TransportEvent::RealtimeActuator(cmd));
                 }
                 CHAN_TELEMETRY => {

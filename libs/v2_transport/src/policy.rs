@@ -1,5 +1,7 @@
 use crate::{
-    constants::{CHAN_CLIPBOARD, CHAN_FILE_TRANSFER, QUOTA_THROTTLE_KBPS},
+    constants::{
+        CHAN_CLIPBOARD, CHAN_FILE_TRANSFER, CHAN_REALTIME_ACTUATOR, QUOTA_THROTTLE_KBPS,
+    },
     error::TransportError,
 };
 use serde::{Deserialize, Serialize};
@@ -96,7 +98,7 @@ impl VerifiedTenantPolicy {
                 "policy rules digest does not match signed policy_hash".into(),
             ));
         }
-        Ok(Self::from_rules_unchecked(
+        Ok(Self::from_rules_internal(
             device_cert.tenant_id,
             blob.version,
             blob.policy_hash,
@@ -107,10 +109,10 @@ impl VerifiedTenantPolicy {
     pub fn free_tier(tenant_id: [u8; 16]) -> Self {
         let rules = TenantPolicyRules::free_tier_default();
         let hash = rules.canonical_hash();
-        Self::from_rules_unchecked(tenant_id, 1, hash, &rules)
+        Self::from_rules_internal(tenant_id, 1, hash, &rules)
     }
 
-    pub fn from_rules_unchecked(
+    fn from_rules_internal(
         tenant_id: [u8; 16],
         policy_version: u64,
         policy_hash: [u8; 32],
@@ -133,6 +135,16 @@ impl VerifiedTenantPolicy {
         }
     }
 
+    #[cfg(test)]
+    pub fn from_rules_unchecked(
+        tenant_id: [u8; 16],
+        policy_version: u64,
+        policy_hash: [u8; 32],
+        rules: &TenantPolicyRules,
+    ) -> Self {
+        Self::from_rules_internal(tenant_id, policy_version, policy_hash, rules)
+    }
+
     pub fn enforce_channel(
         &self,
         chan_id: u8,
@@ -148,6 +160,11 @@ impl VerifiedTenantPolicy {
             CHAN_CLIPBOARD if is_file_clipboard && !self.allow_file_clipboard => {
                 Err(TransportError::PolicyDenied(
                     "file clipboard (Cliprdr) blocked when file transfer is disabled".into(),
+                ))
+            }
+            CHAN_REALTIME_ACTUATOR if !self.allow_realtime_actuator => {
+                Err(TransportError::PolicyDenied(
+                    "0x07 RealtimeActuator blocked by tenant policy".into(),
                 ))
             }
             _ => Ok(()),

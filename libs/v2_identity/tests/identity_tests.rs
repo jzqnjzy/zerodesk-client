@@ -8,16 +8,27 @@ use v2_identity::{
     ERR_CERT_EXPIRED, ERR_CERT_REVOKED, ERR_DELEGATION_ROLLBACK, X25519_SLICE_SECS,
 };
 
+/// Golden vector directory resolution:
+/// - Set `ZERODESK_VECTORS_DIR` to point at `protocol-spec/vectors` in CI or custom checkouts.
+/// - Defaults to `/Volumes/data/github/zerodesk/protocol-spec/vectors` when unset.
+const DEFAULT_VECTORS_DIR: &str = "/Volumes/data/github/zerodesk/protocol-spec/vectors";
+
 fn vectors_dir() -> PathBuf {
     std::env::var("ZERODESK_VECTORS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/Volumes/data/github/zerodesk/protocol-spec/vectors"))
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_VECTORS_DIR))
 }
 
 fn load_vector(name: &str) -> Value {
     let path = vectors_dir().join(name);
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read golden vector {}: {}", path.display(), e));
+    let data = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read golden vector {} (set ZERODESK_VECTORS_DIR or populate default {}): {}",
+            path.display(),
+            DEFAULT_VECTORS_DIR,
+            e
+        )
+    });
     serde_json::from_str(&data).expect("valid vector json")
 }
 
@@ -280,22 +291,38 @@ fn golden_vector_v14_delegation_rollback_and_certs() {
         expected["seq11_exceeds_cert_exp_err"].as_u64().unwrap() as u16
     );
 
-    // StaticKeyHint retry succeeds once and rejects a second retry.
+    // StaticKeyHint retry succeeds once per handshake session and rejects a second retry
+    // in the same session, without deadlocking a subsequent handshake session.
     let d11_hint = parse_deleg(&input["deleg_seq11_hint_valid"]);
     assert_eq!(
         hex::encode(d11_hint.tbs_bytes()),
         input["deleg_seq11_hint_valid"]["tbs_hex"].as_str().unwrap()
     );
     let mut hint_retry = StaticKeyHintRetry::new();
+    let hs_session_1 = [0x01; 16];
     hint_retry
-        .accept_hint(&mut cache, &d11_hint, &dev_pub, cert_exp, d11_hint.exp_unix - 10)
+        .accept_hint(
+            hs_session_1,
+            &mut cache,
+            &d11_hint,
+            &dev_pub,
+            cert_exp,
+            d11_hint.exp_unix - 10,
+        )
         .unwrap();
     assert_eq!(
-        hint_retry.retries_used() as u64,
+        hint_retry.retries_used(&hs_session_1) as u64,
         expected["static_key_hint_max_retries"].as_u64().unwrap()
     );
     assert_eq!(
-        hint_retry.accept_hint(&mut cache, &d11_hint, &dev_pub, cert_exp, d11_hint.exp_unix - 10),
+        hint_retry.accept_hint(
+            hs_session_1,
+            &mut cache,
+            &d11_hint,
+            &dev_pub,
+            cert_exp,
+            d11_hint.exp_unix - 10,
+        ),
         Err(IdentityError::RetryLimitExceeded)
     );
 }
@@ -353,4 +380,136 @@ fn golden_vector_v04_edge_cert_and_v24_preempt_token() {
         bad_token.verify(&pt_ca, &tenant_id, &drone_id, now_unix),
         Err(IdentityError::InvalidSignature)
     );
+}
+
+#[test]
+fn x25519_rotator_persists_state_across_restart_and_hint_retry_is_per_session() {
+    let ks = SoftwareDeviceKeyStore::generate();
+    let spki = ks.public_key_spki_der().unwrap();
+    let device_id = [0xCD; 16];
+    let t0 = 1_700_000_000;
+    let cert_exp = t0 + 6 * 3600;
+
+    let mut rotator = X25519StaticKeyRotator::new(device_id, true, 9);
+    let g10 = rotator.ensure_current(&ks, t0, cert_exp).unwrap();
+    let d10 = g10.delegation.clone();
+    assert_eq!(d10.delegation_seq, 10);
+
+    let mut cache = DelegationCache::new();
+    cache.verify_and_record(&d10, &spki, cert_exp, t0).unwrap();
+
+    // Persist state to disk and reload after simulated process restart.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "zerodesk_rotator_state_{}.bin",
+        std::process::id()
+    ));
+    rotator.save_state(&tmp_path).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let mut restarted = X25519StaticKeyRotator::load_state(&tmp_path).unwrap();
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(restarted.last_delegation_seq(), 10);
+    assert_eq!(restarted.retained_metadata().len(), 1);
+
+    // After restart, new in-memory key MUST advance to seq 11 (never colliding on seq 10).
+    let g11 = restarted.ensure_current(&ks, t0 + 5, cert_exp).unwrap();
+    let d11 = g11.delegation.clone();
+    assert_eq!(d11.delegation_seq, 11);
+    assert_ne!(d11.x25519_pub, d10.x25519_pub);
+
+    // StaticKeyHintRetry tracks retries per handshake session instead of deadlocking globally.
+    let mut hint_retry = StaticKeyHintRetry::new();
+    let session_a = [0xA1; 16];
+    let session_b = [0xB2; 16];
+
+    hint_retry
+        .accept_hint(session_a, &mut cache, &d11, &spki, cert_exp, t0 + 10)
+        .unwrap();
+    assert_eq!(hint_retry.retries_used(&session_a), 1);
+    assert_eq!(
+        hint_retry.accept_hint(session_a, &mut cache, &d11, &spki, cert_exp, t0 + 11),
+        Err(IdentityError::RetryLimitExceeded)
+    );
+
+    // Rotate again to seq 12: a fresh handshake session B MUST still get its 1 retry.
+    let d12 = restarted
+        .rotate_now(&ks, t0 + 20, cert_exp)
+        .unwrap()
+        .delegation
+        .clone();
+    assert_eq!(d12.delegation_seq, 12);
+    hint_retry
+        .accept_hint(session_b, &mut cache, &d12, &spki, cert_exp, t0 + 25)
+        .unwrap();
+    assert_eq!(hint_retry.retries_used(&session_b), 1);
+    assert_eq!(
+        hint_retry.accept_hint(session_b, &mut cache, &d12, &spki, cert_exp, t0 + 26),
+        Err(IdentityError::RetryLimitExceeded)
+    );
+
+    // Wire round-trip + DH shared secret returns Zeroizing<[u8; 32]>.
+    let wire = d12.encode_wire().unwrap();
+    assert_eq!(DelegationStatement::decode_wire(&wire).unwrap(), d12);
+    assert!(DelegationStatement::decode_wire(b"host-delegation").is_err());
+
+    let shared = restarted.current().unwrap().diffie_hellman(d10.x25519_pub);
+    assert_eq!(shared.len(), 32);
+}
+
+#[test]
+fn certs_reject_future_iat_and_excessive_ttl_and_keystore_sets_0600() {
+    let ca = SoftwareDeviceKeyStore::generate();
+    let ca_spki = ca.public_key_spki_der().unwrap();
+    let dev = SoftwareDeviceKeyStore::generate();
+    let dev_spki = dev.public_key_spki_der().unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let key_path = std::env::temp_dir().join(format!(
+            "zerodesk_pkcs8_mode_{}.der",
+            std::process::id()
+        ));
+        dev.save_pkcs8_der(&key_path).unwrap();
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let reloaded = SoftwareDeviceKeyStore::load_pkcs8_der(&key_path).unwrap();
+        assert_eq!(reloaded.public_key_spki_der().unwrap(), dev_spki);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    let now = 1_700_000_000;
+    let mut cert = DeviceCert {
+        version: 1,
+        cert_id: [1; 16],
+        device_id: [2; 16],
+        tenant_id: [3; 16],
+        p256_pub_der: dev_spki,
+        key_epoch: 1,
+        policy_hash: [4; 32],
+        cap_bits: 1,
+        iat_unix: now + 60, // future iat
+        exp_unix: now + 3600,
+        hardware_backed: false,
+        sig_der: Vec::new(),
+    };
+    cert.sig_der = ca.sign_p256_low_s(&cert.tbs_bytes().unwrap()).unwrap();
+    assert_eq!(cert.verify(&ca_spki, now), Err(IdentityError::CertExpired));
+
+    // Excessive TTL (> 24h max for DeviceCert) rejected even with valid signature.
+    cert.iat_unix = now;
+    cert.exp_unix = now + 30 * 86_400;
+    cert.sig_der = ca.sign_p256_low_s(&cert.tbs_bytes().unwrap()).unwrap();
+    assert_eq!(cert.verify(&ca_spki, now + 10), Err(IdentityError::CertExpired));
+
+    // Reasonable TTL within [iat, exp] succeeds.
+    cert.exp_unix = now + 6 * 3600;
+    cert.sig_der = ca.sign_p256_low_s(&cert.tbs_bytes().unwrap()).unwrap();
+    cert.verify(&ca_spki, now + 10).unwrap();
 }

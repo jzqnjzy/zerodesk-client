@@ -38,7 +38,7 @@ impl L3Header {
         if self.pkt_seq > PKT_SEQ_MAX {
             return Err(TransportError::SequenceExhausted);
         }
-        if self.frame_flags & !0x03 != 0 {
+        if self.frame_flags != 0 {
             return Err(TransportError::InvalidFraming(
                 "L3 frame_flags reserved bits must be zero".into(),
             ));
@@ -63,7 +63,7 @@ impl L3Header {
             ));
         }
         let frame_flags = bytes[13];
-        if frame_flags & !0x03 != 0 {
+        if frame_flags != 0 {
             return Err(TransportError::InvalidFraming(
                 "L3 frame_flags reserved bits must be zero".into(),
             ));

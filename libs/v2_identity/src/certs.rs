@@ -9,6 +9,26 @@ pub const TENANT_POLICY_DOMAIN: &[u8; 19] = b"V2-TENANT-POLICY-v1";
 pub const REVOCATION_DOMAIN: &[u8; 16] = b"V2-REVOCATION-v1";
 pub const PREEMPT_DOMAIN: &[u8; 13] = b"V2-PREEMPT-v1";
 
+pub const MAX_DEVICE_CERT_TTL_SECS: u64 = 24 * 3600;
+pub const MAX_EDGE_CERT_TTL_SECS: u64 = 48 * 3600;
+pub const MAX_TENANT_POLICY_TTL_SECS: u64 = 7 * 24 * 3600;
+pub const MAX_PREEMPT_TOKEN_TTL_SECS: u64 = 3600;
+
+fn validate_time_window(
+    iat_unix: u64,
+    exp_unix: u64,
+    now_unix: u64,
+    max_ttl_secs: u64,
+) -> Result<(), IdentityError> {
+    if exp_unix <= iat_unix || exp_unix.saturating_sub(iat_unix) > max_ttl_secs {
+        return Err(IdentityError::CertExpired);
+    }
+    if now_unix < iat_unix || now_unix > exp_unix {
+        return Err(IdentityError::CertExpired);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCert {
     pub version: u32,
@@ -51,9 +71,7 @@ impl DeviceCert {
     }
 
     pub fn verify(&self, ca_spki_der: &[u8], now_unix: u64) -> Result<(), IdentityError> {
-        if now_unix > self.exp_unix {
-            return Err(IdentityError::CertExpired);
-        }
+        validate_time_window(self.iat_unix, self.exp_unix, now_unix, MAX_DEVICE_CERT_TTL_SECS)?;
         let tbs = self.tbs_bytes()?;
         verify_p256_low_s(ca_spki_der, &tbs, &self.sig_der)
     }
@@ -98,9 +116,7 @@ impl EdgeCert {
     }
 
     pub fn verify(&self, ca_spki_der: &[u8], now_unix: u64) -> Result<(), IdentityError> {
-        if now_unix > self.exp_unix {
-            return Err(IdentityError::CertExpired);
-        }
+        validate_time_window(self.iat_unix, self.exp_unix, now_unix, MAX_EDGE_CERT_TTL_SECS)?;
         let tbs = self.tbs_bytes();
         verify_p256_low_s(ca_spki_der, &tbs, &self.sig_der)
     }
@@ -140,6 +156,62 @@ impl DelegationStatement {
         let tbs = self.tbs_bytes();
         verify_p256_low_s(device_spki_der, &tbs, &self.sig_der)
     }
+
+    pub fn encode_wire(&self) -> Result<Vec<u8>, IdentityError> {
+        let sig_len = u16::try_from(self.sig_der.len())
+            .map_err(|_| IdentityError::InvalidFraming("delegation sig exceeds u16::MAX".into()))?;
+        let mut out = Vec::with_capacity(16 + 32 + 1 + 8 + 8 + 2 + self.sig_der.len());
+        out.extend_from_slice(&self.device_id);
+        out.extend_from_slice(&self.x25519_pub);
+        out.push(u8::from(self.prefer_chacha));
+        out.extend_from_slice(&self.delegation_seq.to_be_bytes());
+        out.extend_from_slice(&self.exp_unix.to_be_bytes());
+        out.extend_from_slice(&sig_len.to_be_bytes());
+        out.extend_from_slice(&self.sig_der);
+        Ok(out)
+    }
+
+    pub fn decode_wire(bytes: &[u8]) -> Result<Self, IdentityError> {
+        const FIXED_LEN: usize = 16 + 32 + 1 + 8 + 8 + 2;
+        if bytes.len() < FIXED_LEN {
+            return Err(IdentityError::InvalidFraming(
+                "DelegationStatement wire payload truncated".into(),
+            ));
+        }
+        let prefer_chacha = match bytes[48] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(IdentityError::InvalidFraming(
+                    "invalid prefer_chacha boolean byte".into(),
+                ));
+            }
+        };
+        let sig_len = u16::from_be_bytes([bytes[65], bytes[66]]) as usize;
+        if bytes.len() != FIXED_LEN + sig_len || sig_len == 0 {
+            return Err(IdentityError::InvalidFraming(
+                "DelegationStatement wire length mismatch".into(),
+            ));
+        }
+        let mut device_id = [0u8; 16];
+        device_id.copy_from_slice(&bytes[0..16]);
+        let mut x25519_pub = [0u8; 32];
+        x25519_pub.copy_from_slice(&bytes[16..48]);
+        let delegation_seq = u64::from_be_bytes([
+            bytes[49], bytes[50], bytes[51], bytes[52], bytes[53], bytes[54], bytes[55], bytes[56],
+        ]);
+        let exp_unix = u64::from_be_bytes([
+            bytes[57], bytes[58], bytes[59], bytes[60], bytes[61], bytes[62], bytes[63], bytes[64],
+        ]);
+        Ok(Self {
+            device_id,
+            x25519_pub,
+            prefer_chacha,
+            delegation_seq,
+            exp_unix,
+            sig_der: bytes[FIXED_LEN..].to_vec(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,9 +245,12 @@ impl TenantPolicyBlob {
         if &self.tenant_id != expected_tenant_id {
             return Err(IdentityError::BindingMismatch);
         }
-        if now_unix > self.exp_unix {
-            return Err(IdentityError::CertExpired);
-        }
+        validate_time_window(
+            self.iat_unix,
+            self.exp_unix,
+            now_unix,
+            MAX_TENANT_POLICY_TTL_SECS,
+        )?;
         let tbs = self.tbs_bytes();
         verify_p256_low_s(ca_spki_der, &tbs, &self.sig_der)
     }
@@ -241,9 +316,12 @@ impl ControlPreemptToken {
         {
             return Err(IdentityError::BindingMismatch);
         }
-        if now_unix > self.exp_unix {
-            return Err(IdentityError::CertExpired);
-        }
+        validate_time_window(
+            self.iat_unix,
+            self.exp_unix,
+            now_unix,
+            MAX_PREEMPT_TOKEN_TTL_SECS,
+        )?;
         let tbs = self.tbs_bytes();
         verify_p256_low_s(ca_spki_der, &tbs, &self.sig_der)
     }

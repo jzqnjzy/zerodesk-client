@@ -54,7 +54,8 @@ pub use l4::{
     ActuatorReceiver, HidBatchResult, HidEvent, L4Header, LtrRecoveryController, LtrRecoveryReq,
     ReassembledVideoFrame, RecoveryAction, StreamSeqDedup, TelemetryFrame, VideoReassembler,
     VideoSlice, ACTUATOR_HDR_LEN, LTR_REASON_DECODE_ERROR, LTR_REASON_SLICE_LOST_TIMEOUT,
-    TELEMETRY_HDR_LEN, VIDEO_SLICE_META_LEN,
+    STREAM_SEQ_DEDUP_CAPACITY, TELEMETRY_HDR_LEN, VIDEO_REASSEMBLER_MAX_AGE_MS,
+    VIDEO_REASSEMBLER_MAX_PARTIALS, VIDEO_SLICE_META_LEN,
 };
 pub use path::{
     DualSendWindow, PathHandle, PathId, PathSet, PathState, TransportMode, DUAL_SEND_MAX_MS,

@@ -8,7 +8,9 @@ use std::{
 #[cfg(feature = "hwcodec")]
 use crate::hwcodec::*;
 #[cfg(feature = "mediacodec")]
-use crate::mediacodec::{MediaCodecDecoder, H264_DECODER_SUPPORT, H265_DECODER_SUPPORT};
+use crate::mediacodec::{
+    has_hardware_h265_decoder, MediaCodecDecoder, H264_DECODER_SUPPORT,
+};
 #[cfg(feature = "vram")]
 use crate::vram::*;
 use crate::{
@@ -497,12 +499,12 @@ impl Decoder {
                 } else {
                     0
                 };
-            decoding.ability_h265 =
-                if H265_DECODER_SUPPORT.load(std::sync::atomic::Ordering::SeqCst) {
-                    1
-                } else {
-                    0
-                };
+            // ZeroDesk HEVC_OS_HW_ONLY: advertise Android HEVC decode only when a hardware MediaCodec decoder is available.
+            decoding.ability_h265 = if has_hardware_h265_decoder() {
+                1
+            } else {
+                0
+            };
         }
         for unsupported in mark_unsupported {
             match unsupported {

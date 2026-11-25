@@ -135,10 +135,60 @@ impl MediaCodecDecoder {
     }
 }
 
-fn create_media_codec(name: &str, direction: MediaCodecDirection) -> Option<MediaCodecDecoder> {
-    let codec = MediaCodec::from_decoder_type(name)?;
+pub fn is_software_mediacodec_name(codec_name: &str) -> bool {
+    let lower = codec_name.to_ascii_lowercase();
+    lower.starts_with("c2.android.")
+        || lower.starts_with("omx.google.")
+        || lower.starts_with("omx.ffmpeg.")
+        || lower.starts_with("c2.ffmpeg.")
+        || lower.contains(".sw.")
+        || lower.contains("software")
+}
+
+pub fn is_hardware_mediacodec_decoder(codec_name: &str, hw_flag: Option<bool>) -> bool {
+    if is_software_mediacodec_name(codec_name) {
+        return false;
+    }
+    !matches!(hw_flag, Some(false))
+}
+
+fn select_hardware_hevc_decoder_name() -> Option<String> {
+    #[cfg(target_os = "android")]
+    {
+        let infos = crate::android::ffi::get_codec_info()?;
+        infos
+            .codecs
+            .into_iter()
+            .find(|c| {
+                !c.is_encoder
+                    && c.mime_type == H265_MIME_TYPE
+                    && is_hardware_mediacodec_decoder(&c.name, c.hw)
+            })
+            .map(|c| c.name)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
+
+pub fn has_hardware_h265_decoder() -> bool {
+    H265_DECODER_SUPPORT.load(Ordering::SeqCst) && select_hardware_hevc_decoder_name().is_some()
+}
+
+fn create_media_codec(mime_type: &str, direction: MediaCodecDirection) -> Option<MediaCodecDecoder> {
+    let (codec, resolved_name) = if mime_type == H265_MIME_TYPE {
+        // ZeroDesk HEVC_OS_HW_ONLY: never use from_decoder_type() for HEVC because Android
+        // silently selects software decoders (c2.android.hevc.decoder / OMX.google.hevc.decoder).
+        let hw_name = select_hardware_hevc_decoder_name()?;
+        let codec = MediaCodec::from_codec_name(&hw_name)?;
+        (codec, hw_name)
+    } else {
+        let codec = MediaCodec::from_decoder_type(mime_type)?;
+        (codec, mime_type.to_owned())
+    };
     let media_format = MediaFormat::new();
-    media_format.set_str("mime", name);
+    media_format.set_str("mime", mime_type);
     media_format.set_i32("width", 0);
     media_format.set_i32("height", 0);
     media_format.set_i32("color-format", 19); // COLOR_FormatYUV420Planar
@@ -151,21 +201,55 @@ fn create_media_codec(name: &str, direction: MediaCodecDirection) -> Option<Medi
         log::error!("Failed to start decoder: {:?}", e);
         return None;
     };
-    log::debug!("Init decoder succeeded!: {:?}", name);
+    log::debug!("Init decoder succeeded!: {:?}", resolved_name);
     return Some(MediaCodecDecoder {
         decoder: codec,
-        name: name.to_owned(),
+        name: resolved_name,
     });
 }
 
 pub fn check_mediacodec() {
     std::thread::spawn(move || {
         // check decoders
-        let decoders = MediaCodecDecoder::new_decoders();
-        H264_DECODER_SUPPORT.swap(decoders.h264.is_some(), Ordering::SeqCst);
-        H265_DECODER_SUPPORT.swap(decoders.h265.is_some(), Ordering::SeqCst);
-        decoders.h264.map(|d| d.stop());
-        decoders.h265.map(|d| d.stop());
+        let h264 = MediaCodecDecoder::new(CodecFormat::H264);
+        let h265 = MediaCodecDecoder::new(CodecFormat::H265);
+        H264_DECODER_SUPPORT.swap(h264.is_some(), Ordering::SeqCst);
+        H265_DECODER_SUPPORT.swap(h265.is_some(), Ordering::SeqCst);
+        h264.map(|d| d.stop());
+        h265.map(|d| d.stop());
         // TODO encoders
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_android_software_hevc_decoders() {
+        for sw in [
+            "c2.android.hevc.decoder",
+            "OMX.google.hevc.decoder",
+            "omx.google.hevc.decoder",
+            "c2.ffmpeg.hevc.decoder",
+            "OMX.vendor.hevc.sw.decoder",
+            "vendor.software.hevc",
+        ] {
+            assert!(is_software_mediacodec_name(sw), "{sw}");
+            assert!(!is_hardware_mediacodec_decoder(sw, Some(true)), "{sw}");
+            assert!(!is_hardware_mediacodec_decoder(sw, None), "{sw}");
+        }
+        assert!(!is_hardware_mediacodec_decoder(
+            "c2.qti.hevc.decoder",
+            Some(false)
+        ));
+        assert!(is_hardware_mediacodec_decoder(
+            "c2.qti.hevc.decoder",
+            Some(true)
+        ));
+        assert!(is_hardware_mediacodec_decoder(
+            "OMX.qcom.video.decoder.hevc",
+            None
+        ));
+    }
 }

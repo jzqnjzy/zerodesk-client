@@ -1,30 +1,46 @@
 use serde_json::Value;
 use std::path::PathBuf;
-use v2_identity::{ControlPreemptToken, DelegationStatement};
+use v2_identity::{
+    ControlPreemptToken, DelegationStatement, DeviceCert, DeviceKeyStore, SoftwareDeviceKeyStore,
+    TenantPolicyBlob, X25519StaticKeyRotator,
+};
 use v2_transport::{
     anchor_rs_parity_count, build_sack_bitmap, check_arq_retry_limit, compute_rto_ms,
     compute_stream_mac64, compute_udp_mac64, derive_access_key, derive_access_key_with_prk,
     effective_p3_credit, open_l3, process_hid_queue, seal_l3, seal_stream_v11, seal_udp_v11,
     seq_u32_gt, verify_mac64_ct, AccessEpochState, AccessFlags, AccessHeaderV10, AccessHeaderV11,
-    ActuatorCmd, ActuatorReceiver, BwHintController, EdgeCtrlFrame, HidEvent, L3Header, L3Receiver,
-    L4Header, LegCiphertextCache, LegSeqDedupWindow, LtrRecoveryController, LtrRecoveryReq,
-    PrologueInput, QueuedStreamSlice, QuotaExhaustPolicy, RecoveryAction, ReplayWindow2048,
-    StreamFrameParser, StreamSeqDedup, TcpStreamSendQueue, TelemetryFrame, TenantPolicyRules,
-    TransportError, VerifiedTenantPolicy, ZeroRttGuard, ACCESS_HDR_V10_LEN,
-    BACKBONE_MAX_WIRE_BYTES, BW_EVENT_SURVIVAL_MODE, CIPHER_AESGCM, CIPHER_CHACHAPOLY,
-    DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT, TRANSPORT_DATAGRAM, TRANSPORT_STREAM,
+    ActuatorCmd, ActuatorReceiver, BwHintController, E2eeNoiseHandshake, EdgeCtrlFrame, ErrorCode,
+    HidEvent, L3Header, L3Receiver, L4Header, LegCiphertextCache, LegSeqDedupWindow,
+    LtrRecoveryController, LtrRecoveryReq, PrologueInput, QueuedStreamSlice, QuotaExhaustPolicy,
+    RecoveryAction, ReplayWindow2048, StreamFrameParser, StreamSeqDedup, TcpStreamSendQueue,
+    TelemetryFrame, TenantPolicyRules, TransportError, VerifiedTenantPolicy, VideoReassembler,
+    VideoSlice, ZeroRttGuard, ACCESS_HDR_V10_LEN, ACCESS_HDR_V11_LEN, BACKBONE_MAX_WIRE_BYTES,
+    BW_EVENT_SURVIVAL_MODE, CIPHER_AESGCM, CIPHER_CHACHAPOLY, DIR_CLIENT_TO_EDGE,
+    DIR_EDGE_TO_CLIENT, L3_MTU_DEFAULT, LTR_REASON_SLICE_LOST_TIMEOUT, TRANSPORT_DATAGRAM,
+    TRANSPORT_STREAM,
 };
+
+/// Golden vector directory resolution:
+/// - Set `ZERODESK_VECTORS_DIR` to point at `protocol-spec/vectors` in CI or custom checkouts.
+/// - Defaults to `/Volumes/data/github/zerodesk/protocol-spec/vectors` when unset.
+const DEFAULT_VECTORS_DIR: &str = "/Volumes/data/github/zerodesk/protocol-spec/vectors";
 
 fn vectors_dir() -> PathBuf {
     std::env::var("ZERODESK_VECTORS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/Volumes/data/github/zerodesk/protocol-spec/vectors"))
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_VECTORS_DIR))
 }
 
 fn load_vector(name: &str) -> Value {
     let path = vectors_dir().join(name);
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read golden vector {}: {}", path.display(), e));
+    let data = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read golden vector {} (set ZERODESK_VECTORS_DIR or populate default {}): {}",
+            path.display(),
+            DEFAULT_VECTORS_DIR,
+            e
+        )
+    });
     serde_json::from_str(&data).expect("valid json")
 }
 
@@ -226,7 +242,8 @@ fn vector_v04_noise_downgrade_reject() {
 
     for m in v["downgrade_mutations"].as_array().unwrap() {
         let mut mutated = base.clone();
-        match m["mutated_field"].as_str().unwrap() {
+        let field = m["mutated_field"].as_str().unwrap();
+        match field {
             "handshake_pattern" => {
                 mutated.handshake_pattern = m["mutated_value"].as_u64().unwrap() as u8
             }
@@ -240,10 +257,130 @@ fn vector_v04_noise_downgrade_reject() {
             }
             other => panic!("unexpected mutation {other}"),
         }
-        let got = mutated.compute_prologue();
-        assert_eq!(hex::encode(got), m["mutated_prologue_hex"].as_str().unwrap());
-        assert_ne!(got, base.compute_prologue());
+        let base_prologue = base.compute_prologue();
+        let mutated_prologue = mutated.compute_prologue();
+        assert_eq!(
+            hex::encode(mutated_prologue),
+            m["mutated_prologue_hex"].as_str().unwrap()
+        );
+        assert_ne!(mutated_prologue, base_prologue);
+
+        // Drive BOTH peers through a real snow Noise_IK handshake so every downgrade mutation
+        // fails cryptographic transcript authentication (0x0204 TranscriptMismatch).
+        let ctrl_ks = SoftwareDeviceKeyStore::generate();
+        let host_ks = SoftwareDeviceKeyStore::generate();
+        let mut ctrl_rot = X25519StaticKeyRotator::new(base.device_id_ctrl, false, 0);
+        let mut host_rot = X25519StaticKeyRotator::new(base.device_id_host, false, 0);
+        let ctrl_gen = ctrl_rot
+            .ensure_current(&ctrl_ks, 1_700_000_000, 1_700_021_600)
+            .unwrap();
+        let host_gen = host_rot
+            .ensure_current(&host_ks, 1_700_000_000, 1_700_021_600)
+            .unwrap();
+        let ctrl_priv = *ctrl_gen.secret_bytes();
+        let host_priv = *host_gen.secret_bytes();
+        let host_pub = host_gen.public_key;
+
+        let expected_err = m["expected_err"].as_u64().unwrap() as u16;
+        let mut init = E2eeNoiseHandshake::build_ik_initiator(
+            base.cipher_suite,
+            &ctrl_priv,
+            &host_pub,
+            &mutated_prologue,
+        )
+        .unwrap();
+        let mut resp = E2eeNoiseHandshake::build_ik_responder(
+            base.cipher_suite,
+            &host_priv,
+            &base_prologue,
+        )
+        .unwrap();
+        let msg1 = init.write_message(b"v04-downgrade-probe").unwrap();
+        let err = resp
+            .read_message(&msg1)
+            .expect_err(&format!("snow Noise_IK must reject mutated field {field}"));
+        assert_eq!(err.error_code(), ErrorCode::TranscriptMismatch);
+        assert_eq!(err.error_code().as_u16(), expected_err, "field {field}");
+
+        // For cipher_suite downgrade, also verify mismatched suite + mutated prologue fails.
+        if field == "cipher_suite" {
+            let mut init_downgraded = E2eeNoiseHandshake::build_ik_initiator(
+                mutated.cipher_suite,
+                &ctrl_priv,
+                &host_pub,
+                &mutated_prologue,
+            )
+            .unwrap();
+            let mut resp_base = E2eeNoiseHandshake::build_ik_responder(
+                base.cipher_suite,
+                &host_priv,
+                &base_prologue,
+            )
+            .unwrap();
+            let msg1_down = init_downgraded.write_message(b"v04-cipher-down").unwrap();
+            let err_down = resp_base
+                .read_message(&msg1_down)
+                .expect_err("cipher_suite downgrade must fail decrypt");
+            assert_eq!(err_down.error_code().as_u16(), expected_err);
+        }
     }
+}
+
+#[test]
+fn vector_v02_lookup_before_mac() {
+    let v = load_vector("v02_lookup_before_mac.json");
+    let tbl = &v["session_table"];
+    let exp = &v["expected"];
+
+    let known_cid: [u8; 8] = hex_arr(tbl["route_cid_hex"].as_str().unwrap());
+    let hs_hash: [u8; 32] = hex_arr(tbl["hs_hash_hex"].as_str().unwrap());
+    let access_epoch = tbl["access_epoch"].as_u64().unwrap() as u32;
+    let mut state = AccessEpochState::new(
+        known_cid,
+        hs_hash,
+        TRANSPORT_DATAGRAM,
+        DIR_CLIENT_TO_EDGE,
+        access_epoch,
+        20,
+    )
+    .unwrap();
+
+    let mut mac_calls = 0u64;
+    let mut replies = 0u64;
+
+    for pkt in v["packets"].as_array().unwrap() {
+        let raw = hex_bytes(pkt["hex_input"].as_str().unwrap());
+        let expected_err = pkt["expected_err"].as_u64().unwrap() as u16;
+        let res = AccessHeaderV11::decode(&raw).and_then(|hdr| {
+            hdr.validate_udp_ingress(raw.len())?;
+            if hdr.route_cid != known_cid {
+                return Err(TransportError::InvalidFraming("unknown route_cid".into()));
+            }
+            mac_calls += 1;
+            state.verify_udp_packet(&raw, 100).map(|_| ())
+        });
+        assert!(res.is_err(), "case {}", pkt["case"]);
+        if pkt["case"].as_str().unwrap() != "unknown_route_cid" {
+            assert_eq!(res.unwrap_err().error_code().as_u16(), expected_err);
+        }
+    }
+    assert_eq!(mac_calls, exp["mac_call_count"].as_u64().unwrap());
+    assert_eq!(replies, exp["reply_count"].as_u64().unwrap());
+
+    let valid_ping = hex_bytes(v["valid_ping_pkt_hex"].as_str().unwrap());
+    let hdr = AccessHeaderV11::decode(&valid_ping).unwrap();
+    hdr.validate_udp_ingress(valid_ping.len()).unwrap();
+    assert_eq!(hdr.route_cid, known_cid);
+    let (verified_hdr, payload) = state.verify_udp_packet(&valid_ping, 100).unwrap();
+    assert!(verified_hdr.flags.is_ctrl_edge);
+    let ctrl = EdgeCtrlFrame::decode(payload).unwrap();
+    if let EdgeCtrlFrame::Ping { .. } = ctrl {
+        replies += 1;
+    }
+    assert_eq!(
+        replies,
+        exp["reply_count_after_valid_ping"].as_u64().unwrap()
+    );
 }
 
 #[test]
@@ -701,9 +838,20 @@ fn vector_v19_leg_nack_anti_amplification() {
         inp["leg_nack_wire_hex"].as_str().unwrap()
     );
 
-    // Exercise 100x replayed LEG_NACK against wraparound leg_seq cache
+    // Exercise 100x replayed LEG_NACK against wraparound leg_seq cache using real 28B headers
+    // and precomputed AccessEpochState keys: every emitted RTX MUST have x=1, valid recomputed
+    // MAC, and be excluded from RTT sampling.
+    let mut epoch_state = AccessEpochState::new(
+        route_cid,
+        hs_hash,
+        TRANSPORT_DATAGRAM,
+        DIR_EDGE_TO_CLIENT,
+        access_epoch,
+        rtt_ms,
+    )
+    .unwrap();
     let mut cache = LegCiphertextCache::new(access_epoch);
-    let mk_hdr = |seq: u32, pp: u8, d: bool| AccessHeaderV11 {
+    let mk_hdr = |seq: u32, pp: u8, d: bool, epoch: u32| AccessHeaderV11 {
         flags: AccessFlags {
             pp,
             discardable: d,
@@ -713,15 +861,27 @@ fn vector_v19_leg_nack_anti_amplification() {
             rtx: false,
         },
         route_cid,
-        access_epoch,
+        access_epoch: epoch,
         leg_seq: seq,
         mac_64: [0; 8],
     };
-    // seq 0xFFFFFFFE (p0), 0xFFFFFFFF (p3), 0 (p2 d=1), 1 (p2 ref), 2 (p0 old)
-    cache.record_original(&mk_hdr(base_leg_seq, 0, false), vec![1; 100], 1000);
-    cache.record_original(&mk_hdr(base_leg_seq.wrapping_add(1), 3, false), vec![2; 100], 1000);
-    cache.record_original(&mk_hdr(base_leg_seq.wrapping_add(2), 2, true), vec![3; 100], 1000);
-    cache.record_original(&mk_hdr(base_leg_seq.wrapping_add(3), 2, false), vec![4; 100], 1000);
+    // seq 0xFFFFFFFE (p0), 0xFFFFFFFF (p3), 0 (p2 d=1), 1 (p2 ref)
+    cache.record_original(&mk_hdr(base_leg_seq, 0, false, access_epoch), vec![1; 72], 1000);
+    cache.record_original(
+        &mk_hdr(base_leg_seq.wrapping_add(1), 3, false, access_epoch),
+        vec![2; 72],
+        1000,
+    );
+    cache.record_original(
+        &mk_hdr(base_leg_seq.wrapping_add(2), 2, true, access_epoch),
+        vec![3; 72],
+        1000,
+    );
+    cache.record_original(
+        &mk_hdr(base_leg_seq.wrapping_add(3), 2, false, access_epoch),
+        vec![4; 72],
+        1000,
+    );
 
     let mut p0_rtx = 0usize;
     let mut p3_rtx = 0usize;
@@ -731,8 +891,17 @@ fn vector_v19_leg_nack_anti_amplification() {
         if t - 1000 > 99 {
             break;
         }
-        for pkt in cache.handle_leg_nack(base_leg_seq, loss_bitmap, t, rtt_ms, None) {
-            match pkt[0] {
+        for pkt in cache.handle_leg_nack(base_leg_seq, loss_bitmap, t, rtt_ms, None, &epoch_state) {
+            let (decoded_hdr, payload) = epoch_state
+                .verify_udp_packet(&pkt, t)
+                .expect("retransmitted packet MUST have valid recomputed MAC");
+            assert!(decoded_hdr.flags.rtx, "retransmitted packet MUST set x=1");
+            assert!(
+                !decoded_hdr.eligible_for_rtt_sample(),
+                "retransmitted packet MUST be excluded from RTT sampling"
+            );
+            assert_eq!(pkt.len(), ACCESS_HDR_V11_LEN + 72);
+            match payload[0] {
                 1 => p0_rtx += 1,
                 2 => p3_rtx += 1,
                 3 => d1_rtx += 1,
@@ -752,22 +921,34 @@ fn vector_v19_leg_nack_anti_amplification() {
         cache.orig_emitted_bytes + cache.rtx_emitted_bytes
     );
 
-    // Expired > 100ms emits 0 RTX
+    // Fresh video (p2) packet expired > 100ms emits 0 RTX
+    let mut vid_cache = LegCiphertextCache::new(access_epoch);
+    vid_cache.record_original(&mk_hdr(50, 2, false, access_epoch), vec![7; 72], 1000);
     assert_eq!(
-        cache.handle_leg_nack(base_leg_seq, loss_bitmap, 1101, rtt_ms, None).len() as u64,
+        vid_cache
+            .handle_leg_nack(50, 1, 1101, rtt_ms, None, &epoch_state)
+            .len() as u64,
         exp["expired_101ms_rtx_count"].as_u64().unwrap()
     );
 
-    // Soft rekey 150ms old-epoch grace check
+    // Soft rekey 150ms old-epoch grace check with real epoch-2 MAC verification
     let mut rekey_cache = LegCiphertextCache::new(2);
-    rekey_cache.record_original(&mk_hdr(10, 0, false), vec![9; 100], 2000);
+    rekey_cache.record_original(&mk_hdr(10, 0, false, 2), vec![9; 72], 2000);
     rekey_cache.on_soft_rekey(3, 2000);
+    epoch_state.advance_epoch(3, 2000).unwrap();
+    let rtx_100 = rekey_cache.handle_leg_nack(10, 1, 2100, 10, None, &epoch_state);
     assert_eq!(
-        !rekey_cache.handle_leg_nack(10, 1, 2100, 10, None).is_empty(),
+        !rtx_100.is_empty(),
         exp["old_epoch_at_100ms_accepted"].as_bool().unwrap()
     );
+    let (h_old, _) = epoch_state.verify_udp_packet(&rtx_100[0], 2100).unwrap();
+    assert!(h_old.flags.rtx);
+    assert!(!h_old.eligible_for_rtt_sample());
+    assert_eq!(h_old.access_epoch, 2);
     assert_eq!(
-        !rekey_cache.handle_leg_nack(10, 1, 2160, 10, None).is_empty(),
+        !rekey_cache
+            .handle_leg_nack(10, 1, 2160, 10, None, &epoch_state)
+            .is_empty(),
         exp["old_epoch_at_160ms_accepted"].as_bool().unwrap()
     );
 }
@@ -956,6 +1137,30 @@ fn vector_v22_leg_seq_header_rekey() {
         leg3["mac_wrap_rekey_hex"].as_str().unwrap()
     );
 
+    // Verify LegCiphertextCache::handle_leg_nack produces the exact golden hdr_rtx_hex || l3_payload
+    // with flags.rtx == true, valid recomputed mac_rtx_hex, and RTT exclusion!
+    let mut leg3_epoch = AccessEpochState::new(
+        cid3,
+        hs3,
+        TRANSPORT_DATAGRAM,
+        DIR_EDGE_TO_CLIENT,
+        1,
+        20,
+    )
+    .unwrap();
+    let mut leg3_cache = LegCiphertextCache::new(1);
+    leg3_cache.record_original(&h_orig, l3_payload.clone(), 1000);
+    let emitted = leg3_cache.handle_leg_nack(h_orig.leg_seq, 1, 1020, 20, None, &leg3_epoch);
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(
+        hex::encode(&emitted[0][..ACCESS_HDR_V11_LEN]),
+        leg3["hdr_rtx_hex"].as_str().unwrap()
+    );
+    assert_eq!(&emitted[0][ACCESS_HDR_V11_LEN..], l3_payload.as_slice());
+    let (verified_rtx, _) = leg3_epoch.verify_udp_packet(&emitted[0], 1020).unwrap();
+    assert!(verified_rtx.flags.rtx);
+    assert!(!verified_rtx.eligible_for_rtt_sample());
+
     // Modular leg_seq wraparound 0xFFFFFFFF -> 0 across access_epoch 1 -> 2
     let mut dedup = LegSeqDedupWindow::new();
     assert!(dedup.check_and_mark(h_orig.leg_seq));
@@ -965,6 +1170,149 @@ fn vector_v22_leg_seq_header_rekey() {
         seq_u32_gt(h_wrap.leg_seq, h_orig.leg_seq),
         exp["leg_seq_wrap_next_gt_prev"].as_bool().unwrap()
     );
+}
+
+#[test]
+fn vector_v17_amplification_and_rebind() {
+    let v = load_vector("v17_amplification_and_rebind.json");
+    let inp = &v["input"];
+    let exp = &v["expected"];
+
+    let route_cid: [u8; 8] = hex_arr(inp["route_cid_hex"].as_str().unwrap());
+    let hs_hash: [u8; 32] = hex_arr(inp["hs_hash_hex"].as_str().unwrap());
+    let mut state = AccessEpochState::new(
+        route_cid,
+        hs_hash,
+        TRANSPORT_DATAGRAM,
+        DIR_CLIENT_TO_EDGE,
+        0,
+        20,
+    )
+    .unwrap();
+    let mut leg_dedup = LegSeqDedupWindow::new();
+
+    // Bad MAC packet fails verification with zero reply.
+    let bad_pkt = hex_bytes(inp["bad_mac_pkt_hex"].as_str().unwrap());
+    let mut reply_count_on_forged = 0u64;
+    if state.verify_udp_packet(&bad_pkt, 100).is_ok() {
+        reply_count_on_forged += 1;
+    }
+    assert_eq!(
+        reply_count_on_forged,
+        exp["reply_count_on_forged"].as_u64().unwrap()
+    );
+
+    // Valid packet passes MAC and is deduplicated on repeat via LegSeqDedupWindow.
+    let valid_pkt = hex_bytes(inp["valid_pkt_hex"].as_str().unwrap());
+    let (h1, _) = state.verify_udp_packet(&valid_pkt, 100).unwrap();
+    assert!(leg_dedup.check_and_mark(h1.leg_seq));
+    assert!(!leg_dedup.check_and_mark(h1.leg_seq));
+
+    // Valid packet after authorized rebind passes MAC and advances leg_seq.
+    let after_rebind = hex_bytes(inp["valid_pkt_after_rebind_hex"].as_str().unwrap());
+    let (h2, _) = state.verify_udp_packet(&after_rebind, 200).unwrap();
+    assert_eq!(
+        leg_dedup.check_and_mark(h2.leg_seq),
+        exp["authorized_rebind_accept"].as_bool().unwrap()
+    );
+
+    // Valid PING increments reply_count to 1.
+    let valid_ping = hex_bytes(inp["valid_ping_pkt_hex"].as_str().unwrap());
+    let (h_ping, body) = state.verify_udp_packet(&valid_ping, 300).unwrap();
+    assert!(h_ping.flags.is_ctrl_edge);
+    let mut ping_replies = 0u64;
+    if matches!(EdgeCtrlFrame::decode(body).unwrap(), EdgeCtrlFrame::Ping { .. }) {
+        ping_replies += 1;
+    }
+    assert_eq!(
+        ping_replies,
+        exp["reply_count_after_valid_ping"].as_u64().unwrap()
+    );
+}
+
+#[test]
+fn vector_v23_three_leg_weak_e2e() {
+    let v = load_vector("v23_three_leg_weak_e2e.json");
+    let inp = &v["input"];
+    let exp = &v["expected"];
+
+    let total_frames = inp["total_frames"].as_u64().unwrap() as u32;
+    let slices_per_frame = inp["slices_per_frame"].as_u64().unwrap() as usize;
+    let min_intact_ratio = exp["min_intact_ratio"].as_f64().unwrap();
+    let max_idr_count = exp["max_idr_count"].as_u64().unwrap();
+    let seed = u64::from_be_bytes(hex_arr::<8>(inp["prng_seed_hex"].as_str().unwrap()));
+
+    // Deterministic client-side E2E video slice reassembly + dual-slot LTR recovery simulation
+    // validating intact ratio >= 0.97 and IDR count <= 2 across 600 frames.
+    let mut ltr = LtrRecoveryController::new(true, true);
+    let mut reassembler = VideoReassembler::default();
+    let mut intact_frames = 0u64;
+    let mut idr_count = 0u64;
+    let mut ltr_recoveries = 0u64;
+
+    // Initial IDR establishes confirmed LTR slot 0.
+    idr_count += 1;
+    assert!(ltr.try_mark_ltr(0, 1));
+    ltr.confirm_ltr(1);
+
+    let mut prng = seed;
+    let frame_payload = vec![0x42u8; slices_per_frame * 900];
+    for fid in 1..=total_frames {
+        let now_ms = (fid as u64) * 16;
+        let slices = VideoSlice::slice_frame(
+            1,
+            fid,
+            fid.saturating_sub(1),
+            0,
+            fid == 1,
+            true,
+            100,
+            &frame_payload,
+            L3_MTU_DEFAULT,
+        )
+        .unwrap();
+
+        // Residual unrecovered loss after Leg1/Leg3 LEG_NACK + Leg2 RS (~1% frame break).
+        prng = prng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let unrecovered_frame_loss = fid > 1 && (prng >> 56) < 2; // ~0.78% residual frame break
+        let mut assembled = None;
+        for (idx, slice) in slices.into_iter().enumerate() {
+            if unrecovered_frame_loss && idx == 0 {
+                continue;
+            }
+            if let Some(frame) = reassembler.push_slice(slice, now_ms) {
+                assembled = Some(frame);
+            }
+        }
+        if assembled.is_some() {
+            intact_frames += 1;
+        } else {
+            let action = ltr.handle_recovery_req(
+                LtrRecoveryReq {
+                    last_good_ref_frame_id: 1,
+                    broken_frame_id: fid,
+                    reason: LTR_REASON_SLICE_LOST_TIMEOUT,
+                },
+                now_ms,
+            );
+            match action {
+                RecoveryAction::ForceRefLtr(1) => ltr_recoveries += 1,
+                RecoveryAction::ForceIdr => idr_count += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let intact_ratio = (intact_frames as f64) / (total_frames as f64);
+    assert!(
+        intact_ratio >= min_intact_ratio,
+        "intact_ratio {intact_ratio} < {min_intact_ratio}"
+    );
+    assert!(
+        idr_count <= max_idr_count,
+        "idr_count {idr_count} > {max_idr_count}"
+    );
+    assert!(ltr_recoveries > 0);
 }
 
 #[test]
@@ -1099,12 +1447,41 @@ fn vector_v24_realtime_actuator_telemetry_and_survival() {
         bw_cap_kbps: 6000,
         exhaust_policy: QuotaExhaustPolicy::MissionLockedAlert,
     };
-    let pol = VerifiedTenantPolicy::from_rules_unchecked(
+    let test_ca = SoftwareDeviceKeyStore::generate();
+    let test_ca_spki = test_ca.public_key_spki_der().unwrap();
+    let test_dev = SoftwareDeviceKeyStore::generate();
+    let mut cert = DeviceCert {
+        version: 1,
+        cert_id: [0x21; 16],
+        device_id: drone_id,
         tenant_id,
-        1,
-        rules.canonical_hash(),
+        p256_pub_der: test_dev.public_key_spki_der().unwrap(),
+        key_epoch: 1,
+        policy_hash: rules.canonical_hash(),
+        cap_bits: 0x1_7001,
+        iat_unix: now_unix - 10,
+        exp_unix: now_unix + 6 * 3600,
+        hardware_backed: false,
+        sig_der: Vec::new(),
+    };
+    cert.sig_der = test_ca.sign_p256_low_s(&cert.tbs_bytes().unwrap()).unwrap();
+    let mut blob = TenantPolicyBlob {
+        tenant_id,
+        version: 1,
+        policy_hash: rules.canonical_hash(),
+        iat_unix: now_unix - 10,
+        exp_unix: now_unix + 24 * 3600,
+        sig_der: Vec::new(),
+    };
+    blob.sig_der = test_ca.sign_p256_low_s(&blob.tbs_bytes()).unwrap();
+    let pol = VerifiedTenantPolicy::from_verified_blob(
+        &blob,
+        &cert,
         &rules,
-    );
+        &test_ca_spki,
+        now_unix,
+    )
+    .unwrap();
     let (cap_on_exhaust, rth_alert) = pol.on_quota_exhausted();
     assert_eq!(cap_on_exhaust == 256, exp["mission_locked_throttled_on_exhaust"].as_bool().unwrap());
     assert_eq!(rth_alert, exp["mission_locked_rth_alert"].as_bool().unwrap());
