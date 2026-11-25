@@ -19,7 +19,7 @@ AppDir:
     name: rustdesk
     icon: rustdesk
     version: 1.5.3
-    exec: usr/share/rustdesk/rustdesk
+    exec: usr/share/rustdesk/zerodesk
     exec_args: $@
   apt:
     arch:

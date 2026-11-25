@@ -3,7 +3,10 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -190,10 +193,14 @@ impl X25519KeyGeneration {
     }
 
     pub fn diffie_hellman(&self, peer_public: [u8; 32]) -> Zeroizing<[u8; 32]> {
-        let secret = StaticSecret::from(self.secret_bytes);
+        let mut secret = StaticSecret::from(self.secret_bytes);
         let peer = PublicKey::from(peer_public);
-        let shared = secret.diffie_hellman(&peer);
-        Zeroizing::new(*shared.as_bytes())
+        let mut shared = secret.diffie_hellman(&peer);
+        let mut out = Zeroizing::new([0u8; 32]);
+        out.copy_from_slice(shared.as_bytes());
+        shared.zeroize();
+        secret.zeroize();
+        out
     }
 }
 
@@ -271,30 +278,58 @@ impl X25519StaticKeyRotator {
     }
 
     pub fn save_state(&self, path: &Path) -> Result<(), IdentityError> {
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let bytes = self.to_persisted_state().encode_bytes()?;
-        #[cfg(unix)]
-        {
-            use std::{
-                fs::{OpenOptions, Permissions},
-                io::Write,
-                os::unix::fs::{OpenOptionsExt, PermissionsExt},
-            };
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let base_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("rotator_state");
+        let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path: PathBuf = parent.join(format!(
+            ".{base_name}.tmp.{}.{nonce}",
+            std::process::id()
+        ));
+
+        let write_result: Result<(), IdentityError> = (|| {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts
+                .open(&tmp_path)
                 .map_err(|e| IdentityError::Storage(e.to_string()))?;
             file.write_all(&bytes)
                 .map_err(|e| IdentityError::Storage(e.to_string()))?;
-            std::fs::set_permissions(path, Permissions::from_mode(0o600))
-                .map_err(|e| IdentityError::Storage(e.to_string()))
+            file.sync_all()
+                .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+                std::fs::set_permissions(&tmp_path, Permissions::from_mode(0o600))
+                    .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            }
+            drop(file);
+            std::fs::rename(&tmp_path, path)
+                .map_err(|e| IdentityError::Storage(e.to_string()))?;
+            #[cfg(unix)]
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
         }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(path, &bytes).map_err(|e| IdentityError::Storage(e.to_string()))
-        }
+        write_result
     }
 
     pub fn load_state(path: &Path) -> Result<Self, IdentityError> {
@@ -343,9 +378,10 @@ impl X25519StaticKeyRotator {
         }
         let slice = Self::slice_for(now_unix);
         let next_seq = self.last_delegation_seq.saturating_add(1);
-        let static_secret = StaticSecret::random_from_rng(OsRng);
+        let mut static_secret = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&static_secret).to_bytes();
         let secret_bytes = static_secret.to_bytes();
+        static_secret.zeroize();
 
         let slice_end = (slice + 1).saturating_mul(X25519_SLICE_SECS);
         let exp_unix = slice_end.min(device_cert_exp_unix);

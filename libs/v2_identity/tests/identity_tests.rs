@@ -398,11 +398,14 @@ fn x25519_rotator_persists_state_across_restart_and_hint_retry_is_per_session() 
     let mut cache = DelegationCache::new();
     cache.verify_and_record(&d10, &spki, cert_exp, t0).unwrap();
 
-    // Persist state to disk and reload after simulated process restart.
-    let tmp_path = std::env::temp_dir().join(format!(
-        "zerodesk_rotator_state_{}.bin",
+    // Persist state to disk atomically (temp + sync_all + rename) and reload after restart.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "zerodesk_rotator_atomic_{}",
         std::process::id()
     ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let tmp_path = tmp_dir.join("rotator_state.bin");
     rotator.save_state(&tmp_path).unwrap();
 
     #[cfg(unix)]
@@ -413,7 +416,6 @@ fn x25519_rotator_persists_state_across_restart_and_hint_retry_is_per_session() 
     }
 
     let mut restarted = X25519StaticKeyRotator::load_state(&tmp_path).unwrap();
-    let _ = std::fs::remove_file(&tmp_path);
     assert_eq!(restarted.last_delegation_seq(), 10);
     assert_eq!(restarted.retained_metadata().len(), 1);
 
@@ -422,6 +424,21 @@ fn x25519_rotator_persists_state_across_restart_and_hint_retry_is_per_session() 
     let d11 = g11.delegation.clone();
     assert_eq!(d11.delegation_seq, 11);
     assert_ne!(d11.x25519_pub, d10.x25519_pub);
+
+    // Atomic overwrite leaves zero leftover temp files and advances persisted sequence.
+    restarted.save_state(&tmp_path).unwrap();
+    let entries: Vec<_> = std::fs::read_dir(&tmp_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        X25519StaticKeyRotator::load_state(&tmp_path)
+            .unwrap()
+            .last_delegation_seq(),
+        11
+    );
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 
     // StaticKeyHintRetry tracks retries per handshake session instead of deadlocking globally.
     let mut hint_retry = StaticKeyHintRetry::new();

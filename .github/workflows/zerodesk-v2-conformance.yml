@@ -1,0 +1,44 @@
+name: ZeroDesk V2 Conformance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "libs/v2_identity/**"
+      - "libs/v2_transport/**"
+      - ".github/workflows/zerodesk-v2-conformance.yml"
+  push:
+    paths:
+      - "libs/v2_identity/**"
+      - "libs/v2_transport/**"
+      - ".github/workflows/zerodesk-v2-conformance.yml"
+
+jobs:
+  v2-crates-test:
+    name: Test v2_identity and v2_transport
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      ZERODESK_VECTORS_DIR: ${{ vars.ZERODESK_VECTORS_DIR || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run v2_identity tests
+        run: |
+          if [ -n "$ZERODESK_VECTORS_DIR" ] && [ -d "$ZERODESK_VECTORS_DIR" ]; then
+            cargo test --manifest-path libs/v2_identity/Cargo.toml
+          else
+            cargo test --manifest-path libs/v2_identity/Cargo.toml -- --skip golden_vector_
+          fi
+
+      - name: Run v2_transport tests
+        run: |
+          if [ -n "$ZERODESK_VECTORS_DIR" ] && [ -d "$ZERODESK_VECTORS_DIR" ]; then
+            cargo test --manifest-path libs/v2_transport/Cargo.toml
+          else
+            cargo test --manifest-path libs/v2_transport/Cargo.toml --test transport_tests
+          fi
