@@ -39,7 +39,7 @@ pub const MIN_VIDEO_DELIVERY_RATIO: f64 = 0.90;
 
 const CTRL_MSG_WAN_REQUEST_IDR: u8 = 0x10;
 const CTRL_MSG_WAN_VIDEO_EOS: u8 = 0x11;
-const PROBE_ECHO_TIMEOUT: Duration = Duration::from_millis(1_000);
+const PROBE_ECHO_TIMEOUT: Duration = Duration::from_millis(1_500);
 const LOADED_WARMUP_DURATION: Duration = Duration::from_millis(200);
 const MIN_LOADED_PROBE_INTERVAL: Duration = Duration::from_millis(5);
 const VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(33);

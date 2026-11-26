@@ -272,9 +272,11 @@ pub struct DesktopControllerSession {
     decoder_codec: VideoCodec,
     pending_video: VecDeque<AssembledVideoFrame>,
     last_delivered_frame_id: Option<u32>,
+    need_idr: bool,
     pub video_frames_received: u64,
     pub pending_video_dropped: u64,
     pub stale_video_frames_dropped: u64,
+    pub resync_non_idr_frames_skipped: u64,
     pub decode_errors: u64,
     pub decoder_flushed_frames: u64,
     pub hid_frames_sent: u64,
@@ -293,9 +295,11 @@ impl DesktopControllerSession {
             decoder_codec,
             pending_video: VecDeque::with_capacity(PENDING_VIDEO_QUEUE_CAP),
             last_delivered_frame_id: None,
+            need_idr: false,
             video_frames_received: 0,
             pending_video_dropped: 0,
             stale_video_frames_dropped: 0,
+            resync_non_idr_frames_skipped: 0,
             decode_errors: 0,
             decoder_flushed_frames: 0,
             hid_frames_sent: 0,
@@ -331,6 +335,7 @@ impl DesktopControllerSession {
         self.decoder = Arc::new(Mutex::new(decoder));
         self.pending_video.clear();
         self.last_delivered_frame_id = None;
+        self.need_idr = false;
     }
 
     pub fn into_inner(self) -> (UdpE2eeSession, Arc<Mutex<V2VideoDecoder>>) {
@@ -367,6 +372,7 @@ impl DesktopControllerSession {
         while self.pending_video.len() >= PENDING_VIDEO_QUEUE_CAP {
             self.pending_video.pop_front();
             self.pending_video_dropped = self.pending_video_dropped.saturating_add(1);
+            self.need_idr = true;
         }
         self.pending_video.push_back(frame);
     }
@@ -413,11 +419,33 @@ impl DesktopControllerSession {
             .is_some_and(|last| frame_id <= last)
     }
 
+    fn should_skip_for_idr_resync(&mut self, frame: &AssembledVideoFrame) -> bool {
+        if frame.is_idr {
+            self.need_idr = false;
+            return false;
+        }
+        if self.need_idr {
+            self.resync_non_idr_frames_skipped =
+                self.resync_non_idr_frames_skipped.saturating_add(1);
+            return true;
+        }
+        if self
+            .last_delivered_frame_id
+            .is_some_and(|last| frame.frame_id > last.saturating_add(1))
+        {
+            self.need_idr = true;
+            self.resync_non_idr_frames_skipped =
+                self.resync_non_idr_frames_skipped.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
     /// Receives the next assembled `0x03 Video` frame (draining any buffered frames from
     /// `pending_video` first), computes its SHA-256, and decodes it to I420 on Tokio's blocking
-    /// pool. Out-of-order stale frames (`frame_id <= last_delivered_frame_id`) and late/unexpected
-    /// HID or Control events are skipped and counted; `0x04 SESSION_CLOSE` returns
-    /// `Err(SessionError::SessionClosed { error_code })`.
+    /// pool. Out-of-order stale frames (`frame_id <= last_delivered_frame_id`), orphan non-IDR
+    /// frames awaiting IDR resync, and late/unexpected HID or Control events are skipped and
+    /// counted; `0x04 SESSION_CLOSE` returns `Err(SessionError::SessionClosed { error_code })`.
     pub async fn recv_and_decode_video(
         &mut self,
         timeout: Duration,
@@ -426,6 +454,9 @@ impl DesktopControllerSession {
             if self.is_stale_video_frame(frame.frame_id) {
                 self.stale_video_frames_dropped =
                     self.stale_video_frames_dropped.saturating_add(1);
+                continue;
+            }
+            if self.should_skip_for_idr_resync(&frame) {
                 continue;
             }
             return self.decode_video_frame(frame).await;
@@ -440,6 +471,9 @@ impl DesktopControllerSession {
                     if self.is_stale_video_frame(frame.frame_id) {
                         self.stale_video_frames_dropped =
                             self.stale_video_frames_dropped.saturating_add(1);
+                        continue;
+                    }
+                    if self.should_skip_for_idr_resync(&frame) {
                         continue;
                     }
                     break frame;
@@ -1050,5 +1084,141 @@ mod tests {
             .unwrap();
         assert_eq!(d_reset.frame.frame_id, 1);
         assert_eq!(pair.controller.stale_video_frames_dropped, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controller_resyncs_to_next_idr_after_gap_or_pending_overflow() {
+        let mut pair = spawn_loopback_pair().await;
+
+        // (a) Direct frame-id gap with non-IDR P-frames: skip orphan P-frames until next IDR.
+        let mut enc1 = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(60)).unwrap();
+        let f1 = enc1.encode_i420(&generate_animated_i420(64, 64, 0), 0).unwrap();
+        let _f2_lost = enc1.encode_i420(&generate_animated_i420(64, 64, 1), 33).unwrap();
+        let f3 = enc1.encode_i420(&generate_animated_i420(64, 64, 2), 66).unwrap();
+        let f4 = enc1.encode_i420(&generate_animated_i420(64, 64, 3), 99).unwrap();
+        assert!(f1.meta.is_idr && !f3.meta.is_idr && !f4.meta.is_idr);
+
+        let mut enc2 = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(60)).unwrap();
+        enc2.advance_next_frame_id_at_least(5);
+        let f5_idr = enc2.encode_i420(&generate_animated_i420(64, 64, 4), 0).unwrap();
+        let f6_p = enc2.encode_i420(&generate_animated_i420(64, 64, 5), 33).unwrap();
+        assert!(f5_idr.meta.is_idr && !f6_p.meta.is_idr);
+
+        pair.host.publish_raw_video(&f1.meta, &f1.data).await.unwrap();
+        let d1 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d1.frame.frame_id, 1);
+
+        // Drop f2; transmit orphan P-frames f3, f4 followed by fresh IDR f5 and P-frame f6.
+        pair.host.publish_raw_video(&f3.meta, &f3.data).await.unwrap();
+        pair.host.publish_raw_video(&f4.meta, &f4.data).await.unwrap();
+        pair.host
+            .publish_raw_video(&f5_idr.meta, &f5_idr.data)
+            .await
+            .unwrap();
+        pair.host
+            .publish_raw_video(&f6_p.meta, &f6_p.data)
+            .await
+            .unwrap();
+
+        let d5 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d5.frame.frame_id, 5);
+        assert_eq!(pair.controller.resync_non_idr_frames_skipped, 2);
+        assert_eq!(pair.controller.decode_errors, 0);
+
+        let d6 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d6.frame.frame_id, 6);
+        assert_eq!(pair.controller.resync_non_idr_frames_skipped, 2);
+        assert_eq!(pair.controller.decode_errors, 0);
+
+        // (b) pending_video overflow evicts older IDR/frames, sets need_idr=true, and skips
+        //     all buffered orphan P-frames until the next IDR arrives.
+        let mut enc3 = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(60)).unwrap();
+        enc3.advance_next_frame_id_at_least(7);
+        let overflow_total = PENDING_VIDEO_QUEUE_CAP + 2;
+        for i in 0..overflow_total {
+            let f = enc3
+                .encode_i420(&generate_animated_i420(64, 64, i as u32), (i as i64) * 33)
+                .unwrap();
+            if i == 0 {
+                assert!(f.meta.is_idr);
+            } else {
+                assert!(!f.meta.is_idr);
+            }
+            pair.host.publish_raw_video(&f.meta, &f.data).await.unwrap();
+        }
+        let ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
+            echo_seq: 1,
+            client_ts_ms: 999,
+        }))
+        .unwrap();
+        pair.host.session_mut().send_hid(&ack).await.unwrap();
+        let probe = HidPayload::Key(KeyEvent {
+            down: true,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 'a' as u32,
+            client_ts_ms: 999,
+        });
+        let (_, _, interleaved) = pair
+            .controller
+            .send_hid_and_await_echo(&probe, 1, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(interleaved, overflow_total as u64);
+        assert_eq!(pair.controller.pending_video_len(), PENDING_VIDEO_QUEUE_CAP);
+        assert_eq!(pair.controller.pending_video_dropped, 2);
+        assert!(pair.controller.need_idr);
+
+        let next_id = 7 + (overflow_total as u32);
+        let mut enc4 = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(60)).unwrap();
+        enc4.advance_next_frame_id_at_least(next_id);
+        let recovery_idr = enc4
+            .encode_i420(&generate_animated_i420(64, 64, 30), 0)
+            .unwrap();
+        let recovery_p = enc4
+            .encode_i420(&generate_animated_i420(64, 64, 31), 33)
+            .unwrap();
+        assert!(recovery_idr.meta.is_idr && !recovery_p.meta.is_idr);
+        pair.host
+            .publish_raw_video(&recovery_idr.meta, &recovery_idr.data)
+            .await
+            .unwrap();
+        pair.host
+            .publish_raw_video(&recovery_p.meta, &recovery_p.data)
+            .await
+            .unwrap();
+
+        let d_idr = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d_idr.frame.frame_id, recovery_idr.meta.frame_id);
+        assert!(!pair.controller.need_idr);
+        assert_eq!(
+            pair.controller.resync_non_idr_frames_skipped,
+            2 + (PENDING_VIDEO_QUEUE_CAP as u64)
+        );
+        assert_eq!(pair.controller.decode_errors, 0);
+
+        let d_p = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d_p.frame.frame_id, recovery_p.meta.frame_id);
+        assert_eq!(pair.controller.decode_errors, 0);
     }
 }

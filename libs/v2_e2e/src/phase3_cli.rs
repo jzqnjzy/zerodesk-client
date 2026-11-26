@@ -1908,59 +1908,68 @@ async fn run_controller(
         let target_frames = args.frames.max(1);
         let pre_hid_frames = 2usize.min(target_frames);
         let mut last_tx_to_host = Instant::now();
-        for idx in 0..pre_hid_frames {
-            let delivery = recv_video_with_keepalive(
-                &mut controller,
-                Duration::from_secs(10),
-                &mut last_tx_to_host,
-            )
-            .await
-            .map_err(|e| format!("controller video recv #{idx} failed: {e}"))?;
-            if let Some(prev) = prev_frame_id {
-                if delivery.frame.frame_id <= prev {
-                    frame_id_monotonic = false;
-                }
-            }
-            prev_frame_id = Some(delivery.frame.frame_id);
-            frames_decoded += 1;
-            // 2B-P1-3: check ALL pre-HID frames (not only frame #0).
-            if detect_visual_marker(&delivery.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
-                visual_marker_before_hid = true;
-            }
-        }
-
-        // Send deterministic safe HID sequence and await Host's P0 EchoAck for every event.
-        let hid_seq = build_interactive_hid_sequence(now_ms(), args.audit_key_identity);
-        for (idx, (payload, audit_rec)) in hid_seq.into_iter().enumerate() {
-            let _ = controller
-                .send_hid_and_await_echo(&payload, idx as u32, Duration::from_secs(5))
+        let run_res: Result<(), String> = async {
+            for idx in 0..pre_hid_frames {
+                let delivery = recv_video_with_keepalive(
+                    &mut controller,
+                    Duration::from_secs(10),
+                    &mut last_tx_to_host,
+                )
                 .await
-                .map_err(|e| format!("controller HID seq {idx} echo failed: {e}"))?;
-            last_tx_to_host = Instant::now();
-            sent_audit.push(audit_rec);
-        }
-        write_audit_jsonl_atomic(&args.audit_out, &sent_audit)?;
-
-        // Decode remaining video frames and verify closed-loop visual marker at (640, 360),
-        // emitting 0x03 KEEPALIVE every >=500ms so Host never hits idle_timeout during slow AV1.
-        while (frames_decoded as usize) < target_frames {
-            let delivery = recv_video_with_keepalive(
-                &mut controller,
-                Duration::from_secs(10),
-                &mut last_tx_to_host,
-            )
-            .await
-            .map_err(|e| format!("controller video recv #{frames_decoded} failed: {e}"))?;
-            if let Some(prev) = prev_frame_id {
-                if delivery.frame.frame_id <= prev {
-                    frame_id_monotonic = false;
+                .map_err(|e| format!("controller video recv #{idx} failed: {e}"))?;
+                if let Some(prev) = prev_frame_id {
+                    if delivery.frame.frame_id <= prev {
+                        frame_id_monotonic = false;
+                    }
+                }
+                prev_frame_id = Some(delivery.frame.frame_id);
+                frames_decoded += 1;
+                // 2B-P1-3: check ALL pre-HID frames (not only frame #0).
+                if detect_visual_marker(&delivery.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
+                    visual_marker_before_hid = true;
                 }
             }
-            prev_frame_id = Some(delivery.frame.frame_id);
-            frames_decoded += 1;
-            if detect_visual_marker(&delivery.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
-                visual_marker_detected_frames += 1;
+
+            // Send deterministic safe HID sequence and await Host's P0 EchoAck for every event.
+            let hid_seq = build_interactive_hid_sequence(now_ms(), args.audit_key_identity);
+            for (idx, (payload, audit_rec)) in hid_seq.into_iter().enumerate() {
+                let _ = controller
+                    .send_hid_and_await_echo(&payload, idx as u32, Duration::from_secs(5))
+                    .await
+                    .map_err(|e| format!("controller HID seq {idx} echo failed: {e}"))?;
+                last_tx_to_host = Instant::now();
+                sent_audit.push(audit_rec);
             }
+            write_audit_jsonl_atomic(&args.audit_out, &sent_audit)?;
+
+            // Decode remaining video frames and verify closed-loop visual marker at (640, 360),
+            // emitting 0x03 KEEPALIVE every >=500ms so Host never hits idle_timeout during slow AV1.
+            while (frames_decoded as usize) < target_frames {
+                let delivery = recv_video_with_keepalive(
+                    &mut controller,
+                    Duration::from_secs(10),
+                    &mut last_tx_to_host,
+                )
+                .await
+                .map_err(|e| format!("controller video recv #{frames_decoded} failed: {e}"))?;
+                if let Some(prev) = prev_frame_id {
+                    if delivery.frame.frame_id <= prev {
+                        frame_id_monotonic = false;
+                    }
+                }
+                prev_frame_id = Some(delivery.frame.frame_id);
+                frames_decoded += 1;
+                if detect_visual_marker(&delivery.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
+                    visual_marker_detected_frames += 1;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = run_res {
+            let _ = send_redundant_session_close(&mut controller, 0x0001).await;
+            return Err(err);
         }
 
         // Graceful SESSION_CLOSE (`0x04`) with 3x redundancy spaced 20ms apart for lossy WAN UDP.
@@ -2369,6 +2378,41 @@ fn parse_child_json<T: for<'de> Deserialize<'de>>(
         .map_err(|e| format!("parse {name} stdout JSON failed: {e}; stdout={stdout}; stderr={stderr}"))
 }
 
+fn format_child_output(name: &str, out: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    format!(
+        "{name}(exit={:?}, stdout={stdout}, stderr={stderr})",
+        out.status.code()
+    )
+}
+
+fn parse_host_and_ctrl_json(
+    host_out: &std::process::Output,
+    ctrl_out: &std::process::Output,
+) -> Result<(HostSummary, ControllerSummary), String> {
+    let host_res: Result<HostSummary, String> = parse_child_json("host", host_out);
+    let ctrl_res: Result<ControllerSummary, String> = parse_child_json("controller", ctrl_out);
+    match (host_res, ctrl_res) {
+        (Ok(h), Ok(c)) => Ok((h, c)),
+        (h, c) => {
+            let mut errs = Vec::new();
+            if let Err(e) = h {
+                errs.push(e);
+            }
+            if let Err(e) = c {
+                errs.push(e);
+            }
+            Err(format!(
+                "{} | {} | {}",
+                errs.join(" || "),
+                format_child_output("host", host_out),
+                format_child_output("controller", ctrl_out),
+            ))
+        }
+    }
+}
+
 async fn run_scenario_a(
     exe: &Path,
     work_dir: &Path,
@@ -2461,12 +2505,8 @@ async fn run_scenario_a(
         Err(e) => return make_err(e),
     };
 
-    let host_sum: HostSummary = match parse_child_json("host", &host_out) {
-        Ok(s) => s,
-        Err(e) => return make_err(e),
-    };
-    let ctrl_sum: ControllerSummary = match parse_child_json("controller", &ctrl_out) {
-        Ok(s) => s,
+    let (host_sum, ctrl_sum) = match parse_host_and_ctrl_json(&host_out, &ctrl_out) {
+        Ok(pair) => pair,
         Err(e) => return make_err(e),
     };
 
@@ -2609,12 +2649,8 @@ async fn run_scenario_b(
         Err(e) => return make_err(e),
     };
 
-    let host_sum: HostSummary = match parse_child_json("host", &host_out) {
-        Ok(s) => s,
-        Err(e) => return make_err(e),
-    };
-    let ctrl_sum: ControllerSummary = match parse_child_json("controller", &ctrl_out) {
-        Ok(s) => s,
+    let (host_sum, ctrl_sum) = match parse_host_and_ctrl_json(&host_out, &ctrl_out) {
+        Ok(pair) => pair,
         Err(e) => return make_err(e),
     };
 
