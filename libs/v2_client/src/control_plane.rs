@@ -233,7 +233,7 @@ pub struct ClientMeterReportResp {
     #[serde(default)]
     pub rejected: u64,
     #[serde(default)]
-    pub retryable: Option<bool>,
+    pub retryable: u64,
     #[serde(default)]
     pub total_billed: u64,
     #[serde(default)]
@@ -779,4 +779,27 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, ClientError> {
         input = &input[size + 2..];
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientMeterReportResp;
+
+    #[test]
+    fn client_meter_report_resp_deserializes_retryable_u64_counts() {
+        let json_zero = r#"{"accepted":1,"upgraded":0,"deduplicated":0,"rejected":0,"retryable":0,"total_billed":4096,"results":[]}"#;
+        let resp_zero: ClientMeterReportResp = serde_json::from_str(json_zero).unwrap();
+        assert_eq!(resp_zero.accepted, 1);
+        assert_eq!(resp_zero.rejected, 0);
+        assert_eq!(resp_zero.retryable, 0);
+        assert_eq!(resp_zero.total_billed, 4096);
+
+        let json_two = r#"{"accepted":1,"upgraded":0,"deduplicated":0,"rejected":0,"retryable":2,"total_billed":4096,"results":[]}"#;
+        let resp_two: ClientMeterReportResp = serde_json::from_str(json_two).unwrap();
+        assert_eq!(resp_two.retryable, 2);
+
+        let json_default = r#"{"accepted":1,"upgraded":0,"deduplicated":0,"rejected":0,"total_billed":4096,"results":[]}"#;
+        let resp_default: ClientMeterReportResp = serde_json::from_str(json_default).unwrap();
+        assert_eq!(resp_default.retryable, 0);
+    }
 }
