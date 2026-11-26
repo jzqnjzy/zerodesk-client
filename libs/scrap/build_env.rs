@@ -1,6 +1,17 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
+
+pub const KNOWN_ZERODESK_LINK_VARS: &[&str] = &["ZERODESK_LINK_VMAF"];
 
 pub fn parse_zerodesk_link_flag(name: &str, value: Option<&str>) -> Result<Option<bool>, String> {
+    if !KNOWN_ZERODESK_LINK_VARS.contains(&name) {
+        return Err(format!(
+            "Unknown ZERODESK_LINK_* environment variable '{name}': expected one of {:?}",
+            KNOWN_ZERODESK_LINK_VARS
+        ));
+    }
     match value {
         None | Some("") => Ok(None),
         Some("0") => Ok(Some(false)),
@@ -11,16 +22,34 @@ pub fn parse_zerodesk_link_flag(name: &str, value: Option<&str>) -> Result<Optio
     }
 }
 
-pub fn validate_all_zerodesk_link_vars<'a, I>(vars: I) -> Result<(), String>
+fn is_zerodesk_link_os_key(key: &OsStr) -> bool {
+    key.to_string_lossy().starts_with("ZERODESK_LINK_")
+}
+
+pub fn validate_all_zerodesk_link_vars_os<I>(vars: I) -> Result<Vec<String>, String>
 where
-    I: IntoIterator<Item = (&'a str, &'a str)>,
+    I: IntoIterator<Item = (OsString, OsString)>,
 {
-    for (key, value) in vars {
-        if key.starts_with("ZERODESK_LINK_") {
-            let _ = parse_zerodesk_link_flag(key, Some(value))?;
+    let mut matched_keys = Vec::new();
+    for (raw_key, raw_val) in vars {
+        if !is_zerodesk_link_os_key(&raw_key) {
+            continue;
         }
+        let key = raw_key.to_str().ok_or_else(|| {
+            format!(
+                "Invalid non-UTF-8 ZERODESK_LINK_* environment variable name '{}'",
+                raw_key.to_string_lossy()
+            )
+        })?;
+        let val = raw_val.to_str().ok_or_else(|| {
+            format!(
+                "Invalid non-UTF-8 value for {key}: expected unset/empty, \"0\", or \"1\""
+            )
+        })?;
+        let _ = parse_zerodesk_link_flag(key, Some(val))?;
+        matched_keys.push(key.to_string());
     }
-    Ok(())
+    Ok(matched_keys)
 }
 
 pub fn validate_libyuv_prefix(prefix: &Path) -> Result<(PathBuf, PathBuf), String> {

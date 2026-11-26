@@ -108,8 +108,8 @@ pub fn overlay_visual_marker(frame: &mut I420Frame, mx: i32, my: i32) {
     if w < 32 || h < 32 {
         return;
     }
-    let cx = mx.clamp(16, w - 17);
-    let cy = my.clamp(16, h - 17);
+    let cx = mx.clamp(16, w - 16);
+    let cy = my.clamp(16, h - 16);
 
     let y_start = (cy - 16).max(0);
     let y_end = (cy + 16).min(h);
@@ -167,18 +167,18 @@ pub fn detect_visual_marker(frame: &I420Frame, mx: i32, my: i32) -> VisualMarker
             inner_mean_v: 0.0,
         };
     }
-    let cx = mx.clamp(16, w - 17);
-    let cy = my.clamp(16, h - 17);
+    let cx = mx.clamp(16, w - 16);
+    let cy = my.clamp(16, h - 16);
 
     let mut inner_sum = 0.0f64;
     let mut inner_cnt = 0usize;
     let mut border_sum = 0.0f64;
     let mut border_cnt = 0usize;
 
-    for py in (cy - 15)..(cy + 15) {
+    for py in (cy - 15).max(0)..(cy + 15).min(h) {
         let row_off = (py as usize) * frame.width;
         let dy = (py - cy).abs();
-        for px in (cx - 15)..(cx + 15) {
+        for px in (cx - 15).max(0)..(cx + 15).min(w) {
             let dx = (px - cx).abs();
             let v = frame.y[row_off + (px as usize)] as f64;
             if dx <= 6 && dy <= 6 {
@@ -319,11 +319,12 @@ impl ScreenCaptureSource for SyntheticAnimatedSource {
 mod macos_tcc {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
-        fn CGPreflightScreenCaptureAccess() -> bool;
+        // CoreGraphics `boolean_t` is C `unsigned int` (`u32`).
+        fn CGPreflightScreenCaptureAccess() -> u32;
     }
 
     pub fn preflight_screen_capture() -> bool {
-        unsafe { CGPreflightScreenCaptureAccess() }
+        unsafe { CGPreflightScreenCaptureAccess() != 0 }
     }
 }
 
@@ -658,6 +659,7 @@ pub struct CaptureStats {
     pub frames_overwritten: AtomicU64,
     pub would_block_count: AtomicU64,
     pub zero_variance_warning: AtomicBool,
+    pub thread_exited: AtomicBool,
     last_consumed_seq: AtomicU64,
     last_error: Mutex<Option<CaptureError>>,
 }
@@ -665,6 +667,10 @@ pub struct CaptureStats {
 impl CaptureStats {
     pub fn mark_consumed(&self, seq: u64) {
         self.last_consumed_seq.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    pub fn is_thread_exited(&self) -> bool {
+        self.thread_exited.load(Ordering::Acquire)
     }
 
     pub fn last_error(&self) -> Option<CaptureError> {
@@ -675,6 +681,14 @@ impl CaptureStats {
         if let Ok(mut g) = self.last_error.lock() {
             *g = Some(err);
         }
+    }
+}
+
+struct ThreadExitGuard(Arc<CaptureStats>);
+
+impl Drop for ThreadExitGuard {
+    fn drop(&mut self) {
+        self.0.thread_exited.store(true, Ordering::Release);
     }
 }
 
@@ -701,12 +715,20 @@ impl CapturePipelineHandle {
         &self.stop_flag
     }
 
+    pub fn is_thread_exited(&self) -> bool {
+        self.stats.is_thread_exited()
+    }
+
     /// Returns the newest captured frame if unseen, or re-emits the latest frame once
     /// `keepalive_interval` has elapsed so unchanged screens never starve decoder recovery.
+    /// Once the capture thread has exited (error, panic, or stop), never emits stale keepalives.
     pub fn try_take_latest_or_keepalive(
         &mut self,
         keepalive_interval: Duration,
     ) -> Option<CapturedFrame> {
+        if self.stats.is_thread_exited() {
+            return None;
+        }
         let latest = self.rx.borrow_and_update().clone()?;
         if latest.seq > self.last_sent_seq {
             self.last_sent_seq = latest.seq;
@@ -726,6 +748,7 @@ impl CapturePipelineHandle {
     }
 
     /// Async consumer helper pulling at `target_fps` while honoring `keepalive_interval`.
+    /// Immediately returns `None` if the capture thread exits (`RecvError` or `thread_exited`).
     pub async fn next_frame_for_sender(
         &mut self,
         target_fps: u32,
@@ -735,6 +758,9 @@ impl CapturePipelineHandle {
         let frame_period = Duration::from_nanos(1_000_000_000u64 / u64::from(target_fps.max(1)));
         let deadline = Instant::now() + timeout;
         loop {
+            if self.stats.is_thread_exited() {
+                return None;
+            }
             if let Some(frame) = self.try_take_latest_or_keepalive(keepalive_interval) {
                 return Some(frame);
             }
@@ -743,9 +769,13 @@ impl CapturePipelineHandle {
                 return None;
             }
             let wait = rem.min(frame_period).min(keepalive_interval);
-            let _ = tokio::time::timeout(wait, self.rx.changed()).await;
-            if self.stop_flag.load(Ordering::Acquire) {
-                return self.try_take_latest_or_keepalive(keepalive_interval);
+            match tokio::time::timeout(wait, self.rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_closed)) => return None,
+                Err(_elapsed) => {}
+            }
+            if self.stats.is_thread_exited() || self.stop_flag.load(Ordering::Acquire) {
+                return None;
             }
         }
     }
@@ -786,6 +816,7 @@ pub fn spawn_capture_pipeline<S: ScreenCaptureSource + 'static>(
     let join_handle = thread::Builder::new()
         .name("zd-v2-capture".to_string())
         .spawn(move || {
+            let _exit_guard = ThreadExitGuard(Arc::clone(&thread_stats));
             let mut last_published_seq = 0u64;
             while !thread_stop.load(Ordering::Acquire) {
                 match source.next_frame() {
@@ -962,6 +993,75 @@ mod tests {
         let mut handle = spawn_capture_pipeline(source, stop).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(handle.stats().zero_variance_warning.load(Ordering::Acquire));
+        handle.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn visual_marker_at_minimum_32x32_dimensions_never_panics() {
+        for &(mx, my) in &[(0, 0), (16, 16), (31, 31), (-10, 100)] {
+            let mut frame = generate_animated_i420(32, 32, 0);
+            overlay_visual_marker(&mut frame, mx, my);
+            let check = detect_visual_marker(&frame, mx, my);
+            assert!(
+                check.detected,
+                "32x32 marker at ({mx}, {my}) should be detected cleanly: {check:?}"
+            );
+        }
+    }
+
+    struct FailingAfterOneFrameSource {
+        emitted: bool,
+    }
+
+    impl ScreenCaptureSource for FailingAfterOneFrameSource {
+        fn dimensions(&self) -> (usize, usize) {
+            (64, 64)
+        }
+
+        fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
+            if !self.emitted {
+                self.emitted = true;
+                let frame = generate_animated_i420(64, 64, 0);
+                return Ok(Some(CapturedFrame {
+                    seq: 1,
+                    captured_at_ms: 1,
+                    frame: Arc::new(frame),
+                }));
+            }
+            Err(CaptureError::Backend("simulated display disconnect".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_thread_error_returns_none_immediately_without_stale_keepalive() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handle =
+            spawn_capture_pipeline(FailingAfterOneFrameSource { emitted: false }, stop).unwrap();
+
+        // Wait briefly for the source to emit 1 frame then fail and exit the thread.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(handle.is_thread_exited());
+        assert!(matches!(
+            handle.stats().last_error(),
+            Some(CaptureError::Backend(_))
+        ));
+
+        // Must never emit a stale keepalive frame.
+        assert!(handle
+            .try_take_latest_or_keepalive(Duration::from_millis(1))
+            .is_none());
+
+        // `next_frame_for_sender` must return `None` immediately (not wait out the 2s timeout).
+        let started = Instant::now();
+        let next = handle
+            .next_frame_for_sender(30, Duration::from_millis(10), Duration::from_secs(2))
+            .await;
+        assert!(next.is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "next_frame_for_sender stalled after capture thread exit: {:?}",
+            started.elapsed()
+        );
         handle.stop_and_join().unwrap();
     }
 }

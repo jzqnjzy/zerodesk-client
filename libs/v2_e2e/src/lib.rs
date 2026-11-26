@@ -12,6 +12,7 @@ mod scrap_build_env_tests {
     use super::build_env;
 
     use std::{
+        ffi::OsString,
         fs,
         path::Path,
         time::{SystemTime, UNIX_EPOCH},
@@ -24,8 +25,6 @@ mod scrap_build_env_tests {
             ("ZERODESK_LINK_VMAF", Some(""), None),
             ("ZERODESK_LINK_VMAF", Some("0"), Some(false)),
             ("ZERODESK_LINK_VMAF", Some("1"), Some(true)),
-            ("ZERODESK_LINK_CUSTOM", Some("0"), Some(false)),
-            ("ZERODESK_LINK_CUSTOM", Some("1"), Some(true)),
         ];
         for &(name, val, expected) in valid_cases {
             assert_eq!(
@@ -43,23 +42,47 @@ mod scrap_build_env_tests {
             ("ZERODESK_LINK_VMAF", "auto"),
             ("ZERODESK_LINK_VMAF", " 1"),
             ("ZERODESK_LINK_VMAF", "1 "),
-            ("ZERODESK_LINK_FOO", "on"),
+            ("ZERODESK_LINK_TYPO", "1"),
+            ("ZERODESK_LINK_VAMF", "0"),
+            ("ZERODESK_LINK_FOO", ""),
         ];
         for &(name, val) in invalid_cases {
             let err = build_env::parse_zerodesk_link_flag(name, Some(val)).unwrap_err();
             assert!(
-                err.contains(name) && err.contains(val),
-                "expected clear diagnostic for ({name}, {val}), got: {err}"
+                err.contains(name),
+                "expected clear diagnostic naming '{name}', got: {err}"
             );
-            assert!(build_env::validate_all_zerodesk_link_vars([(name, val)]).is_err());
+            assert!(build_env::validate_all_zerodesk_link_vars_os([(
+                OsString::from(name),
+                OsString::from(val),
+            )])
+            .is_err());
         }
 
-        assert!(build_env::validate_all_zerodesk_link_vars([
-            ("PATH", "/usr/bin"),
-            ("ZERODESK_LINK_VMAF", "1"),
-            ("ZERODESK_LINK_OTHER", ""),
+        // Valid known env vars plus unrelated env vars pass cleanly.
+        let matched = build_env::validate_all_zerodesk_link_vars_os([
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("ZERODESK_LINK_VMAF"), OsString::from("1")),
         ])
-        .is_ok());
+        .unwrap();
+        assert_eq!(matched, vec!["ZERODESK_LINK_VMAF".to_string()]);
+
+        // Non-UTF-8 unrelated env vars are ignored without panicking; non-UTF-8 ZERODESK_LINK_* fails closed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_utf8 = OsString::from_vec(vec![0xFF, 0xFE]);
+            assert!(build_env::validate_all_zerodesk_link_vars_os([(
+                OsString::from("UNRELATED_BIN_VAR"),
+                non_utf8.clone(),
+            )])
+            .is_ok());
+            assert!(build_env::validate_all_zerodesk_link_vars_os([(
+                OsString::from("ZERODESK_LINK_VMAF"),
+                non_utf8,
+            )])
+            .is_err());
+        }
     }
 
     #[test]

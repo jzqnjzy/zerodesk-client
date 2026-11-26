@@ -19,10 +19,10 @@ pub fn parse_session_close(ctrl: &ControlFrame) -> Option<u16> {
     if ctrl.msg_type != CTRL_MSG_SESSION_CLOSE {
         return None;
     }
-    if ctrl.payload.len() >= 2 {
+    if ctrl.payload.len() == 2 {
         Some(u16::from_be_bytes([ctrl.payload[0], ctrl.payload[1]]))
     } else {
-        Some(0)
+        None
     }
 }
 
@@ -898,5 +898,31 @@ mod tests {
 
         let flushed = pair.controller.flush_decoder().unwrap();
         assert_eq!(pair.controller.decoder_flushed_frames, flushed.len() as u64);
+    }
+
+    #[test]
+    fn parse_session_close_requires_exact_two_byte_payload() {
+        let ok_frame = ControlFrame {
+            msg_type: CTRL_MSG_SESSION_CLOSE,
+            stream_seq: 1,
+            payload: Bytes::from_static(&[0x04, 0x01]),
+        };
+        assert_eq!(parse_session_close(&ok_frame), Some(0x0401));
+
+        for bad in [&[][..], &[0x01][..], &[0x00, 0x01, 0x02][..]] {
+            let malformed = ControlFrame {
+                msg_type: CTRL_MSG_SESSION_CLOSE,
+                stream_seq: 2,
+                payload: Bytes::copy_from_slice(bad),
+            };
+            assert_eq!(parse_session_close(&malformed), None);
+        }
+
+        let other = ControlFrame {
+            msg_type: 0x03,
+            stream_seq: 3,
+            payload: Bytes::from_static(&[0x00, 0x00]),
+        };
+        assert_eq!(parse_session_close(&other), None);
     }
 }

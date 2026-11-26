@@ -121,7 +121,15 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
         // leaving undefined `_vmaf_*` symbols (e.g. `_vmaf_init`, `_vmaf_model_load_from_path`)
         // that require linking `libvmaf.a` statically.
         println!("cargo:rerun-if-env-changed=ZERODESK_LINK_VMAF");
-        let vmaf_env = std::env::var("ZERODESK_LINK_VMAF").ok();
+        let vmaf_env = match std::env::var_os("ZERODESK_LINK_VMAF") {
+            None => None,
+            Some(os_val) => match os_val.to_str() {
+                Some(s) => Some(s.to_owned()),
+                None => panic!(
+                    "Invalid non-UTF-8 value for ZERODESK_LINK_VMAF: expected unset/empty, \"0\", or \"1\""
+                ),
+            },
+        };
         let link_vmaf = match build_env::parse_zerodesk_link_flag(
             "ZERODESK_LINK_VMAF",
             vmaf_env.as_deref(),
@@ -267,17 +275,16 @@ fn ffmpeg() {
 */
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=ZERODESK_LINK_VMAF");
-    let link_vars: Vec<(String, String)> = env::vars()
-        .filter(|(k, _)| k.starts_with("ZERODESK_LINK_"))
-        .collect();
-    for (k, _) in &link_vars {
-        println!("cargo:rerun-if-env-changed={k}");
+    for known in build_env::KNOWN_ZERODESK_LINK_VARS {
+        println!("cargo:rerun-if-env-changed={}", known);
     }
-    if let Err(msg) = build_env::validate_all_zerodesk_link_vars(
-        link_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-    ) {
-        panic!("{}", msg);
+    match build_env::validate_all_zerodesk_link_vars_os(env::vars_os()) {
+        Ok(keys) => {
+            for k in keys {
+                println!("cargo:rerun-if-env-changed={}", k);
+            }
+        }
+        Err(msg) => panic!("{}", msg),
     }
 
     // in this crate, these are also valid configurations

@@ -19,7 +19,7 @@ use v2_client::{
 };
 use v2_e2e::{
     compute_y_variance, decode_hid_frame, detect_visual_marker, encode_hid_frame,
-    parse_session_close, spawn_capture_pipeline, spawn_release_watchdog, AuditRecord,
+    parse_session_close, spawn_capture_pipeline, spawn_release_watchdog, AuditKey, AuditRecord,
     CaptureError, CapturePipelineHandle, DesktopControllerSession, DesktopHostSession, DryRunSink,
     HidEchoAck, HidInputExecutor, HidInputSink, HidPayload, InputError, KeyEvent, MouseEvent,
     MouseKind, SafeHidKey, ScrapDisplaySource, SessionError, SharedVisualMarker,
@@ -260,8 +260,8 @@ enum ComparableHidEvent {
     MouseDown { button_bit: u8, x: i32, y: i32 },
     MouseUp { button_bit: u8, x: i32, y: i32 },
     MouseWheel { dx: i16, dy: i16 },
-    KeyDown { key: SafeHidKey },
-    KeyUp { key: SafeHidKey },
+    KeyDown { key: AuditKey },
+    KeyUp { key: AuditKey },
 }
 
 fn audit_to_comparable(rec: &AuditRecord) -> Option<ComparableHidEvent> {
@@ -445,13 +445,13 @@ fn build_interactive_hid_sequence(base_ts: u64) -> Vec<(HidPayload, AuditRecord)
         let rec = if down {
             AuditRecord::KeyDown {
                 seq,
-                key,
+                key: AuditKey::Key(key),
                 ts_ms: ts,
             }
         } else {
             AuditRecord::KeyUp {
                 seq,
-                key,
+                key: AuditKey::Key(key),
                 ts_ms: ts,
             }
         };
@@ -789,9 +789,10 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
             v2_e2e::DEFAULT_HID_RATE_LIMIT_PER_SEC,
             Some(visual_marker),
         )
-        .map_err(|e| e.to_string())?,
+        .map_err(|e| e.to_string())?
+        .with_audit_key_identity(true),
     ));
-    let watchdog_handle = spawn_release_watchdog(
+    let mut watchdog_handle = spawn_release_watchdog(
         Arc::clone(&executor),
         Duration::from_millis(args.watchdog_ms),
         Arc::clone(&stop_flag),
@@ -898,7 +899,7 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
             Ok(TransportEvent::Control(ctrl)) => {
                 last_peer_activity = Instant::now();
                 if let Ok(guard) = executor.lock() {
-                    guard.touch_activity(now_ms());
+                    guard.touch_activity();
                 }
                 if parse_session_close(&ctrl).is_some() {
                     close_reason = "session_close".into();
@@ -948,7 +949,7 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
     // Deterministic shutdown chain: stop capture & watchdog threads, release_all, flush audit JSONL.
     stop_flag.store(true, Ordering::Release);
     let capture_thread_joined = capture.stop_and_join().is_ok();
-    let watchdog_thread_joined = watchdog_handle.join().is_ok();
+    let watchdog_thread_joined = watchdog_handle.stop_and_join().is_ok();
 
     let (hid_executed, release_all_count, final_pressed_buttons, final_pressed_keys) = {
         let mut guard = executor
@@ -1427,7 +1428,7 @@ async fn run_controller(args: &ControllerArgs) -> Result<ControllerSummary, Stri
                 }),
                 AuditRecord::KeyDown {
                     seq: 0,
-                    key: SafeHidKey::LeftShift,
+                    key: AuditKey::Key(SafeHidKey::LeftShift),
                     ts_ms: base_ts,
                 },
             ),
@@ -1442,7 +1443,7 @@ async fn run_controller(args: &ControllerArgs) -> Result<ControllerSummary, Stri
                 }),
                 AuditRecord::KeyDown {
                     seq: 1,
-                    key: SafeHidKey::KeyA,
+                    key: AuditKey::Key(SafeHidKey::KeyA),
                     ts_ms: base_ts + 1,
                 },
             ),

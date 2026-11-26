@@ -23,10 +23,11 @@ pub use hid::{
 ))]
 pub use input::EnigoOsSink;
 pub use input::{
-    spawn_release_watchdog, AuditRecord, DryRunOp, DryRunSink, HidInputExecutor, HidInputSink,
-    InputError, InputSinkError, ReleaseAllSummary, SafeHidKey, DEFAULT_HID_RATE_LIMIT_PER_SEC,
-    MAX_HID_BATCH_SIZE, MOUSE_BUTTON_BACK, MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT,
-    MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT,
+    spawn_release_watchdog, AuditKey, AuditRecord, DryRunOp, DryRunSink, HidInputExecutor,
+    HidInputSink, InputError, InputSinkError, ReleaseAllResult, ReleaseAllSummary, SafeHidKey,
+    WatchdogHandle, DEFAULT_AUDIT_LOG_CAP, DEFAULT_HID_RATE_LIMIT_PER_SEC, MAX_HID_BATCH_SIZE,
+    MOUSE_BUTTON_BACK, MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE,
+    MOUSE_BUTTON_RIGHT,
 };
 pub use session::{
     parse_session_close, DecodedVideoDelivery, DesktopControllerSession, DesktopHostSession,

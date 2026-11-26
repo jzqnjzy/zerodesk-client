@@ -297,9 +297,14 @@ osx_info_plist_exts = ["res/osx_camera_info.plist"]
 [profile.release]
 lto = true
 codegen-units = 1
+panic = 'abort'
 strip = true
 #opt-level = 'z' # only have smaller size after strip
 rpath = true
+
+[profile.e2e]
+inherits = "release"
+panic = "unwind"
 
 [profile.dev]
 debug = 1
