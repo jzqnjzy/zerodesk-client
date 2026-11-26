@@ -1,6 +1,6 @@
 use super::{
-    bootstrap_live_pair, now_ms, parse_flag_value, percentile_ms, print_usage, ENCODER_QUALITY,
-    HEIGHT, MIN_PSNR_DB, MIN_SSIM, WIDTH,
+    bootstrap_live_pair, now_ms, parse_flag_value, percentile_ms, print_usage,
+    BootstrappedSessions, ENCODER_QUALITY, HEIGHT, MIN_PSNR_DB, MIN_SSIM, WIDTH,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1083,6 +1083,28 @@ pub async fn run_wan_hid_preemption(
             PROBE_ECHO_TIMEOUT,
         )
         .await?;
+        let round_verdict = if metrics.inconclusive {
+            "INCONCLUSIVE"
+        } else if metrics.delta_p50_ms <= DELTA_P50_GATE_MS
+            && metrics.delta_p95_ms <= DELTA_P95_GATE_MS
+            && metrics.wire_mbps <= effective_target_wire_mbps + 1e-6
+            && metrics.unloaded_field_exact_match
+            && metrics.loaded_field_exact_match
+            && metrics.bg_recv_video_frames > 0
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        eprintln!(
+            "[wan-bench] round {round_idx}/{rounds}: unloaded_p50={:.2}ms unloaded_p95={:.2}ms loaded_p50={:.2}ms loaded_p95={:.2}ms delta_p95={:.2}ms wire_mbps={:.2} verdict={round_verdict}",
+            metrics.unloaded_p50_ms,
+            metrics.unloaded_p95_ms,
+            metrics.loaded_p50_ms,
+            metrics.loaded_p95_ms,
+            metrics.delta_p95_ms,
+            metrics.wire_mbps,
+        );
         round_results.push(metrics);
 
         // Drain any in-flight P2 video packets across the WAN before the next round's
@@ -1559,9 +1581,16 @@ pub async fn run_wan_video_telemetry(
 pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, SessionError> {
     let cfg = ClusterConfig::from_file(&args.config)?;
     let bootstrap_mbps = (args.bg_mbps.max(args.max_wire_mbps).ceil() as u32).max(1);
-    let pair = bootstrap_live_pair(&cfg, args.ca_der.as_deref(), bootstrap_mbps).await?;
+    let BootstrappedSessions {
+        controller: pair_ctrl,
+        host: pair_host,
+        edge_a_ping_us,
+        edge_b_ping_us,
+        signaling_rtt_us,
+        renew_guard,
+    } = bootstrap_live_pair(&cfg, args.ca_der.as_deref(), bootstrap_mbps).await?;
 
-    let is_ipv6 = pair.host.link().edge_addr().is_ipv6();
+    let is_ipv6 = pair_host.link().edge_addr().is_ipv6();
     let init_enc = V2VideoEncoder::new(
         args.codec,
         WIDTH as u32,
@@ -1570,8 +1599,8 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
         Some(WAN_KEYFRAME_INTERVAL),
     )?;
     let init_dec = V2VideoDecoder::new(args.codec)?;
-    let mut host = DesktopHostSession::new(pair.host, init_enc);
-    let mut controller = DesktopControllerSession::new(pair.controller, init_dec);
+    let mut host = DesktopHostSession::new(pair_host, init_enc);
+    let mut controller = DesktopControllerSession::new(pair_ctrl, init_dec);
 
     let hid_preemption = run_wan_hid_preemption(
         &mut host,
@@ -1591,6 +1620,13 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
         args.max_wire_mbps,
     )
     .await?;
+
+    let renewals_ok = renew_guard.renewals_ok();
+    let renewals_err = renew_guard.renewals_err();
+    eprintln!(
+        "[wan-bench] lease_renewals_ok={renewals_ok} lease_renewals_err={renewals_err}"
+    );
+    renew_guard.shutdown().await;
 
     let (verdict, pass, error) = if hid_preemption.verdict == "INCONCLUSIVE" {
         (
@@ -1635,9 +1671,9 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
         width: WIDTH,
         height: HEIGHT,
         ip_udp_overhead_bytes: ip_udp_overhead_bytes(is_ipv6),
-        edge_a_ping_rtt_ms: (pair.edge_a_ping_us as f64) / 1000.0,
-        edge_b_ping_rtt_ms: (pair.edge_b_ping_us as f64) / 1000.0,
-        signaling_tcp_rtt_ms: (pair.signaling_rtt_us as f64) / 1000.0,
+        edge_a_ping_rtt_ms: (edge_a_ping_us as f64) / 1000.0,
+        edge_b_ping_rtt_ms: (edge_b_ping_us as f64) / 1000.0,
+        signaling_tcp_rtt_ms: (signaling_rtt_us as f64) / 1000.0,
         hid_preemption,
         video_telemetry,
         error,

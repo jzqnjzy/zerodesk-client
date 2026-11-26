@@ -39,12 +39,12 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use v2_client::{
     decode_hex_array, now_unix_secs, AccessControlTunnel, ClientError, ClusterConfig,
     ControlPlaneClient, CreateTenantReq, SignalingClient, UdpAccessLink, UdpE2eeSession,
@@ -327,15 +327,51 @@ fn cmd_codec_selftest(vp9_frames: usize, av1_frames: usize) -> CodecSelftestRepo
     }
 }
 
-struct BootstrappedSessions {
-    controller: UdpE2eeSession,
-    host: UdpE2eeSession,
-    edge_a_ping_us: u64,
-    edge_b_ping_us: u64,
-    signaling_rtt_us: u64,
-    // Keep Noise_IK control tunnels alive for the duration of the E2EE session.
-    _ctrl_a: AccessControlTunnel,
-    _ctrl_b: AccessControlTunnel,
+// Per protocol-spec v1.2.3 spec/06 conservative unadvertised renewal horizon (<= 15s)
+// so both Edge control tunnel io_timeout (30..=600s) and RelayTicket TTL stay continuously fresh.
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
+
+pub(crate) struct LeaseRenewalGuard {
+    stop_tx: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    lease_renewals_ok: Arc<AtomicU64>,
+    lease_renewals_err: Arc<AtomicU64>,
+}
+
+impl LeaseRenewalGuard {
+    pub(crate) fn renewals_ok(&self) -> u64 {
+        self.lease_renewals_ok.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn renewals_err(&self) -> u64 {
+        self.lease_renewals_err.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(handle) = self.task.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LeaseRenewalGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(handle) = self.task.take() {
+            handle.abort();
+        }
+    }
+}
+
+pub(crate) struct BootstrappedSessions {
+    pub(crate) controller: UdpE2eeSession,
+    pub(crate) host: UdpE2eeSession,
+    pub(crate) edge_a_ping_us: u64,
+    pub(crate) edge_b_ping_us: u64,
+    pub(crate) signaling_rtt_us: u64,
+    // Background Noise_IK control-tunnel lease renewal guard; must outlive the E2EE session.
+    pub(crate) renew_guard: LeaseRenewalGuard,
 }
 
 async fn bootstrap_live_pair(
@@ -592,14 +628,141 @@ async fn bootstrap_live_pair(
     );
     let ((controller, _), (host, _)) = tokio::try_join!(hs_ctrl, hs_host)?;
 
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let lease_renewals_ok = Arc::new(AtomicU64::new(0));
+    let lease_renewals_err = Arc::new(AtomicU64::new(0));
+    let renewals_ok_task = Arc::clone(&lease_renewals_ok);
+    let renewals_err_task = Arc::clone(&lease_renewals_err);
+    let mut lease_seq = lease_b.lease_seq;
+
+    let renew_task = tokio::spawn(async move {
+        let mut ctrl_a_opt = Some(ctrl_a);
+        let mut ctrl_b_opt = Some(ctrl_b);
+        let mut interval = tokio::time::interval(LEASE_RENEW_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume immediate t=0 tick so first renewal runs after LEASE_RENEW_INTERVAL (15s).
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                res = stop_rx.changed() => {
+                    if res.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if ctrl_a_opt.is_none() && ctrl_b_opt.is_none() {
+                        break;
+                    }
+                    if let Some(ctrl_a) = ctrl_a_opt.as_mut() {
+                        match cp
+                            .renew_lease(
+                                &ks_ctrl,
+                                Some(&tenant_id),
+                                &session_id,
+                                &cid_a,
+                                &pop_a,
+                                &ctrl_dev_id,
+                                &host_dev_id,
+                                lease_seq,
+                                0,
+                                1,
+                            )
+                            .await
+                        {
+                            Ok(la) => {
+                                lease_seq = la.lease_seq;
+                                match la.to_relay_ticket() {
+                                    Ok(ta) => match ctrl_a.lease_renew(&ta).await {
+                                        Ok(_) => {
+                                            renewals_ok_task.fetch_add(1, Ordering::Release);
+                                        }
+                                        Err(e) => {
+                                            renewals_err_task.fetch_add(1, Ordering::Release);
+                                            eprintln!(
+                                                "[lease-renew] ctrl_a.lease_renew failed (stopping ctrl_a): {e}"
+                                            );
+                                            ctrl_a_opt = None;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        renewals_err_task.fetch_add(1, Ordering::Release);
+                                        eprintln!("[lease-renew] lease_a.to_relay_ticket failed: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                renewals_err_task.fetch_add(1, Ordering::Release);
+                                eprintln!("[lease-renew] cp.renew_lease(a) failed: {e}");
+                            }
+                        }
+                    }
+
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+
+                    if let Some(ctrl_b) = ctrl_b_opt.as_mut() {
+                        match cp
+                            .renew_lease(
+                                &ks_ctrl,
+                                Some(&tenant_id),
+                                &session_id,
+                                &cid_b,
+                                &pop_b,
+                                &ctrl_dev_id,
+                                &host_dev_id,
+                                lease_seq,
+                                0,
+                                1,
+                            )
+                            .await
+                        {
+                            Ok(lb) => {
+                                lease_seq = lb.lease_seq;
+                                match lb.to_relay_ticket() {
+                                    Ok(tb) => match ctrl_b.lease_renew(&tb).await {
+                                        Ok(_) => {
+                                            renewals_ok_task.fetch_add(1, Ordering::Release);
+                                        }
+                                        Err(e) => {
+                                            renewals_err_task.fetch_add(1, Ordering::Release);
+                                            eprintln!(
+                                                "[lease-renew] ctrl_b.lease_renew failed (stopping ctrl_b): {e}"
+                                            );
+                                            ctrl_b_opt = None;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        renewals_err_task.fetch_add(1, Ordering::Release);
+                                        eprintln!("[lease-renew] lease_b.to_relay_ticket failed: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                renewals_err_task.fetch_add(1, Ordering::Release);
+                                eprintln!("[lease-renew] cp.renew_lease(b) failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     Ok(BootstrappedSessions {
         controller,
         host,
         edge_a_ping_us,
         edge_b_ping_us,
         signaling_rtt_us: sig_probe.connect_rtt_us,
-        _ctrl_a: ctrl_a,
-        _ctrl_b: ctrl_b,
+        renew_guard: LeaseRenewalGuard {
+            stop_tx,
+            task: Some(renew_task),
+            lease_renewals_ok,
+            lease_renewals_err,
+        },
     })
 }
 
@@ -1016,7 +1179,14 @@ async fn cmd_e2e(
     secondary_burst: usize,
 ) -> Result<DesktopE2eReport, SessionError> {
     let cfg = ClusterConfig::from_file(cfg_path)?;
-    let pair = bootstrap_live_pair(&cfg, ca_der_override, bg_mbps).await?;
+    let BootstrappedSessions {
+        controller: pair_ctrl,
+        host: pair_host,
+        edge_a_ping_us,
+        edge_b_ping_us,
+        signaling_rtt_us,
+        renew_guard,
+    } = bootstrap_live_pair(&cfg, ca_der_override, bg_mbps).await?;
     let secondary_codec = match primary_codec {
         VideoCodec::Vp9 => VideoCodec::Av1,
         VideoCodec::Av1 => VideoCodec::Vp9,
@@ -1030,8 +1200,8 @@ async fn cmd_e2e(
         Some(KEYFRAME_INTERVAL),
     )?;
     let init_dec = V2VideoDecoder::new(primary_codec)?;
-    let mut host = DesktopHostSession::new(pair.host, init_enc);
-    let mut controller = DesktopControllerSession::new(pair.controller, init_dec);
+    let mut host = DesktopHostSession::new(pair_host, init_enc);
+    let mut controller = DesktopControllerSession::new(pair_ctrl, init_dec);
 
     let g2_primary_video =
         run_live_video_stream(&mut host, &mut controller, primary_codec, frames).await?;
@@ -1039,14 +1209,16 @@ async fn cmd_e2e(
         run_live_video_stream(&mut host, &mut controller, secondary_codec, secondary_burst).await?;
     let g3_hid = run_g3_hid_and_preemption(&mut host, &mut controller, bg_mbps).await?;
 
+    renew_guard.shutdown().await;
+
     let pass = g2_primary_video.pass && g2_secondary_video.pass && g3_hid.pass;
     Ok(DesktopE2eReport {
         pass,
         width: WIDTH,
         height: HEIGHT,
-        edge_a_ping_rtt_ms: (pair.edge_a_ping_us as f64) / 1000.0,
-        edge_b_ping_rtt_ms: (pair.edge_b_ping_us as f64) / 1000.0,
-        signaling_tcp_rtt_ms: (pair.signaling_rtt_us as f64) / 1000.0,
+        edge_a_ping_rtt_ms: (edge_a_ping_us as f64) / 1000.0,
+        edge_b_ping_rtt_ms: (edge_b_ping_us as f64) / 1000.0,
+        signaling_tcp_rtt_ms: (signaling_rtt_us as f64) / 1000.0,
         g2_primary_video,
         g2_secondary_video,
         g3_hid,
@@ -1237,5 +1409,45 @@ async fn main() -> ExitCode {
             print_usage();
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lease_renewal_guard_horizon_and_clean_shutdown_or_drop() {
+        assert!(LEASE_RENEW_INTERVAL <= Duration::from_secs(15));
+
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let ok = Arc::new(AtomicU64::new(0));
+        let err = Arc::new(AtomicU64::new(0));
+        let ok_c = Arc::clone(&ok);
+        let task = tokio::spawn(async move {
+            let _ = stop_rx.changed().await;
+            ok_c.fetch_add(1, Ordering::Release);
+        });
+        let guard = LeaseRenewalGuard {
+            stop_tx,
+            task: Some(task),
+            lease_renewals_ok: ok,
+            lease_renewals_err: err,
+        };
+        guard.shutdown().await;
+
+        let (stop_tx2, mut stop_rx2) = watch::channel(false);
+        let task2 = tokio::spawn(async move {
+            let _ = stop_rx2.changed().await;
+        });
+        let guard2 = LeaseRenewalGuard {
+            stop_tx: stop_tx2,
+            task: Some(task2),
+            lease_renewals_ok: Arc::new(AtomicU64::new(0)),
+            lease_renewals_err: Arc::new(AtomicU64::new(0)),
+        };
+        assert_eq!(guard2.renewals_ok(), 0);
+        assert_eq!(guard2.renewals_err(), 0);
+        drop(guard2);
     }
 }
