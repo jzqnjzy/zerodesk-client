@@ -696,14 +696,26 @@ async fn cmd_e2e(
         .await
         .map_err(|e| ClientError::Protocol(format!("bridge writer task failed: {e}")))??;
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), serve_a).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), fwd_b).await;
-    let _ = echo_task.await;
+    let (serve_tx, serve_rx) = tokio::time::timeout(Duration::from_secs(12), serve_a)
+        .await
+        .map_err(|_| ClientError::Timeout("V2LoopbackBridge serve_a timed out".into()))?
+        .map_err(|e| ClientError::Protocol(format!("V2LoopbackBridge serve_a join error: {e}")))??;
+    let (fwd_tx, fwd_rx) = tokio::time::timeout(Duration::from_secs(12), fwd_b)
+        .await
+        .map_err(|_| ClientError::Timeout("V2LoopbackBridge fwd_b timed out".into()))?
+        .map_err(|e| ClientError::Protocol(format!("V2LoopbackBridge fwd_b join error: {e}")))??;
+    echo_task
+        .await
+        .map_err(|e| ClientError::Protocol(format!("V2LoopbackBridge echo task join error: {e}")))?;
     mux_a.shutdown().await;
 
     let got_tunnel_sha: [u8; 32] = Sha256::digest(&echoed).into();
-    let loopback_bridge_sha256_match =
-        echoed.len() == tunnel_bytes && got_tunnel_sha == expected_tunnel_sha;
+    let loopback_bridge_sha256_match = echoed.len() == tunnel_bytes
+        && serve_tx as usize == tunnel_bytes
+        && serve_rx as usize == tunnel_bytes
+        && fwd_tx as usize == tunnel_bytes
+        && fwd_rx as usize == tunnel_bytes
+        && got_tunnel_sha == expected_tunnel_sha;
     if !loopback_bridge_sha256_match {
         return Err(ClientError::Protocol(format!(
             "V2LoopbackBridge byte mismatch: sent {tunnel_bytes}, got {}",
@@ -781,10 +793,22 @@ async fn cmd_e2e(
             65_536,
         )
         .await?;
-    let fallback_metering_ok = meter_resp.rejected == 0;
+    let fallback_metering_ok = meter_resp.rejected == 0
+        && (meter_resp.accepted > 0 || meter_resp.upgraded > 0 || meter_resp.deduplicated > 0);
+
+    let pass = video_sha256_match
+        && hid_rtts.len() == hid_count
+        && clipboard_ok
+        && rs64_recovered_ok
+        && leg_nack_rtx_verified
+        && tls443_passthrough_ok
+        && lease_renew_ok
+        && lease_renew_route_cid_preserved
+        && fallback_metering_ok
+        && loopback_bridge_sha256_match;
 
     Ok(E2eReport {
-        pass: true,
+        pass,
         enrollment_ok: true,
         signaling_tcp_rtt_ms: (pair.signaling_rtt_us as f64) / 1000.0,
         edge_a_bind_ok: true,
@@ -862,7 +886,9 @@ async fn cmd_loopback_bridge(
         res
     });
     let (tx, rx) = bridge.serve_one().await?;
-    let _ = fwd.await;
+    let _ = fwd
+        .await
+        .map_err(|e| ClientError::Protocol(format!("V2LoopbackBridge forward join error: {e}")))??;
     mux_a.shutdown().await;
     println!(
         "{}",

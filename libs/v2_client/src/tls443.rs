@@ -26,6 +26,27 @@ use zeroize::Zeroizing;
 pub const TLS443_PREFACE_LEN: usize = 9;
 pub const TLS443_AUTH_DEADLINE: Duration = Duration::from_secs(5);
 pub const TLS443_HOL_THRESHOLD_MS: u64 = 80;
+pub const STREAM_DATA_MIN_LEN: usize = 64;
+pub const STREAM_DATA_MAX_LEN: usize = STREAM_FRAME_MAX_LEN;
+pub const STREAM_CTRL_MIN_LEN: usize = STREAM_FRAME_MIN_LEN;
+pub const STREAM_CTRL_MAX_LEN: usize = 289;
+
+/// Validates TLS-443 frame length strictly according to the `c` (`is_ctrl_edge`) bit:
+/// - `c=0` (L3 data): `64..=1232`
+/// - `c=1` (EdgeCtrl): `34..=289`
+pub fn validate_stream_frame_len(is_ctrl_edge: bool, frame_len: usize) -> Result<(), ClientError> {
+    let (min_len, max_len, kind) = if is_ctrl_edge {
+        (STREAM_CTRL_MIN_LEN, STREAM_CTRL_MAX_LEN, "EdgeCtrl (c=1)")
+    } else {
+        (STREAM_DATA_MIN_LEN, STREAM_DATA_MAX_LEN, "data (c=0)")
+    };
+    if !(min_len..=max_len).contains(&frame_len) {
+        return Err(ClientError::Protocol(format!(
+            "illegal TLS-443 {kind} frame_len {frame_len} (allowed {min_len}..={max_len})"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -94,6 +115,7 @@ pub struct Tls443Stream {
     parser: StreamFrameParser,
     send_queue: TcpStreamSendQueue,
     queued_bytes: usize,
+    poisoned: bool,
     pub bw_hint: BwHintController,
     pub bulk_paused: bool,
     pub hol_dropped_frames: u64,
@@ -151,6 +173,7 @@ impl Tls443Stream {
                 parser: StreamFrameParser::new(),
                 send_queue: TcpStreamSendQueue::default(),
                 queued_bytes: 0,
+                poisoned: false,
                 bw_hint: BwHintController::new(lease_bw_cap_kbps, lease_bw_cap_kbps),
                 bulk_paused: false,
                 hol_dropped_frames: 0,
@@ -173,8 +196,34 @@ impl Tls443Stream {
         self.role
     }
 
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    fn ensure_healthy(&self) -> Result<(), ClientError> {
+        if self.poisoned {
+            return Err(ClientError::Protocol(
+                "TLS-443 stream is poisoned after framing/protocol violation; reconnect required"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn poison_and_err<T>(&mut self, err: ClientError) -> Result<T, ClientError> {
+        self.poisoned = true;
+        let _ = self.stream.shutdown().await;
+        Err(err)
+    }
+
     pub async fn send_edge_ctrl(&mut self, ctrl: &EdgeCtrlFrame) -> Result<(), ClientError> {
+        self.ensure_healthy()?;
         let body = ctrl.encode();
+        validate_stream_frame_len(true, 28 + 4 + body.len())?;
         let hdr = AccessHeaderV11 {
             flags: AccessFlags {
                 pp: 0,
@@ -190,12 +239,17 @@ impl Tls443Stream {
             mac_64: [0; 8],
         };
         let wire = seal_stream_v11(&self.tx_key, hdr, 0, &body)?;
-        self.stream.write_all(&wire).await?;
-        self.stream.flush().await?;
+        if let Err(e) = self.stream.write_all(&wire).await {
+            return self.poison_and_err(e.into()).await;
+        }
+        if let Err(e) = self.stream.flush().await {
+            return self.poison_and_err(e.into()).await;
+        }
         Ok(())
     }
 
     pub async fn ping(&mut self, timeout: Duration) -> Result<u64, ClientError> {
+        self.ensure_healthy()?;
         let ts_us = now_us();
         let start = Instant::now();
         self.send_edge_ctrl(&EdgeCtrlFrame::Ping { ts_us }).await?;
@@ -225,6 +279,8 @@ impl Tls443Stream {
         l3_payload: &[u8],
         enqueue_ms: u64,
     ) -> Result<Vec<u8>, ClientError> {
+        self.ensure_healthy()?;
+        validate_stream_frame_len(false, 28 + 4 + l3_payload.len())?;
         let seq = self.next_leg_seq;
         self.next_leg_seq = self.next_leg_seq.wrapping_add(1);
         let flags = AccessFlags {
@@ -244,10 +300,8 @@ impl Tls443Stream {
         };
         let wire = seal_stream_v11(&self.tx_key, hdr, frame_id, l3_payload)?;
         if self.queued_bytes.saturating_add(wire.len()) > STREAM_QUEUE_CAP_BYTES {
-            let (dropped, _) = self.prune_hol_queue(enqueue_ms);
-            if dropped.is_empty()
-                && self.queued_bytes.saturating_add(wire.len()) > STREAM_QUEUE_CAP_BYTES
-            {
+            let _ = self.prune_hol_queue(enqueue_ms);
+            if self.queued_bytes.saturating_add(wire.len()) > STREAM_QUEUE_CAP_BYTES {
                 return Err(ClientError::Protocol(
                     "TLS-443 send queue exceeded 256 KB hard cap".into(),
                 ));
@@ -263,13 +317,48 @@ impl Tls443Stream {
         Ok(wire)
     }
 
-    /// Runs the 80ms head-of-line non-reference frame discard rule on the Realtime send queue.
+    /// Runs the 80ms head-of-line non-reference frame discard rule on the Realtime send queue,
+    /// reclaiming `queued_bytes` for all evicted frames.
     pub fn prune_hol_queue(&mut self, now_ms_val: u64) -> (Vec<u32>, Option<EdgeCtrlFrame>) {
+        let before_bytes = self.send_queue.total_bytes();
         let (dropped, hint) = self
             .send_queue
             .prune_hol_expired(now_ms_val, TLS443_HOL_THRESHOLD_MS);
+        let after_bytes = self.send_queue.total_bytes();
+        let evicted = before_bytes.saturating_sub(after_bytes);
+        self.queued_bytes = self.queued_bytes.saturating_sub(evicted);
         self.hol_dropped_frames = self.hol_dropped_frames.saturating_add(dropped.len() as u64);
         (dropped, hint)
+    }
+
+    /// Drains all currently queued slices from the send queue, decrementing `queued_bytes`.
+    pub fn drain_send_queue(&mut self) -> Vec<QueuedStreamSlice> {
+        let drained = self.send_queue.drain_all();
+        for item in &drained {
+            self.queued_bytes = self.queued_bytes.saturating_sub(item.wire_bytes.len());
+        }
+        drained
+    }
+
+    /// Flushes all queued slices in `send_queue` to the TLS stream, decrementing `queued_bytes`
+    /// as each slice is drained. Returns total wire bytes written.
+    pub async fn flush_send_queue(&mut self) -> Result<usize, ClientError> {
+        self.ensure_healthy()?;
+        let mut written = 0usize;
+        while let Some(item) = self.send_queue.pop_front() {
+            let len = item.wire_bytes.len();
+            self.queued_bytes = self.queued_bytes.saturating_sub(len);
+            if let Err(e) = self.stream.write_all(&item.wire_bytes).await {
+                return self.poison_and_err(e.into()).await;
+            }
+            written = written.saturating_add(len);
+        }
+        if written > 0 {
+            if let Err(e) = self.stream.flush().await {
+                return self.poison_and_err(e.into()).await;
+            }
+        }
+        Ok(written)
     }
 
     /// Sends a single L3 payload immediately over this TLS-443 stream (checking HoL rules first).
@@ -281,6 +370,8 @@ impl Tls443Stream {
         frame_id: u32,
         l3_payload: &[u8],
     ) -> Result<(), ClientError> {
+        self.ensure_healthy()?;
+        validate_stream_frame_len(false, 28 + 4 + l3_payload.len())?;
         let seq = self.next_leg_seq;
         self.next_leg_seq = self.next_leg_seq.wrapping_add(1);
         let hdr = AccessHeaderV11 {
@@ -298,28 +389,40 @@ impl Tls443Stream {
             mac_64: [0; 8],
         };
         let wire = seal_stream_v11(&self.tx_key, hdr, frame_id, l3_payload)?;
-        self.stream.write_all(&wire).await?;
-        self.stream.flush().await?;
+        if let Err(e) = self.stream.write_all(&wire).await {
+            return self.poison_and_err(e.into()).await;
+        }
+        if let Err(e) = self.stream.flush().await {
+            return self.poison_and_err(e.into()).await;
+        }
         Ok(())
     }
 
-    /// Receives and authenticates the next stream frame. Enforces strict `34..=1232` length gate
+    /// Receives and authenticates the next stream frame. Enforces per-`c`-bit length bounds
+    /// (`c=0`: `64..=1232`, `c=1`: `34..=289`), poisons & disconnects on any framing violation,
     /// and updates `BwHintController` / `bulk_paused` on `EdgeCtrl::BwHint`.
     pub async fn recv_frame(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
+        self.ensure_healthy()?;
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 4096];
         loop {
-            if let Some(frame) = self.parser.next_frame()? {
-                return self.verify_and_dispatch(frame).await;
+            match self.parser.next_frame() {
+                Ok(Some(frame)) => return self.verify_and_dispatch(frame).await,
+                Ok(None) => {}
+                Err(e) => return self.poison_and_err(e.into()).await,
             }
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("TLS-443 recv_frame timed out".into()));
             };
-            let n = tokio::time::timeout(rem, self.stream.read(&mut buf))
-                .await
-                .map_err(|_| ClientError::Timeout("TLS-443 recv_frame timed out".into()))??;
+            let n = match tokio::time::timeout(rem, self.stream.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return self.poison_and_err(e.into()).await,
+                Err(_) => return Err(ClientError::Timeout("TLS-443 recv_frame timed out".into())),
+            };
             if n == 0 {
-                return Err(ClientError::Protocol("TLS-443 stream closed by peer".into()));
+                return self
+                    .poison_and_err(ClientError::Protocol("TLS-443 stream closed by peer".into()))
+                    .await;
             }
             self.parser.feed(&buf[..n]);
         }
@@ -330,26 +433,36 @@ impl Tls443Stream {
         frame: DecodedStreamFrame,
     ) -> Result<StreamRecvEvent, ClientError> {
         let frame_len = 28 + 4 + frame.payload.len();
-        if !(STREAM_FRAME_MIN_LEN..=STREAM_FRAME_MAX_LEN).contains(&frame_len) {
-            return Err(ClientError::Protocol(format!(
-                "illegal TLS-443 frame_len {frame_len}"
-            )));
+        if let Err(e) = validate_stream_frame_len(frame.header.flags.is_ctrl_edge, frame_len) {
+            return self.poison_and_err(e).await;
         }
         if frame.header.route_cid != self.route_cid {
-            return Err(ClientError::Protocol("TLS-443 route_cid mismatch".into()));
+            return self
+                .poison_and_err(ClientError::Protocol("TLS-443 route_cid mismatch".into()))
+                .await;
         }
         if !frame.header.flags.dir_edge_to_client {
-            return Err(ClientError::Protocol(
-                "TLS-443 incoming frame missing Edge->Client direction bit".into(),
-            ));
+            return self
+                .poison_and_err(ClientError::Protocol(
+                    "TLS-443 incoming frame missing Edge->Client direction bit".into(),
+                ))
+                .await;
         }
         let hdr_zero = frame.header.encode_mac_zero();
         let expected_mac =
-            compute_stream_mac64(&self.rx_key, &hdr_zero, frame.frame_id, &frame.payload)?;
-        verify_mac64_ct(&expected_mac, &frame.header.mac_64)?;
+            match compute_stream_mac64(&self.rx_key, &hdr_zero, frame.frame_id, &frame.payload) {
+                Ok(m) => m,
+                Err(e) => return self.poison_and_err(e.into()).await,
+            };
+        if let Err(e) = verify_mac64_ct(&expected_mac, &frame.header.mac_64) {
+            return self.poison_and_err(e.into()).await;
+        }
 
         if frame.header.flags.is_ctrl_edge {
-            let ctrl = EdgeCtrlFrame::decode(&frame.payload)?;
+            let ctrl = match EdgeCtrlFrame::decode(&frame.payload) {
+                Ok(c) => c,
+                Err(e) => return self.poison_and_err(e.into()).await,
+            };
             match ctrl {
                 EdgeCtrlFrame::Ping { ts_us } => {
                     let _ = self.send_edge_ctrl(&EdgeCtrlFrame::Pong { ts_us }).await;

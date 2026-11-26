@@ -1174,6 +1174,30 @@ impl TcpStreamSendQueue {
         self.items.push(item);
     }
 
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.items.iter().map(|i| i.wire_bytes.len()).sum()
+    }
+
+    pub fn pop_front(&mut self) -> Option<QueuedStreamSlice> {
+        if self.items.is_empty() {
+            None
+        } else {
+            Some(self.items.remove(0))
+        }
+    }
+
+    pub fn drain_all(&mut self) -> Vec<QueuedStreamSlice> {
+        std::mem::take(&mut self.items)
+    }
+
     pub fn prune_hol_expired(
         &mut self,
         now_ms: u64,

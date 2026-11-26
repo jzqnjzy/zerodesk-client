@@ -201,6 +201,7 @@ pub struct AccessControlTunnel {
     transport: TransportState,
     session_access_secret: Zeroizing<[u8; 32]>,
     timeout: Duration,
+    poisoned: bool,
 }
 
 impl AccessControlTunnel {
@@ -266,6 +267,7 @@ impl AccessControlTunnel {
                 transport,
                 session_access_secret: secret,
                 timeout,
+                poisoned: false,
             })
         };
 
@@ -276,6 +278,10 @@ impl AccessControlTunnel {
 
     pub fn session_access_secret(&self) -> &[u8; 32] {
         &self.session_access_secret
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub async fn relay_bind(
@@ -344,6 +350,11 @@ impl AccessControlTunnel {
     }
 
     async fn rpc(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ClientError> {
+        if self.poisoned {
+            return Err(ClientError::Protocol(
+                "Noise_IK access control tunnel is poisoned; reconnect required".into(),
+            ));
+        }
         let timeout = self.timeout;
         let fut = async {
             let mut ct = vec![0u8; plaintext.len() + 64];
@@ -362,9 +373,21 @@ impl AccessControlTunnel {
             pt.truncate(m);
             Ok(pt)
         };
-        tokio::time::timeout(timeout, fut)
-            .await
-            .map_err(|_| ClientError::Timeout("Noise_IK access control RPC timed out".into()))?
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(Ok(pt)) => Ok(pt),
+            Ok(Err(e)) => {
+                self.poisoned = true;
+                let _ = self.stream.shutdown().await;
+                Err(e)
+            }
+            Err(_) => {
+                self.poisoned = true;
+                let _ = self.stream.shutdown().await;
+                Err(ClientError::Timeout(
+                    "Noise_IK access control RPC timed out".into(),
+                ))
+            }
+        }
     }
 }
 

@@ -12,7 +12,11 @@ pub use access_ctrl::{
     EdgeLeaseRenewResp, EdgeRebindResp, RelayBindResp, ACCESS_IK_PATTERN, ACCESS_PROLOGUE_LEN,
     ACCESS_PROLOGUE_PREFIX, MAX_CTRL_FRAME_LEN,
 };
-pub use bridge::{V2LoopbackBridge, V2ServiceStream, V2SessionMux, DEFAULT_BRIDGE_CHANNEL};
+pub use bridge::{
+    TunnelReorderBuffer, V2LoopbackBridge, V2ServiceStream, V2SessionMux, BRIDGE_CHANNEL_CAPACITY,
+    DEFAULT_BRIDGE_CHANNEL, MAX_REORDER_WINDOW, MAX_RETRANSMIT_ATTEMPTS,
+    MAX_RETRANSMIT_TOTAL_TIMEOUT,
+};
 pub use config::{
     decode_hex_array, default_edge_cert_hash, ClusterConfig, EdgeEndpointConfig,
 };
@@ -30,10 +34,11 @@ pub use signaling::{
     SignalingMsgKind, SignalingProbeResult,
 };
 pub use tls443::{
-    encode_stream_preface, DualTls443Client, StreamRecvEvent, Tls443Stream, Tls443StreamRole,
-    TLS443_AUTH_DEADLINE, TLS443_HOL_THRESHOLD_MS, TLS443_PREFACE_LEN,
+    encode_stream_preface, validate_stream_frame_len, DualTls443Client, StreamRecvEvent,
+    Tls443Stream, Tls443StreamRole, STREAM_CTRL_MAX_LEN, STREAM_CTRL_MIN_LEN, STREAM_DATA_MAX_LEN,
+    STREAM_DATA_MIN_LEN, TLS443_AUTH_DEADLINE, TLS443_HOL_THRESHOLD_MS, TLS443_PREFACE_LEN,
 };
 pub use udp_session::{
     bind_addr_for_edge, decode_survival_rs64_shards, encode_survival_rs64_shards, LegGapTracker,
-    UdpAccessLink, UdpE2eeSession, UdpLinkStats, UdpRecvEvent,
+    UdpAccessLink, UdpE2eeSession, UdpLinkStats, UdpRecvEvent, MAX_LEG_GAP_MISSING,
 };

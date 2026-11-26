@@ -55,23 +55,21 @@ pub fn build_tls_client_config(ca_der_path: Option<&Path>) -> Result<Arc<ClientC
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| ClientError::Tls(e.to_string()))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(cfg))
 }
 
-/// Resolves TLS SNI / IP SAN `ServerName`. Loopback IPs map to `"localhost"` for
-/// local E2E self-signed certs; non-loopback IPs verify directly via IP SAN.
+/// Resolves TLS SNI / IP SAN `ServerName`.
+/// IP literals (including loopback IPs) verify directly via IP SAN;
+/// DNS hostnames (such as `"localhost"`) verify via DNS SAN.
 pub fn tls_server_name_for_host(host: &str) -> Result<ServerName<'static>, ClientError> {
     let trimmed = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        if ip.is_loopback() {
-            return ServerName::try_from("localhost".to_string())
-                .map_err(|e| ClientError::Tls(e.to_string()));
-        }
-        return Ok(ServerName::IpAddress(ip.into()));
+        return ServerName::try_from(ip.to_string())
+            .map_err(|e| ClientError::Tls(e.to_string()));
     }
     ServerName::try_from(trimmed.to_string()).map_err(|e| ClientError::Tls(e.to_string()))
 }

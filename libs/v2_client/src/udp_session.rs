@@ -53,6 +53,9 @@ pub fn bind_addr_for_edge(edge_udp_addr: &SocketAddr) -> &'static str {
     }
 }
 
+/// Maximum number of missing `leg_seq` entries retained by `LegGapTracker`.
+pub const MAX_LEG_GAP_MISSING: usize = 512;
+
 /// Tracks incoming `leg_seq` gaps on a single access leg to emit `EdgeCtrl::LegNack`
 /// for missing sequences without amplifying on discardable (`d=1`) drops.
 #[derive(Debug, Default)]
@@ -90,6 +93,18 @@ impl LegGapTracker {
                 self.missing.clear();
             }
             self.highest_seq = leg_seq;
+            while self.missing.len() > MAX_LEG_GAP_MISSING {
+                let oldest = self
+                    .missing
+                    .iter()
+                    .copied()
+                    .max_by_key(|&s| self.highest_seq.wrapping_sub(s));
+                if let Some(seq) = oldest {
+                    self.missing.remove(&seq);
+                } else {
+                    break;
+                }
+            }
             if opened && !discardable {
                 return self.build_nack();
             }
@@ -101,7 +116,11 @@ impl LegGapTracker {
     }
 
     pub fn build_nack(&self) -> Option<(u32, u64)> {
-        let &base = self.missing.iter().next()?;
+        let base = self
+            .missing
+            .iter()
+            .copied()
+            .max_by_key(|&s| self.highest_seq.wrapping_sub(s))?;
         let mut bitmap = 0u64;
         for &seq in &self.missing {
             let off = seq.wrapping_sub(base);
@@ -674,6 +693,8 @@ impl UdpE2eeSession {
         discardable: bool,
         body: &[u8],
     ) -> Result<u32, ClientError> {
+        let is_file_clipboard = chan_id == CHAN_CLIPBOARD && flags != 0;
+        self.policy.enforce_channel(chan_id, is_file_clipboard)?;
         let pp = default_channel_priority(chan_id)
             .ok_or_else(|| TransportError::InvalidFraming(format!("unknown chan_id {chan_id}")))?;
         let body_len = u16::try_from(body.len())
