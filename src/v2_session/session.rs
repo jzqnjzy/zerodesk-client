@@ -1,0 +1,735 @@
+use super::{
+    hid::{decode_hid_frame, encode_hid_frame, HidCodecError, HidEchoAck, HidPayload},
+    video::{EncodedV2Frame, I420Frame, V2VideoDecoder, V2VideoEncoder, VideoCodec, VideoError},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use v2_client::{ClientError, UdpE2eeSession};
+use v2_transport::{AssembledVideoFrame, TransportEvent, VideoFrameMeta};
+
+pub const PENDING_VIDEO_QUEUE_CAP: usize = 8;
+
+#[derive(Debug)]
+pub enum SessionError {
+    Client(ClientError),
+    Hid(HidCodecError),
+    Video(VideoError),
+    Protocol(String),
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client(e) => write!(f, "v2 client error: {e}"),
+            Self::Hid(e) => write!(f, "v2 HID codec error: {e}"),
+            Self::Video(e) => write!(f, "v2 video error: {e}"),
+            Self::Protocol(msg) => write!(f, "v2 session protocol error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+impl From<ClientError> for SessionError {
+    fn from(e: ClientError) -> Self {
+        Self::Client(e)
+    }
+}
+
+impl From<HidCodecError> for SessionError {
+    fn from(e: HidCodecError) -> Self {
+        Self::Hid(e)
+    }
+}
+
+impl From<VideoError> for SessionError {
+    fn from(e: VideoError) -> Self {
+        Self::Video(e)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishedFrameInfo {
+    pub meta: VideoFrameMeta,
+    pub raw_bytes: usize,
+    pub slices_sent: usize,
+    pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedVideoDelivery {
+    pub frame: AssembledVideoFrame,
+    pub sha256: [u8; 32],
+    pub i420: I420Frame,
+}
+
+/// Native V2 Host desktop session controller.
+/// Routes Video (`0x03`), InputHID (`0x01`), and TransportCtrl (`0x00`) directly over
+/// `UdpE2eeSession` (never through `V2LoopbackBridge` / `V2ServiceStream`).
+pub struct DesktopHostSession {
+    session: UdpE2eeSession,
+    encoder: Arc<Mutex<V2VideoEncoder>>,
+    encoder_codec: VideoCodec,
+    pub video_frames_sent: u64,
+    pub video_slices_sent: u64,
+    pub video_bytes_sent: u64,
+    pub hid_frames_received: u64,
+    pub malformed_hid_frames_dropped: u64,
+    pub skipped_non_hid_events: u64,
+}
+
+impl DesktopHostSession {
+    pub fn new(session: UdpE2eeSession, encoder: V2VideoEncoder) -> Self {
+        let encoder_codec = encoder.codec();
+        Self {
+            session,
+            encoder: Arc::new(Mutex::new(encoder)),
+            encoder_codec,
+            video_frames_sent: 0,
+            video_slices_sent: 0,
+            video_bytes_sent: 0,
+            hid_frames_received: 0,
+            malformed_hid_frames_dropped: 0,
+            skipped_non_hid_events: 0,
+        }
+    }
+
+    pub fn session(&self) -> &UdpE2eeSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut UdpE2eeSession {
+        &mut self.session
+    }
+
+    pub fn encoder_codec(&self) -> VideoCodec {
+        self.encoder_codec
+    }
+
+    /// Replaces the active encoder while keeping `frame_id` strictly monotonic across codec switches.
+    pub fn replace_encoder(&mut self, mut encoder: V2VideoEncoder) {
+        if let Ok(prev) = self.encoder.lock() {
+            encoder.advance_next_frame_id_at_least(prev.next_frame_id());
+        }
+        self.encoder_codec = encoder.codec();
+        self.encoder = Arc::new(Mutex::new(encoder));
+    }
+
+    pub fn into_inner(self) -> (UdpE2eeSession, Arc<Mutex<V2VideoEncoder>>) {
+        (self.session, self.encoder)
+    }
+
+    /// Encodes an I420 frame via `scrap` and computes SHA-256 on Tokio's blocking pool so the
+    /// async worker never stalls P0 HID or packet I/O, then transmits the raw bitstream over
+    /// `UdpE2eeSession::send_video_frame` (`0x03 Video`).
+    pub async fn publish_i420_frame(
+        &mut self,
+        frame: &I420Frame,
+        pts_ms: i64,
+    ) -> Result<PublishedFrameInfo, SessionError> {
+        let enc = Arc::clone(&self.encoder);
+        let frame_owned = frame.clone();
+        let (encoded, sha256) = tokio::task::spawn_blocking(
+            move || -> Result<(EncodedV2Frame, [u8; 32]), SessionError> {
+                let mut guard = enc
+                    .lock()
+                    .map_err(|_| SessionError::Protocol("video encoder mutex poisoned".into()))?;
+                let encoded = guard.encode_i420(&frame_owned, pts_ms)?;
+                let sha256: [u8; 32] = Sha256::digest(&encoded.data).into();
+                Ok((encoded, sha256))
+            },
+        )
+        .await
+        .map_err(|e| SessionError::Protocol(format!("video encode blocking task failed: {e}")))??;
+
+        let raw_bytes = encoded.data.len();
+        let slices_sent = self
+            .session
+            .send_video_frame(&encoded.meta, &encoded.data)
+            .await?;
+        self.video_frames_sent = self.video_frames_sent.saturating_add(1);
+        self.video_slices_sent = self.video_slices_sent.saturating_add(slices_sent as u64);
+        self.video_bytes_sent = self.video_bytes_sent.saturating_add(raw_bytes as u64);
+        Ok(PublishedFrameInfo {
+            meta: encoded.meta,
+            raw_bytes,
+            slices_sent,
+            sha256,
+        })
+    }
+
+    /// Transmits a pre-encoded raw video frame directly over `0x03 Video`.
+    pub async fn publish_raw_video(
+        &mut self,
+        meta: &VideoFrameMeta,
+        data: &[u8],
+    ) -> Result<usize, SessionError> {
+        let slices_sent = self.session.send_video_frame(meta, data).await?;
+        self.video_frames_sent = self.video_frames_sent.saturating_add(1);
+        self.video_slices_sent = self.video_slices_sent.saturating_add(slices_sent as u64);
+        self.video_bytes_sent = self.video_bytes_sent.saturating_add(data.len() as u64);
+        Ok(slices_sent)
+    }
+
+    /// Receives the next valid `0x01 InputHID` frame, strictly decodes it without injecting any OS
+    /// synthetic input, and echoes a `HidEchoAck` back on P0. Malformed HID frames and
+    /// unexpected non-HID events are counted and skipped without aborting the receive loop.
+    pub async fn recv_hid_and_echo(
+        &mut self,
+        echo_seq: u32,
+        timeout: Duration,
+    ) -> Result<HidPayload, SessionError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ClientError::Timeout("host HID recv timed out".into()).into());
+            };
+            match self.session.recv_event(rem).await? {
+                TransportEvent::Hid(frame) => {
+                    let payload = match decode_hid_frame(&frame) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            self.malformed_hid_frames_dropped =
+                                self.malformed_hid_frames_dropped.saturating_add(1);
+                            continue;
+                        }
+                    };
+                    self.hid_frames_received = self.hid_frames_received.saturating_add(1);
+                    let ack = HidPayload::EchoAck(HidEchoAck {
+                        echo_seq,
+                        client_ts_ms: payload.client_ts_ms(),
+                    });
+                    let ack_frame = encode_hid_frame(&ack)?;
+                    self.session.send_hid(&ack_frame).await?;
+                    return Ok(payload);
+                }
+                _ => {
+                    self.skipped_non_hid_events = self.skipped_non_hid_events.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/// Native V2 Controller desktop session controller.
+/// Receives and decodes raw `0x03 Video` bitstreams and transmits `0x01 InputHID` on P0 directly
+/// over `UdpE2eeSession`.
+pub struct DesktopControllerSession {
+    session: UdpE2eeSession,
+    decoder: Arc<Mutex<V2VideoDecoder>>,
+    decoder_codec: VideoCodec,
+    pending_video: VecDeque<AssembledVideoFrame>,
+    pub video_frames_received: u64,
+    pub pending_video_dropped: u64,
+    pub hid_frames_sent: u64,
+    pub skipped_hid_events: u64,
+    pub skipped_stale_echo_acks: u64,
+    pub skipped_control_events: u64,
+    pub skipped_other_events: u64,
+}
+
+impl DesktopControllerSession {
+    pub fn new(session: UdpE2eeSession, decoder: V2VideoDecoder) -> Self {
+        let decoder_codec = decoder.codec();
+        Self {
+            session,
+            decoder: Arc::new(Mutex::new(decoder)),
+            decoder_codec,
+            pending_video: VecDeque::with_capacity(PENDING_VIDEO_QUEUE_CAP),
+            video_frames_received: 0,
+            pending_video_dropped: 0,
+            hid_frames_sent: 0,
+            skipped_hid_events: 0,
+            skipped_stale_echo_acks: 0,
+            skipped_control_events: 0,
+            skipped_other_events: 0,
+        }
+    }
+
+    pub fn session(&self) -> &UdpE2eeSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut UdpE2eeSession {
+        &mut self.session
+    }
+
+    pub fn decoder_codec(&self) -> VideoCodec {
+        self.decoder_codec
+    }
+
+    pub fn pending_video_len(&self) -> usize {
+        self.pending_video.len()
+    }
+
+    pub fn clear_pending_video(&mut self) {
+        self.pending_video.clear();
+    }
+
+    pub fn replace_decoder(&mut self, decoder: V2VideoDecoder) {
+        self.decoder_codec = decoder.codec();
+        self.decoder = Arc::new(Mutex::new(decoder));
+        self.pending_video.clear();
+    }
+
+    pub fn into_inner(self) -> (UdpE2eeSession, Arc<Mutex<V2VideoDecoder>>) {
+        (self.session, self.decoder)
+    }
+
+    fn push_pending_video(&mut self, frame: AssembledVideoFrame) {
+        while self.pending_video.len() >= PENDING_VIDEO_QUEUE_CAP {
+            self.pending_video.pop_front();
+            self.pending_video_dropped = self.pending_video_dropped.saturating_add(1);
+        }
+        self.pending_video.push_back(frame);
+    }
+
+    async fn decode_video_frame(
+        &mut self,
+        frame: AssembledVideoFrame,
+    ) -> Result<DecodedVideoDelivery, SessionError> {
+        let dec = Arc::clone(&self.decoder);
+        let (frame, sha256, i420) = tokio::task::spawn_blocking(
+            move || -> Result<(AssembledVideoFrame, [u8; 32], I420Frame), SessionError> {
+                let sha256: [u8; 32] = Sha256::digest(&frame.data).into();
+                let mut guard = dec
+                    .lock()
+                    .map_err(|_| SessionError::Protocol("video decoder mutex poisoned".into()))?;
+                let i420 = guard.decode_assembled(&frame)?;
+                Ok((frame, sha256, i420))
+            },
+        )
+        .await
+        .map_err(|e| SessionError::Protocol(format!("video decode blocking task failed: {e}")))??;
+
+        self.video_frames_received = self.video_frames_received.saturating_add(1);
+        Ok(DecodedVideoDelivery {
+            frame,
+            sha256,
+            i420,
+        })
+    }
+
+    /// Receives the next assembled `0x03 Video` frame (draining any buffered frames from
+    /// `pending_video` first), computes its SHA-256, and decodes it to I420 on Tokio's blocking
+    /// pool. Late/unexpected HID or Control events are skipped and counted instead of aborting.
+    pub async fn recv_and_decode_video(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<DecodedVideoDelivery, SessionError> {
+        if let Some(frame) = self.pending_video.pop_front() {
+            return self.decode_video_frame(frame).await;
+        }
+        let deadline = Instant::now() + timeout;
+        let frame = loop {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ClientError::Timeout("controller video recv timed out".into()).into());
+            };
+            match self.session.recv_event(rem).await? {
+                TransportEvent::VideoFrame(frame) => break frame,
+                TransportEvent::Control(_) => {
+                    self.skipped_control_events = self.skipped_control_events.saturating_add(1);
+                    continue;
+                }
+                TransportEvent::Hid(_) => {
+                    self.skipped_hid_events = self.skipped_hid_events.saturating_add(1);
+                    continue;
+                }
+                _ => {
+                    self.skipped_other_events = self.skipped_other_events.saturating_add(1);
+                    continue;
+                }
+            }
+        };
+        self.decode_video_frame(frame).await
+    }
+
+    /// Sends a typed V2 HID payload over P0 (`0x01 InputHID`).
+    pub async fn send_hid_payload(&mut self, payload: &HidPayload) -> Result<u32, SessionError> {
+        let frame = encode_hid_frame(payload)?;
+        let leg_seq = self.session.send_hid(&frame).await?;
+        self.hid_frames_sent = self.hid_frames_sent.saturating_add(1);
+        Ok(leg_seq)
+    }
+
+    /// Sends a typed P0 HID event and awaits the matching `HidEchoAck` on P0 while buffering any
+    /// interleaved P2 video frames into `pending_video` (without incrementing
+    /// `video_frames_received` until decoded) and skipping stale `echo_seq < expected_echo_seq`.
+    pub async fn send_hid_and_await_echo(
+        &mut self,
+        payload: &HidPayload,
+        expected_echo_seq: u32,
+        timeout: Duration,
+    ) -> Result<(HidEchoAck, u64, u64), SessionError> {
+        let sent = Instant::now();
+        self.send_hid_payload(payload).await?;
+        let deadline = Instant::now() + timeout;
+        let mut interleaved_video_frames = 0u64;
+        loop {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ClientError::Timeout("controller HidEchoAck timed out".into()).into());
+            };
+            match self.session.recv_event(rem).await? {
+                TransportEvent::Hid(frame) => match decode_hid_frame(&frame) {
+                    Ok(HidPayload::EchoAck(ack)) if ack.echo_seq == expected_echo_seq => {
+                        let rtt_us = sent.elapsed().as_micros() as u64;
+                        return Ok((ack, rtt_us, interleaved_video_frames));
+                    }
+                    Ok(HidPayload::EchoAck(ack)) if ack.echo_seq < expected_echo_seq => {
+                        self.skipped_stale_echo_acks =
+                            self.skipped_stale_echo_acks.saturating_add(1);
+                        continue;
+                    }
+                    Ok(other) => {
+                        return Err(SessionError::Protocol(format!(
+                            "unexpected HID frame while awaiting echo_seq {expected_echo_seq}: {other:?}"
+                        )));
+                    }
+                    Err(_) => {
+                        self.skipped_hid_events = self.skipped_hid_events.saturating_add(1);
+                        continue;
+                    }
+                },
+                TransportEvent::VideoFrame(frame) => {
+                    interleaved_video_frames = interleaved_video_frames.saturating_add(1);
+                    self.push_pending_video(frame);
+                }
+                TransportEvent::Control(_) => {
+                    self.skipped_control_events = self.skipped_control_events.saturating_add(1);
+                    continue;
+                }
+                _ => {
+                    self.skipped_other_events = self.skipped_other_events.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2_session::{
+        hid::{KeyEvent, MouseEvent, MouseKind},
+        video::generate_animated_i420,
+    };
+    use bytes::Bytes;
+    use tokio::{net::UdpSocket, task::JoinHandle};
+    use v2_client::{AccessKeys, UdpAccessLink};
+    use v2_transport::{
+        seal_udp_v11, AccessEpochState, AccessFlags, AccessHeaderV11, HidFrame,
+        VerifiedTenantPolicy, DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT, TRANSPORT_DATAGRAM,
+        UDP_MAX_LEN,
+    };
+
+    struct LoopbackPair {
+        host: DesktopHostSession,
+        controller: DesktopControllerSession,
+        _relay: JoinHandle<()>,
+    }
+
+    async fn spawn_loopback_pair() -> LoopbackPair {
+        let edge_a_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge_b_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge_a_addr = edge_a_sock.local_addr().unwrap();
+        let edge_b_addr = edge_b_sock.local_addr().unwrap();
+
+        let cid_a = [0xA1; 8];
+        let cid_b = [0xB2; 8];
+        let hs_a = [0x33; 32];
+        let hs_b = [0x44; 32];
+        let keys_a = AccessKeys::derive(cid_a, hs_a, 1).unwrap();
+        let keys_b = AccessKeys::derive(cid_b, hs_b, 1).unwrap();
+
+        let link_ctrl = UdpAccessLink::connect(&edge_a_addr.to_string(), &keys_a, 50_000)
+            .await
+            .unwrap();
+        let link_host = UdpAccessLink::connect(&edge_b_addr.to_string(), &keys_b, 50_000)
+            .await
+            .unwrap();
+        let ctrl_local = link_ctrl.local_addr().unwrap();
+        let host_local = link_host.local_addr().unwrap();
+
+        let mut rx_a =
+            AccessEpochState::new(cid_a, hs_a, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 1, 20)
+                .unwrap();
+        let tx_a =
+            AccessEpochState::new(cid_a, hs_a, TRANSPORT_DATAGRAM, DIR_EDGE_TO_CLIENT, 1, 20)
+                .unwrap();
+        let mut rx_b =
+            AccessEpochState::new(cid_b, hs_b, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 1, 20)
+                .unwrap();
+        let tx_b =
+            AccessEpochState::new(cid_b, hs_b, TRANSPORT_DATAGRAM, DIR_EDGE_TO_CLIENT, 1, 20)
+                .unwrap();
+
+        let relay = tokio::spawn(async move {
+            let mut buf_a = [0u8; UDP_MAX_LEN + 64];
+            let mut buf_b = [0u8; UDP_MAX_LEN + 64];
+            let mut seq_to_host = 1u32;
+            let mut seq_to_ctrl = 1u32;
+            loop {
+                tokio::select! {
+                    res = edge_a_sock.recv(&mut buf_a) => {
+                        let Ok(n) = res else { break; };
+                        let Ok((hdr, payload)) = rx_a.verify_udp_packet(&buf_a[..n], 0) else { continue; };
+                        let fwd_hdr = AccessHeaderV11 {
+                            flags: AccessFlags {
+                                pp: hdr.flags.pp,
+                                discardable: hdr.flags.discardable,
+                                frame_end: hdr.flags.frame_end,
+                                is_ctrl_edge: false,
+                                dir_edge_to_client: true,
+                                rtx: false,
+                            },
+                            route_cid: cid_b,
+                            access_epoch: tx_b.cur_epoch(),
+                            leg_seq: seq_to_host,
+                            mac_64: [0; 8],
+                        };
+                        seq_to_host = seq_to_host.wrapping_add(1);
+                        if let Ok(wire) = seal_udp_v11(tx_b.cur_key(), fwd_hdr, payload) {
+                            let _ = edge_b_sock.send_to(&wire, host_local).await;
+                        }
+                    }
+                    res = edge_b_sock.recv(&mut buf_b) => {
+                        let Ok(n) = res else { break; };
+                        let Ok((hdr, payload)) = rx_b.verify_udp_packet(&buf_b[..n], 0) else { continue; };
+                        let fwd_hdr = AccessHeaderV11 {
+                            flags: AccessFlags {
+                                pp: hdr.flags.pp,
+                                discardable: hdr.flags.discardable,
+                                frame_end: hdr.flags.frame_end,
+                                is_ctrl_edge: false,
+                                dir_edge_to_client: true,
+                                rtx: false,
+                            },
+                            route_cid: cid_a,
+                            access_epoch: tx_a.cur_epoch(),
+                            leg_seq: seq_to_ctrl,
+                            mac_64: [0; 8],
+                        };
+                        seq_to_ctrl = seq_to_ctrl.wrapping_add(1);
+                        if let Ok(wire) = seal_udp_v11(tx_a.cur_key(), fwd_hdr, payload) {
+                            let _ = edge_a_sock.send_to(&wire, ctrl_local).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let policy = VerifiedTenantPolicy::free_tier([0x11; 16]);
+        let key_c2h = [0x55; 32];
+        let key_h2c = [0x66; 32];
+        let ctrl_sess =
+            UdpE2eeSession::from_keys(link_ctrl, key_c2h, key_h2c, policy.clone(), [0x01; 16]);
+        let host_sess =
+            UdpE2eeSession::from_keys(link_host, key_h2c, key_c2h, policy, [0x02; 16]);
+
+        let enc = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(30)).unwrap();
+        let dec = V2VideoDecoder::new(VideoCodec::Vp9).unwrap();
+
+        LoopbackPair {
+            host: DesktopHostSession::new(host_sess, enc),
+            controller: DesktopControllerSession::new(ctrl_sess, dec),
+            _relay: relay,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_video_skips_late_hid_echo_and_control_frames() {
+        let mut pair = spawn_loopback_pair().await;
+
+        let late_ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
+            echo_seq: 99,
+            client_ts_ms: 1234,
+        }))
+        .unwrap();
+        pair.host.session_mut().send_hid(&late_ack).await.unwrap();
+        pair.host
+            .session_mut()
+            .send_control(0x01, b"ping")
+            .await
+            .unwrap();
+
+        let src = generate_animated_i420(64, 64, 0);
+        let pub_info = pair.host.publish_i420_frame(&src, 0).await.unwrap();
+
+        let delivered = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(delivered.frame.frame_id, pub_info.meta.frame_id);
+        assert_eq!(delivered.sha256, pub_info.sha256);
+        assert_eq!(pair.controller.skipped_hid_events, 1);
+        assert_eq!(pair.controller.skipped_control_events, 1);
+        assert_eq!(pair.controller.video_frames_received, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_hid_skips_stale_echo_seq_and_buffers_video_until_decoded() {
+        let mut pair = spawn_loopback_pair().await;
+
+        // Host queues: stale echo_seq=2, two real VP9 video frames, then matching echo_seq=5.
+        let stale_ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
+            echo_seq: 2,
+            client_ts_ms: 100,
+        }))
+        .unwrap();
+        pair.host.session_mut().send_hid(&stale_ack).await.unwrap();
+
+        let f0 = generate_animated_i420(64, 64, 0);
+        let f1 = generate_animated_i420(64, 64, 1);
+        let info0 = pair.host.publish_i420_frame(&f0, 0).await.unwrap();
+        let info1 = pair.host.publish_i420_frame(&f1, 33).await.unwrap();
+
+        let good_ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
+            echo_seq: 5,
+            client_ts_ms: 555,
+        }))
+        .unwrap();
+        pair.host.session_mut().send_hid(&good_ack).await.unwrap();
+
+        let probe = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::MoveAbs,
+            buttons: 0,
+            x_or_dx: 10,
+            y_or_dy: 20,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 555,
+        });
+        let (ack, _rtt, interleaved) = pair
+            .controller
+            .send_hid_and_await_echo(&probe, 5, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(ack.echo_seq, 5);
+        assert_eq!(ack.client_ts_ms, 555);
+        assert_eq!(interleaved, 2);
+        assert_eq!(pair.controller.skipped_stale_echo_acks, 1);
+        assert_eq!(pair.controller.pending_video_len(), 2);
+        assert_eq!(pair.controller.video_frames_received, 0);
+
+        let d0 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_millis(200))
+            .await
+            .unwrap();
+        let d1 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert_eq!(d0.frame.frame_id, info0.meta.frame_id);
+        assert_eq!(d0.sha256, info0.sha256);
+        assert_eq!(d1.frame.frame_id, info1.meta.frame_id);
+        assert_eq!(d1.sha256, info1.sha256);
+        assert_eq!(pair.controller.pending_video_len(), 0);
+        assert_eq!(pair.controller.video_frames_received, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_video_queue_caps_at_bound_and_drops_oldest() {
+        let mut pair = spawn_loopback_pair().await;
+
+        let total = PENDING_VIDEO_QUEUE_CAP + 2;
+        for idx in 0..total {
+            let src = generate_animated_i420(64, 64, idx as u32);
+            let _ = pair
+                .host
+                .publish_i420_frame(&src, (idx as i64) * 33)
+                .await
+                .unwrap();
+        }
+        let ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
+            echo_seq: 1,
+            client_ts_ms: 777,
+        }))
+        .unwrap();
+        pair.host.session_mut().send_hid(&ack).await.unwrap();
+
+        let probe = HidPayload::Key(KeyEvent {
+            down: true,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 'a' as u32,
+            client_ts_ms: 777,
+        });
+        let (_, _, interleaved) = pair
+            .controller
+            .send_hid_and_await_echo(&probe, 1, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(interleaved, total as u64);
+        assert_eq!(pair.controller.pending_video_len(), PENDING_VIDEO_QUEUE_CAP);
+        assert_eq!(pair.controller.pending_video_dropped, 2);
+        assert_eq!(pair.controller.video_frames_received, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_recv_hid_drops_malformed_and_non_hid_events_gracefully() {
+        let mut pair = spawn_loopback_pair().await;
+
+        // Controller sends malformed HID frame, unexpected Control frame, then valid KeyEvent.
+        let malformed = HidFrame {
+            msg_type: 0xFF,
+            payload: Bytes::from_static(&[1, 2, 3]),
+        };
+        pair.controller
+            .session_mut()
+            .send_hid(&malformed)
+            .await
+            .unwrap();
+        pair.controller
+            .session_mut()
+            .send_control(0x02, b"ctrl")
+            .await
+            .unwrap();
+        let valid = HidPayload::Key(KeyEvent {
+            down: false,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 'a' as u32,
+            client_ts_ms: 888,
+        });
+        pair.controller.send_hid_payload(&valid).await.unwrap();
+
+        let got = pair
+            .host
+            .recv_hid_and_echo(7, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(got, valid);
+        assert_eq!(pair.host.malformed_hid_frames_dropped, 1);
+        assert_eq!(pair.host.skipped_non_hid_events, 1);
+        assert_eq!(pair.host.hid_frames_received, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_encoder_keeps_frame_id_monotonic() {
+        let mut pair = spawn_loopback_pair().await;
+
+        let f0 = generate_animated_i420(64, 64, 0);
+        let f1 = generate_animated_i420(64, 64, 1);
+        let p0 = pair.host.publish_i420_frame(&f0, 0).await.unwrap();
+        let p1 = pair.host.publish_i420_frame(&f1, 33).await.unwrap();
+        assert_eq!(p0.meta.frame_id, 1);
+        assert_eq!(p1.meta.frame_id, 2);
+
+        let av1 = V2VideoEncoder::new(VideoCodec::Av1, 64, 64, 2.0, Some(30)).unwrap();
+        pair.host.replace_encoder(av1);
+        let p2 = pair.host.publish_i420_frame(&f0, 66).await.unwrap();
+        assert_eq!(p2.meta.frame_id, 3);
+        assert_eq!(p2.meta.ref_frame_id, 3);
+        assert_eq!(p2.meta.ltr_slot, 0);
+    }
+}
