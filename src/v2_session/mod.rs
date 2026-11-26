@@ -30,8 +30,9 @@ pub use input::{
     MOUSE_BUTTON_RIGHT,
 };
 pub use session::{
-    parse_session_close, DecodedVideoDelivery, DesktopControllerSession, DesktopHostSession,
-    PublishedFrameInfo, SessionError, CTRL_MSG_SESSION_CLOSE, PENDING_VIDEO_QUEUE_CAP,
+    parse_request_idr, parse_session_close, DecodedVideoDelivery, DesktopControllerSession,
+    DesktopHostSession, PublishedFrameInfo, SessionError, CTRL_MSG_REQUEST_IDR,
+    CTRL_MSG_SESSION_CLOSE, PENDING_VIDEO_QUEUE_CAP,
 };
 pub use video::{
     compute_y_psnr, compute_y_ssim, generate_animated_i420, EncodedV2Frame, FrameQualityMetrics,

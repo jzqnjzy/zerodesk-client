@@ -28,13 +28,13 @@ use v2_client::{
 use v2_e2e::EnigoOsSink;
 use v2_e2e::{
     compute_y_variance, decode_hid_frame, detect_visual_marker, encode_hid_frame,
-    parse_session_close, spawn_capture_pipeline, spawn_release_watchdog, AuditKey, AuditRecord,
-    CaptureError, CapturePipelineHandle, DecodedVideoDelivery, DesktopControllerSession,
-    DesktopHostSession, DryRunSink,
-    HidEchoAck, HidInputExecutor, HidInputSink, HidPayload, InputError, KeyEvent, MouseEvent,
-    MouseKind, SafeHidKey, ScrapDisplaySource, SessionError, SharedVisualMarker,
-    SyntheticAnimatedSource, V2VideoDecoder, V2VideoEncoder, VideoCodec, DEFAULT_SYNTHETIC_HEIGHT,
-    DEFAULT_SYNTHETIC_WIDTH, MOUSE_BUTTON_LEFT,
+    parse_request_idr, parse_session_close, spawn_capture_pipeline, spawn_release_watchdog,
+    AuditKey, AuditRecord, CaptureError, CapturePipelineHandle, DecodedVideoDelivery,
+    DesktopControllerSession, DesktopHostSession, DryRunSink, HidEchoAck, HidInputExecutor,
+    HidInputSink, HidPayload, InputError, KeyEvent, MouseEvent, MouseKind, SafeHidKey,
+    ScrapDisplaySource, SessionError, SharedVisualMarker, SyntheticAnimatedSource, V2VideoDecoder,
+    V2VideoEncoder, VideoCodec, DEFAULT_SYNTHETIC_HEIGHT, DEFAULT_SYNTHETIC_WIDTH,
+    MOUSE_BUTTON_LEFT,
 };
 use v2_identity::{
     verify_p256_low_s, DelegationStatement, DeviceCert, DeviceKeyStore, SoftwareDeviceKeyStore,
@@ -43,7 +43,7 @@ use v2_identity::{
 use v2_transport::{
     PrologueInput, QuotaExhaustPolicy, TenantPolicyRules, TransportEvent, VerifiedTenantPolicy,
     CAP_ACCESS_LEG_SEQ_V11, CAP_CODEC_AV1, CAP_CODEC_VP9, CAP_SURVIVAL_MODE,
-    CAP_TRANSPORT_TCP443_DUAL, CIPHER_AESGCM, L3_MTU_DEFAULT, PATTERN_IK,
+    CAP_TRANSPORT_TCP443_DUAL, CIPHER_AESGCM, IDR_MIN_INTERVAL_MS, L3_MTU_DEFAULT, PATTERN_IK,
     TRANSPORT_MODE_RELAY_UDP, VER_MAJOR_MINOR,
 };
 
@@ -1073,6 +1073,8 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
     let mut last_peer_activity = Instant::now();
     let mut next_frame_at = Instant::now();
     let mut next_hid_seq = 0u32;
+    let mut last_forced_idr: Option<Instant> = None;
+    let mut force_next_idr = false;
     let close_reason: String;
     let mut fatal_error: Option<String> = None;
 
@@ -1141,8 +1143,28 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
                     close_reason = "session_close".into();
                     break 'session_loop;
                 }
-                // Authenticated Control frames (including 0x03 KEEPALIVE) refresh both idle
-                // tracking and the input-release watchdog per protocol-spec v1.2.3 P0-2.
+                if parse_request_idr(&ctrl).is_some()
+                    && last_forced_idr
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(IDR_MIN_INTERVAL_MS))
+                {
+                    force_next_idr = true;
+                }
+                // Authenticated Control frames (including 0x03 KEEPALIVE / 0x10 REQUEST_IDR)
+                // refresh both idle tracking and the input-release watchdog per spec v1.2.3 P0-2.
+                last_peer_activity = Instant::now();
+                {
+                    let guard = executor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.touch_activity();
+                }
+            }
+            Ok(TransportEvent::RequestIdr { .. }) => {
+                if last_forced_idr
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(IDR_MIN_INTERVAL_MS))
+                {
+                    force_next_idr = true;
+                }
                 last_peer_activity = Instant::now();
                 {
                     let guard = executor
@@ -1161,7 +1183,6 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
                 | TransportEvent::Telemetry(_)
                 | TransportEvent::TransportModeChanged(_)
                 | TransportEvent::BandwidthEstimate { .. }
-                | TransportEvent::RequestIdr { .. }
                 | TransportEvent::PolicyUpdated(_),
             ) => {
                 last_peer_activity = Instant::now();
@@ -1177,6 +1198,26 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
         let now = Instant::now();
         if now >= next_frame_at {
             if let Some(captured) = capture.try_take_latest_or_keepalive(keepalive_interval) {
+                if force_next_idr {
+                    match V2VideoEncoder::new(
+                        args.codec,
+                        width as u32,
+                        height as u32,
+                        ENCODER_QUALITY,
+                        Some(KEYFRAME_INTERVAL),
+                    ) {
+                        Ok(new_enc) => {
+                            host.replace_encoder(new_enc);
+                            last_forced_idr = Some(Instant::now());
+                            force_next_idr = false;
+                        }
+                        Err(e) => {
+                            close_reason = "video_publish_error".into();
+                            fatal_error = Some(e.to_string());
+                            break 'session_loop;
+                        }
+                    }
+                }
                 let pts_ms = session_start.elapsed().as_millis() as i64;
                 if let Err(e) = host.publish_i420_frame(captured.frame, pts_ms).await {
                     close_reason = "video_publish_error".into();

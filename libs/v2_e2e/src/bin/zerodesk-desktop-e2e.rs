@@ -339,19 +339,21 @@ pub(crate) struct LeaseRenewalGuard {
 }
 
 impl LeaseRenewalGuard {
-    pub(crate) fn renewals_ok(&self) -> u64 {
-        self.lease_renewals_ok.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn renewals_err(&self) -> u64 {
-        self.lease_renewals_err.load(Ordering::Acquire)
-    }
-
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) -> (u64, u64) {
         let _ = self.stop_tx.send(true);
-        if let Some(handle) = self.task.take() {
-            let _ = handle.await;
+        if let Some(mut handle) = self.task.take() {
+            if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
+        (
+            self.lease_renewals_ok.load(Ordering::Acquire),
+            self.lease_renewals_err.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -1209,7 +1211,7 @@ async fn cmd_e2e(
         run_live_video_stream(&mut host, &mut controller, secondary_codec, secondary_burst).await?;
     let g3_hid = run_g3_hid_and_preemption(&mut host, &mut controller, bg_mbps).await?;
 
-    renew_guard.shutdown().await;
+    let _ = renew_guard.shutdown().await;
 
     let pass = g2_primary_video.pass && g2_secondary_video.pass && g3_hid.pass;
     Ok(DesktopE2eReport {
@@ -1434,7 +1436,7 @@ mod tests {
             lease_renewals_ok: ok,
             lease_renewals_err: err,
         };
-        guard.shutdown().await;
+        assert_eq!(guard.shutdown().await, (1, 0));
 
         let (stop_tx2, mut stop_rx2) = watch::channel(false);
         let task2 = tokio::spawn(async move {
@@ -1446,8 +1448,6 @@ mod tests {
             lease_renewals_ok: Arc::new(AtomicU64::new(0)),
             lease_renewals_err: Arc::new(AtomicU64::new(0)),
         };
-        assert_eq!(guard2.renewals_ok(), 0);
-        assert_eq!(guard2.renewals_err(), 0);
         drop(guard2);
     }
 }

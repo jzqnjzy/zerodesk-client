@@ -18,9 +18,10 @@ use tokio::sync::mpsc;
 use v2_client::{ClientError, ClusterConfig};
 use v2_e2e::{
     compute_y_psnr, compute_y_ssim, decode_hid_frame, encode_hid_frame, generate_animated_i420,
-    parse_session_close, DesktopControllerSession, DesktopHostSession, HidEchoAck, HidPayload,
-    I420Frame, KeyEvent, MouseEvent, MouseKind, SessionError, V2VideoDecoder, V2VideoEncoder,
-    VideoCodec, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT,
+    parse_request_idr, parse_session_close, DesktopControllerSession, DesktopHostSession,
+    HidEchoAck, HidPayload, I420Frame, KeyEvent, MouseEvent, MouseKind, SessionError,
+    V2VideoDecoder, V2VideoEncoder, VideoCodec, CTRL_MSG_REQUEST_IDR, MOD_ALT, MOD_CTRL, MOD_META,
+    MOD_SHIFT,
 };
 use v2_transport::{
     AssembledVideoFrame, TransportEvent, VideoFrameMeta, ACCESS_HDR_V11_LEN, AEAD_TAG_LEN,
@@ -34,10 +35,12 @@ pub const MIN_PROBES_PER_ROUND: usize = 200;
 pub const BASELINE_JITTER_INCONCLUSIVE_MS: f64 = 50.0;
 pub const DELTA_P50_GATE_MS: f64 = 25.0;
 pub const DELTA_P95_GATE_MS: f64 = 50.0;
+pub const LOADED_LOSS_GATE_PCT: f64 = 1.0;
+pub const MIN_BG_LOAD_RATIO: f64 = 0.90;
+pub const MAX_BG_WIRE_OVERHEAD_RATIO: f64 = 1.01;
 pub const WAN_KEYFRAME_INTERVAL: usize = 30;
 pub const MIN_VIDEO_DELIVERY_RATIO: f64 = 0.90;
 
-const CTRL_MSG_WAN_REQUEST_IDR: u8 = 0x10;
 const CTRL_MSG_WAN_VIDEO_EOS: u8 = 0x11;
 const PROBE_ECHO_TIMEOUT: Duration = Duration::from_millis(1_500);
 const LOADED_WARMUP_DURATION: Duration = Duration::from_millis(200);
@@ -102,6 +105,7 @@ pub struct WanHidPreemptionSummary {
     pub max_wire_mbps: f64,
     pub effective_target_wire_mbps: f64,
     pub wire_mbps: f64,
+    pub min_round_wire_mbps: f64,
     pub max_round_wire_mbps: f64,
     pub unloaded_p50_ms: f64,
     pub unloaded_p95_ms: f64,
@@ -132,6 +136,8 @@ pub struct WanVideoTelemetry {
     pub idr_requests_sent: usize,
     pub idr_frames_sent: usize,
     pub idr_frames_received: usize,
+    pub forced_idr_frame_ids: Vec<u32>,
+    pub sent_frame_ids_strictly_monotonic: bool,
     pub encode_ms_p50: f64,
     pub encode_ms_p95: f64,
     pub encode_ms_max: f64,
@@ -161,6 +167,8 @@ pub struct WanBenchReport {
     pub edge_a_ping_rtt_ms: f64,
     pub edge_b_ping_rtt_ms: f64,
     pub signaling_tcp_rtt_ms: f64,
+    pub lease_renewals_ok: u64,
+    pub lease_renewals_err: u64,
     pub hid_preemption: WanHidPreemptionSummary,
     pub video_telemetry: WanVideoTelemetry,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -473,8 +481,6 @@ pub fn evaluate_round(input: RoundEvalInput) -> WanBenchRoundMetrics {
 
     let inconclusive_reason = if unloaded_received == 0 {
         Some("no unloaded P0 HID echo samples received".to_string())
-    } else if loaded_received == 0 {
-        Some("no loaded P0 HID echo samples received".to_string())
     } else if unloaded_jitter_ms > BASELINE_JITTER_INCONCLUSIVE_MS {
         Some(format!(
             "noisy unloaded baseline: unloaded_p95 - unloaded_p50 = {unloaded_jitter_ms:.2} ms > {BASELINE_JITTER_INCONCLUSIVE_MS:.1} ms"
@@ -534,10 +540,73 @@ pub fn aggregate_rounds(
     let inconclusive_rounds = rounds_total.saturating_sub(valid_rounds);
     let min_valid_required = (rounds_total / 2) + 1;
 
-    let max_round_wire_mbps = rounds
+    let all_wire_finite = rounds.iter().all(|r| r.wire_mbps.is_finite());
+    let max_round_wire_mbps = if all_wire_finite {
+        rounds.iter().map(|r| r.wire_mbps).fold(0.0f64, f64::max)
+    } else {
+        f64::NAN
+    };
+    let valid_wire_finite = valid.iter().all(|r| r.wire_mbps.is_finite());
+    let min_round_wire_mbps = if valid.is_empty() {
+        0.0
+    } else if valid_wire_finite {
+        valid
+            .iter()
+            .map(|r| r.wire_mbps)
+            .fold(f64::INFINITY, f64::min)
+    } else {
+        f64::NAN
+    };
+
+    // Never mask a loaded-phase P0 blackout (unloaded worked, loaded received 0) as INCONCLUSIVE.
+    let any_loaded_blackout = rounds
         .iter()
-        .map(|r| r.wire_mbps)
-        .fold(0.0f64, f64::max);
+        .any(|r| r.unloaded_received > 0 && r.loaded_received == 0);
+    if any_loaded_blackout {
+        return WanHidPreemptionSummary {
+            verdict: "FAIL".to_string(),
+            pass: false,
+            rounds_total,
+            valid_rounds,
+            inconclusive_rounds,
+            probes_per_round,
+            bg_target_mbps,
+            max_wire_mbps,
+            effective_target_wire_mbps,
+            wire_mbps: median_f64(&rounds.iter().map(|r| r.wire_mbps).collect::<Vec<_>>()),
+            min_round_wire_mbps,
+            max_round_wire_mbps,
+            unloaded_p50_ms: median_f64(
+                &rounds.iter().map(|r| r.unloaded_p50_ms).collect::<Vec<_>>(),
+            ),
+            unloaded_p95_ms: median_f64(
+                &rounds.iter().map(|r| r.unloaded_p95_ms).collect::<Vec<_>>(),
+            ),
+            unloaded_jitter_ms: median_f64(
+                &rounds
+                    .iter()
+                    .map(|r| r.unloaded_jitter_ms)
+                    .collect::<Vec<_>>(),
+            ),
+            unloaded_loss_pct: median_f64(
+                &rounds
+                    .iter()
+                    .map(|r| r.unloaded_loss_pct)
+                    .collect::<Vec<_>>(),
+            ),
+            loaded_p50_ms: median_f64(&rounds.iter().map(|r| r.loaded_p50_ms).collect::<Vec<_>>()),
+            loaded_p95_ms: median_f64(&rounds.iter().map(|r| r.loaded_p95_ms).collect::<Vec<_>>()),
+            loaded_loss_pct: median_f64(
+                &rounds.iter().map(|r| r.loaded_loss_pct).collect::<Vec<_>>(),
+            ),
+            delta_p50_ms: median_f64(&rounds.iter().map(|r| r.delta_p50_ms).collect::<Vec<_>>()),
+            delta_p95_ms: median_f64(&rounds.iter().map(|r| r.delta_p95_ms).collect::<Vec<_>>()),
+            delta_p50_threshold_ms: DELTA_P50_GATE_MS,
+            delta_p95_threshold_ms: DELTA_P95_GATE_MS,
+            baseline_jitter_limit_ms: BASELINE_JITTER_INCONCLUSIVE_MS,
+            rounds,
+        };
+    }
 
     if valid_rounds < min_valid_required {
         return WanHidPreemptionSummary {
@@ -551,6 +620,7 @@ pub fn aggregate_rounds(
             max_wire_mbps,
             effective_target_wire_mbps,
             wire_mbps: median_f64(&rounds.iter().map(|r| r.wire_mbps).collect::<Vec<_>>()),
+            min_round_wire_mbps,
             max_round_wire_mbps,
             unloaded_p50_ms: median_f64(
                 &rounds.iter().map(|r| r.unloaded_p50_ms).collect::<Vec<_>>(),
@@ -603,11 +673,19 @@ pub fn aggregate_rounds(
     let all_bg_traversed = valid
         .iter()
         .all(|r| r.bg_wire_bytes_sent > 0 && r.bg_recv_video_frames > 0);
-    let wire_rate_capped = max_round_wire_mbps <= effective_target_wire_mbps + 1e-6;
+    let all_loaded_loss_ok = valid.iter().all(|r| {
+        r.loaded_received > 0 && (r.loaded_loss_pct - r.unloaded_loss_pct) <= LOADED_LOSS_GATE_PCT
+    });
+    let wire_rate_in_band = all_wire_finite
+        && min_round_wire_mbps.is_finite()
+        && max_round_wire_mbps.is_finite()
+        && min_round_wire_mbps >= effective_target_wire_mbps * MIN_BG_LOAD_RATIO
+        && max_round_wire_mbps <= effective_target_wire_mbps * MAX_BG_WIRE_OVERHEAD_RATIO;
 
     let pass = all_fields_exact
         && all_bg_traversed
-        && wire_rate_capped
+        && all_loaded_loss_ok
+        && wire_rate_in_band
         && delta_p50_ms <= DELTA_P50_GATE_MS
         && delta_p95_ms <= DELTA_P95_GATE_MS;
 
@@ -626,6 +704,7 @@ pub fn aggregate_rounds(
         max_wire_mbps,
         effective_target_wire_mbps,
         wire_mbps,
+        min_round_wire_mbps,
         max_round_wire_mbps,
         unloaded_p50_ms,
         unloaded_p95_ms,
@@ -1083,11 +1162,16 @@ pub async fn run_wan_hid_preemption(
             PROBE_ECHO_TIMEOUT,
         )
         .await?;
-        let round_verdict = if metrics.inconclusive {
+        let round_verdict = if metrics.unloaded_received > 0 && metrics.loaded_received == 0 {
+            "FAIL"
+        } else if metrics.inconclusive {
             "INCONCLUSIVE"
         } else if metrics.delta_p50_ms <= DELTA_P50_GATE_MS
             && metrics.delta_p95_ms <= DELTA_P95_GATE_MS
-            && metrics.wire_mbps <= effective_target_wire_mbps + 1e-6
+            && (metrics.loaded_loss_pct - metrics.unloaded_loss_pct) <= LOADED_LOSS_GATE_PCT
+            && metrics.wire_mbps.is_finite()
+            && metrics.wire_mbps >= effective_target_wire_mbps * MIN_BG_LOAD_RATIO
+            && metrics.wire_mbps <= effective_target_wire_mbps * MAX_BG_WIRE_OVERHEAD_RATIO
             && metrics.unloaded_field_exact_match
             && metrics.loaded_field_exact_match
             && metrics.bg_recv_video_frames > 0
@@ -1184,6 +1268,9 @@ pub async fn run_wan_video_telemetry(
         let mut total_raw_bytes = 0u64;
         let mut total_slices = 0u64;
         let mut idr_frames_sent = 0usize;
+        let mut forced_idr_frame_ids = Vec::new();
+        let mut prev_sent_frame_id: Option<u32> = None;
+        let mut sent_frame_ids_strictly_monotonic = true;
         let mut force_next_idr = false;
         let mut last_forced_idr: Option<Instant> = None;
         let mut next_frame_at = Instant::now();
@@ -1202,7 +1289,7 @@ pub async fn run_wan_video_telemetry(
                         if let Some(error_code) = parse_session_close(&ctrl) {
                             return Err(SessionError::SessionClosed { error_code });
                         }
-                        if ctrl.msg_type == CTRL_MSG_WAN_REQUEST_IDR
+                        if parse_request_idr(&ctrl).is_some()
                             && last_forced_idr.is_none_or(|t| {
                                 t.elapsed() >= Duration::from_millis(IDR_MIN_INTERVAL_MS)
                             })
@@ -1222,7 +1309,7 @@ pub async fn run_wan_video_telemetry(
                 }
             }
 
-            if force_next_idr {
+            let was_forced_idr = if force_next_idr {
                 host.replace_encoder(V2VideoEncoder::new(
                     codec,
                     WIDTH as u32,
@@ -1232,12 +1319,22 @@ pub async fn run_wan_video_telemetry(
                 )?);
                 last_forced_idr = Some(Instant::now());
                 force_next_idr = false;
-            }
+                true
+            } else {
+                false
+            };
 
             let src = Arc::new(generate_animated_i420(WIDTH, HEIGHT, idx as u32));
             let tx_bytes_before = host.session().link().stats.tx_bytes;
             let tx_pkts_before = host.session().link().stats.tx_packets;
             let info = host.publish_i420_frame(src, (idx as i64) * 33).await?;
+            if prev_sent_frame_id.is_some_and(|prev| info.meta.frame_id <= prev) {
+                sent_frame_ids_strictly_monotonic = false;
+            }
+            prev_sent_frame_id = Some(info.meta.frame_id);
+            if was_forced_idr && info.meta.is_idr {
+                forced_idr_frame_ids.push(info.meta.frame_id);
+            }
             let tx_bytes_delta = host
                 .session()
                 .link()
@@ -1276,6 +1373,7 @@ pub async fn run_wan_video_telemetry(
         host.session_mut()
             .send_control(CTRL_MSG_WAN_VIDEO_EOS, &(frames as u32).to_be_bytes())
             .await?;
+        let eos_at = Instant::now();
         send_done.store(true, Ordering::Release);
 
         // Continue pumping link events until receiver finishes so late LegNacks still get serviced.
@@ -1296,13 +1394,15 @@ pub async fn run_wan_video_telemetry(
             }
         }
 
-        let wire_mbps = pacer.measured_wire_mbps(Instant::now());
-        Ok::<(Vec<u64>, u64, u64, u64, usize, f64), SessionError>((
+        let wire_mbps = pacer.measured_wire_mbps(eos_at);
+        Ok::<(Vec<u64>, u64, u64, u64, usize, Vec<u32>, bool, f64), SessionError>((
             encode_samples_us,
             total_raw_bytes,
             pacer.total_wire_bytes(),
             total_slices,
             idr_frames_sent,
+            forced_idr_frame_ids,
+            sent_frame_ids_strictly_monotonic,
             wire_mbps,
         ))
     };
@@ -1384,7 +1484,7 @@ pub async fn run_wan_video_telemetry(
                             let _ = controller
                                 .session_mut()
                                 .send_control(
-                                    CTRL_MSG_WAN_REQUEST_IDR,
+                                    CTRL_MSG_REQUEST_IDR,
                                     &assembled.frame_id.to_be_bytes(),
                                 )
                                 .await;
@@ -1409,7 +1509,7 @@ pub async fn run_wan_video_telemetry(
                             let _ = controller
                                 .session_mut()
                                 .send_control(
-                                    CTRL_MSG_WAN_REQUEST_IDR,
+                                    CTRL_MSG_REQUEST_IDR,
                                     &assembled.frame_id.to_be_bytes(),
                                 )
                                 .await;
@@ -1456,7 +1556,7 @@ pub async fn run_wan_video_telemetry(
                                 let _ = controller
                                     .session_mut()
                                     .send_control(
-                                        CTRL_MSG_WAN_REQUEST_IDR,
+                                        CTRL_MSG_REQUEST_IDR,
                                         &meta.frame_id.to_be_bytes(),
                                     )
                                     .await;
@@ -1505,6 +1605,8 @@ pub async fn run_wan_video_telemetry(
             total_wire_bytes,
             total_slices_sent,
             idr_frames_sent,
+            forced_idr_frame_ids,
+            sent_frame_ids_strictly_monotonic,
             wire_mbps,
         ),
         (
@@ -1558,6 +1660,8 @@ pub async fn run_wan_video_telemetry(
         idr_requests_sent,
         idr_frames_sent,
         idr_frames_received,
+        forced_idr_frame_ids,
+        sent_frame_ids_strictly_monotonic,
         encode_ms_p50,
         encode_ms_p95,
         encode_ms_max,
@@ -1621,12 +1725,10 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
     )
     .await?;
 
-    let renewals_ok = renew_guard.renewals_ok();
-    let renewals_err = renew_guard.renewals_err();
+    let (lease_renewals_ok, lease_renewals_err) = renew_guard.shutdown().await;
     eprintln!(
-        "[wan-bench] lease_renewals_ok={renewals_ok} lease_renewals_err={renewals_err}"
+        "[wan-bench] lease_renewals_ok={lease_renewals_ok} lease_renewals_err={lease_renewals_err}"
     );
-    renew_guard.shutdown().await;
 
     let (verdict, pass, error) = if hid_preemption.verdict == "INCONCLUSIVE" {
         (
@@ -1637,17 +1739,18 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
                 hid_preemption.valid_rounds, hid_preemption.rounds_total
             )),
         )
-    } else if hid_preemption.pass && video_telemetry.pass {
+    } else if hid_preemption.pass && video_telemetry.pass && lease_renewals_err == 0 {
         ("PASS".to_string(), true, None)
     } else {
         let mut reasons = Vec::new();
         if !hid_preemption.pass {
             reasons.push(format!(
-                "HID incremental gate failed (delta_p50={:.2}ms <= {:.1}ms, delta_p95={:.2}ms <= {:.1}ms, wire_mbps={:.2} <= {:.2})",
+                "HID incremental gate failed (delta_p50={:.2}ms <= {:.1}ms, delta_p95={:.2}ms <= {:.1}ms, wire_mbps=[{:.2}, {:.2}] target={:.2})",
                 hid_preemption.delta_p50_ms,
                 DELTA_P50_GATE_MS,
                 hid_preemption.delta_p95_ms,
                 DELTA_P95_GATE_MS,
+                hid_preemption.min_round_wire_mbps,
                 hid_preemption.max_round_wire_mbps,
                 hid_preemption.effective_target_wire_mbps,
             ));
@@ -1662,6 +1765,11 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
                 video_telemetry.decoded_min_ssim,
             ));
         }
+        if lease_renewals_err > 0 {
+            reasons.push(format!(
+                "background lease renewal failed ({lease_renewals_err} errors, {lease_renewals_ok} ok)"
+            ));
+        }
         ("FAIL".to_string(), false, Some(reasons.join("; ")))
     };
 
@@ -1674,6 +1782,8 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
         edge_a_ping_rtt_ms: (edge_a_ping_us as f64) / 1000.0,
         edge_b_ping_rtt_ms: (edge_b_ping_us as f64) / 1000.0,
         signaling_tcp_rtt_ms: (signaling_rtt_us as f64) / 1000.0,
+        lease_renewals_ok,
+        lease_renewals_err,
         hid_preemption,
         video_telemetry,
         error,
@@ -2220,6 +2330,173 @@ mod tests {
             telemetry.recovery_ms
         );
         assert!(telemetry.idr_frames_sent >= 2);
+        assert!(
+            telemetry.sent_frame_ids_strictly_monotonic,
+            "every emitted frame_id (including forced IDRs after replace_encoder) must be strictly monotonic"
+        );
+        assert!(
+            !telemetry.forced_idr_frame_ids.is_empty(),
+            "expected at least one forced IDR emitted via replace_encoder on CTRL_MSG_REQUEST_IDR"
+        );
         assert!(!telemetry.unrecovered_loss_at_eof);
+    }
+
+    #[test]
+    fn loaded_blackout_and_high_loaded_loss_fail_never_inconclusive() {
+        let clean = |round| {
+            evaluate_round(RoundEvalInput {
+                round,
+                probes_sent: 200,
+                unloaded_rtts_us: vec![100_000u64; 200],
+                unloaded_field_exact_match: true,
+                loaded_rtts_us: vec![105_000u64; 200],
+                loaded_field_exact_match: true,
+                bg_raw_video_bytes_sent: 100_000,
+                bg_wire_bytes_sent: 111_400,
+                bg_udp_packets_sent: 100,
+                bg_recv_video_frames: 30,
+                wire_mbps: 7.9,
+            })
+        };
+
+        // Round with loaded_received == 0 must NOT be marked INCONCLUSIVE and MUST FAIL aggregate
+        // even when the other 2 rounds pass.
+        let blackout = evaluate_round(RoundEvalInput {
+            round: 1,
+            probes_sent: 200,
+            unloaded_rtts_us: vec![100_000u64; 200],
+            unloaded_field_exact_match: true,
+            loaded_rtts_us: vec![],
+            loaded_field_exact_match: true,
+            bg_raw_video_bytes_sent: 100_000,
+            bg_wire_bytes_sent: 111_400,
+            bg_udp_packets_sent: 100,
+            bg_recv_video_frames: 30,
+            wire_mbps: 7.9,
+        });
+        assert!(!blackout.inconclusive);
+        assert_eq!(blackout.status, "VALID");
+
+        let agg_blackout = aggregate_rounds(vec![blackout.clone(), clean(2), clean(3)], 200, 8.0, 8.0);
+        assert_eq!(agg_blackout.verdict, "FAIL");
+        assert!(!agg_blackout.pass);
+
+        // Even if the other 2 rounds have noisy baselines, loaded blackout MUST still be FAIL
+        // (never masked as INCONCLUSIVE).
+        let mut noisy_unloaded = vec![20_000u64; 185];
+        noisy_unloaded.extend(vec![80_000u64; 15]);
+        let noisy = |round| {
+            evaluate_round(RoundEvalInput {
+                round,
+                probes_sent: 200,
+                unloaded_rtts_us: noisy_unloaded.clone(),
+                unloaded_field_exact_match: true,
+                loaded_rtts_us: vec![25_000u64; 200],
+                loaded_field_exact_match: true,
+                bg_raw_video_bytes_sent: 100_000,
+                bg_wire_bytes_sent: 111_400,
+                bg_udp_packets_sent: 100,
+                bg_recv_video_frames: 30,
+                wire_mbps: 7.9,
+            })
+        };
+        let agg_blackout_noisy =
+            aggregate_rounds(vec![blackout, noisy(2), noisy(3)], 200, 8.0, 8.0);
+        assert_eq!(agg_blackout_noisy.verdict, "FAIL");
+        assert!(!agg_blackout_noisy.pass);
+
+        // High loaded loss (70% lost, surviving RTTs unchanged so delta=0ms) MUST FAIL LOADED_LOSS_GATE_PCT.
+        let high_loss = |round| {
+            evaluate_round(RoundEvalInput {
+                round,
+                probes_sent: 200,
+                unloaded_rtts_us: vec![100_000u64; 200],
+                unloaded_field_exact_match: true,
+                loaded_rtts_us: vec![100_000u64; 60],
+                loaded_field_exact_match: true,
+                bg_raw_video_bytes_sent: 100_000,
+                bg_wire_bytes_sent: 111_400,
+                bg_udp_packets_sent: 100,
+                bg_recv_video_frames: 30,
+                wire_mbps: 7.9,
+            })
+        };
+        let agg_loss = aggregate_rounds(
+            vec![high_loss(1), high_loss(2), high_loss(3)],
+            200,
+            8.0,
+            8.0,
+        );
+        assert_eq!(agg_loss.verdict, "FAIL");
+        assert!(!agg_loss.pass);
+        assert!((agg_loss.loaded_loss_pct - 70.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wire_rate_band_rejects_underdriven_or_non_finite_load() {
+        let make_round = |round, wire_mbps| {
+            evaluate_round(RoundEvalInput {
+                round,
+                probes_sent: 200,
+                unloaded_rtts_us: vec![100_000u64; 200],
+                unloaded_field_exact_match: true,
+                loaded_rtts_us: vec![105_000u64; 200],
+                loaded_field_exact_match: true,
+                bg_raw_video_bytes_sent: 100_000,
+                bg_wire_bytes_sent: 111_400,
+                bg_udp_packets_sent: 100,
+                bg_recv_video_frames: 30,
+                wire_mbps,
+            })
+        };
+
+        // Under-driven load: 7.0 Mbps < 0.90 * 8.0 Mbps (7.2 Mbps) => FAIL.
+        let agg_under = aggregate_rounds(
+            vec![make_round(1, 7.0), make_round(2, 7.9), make_round(3, 7.9)],
+            200,
+            8.0,
+            8.0,
+        );
+        assert_eq!(agg_under.verdict, "FAIL");
+        assert!(!agg_under.pass);
+        assert!((agg_under.min_round_wire_mbps - 7.0).abs() < 1e-6);
+
+        // Over-driven load: 8.2 Mbps > 1.01 * 8.0 Mbps (8.08 Mbps) => FAIL.
+        let agg_over = aggregate_rounds(
+            vec![make_round(1, 8.2), make_round(2, 7.9), make_round(3, 7.9)],
+            200,
+            8.0,
+            8.0,
+        );
+        assert_eq!(agg_over.verdict, "FAIL");
+        assert!(!agg_over.pass);
+
+        // Non-finite wire_mbps (NaN / Inf) => FAIL.
+        for bad_rate in [f64::NAN, f64::INFINITY] {
+            let agg_bad = aggregate_rounds(
+                vec![
+                    make_round(1, bad_rate),
+                    make_round(2, 7.9),
+                    make_round(3, 7.9),
+                ],
+                200,
+                8.0,
+                8.0,
+            );
+            assert_eq!(agg_bad.verdict, "FAIL");
+            assert!(!agg_bad.pass);
+        }
+
+        // In-band load [7.2, 8.08] => PASS.
+        let agg_ok = aggregate_rounds(
+            vec![make_round(1, 7.5), make_round(2, 7.9), make_round(3, 8.05)],
+            200,
+            8.0,
+            8.0,
+        );
+        assert_eq!(agg_ok.verdict, "PASS");
+        assert!(agg_ok.pass);
+        assert!((agg_ok.min_round_wire_mbps - 7.5).abs() < 1e-6);
+        assert!((agg_ok.max_round_wire_mbps - 8.05).abs() < 1e-6);
     }
 }
