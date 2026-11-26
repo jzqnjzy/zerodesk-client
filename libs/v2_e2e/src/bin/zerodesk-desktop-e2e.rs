@@ -1,5 +1,7 @@
 #[path = "../phase3_cli.rs"]
 mod phase3_cli;
+#[path = "../wan_bench.rs"]
+mod wan_bench;
 
 // Standalone headless `v2_e2e` does not link `src/platform/macos.mm`, which normally provides
 // `BackingScaleFactor` for `scrap::quartz::Display::scale()`.
@@ -115,6 +117,8 @@ struct VideoStreamMetrics {
     avg_psnr_db: f64,
     min_ssim: f64,
     avg_ssim: f64,
+    encode_ms_p50: f64,
+    encode_ms_p95: f64,
     elapsed_ms: f64,
     pass: bool,
 }
@@ -134,6 +138,8 @@ struct HidMetrics {
     p50_loaded_ms: f64,
     p95_loaded_ms: f64,
     max_loaded_ms: f64,
+    delta_p50_ms: f64,
+    delta_p95_ms: f64,
     p95_threshold_ms: f64,
     bg_target_mbps: u32,
     bg_sent_video_bytes: u64,
@@ -618,11 +624,13 @@ async fn run_live_video_stream(
     let send_task = async {
         let mut total_raw_bytes = 0u64;
         let mut total_slices = 0u64;
+        let mut encode_samples_us = Vec::with_capacity(frames);
         for idx in 0..frames {
             let src = Arc::new(generate_animated_i420(WIDTH, HEIGHT, idx as u32));
             let info = host.publish_i420_frame(src, (idx as i64) * 33).await?;
             total_raw_bytes = total_raw_bytes.saturating_add(info.raw_bytes as u64);
             total_slices = total_slices.saturating_add(info.slices_sent as u64);
+            encode_samples_us.push(info.encode_us);
             meta_tx
                 .send((
                     idx,
@@ -635,7 +643,7 @@ async fn run_live_video_stream(
             // Gentle pacing keeps loopback UDP buffers well within headroom while staying real-time.
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        Ok::<(u64, u64), SessionError>((total_raw_bytes, total_slices))
+        Ok::<(u64, u64, Vec<u64>), SessionError>((total_raw_bytes, total_slices, encode_samples_us))
     };
 
     let recv_task = async {
@@ -686,10 +694,14 @@ async fn run_live_video_stream(
         ))
     };
 
-    let ((total_raw_bytes, total_slices_sent), (delivered, sha_matches, min_psnr, sum_psnr, min_ssim, sum_ssim)) =
-        tokio::try_join!(send_task, recv_task)?;
+    let (
+        (total_raw_bytes, total_slices_sent, encode_samples_us),
+        (delivered, sha_matches, min_psnr, sum_psnr, min_ssim, sum_ssim),
+    ) = tokio::try_join!(send_task, recv_task)?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let denom = delivered.max(1) as f64;
+    let encode_ms_p50 = percentile_ms(&encode_samples_us, 0.50);
+    let encode_ms_p95 = percentile_ms(&encode_samples_us, 0.95);
     let pass = delivered == frames
         && sha_matches == frames
         && min_psnr >= MIN_PSNR_DB
@@ -706,6 +718,8 @@ async fn run_live_video_stream(
         avg_psnr_db: sum_psnr / denom,
         min_ssim,
         avg_ssim: sum_ssim / denom,
+        encode_ms_p50,
+        encode_ms_p95,
         elapsed_ms,
         pass,
     })
@@ -955,6 +969,8 @@ async fn run_g3_hid_and_preemption(
     let p50_loaded_ms = percentile_ms(&loaded_rtts, 0.50);
     let p95_loaded_ms = percentile_ms(&loaded_rtts, 0.95);
     let max_loaded_ms = percentile_ms(&loaded_rtts, 1.0);
+    let delta_p50_ms = p50_loaded_ms - p50_unloaded_ms;
+    let delta_p95_ms = p95_loaded_ms - p95_unloaded_ms;
     let p95_threshold_ms = 50.0f64.max(3.0 * p50_unloaded_ms);
 
     let pass = unloaded_rx.len() == probe_count
@@ -979,6 +995,8 @@ async fn run_g3_hid_and_preemption(
         p50_loaded_ms,
         p95_loaded_ms,
         max_loaded_ms,
+        delta_p50_ms,
+        delta_p95_ms,
         p95_threshold_ms,
         bg_target_mbps: target_mbps,
         bg_sent_video_bytes,
@@ -1042,7 +1060,7 @@ async fn cmd_e2e(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--allow-idle-exit] [--audit-key-identity] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1] [--leave-stuck] [--hold-after-stuck-ms 0] [--no-visual-marker] [--audit-key-identity]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]"
+        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e wan-bench --config <cluster.json> [--ca-der <ca.der>] [--frames 120] [--codec vp9|av1] [--bg-mbps 8] [--rounds 3] [--probes-per-round 200] [--max-wire-mbps 8]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--allow-idle-exit] [--audit-key-identity] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1] [--leave-stuck] [--hold-after-stuck-ms 0] [--no-visual-marker] [--audit-key-identity]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]"
     );
 }
 
@@ -1209,6 +1227,7 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        "wan-bench" => wan_bench::cmd_wan_bench(&args).await,
         "host" => phase3_cli::cmd_host(&args).await,
         "controller" => phase3_cli::cmd_controller(&args).await,
         "dual-e2e" => phase3_cli::cmd_dual_e2e(&args).await,

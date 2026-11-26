@@ -75,6 +75,7 @@ pub struct PublishedFrameInfo {
     pub raw_bytes: usize,
     pub slices_sent: usize,
     pub sha256: [u8; 32],
+    pub encode_us: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -150,14 +151,16 @@ impl DesktopHostSession {
         pts_ms: i64,
     ) -> Result<PublishedFrameInfo, SessionError> {
         let enc = Arc::clone(&self.encoder);
-        let (encoded, sha256) = tokio::task::spawn_blocking(
-            move || -> Result<(EncodedV2Frame, [u8; 32]), SessionError> {
+        let (encoded, sha256, encode_us) = tokio::task::spawn_blocking(
+            move || -> Result<(EncodedV2Frame, [u8; 32], u64), SessionError> {
                 let mut guard = enc
                     .lock()
                     .map_err(|_| SessionError::Protocol("video encoder mutex poisoned".into()))?;
+                let enc_started = Instant::now();
                 let encoded = guard.encode_i420(&frame, pts_ms)?;
+                let encode_us = enc_started.elapsed().as_micros() as u64;
                 let sha256: [u8; 32] = Sha256::digest(&encoded.data).into();
-                Ok((encoded, sha256))
+                Ok((encoded, sha256, encode_us))
             },
         )
         .await
@@ -176,6 +179,7 @@ impl DesktopHostSession {
             raw_bytes,
             slices_sent,
             sha256,
+            encode_us,
         })
     }
 
