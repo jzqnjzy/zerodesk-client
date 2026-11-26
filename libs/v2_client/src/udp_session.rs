@@ -508,8 +508,13 @@ pub fn decode_survival_rs64_shards(
     Ok(rs64_decode_block(&slots)?)
 }
 
-const HANDSHAKE_RTX_INTERVAL: Duration = Duration::from_millis(400);
+const HANDSHAKE_RTX_INITIAL_INTERVAL: Duration = Duration::from_millis(600);
+const HANDSHAKE_RTX_MAX_INTERVAL: Duration = Duration::from_millis(2_400);
 const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_secs(5);
+
+fn next_handshake_rtx_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(HANDSHAKE_RTX_MAX_INTERVAL)
+}
 
 enum HandshakeReplayCache {
     Initiator {
@@ -568,7 +573,8 @@ impl UdpE2eeSession {
         link.send_l3_packet(0, false, &msg1).await?;
 
         let deadline = Instant::now() + timeout;
-        let mut next_rtx = Instant::now() + HANDSHAKE_RTX_INTERVAL;
+        let mut rtx_interval = HANDSHAKE_RTX_INITIAL_INTERVAL;
+        let mut next_rtx = Instant::now() + rtx_interval;
         let msg2 = loop {
             let now = Instant::now();
             let Some(rem) = deadline
@@ -584,7 +590,8 @@ impl UdpE2eeSession {
                 Some(until_rtx) => rem.min(until_rtx),
                 None => {
                     link.send_l3_packet(0, false, &msg1).await?;
-                    next_rtx = Instant::now() + HANDSHAKE_RTX_INTERVAL;
+                    rtx_interval = next_handshake_rtx_interval(rtx_interval);
+                    next_rtx = Instant::now() + rtx_interval;
                     continue;
                 }
             };
@@ -598,7 +605,8 @@ impl UdpE2eeSession {
                     }
                     if next_rtx.checked_duration_since(now).is_none() {
                         link.send_l3_packet(0, false, &msg1).await?;
-                        next_rtx = Instant::now() + HANDSHAKE_RTX_INTERVAL;
+                        rtx_interval = next_handshake_rtx_interval(rtx_interval);
+                        next_rtx = Instant::now() + rtx_interval;
                     }
                 }
                 Err(e) => return Err(e),
@@ -890,10 +898,7 @@ impl UdpE2eeSession {
                 Some(hdr.flags.pp),
                 now,
             ) {
-                Ok(v) => {
-                    self.hs_replay = None;
-                    v
-                }
+                Ok(v) => v,
                 Err(TransportError::ReplayDetected) => continue,
                 Err(e) => return Err(e.into()),
             };
@@ -1506,6 +1511,137 @@ mod tests {
             ev_a,
             TransportEvent::Control(ref f)
                 if f.msg_type == 0x06 && f.payload.as_ref() == b"DUP-MSG2-IGNORED-OK"
+        ));
+
+        let _ = relay.stop_tx.send(()).await;
+        let _ = relay.relay_task.await;
+    }
+
+    #[test]
+    fn handshake_rtx_exponential_backoff_schedule() {
+        let i0 = HANDSHAKE_RTX_INITIAL_INTERVAL;
+        assert_eq!(i0, Duration::from_millis(600));
+        let i1 = next_handshake_rtx_interval(i0);
+        assert_eq!(i1, Duration::from_millis(1_200));
+        let i2 = next_handshake_rtx_interval(i1);
+        assert_eq!(i2, Duration::from_millis(2_400));
+        let i3 = next_handshake_rtx_interval(i2);
+        assert_eq!(i3, Duration::from_millis(2_400));
+    }
+
+    #[tokio::test]
+    async fn noise_ik_initiator_ignores_late_duplicate_msg2_after_valid_l3_frame() {
+        let relay = spawn_lossy_udp_relay_pair(0, 0, false).await;
+        let fx = build_handshake_fixture();
+
+        let hs_a = UdpE2eeSession::handshake_initiator(
+            relay.link_a,
+            &fx.prologue,
+            &fx.priv_a,
+            &fx.pub_b,
+            &fx.deleg_b,
+            &fx.dev_b,
+            &fx.spki_b,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_a,
+            fx.dev_a,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        );
+        let hs_b = UdpE2eeSession::handshake_responder(
+            relay.link_b,
+            &fx.prologue,
+            &fx.priv_b,
+            &fx.deleg_a,
+            &fx.dev_a,
+            &fx.spki_a,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_b,
+            fx.dev_b,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        );
+        let ((mut sess_a, out_a), (mut sess_b, out_b)) = tokio::try_join!(hs_a, hs_b).unwrap();
+        assert_eq!(out_a.hs_hash, out_b.hs_hash);
+
+        let cached_msg1 = match &sess_b.hs_replay {
+            Some(HandshakeReplayCache::Responder { msg1, .. }) => msg1.clone(),
+            _ => panic!("responder missing HandshakeReplayCache"),
+        };
+
+        // 1. Responder sends a valid L3 video frame immediately after msg2 #1, and initiator
+        //    decrypts it before any late duplicate msg2 #2 arrives (trans-Pacific race).
+        let meta = VideoFrameMeta {
+            display_idx: 0,
+            codec_id: 2,
+            frame_id: 1,
+            ref_frame_id: 1,
+            ltr_slot: 0,
+            is_idr: true,
+            is_ref: true,
+            max_age_ms: 200,
+        };
+        sess_b
+            .send_video_frame(&meta, b"FIRST-VALID-L3-VIDEO-FRAME")
+            .await
+            .unwrap();
+        let ev_a1 = sess_a.recv_event(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            ev_a1,
+            TransportEvent::VideoFrame(ref f)
+                if f.frame_id == 1 && f.data.as_ref() == b"FIRST-VALID-L3-VIDEO-FRAME"
+        ));
+
+        // 2. Initiator also sends a valid L3 HID frame and responder decrypts it — responder's
+        //    replay cache must likewise remain active for the full 5s TTL.
+        sess_a
+            .send_hid(&HidFrame {
+                msg_type: 0x01,
+                payload: Bytes::from_static(b"VALID-L3-HID-BEFORE-LATE-MSG1"),
+            })
+            .await
+            .unwrap();
+        let ev_b1 = sess_b.recv_event(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            ev_b1,
+            TransportEvent::Hid(ref f) if f.payload.as_ref() == b"VALID-L3-HID-BEFORE-LATE-MSG1"
+        ));
+
+        // 3. Late retransmitted msg1 #2 arrives at responder after valid L3 traffic, triggering
+        //    duplicate msg2 #2 back to initiator (followed by another valid L3 frame).
+        sess_a
+            .link_mut()
+            .send_l3_packet(0, false, &cached_msg1)
+            .await
+            .unwrap();
+        sess_a
+            .send_hid(&HidFrame {
+                msg_type: 0x01,
+                payload: Bytes::from_static(b"HID-AFTER-LATE-MSG1"),
+            })
+            .await
+            .unwrap();
+        let ev_b2 = sess_b.recv_event(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            ev_b2,
+            TransportEvent::Hid(ref f) if f.payload.as_ref() == b"HID-AFTER-LATE-MSG1"
+        ));
+
+        sess_b
+            .send_control(0x07, b"CTRL-AFTER-LATE-DUP-MSG2")
+            .await
+            .unwrap();
+
+        // 4. Initiator receives late duplicate msg2 #2 (within 5s TTL) AFTER having already
+        //    decrypted a valid L3 frame; it must silently ignore msg2 #2 without failing with
+        //    'L3 reserved field must be zero' and deliver the subsequent valid L3 frame.
+        let ev_a2 = sess_a.recv_event(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            ev_a2,
+            TransportEvent::Control(ref f)
+                if f.msg_type == 0x07 && f.payload.as_ref() == b"CTRL-AFTER-LATE-DUP-MSG2"
         ));
 
         let _ = relay.stop_tx.send(()).await;
