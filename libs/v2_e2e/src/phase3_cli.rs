@@ -738,6 +738,7 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
         enrollment_token: enrollment_token.clone(),
         enrollment_ttl_sec: ENROLLMENT_TTL_SEC,
         policy_hash_hex: None,
+        ..Default::default()
     };
     cp.create_tenant(admin_token, &tenant_req)
         .await

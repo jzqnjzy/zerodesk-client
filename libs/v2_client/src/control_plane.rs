@@ -24,6 +24,8 @@ pub const DEV_POP_DOMAIN: &[u8; 13] = b"V2-DEV-POP-v1";
 pub const DEV_ROTATE_DOMAIN: &[u8; 16] = b"V2-DEV-ROTATE-v1";
 pub const LEASE_RENEW_DOMAIN: &[u8; 17] = b"V2-LEASE-RENEW-v1";
 pub const CLIENT_METER_DOMAIN: &[u8; 18] = b"V2-CLIENT-METER-v1";
+pub const POLICY_FETCH_DOMAIN: &[u8; 18] = b"V2-POLICY-FETCH-v1";
+pub const POLICY_FETCH_TBS_LEN: usize = 42;
 
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()
@@ -117,7 +119,7 @@ impl CaPubkeyResp {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CreateTenantReq {
     pub tenant_id_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,10 +132,55 @@ pub struct CreateTenantReq {
     pub bw_cap_kbps: u32,
     pub exhaust_policy: u32,
     pub allow_file_transfer: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_clipboard: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_file_clipboard: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_tcp_tunnel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_terminal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_file_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_clipboard_kb: Option<u32>,
     pub enrollment_token: String,
     pub enrollment_ttl_sec: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_hash_hex: Option<String>,
+}
+
+/// Additive v1.2.4 CA-signed tenant policy JSON object returned by
+/// `POST /v2/devices/register` (optional `policy_blob`) and `GET /v2/tenants/policy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyBlobJson {
+    pub tenant_id_hex: String,
+    pub version: u64,
+    pub iat_unix: u64,
+    pub exp_unix: u64,
+    pub body_b64: String,
+    pub policy_hash_hex: String,
+    pub sig_der_b64: String,
+}
+
+impl PolicyBlobJson {
+    pub fn tenant_id(&self) -> Result<[u8; 16], ClientError> {
+        crate::config::decode_hex_array::<16>(&self.tenant_id_hex, "policy_blob.tenant_id_hex")
+    }
+
+    pub fn policy_hash(&self) -> Result<[u8; 32], ClientError> {
+        crate::config::decode_hex_array::<32>(&self.policy_hash_hex, "policy_blob.policy_hash_hex")
+    }
+
+    pub fn body_bytes(&self) -> Result<Vec<u8>, ClientError> {
+        Ok(B64.decode(&self.body_b64)?)
+    }
+
+    pub fn sig_der(&self) -> Result<Vec<u8>, ClientError> {
+        Ok(B64.decode(&self.sig_der_b64)?)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +203,8 @@ pub struct RegisterDeviceResp {
     pub exp_unix: u64,
     pub tbs_b64: String,
     pub sig_der_b64: String,
+    #[serde(default)]
+    pub policy_blob: Option<PolicyBlobJson>,
 }
 
 impl RegisterDeviceResp {
@@ -308,6 +357,19 @@ pub fn build_client_meter_tbs(
     out.extend_from_slice(&window_index.to_be_bytes());
     out.extend_from_slice(&egress_bytes.to_be_bytes());
     out.extend_from_slice(&timestamp_unix.to_be_bytes());
+    out
+}
+
+/// Builds the exact 42-byte `POLICY_FETCH_TBS` preimage per `spec/06` §3.8.4:
+/// `"V2-POLICY-FETCH-v1" (18B) || device_id (16B) || u64_be(timestamp_unix) (8B)`.
+pub fn build_policy_fetch_tbs(
+    device_id: &[u8; 16],
+    timestamp_unix: u64,
+) -> [u8; POLICY_FETCH_TBS_LEN] {
+    let mut out = [0u8; POLICY_FETCH_TBS_LEN];
+    out[0..18].copy_from_slice(POLICY_FETCH_DOMAIN);
+    out[18..34].copy_from_slice(device_id);
+    out[34..42].copy_from_slice(&timestamp_unix.to_be_bytes());
     out
 }
 
@@ -576,6 +638,37 @@ impl ControlPlaneClient {
         Ok(serde_json::from_slice(&body)?)
     }
 
+    /// Fetches the latest CA-signed `TenantPolicyBlob` via `GET /v2/tenants/policy` (`spec/06` §3.8.4),
+    /// authenticating with `X-Device-Id`, `X-Timestamp-Unix`, and `X-Device-Sig` (P-256 low-S DER
+    /// Base64 over the exact 42-byte `POLICY_FETCH_TBS`).
+    pub async fn fetch_tenant_policy(
+        &self,
+        device_id: &[u8; 16],
+        keystore: &dyn DeviceKeyStore,
+        now_unix: u64,
+    ) -> Result<PolicyBlobJson, ClientError> {
+        let tbs = build_policy_fetch_tbs(device_id, now_unix);
+        let sig = keystore.sign_p256_low_s(&tbs)?;
+        let dev_hex = hex::encode(device_id);
+        let ts_str = now_unix.to_string();
+        let sig_b64 = B64.encode(&sig);
+        let headers = [
+            ("X-Device-Id", dev_hex.as_str()),
+            ("X-Timestamp-Unix", ts_str.as_str()),
+            ("X-Device-Sig", sig_b64.as_str()),
+        ];
+        let (status, body) = self
+            .request("GET", "/v2/tenants/policy", &headers, None)
+            .await?;
+        if status != 200 {
+            return Err(ClientError::HttpStatus {
+                status,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+        Ok(serde_json::from_slice(&body)?)
+    }
+
     /// Submits client fallback metering via `POST /v2/metering/client-report`.
     #[allow(clippy::too_many_arguments)]
     pub async fn report_metering_fallback(
@@ -796,7 +889,9 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use super::ClientMeterReportResp;
+    use super::*;
+    use tokio::net::TcpListener;
+    use v2_identity::{verify_p256_low_s, SoftwareDeviceKeyStore};
 
     #[test]
     fn client_meter_report_resp_deserializes_retryable_u64_counts() {
@@ -814,5 +909,103 @@ mod tests {
         let json_default = r#"{"accepted":1,"upgraded":0,"deduplicated":0,"rejected":0,"total_billed":4096,"results":[]}"#;
         let resp_default: ClientMeterReportResp = serde_json::from_str(json_default).unwrap();
         assert_eq!(resp_default.retryable, 0);
+    }
+
+    #[test]
+    fn policy_fetch_tbs_matches_v27_golden_vector() {
+        let dev_id: [u8; 16] = hex::decode("78899aabbccddeef0011223344556677")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let tbs = build_policy_fetch_tbs(&dev_id, 1700000222);
+        assert_eq!(tbs.len(), POLICY_FETCH_TBS_LEN);
+        assert_eq!(
+            hex::encode(tbs),
+            "56322d504f4c4943592d46455443482d763178899aabbccddeef0011223344556677000000006553f1de"
+        );
+        let pub_spki = hex::decode("3059301306072a8648ce3d020106082a8648ce3d030107034200049902877a25419e994566c9495c752a3270a1a2c0ec42349d6f21561162772c65e5e486db6b893960029ffd0bde3d7b6aa00850e2109d621fbe37431621ad0038").unwrap();
+        let sig_ok = hex::decode("3045022100c4fecce8add0e2f66ff8ca1eff6295f12c05235aaa4e309593145692db3080e4022068dfa6facd0b2f05278b475307d6f2f4999e69a05060145068b5c15c598861ea").unwrap();
+        let sig_high_s = hex::decode("3046022100c4fecce8add0e2f66ff8ca1eff6295f12c05235aaa4e309593145692db3080e40221009720590432f4d0fbd874b8acf8290d0b2348910d56b78a348b040966a2dac367").unwrap();
+        verify_p256_low_s(&pub_spki, &tbs, &sig_ok).unwrap();
+        assert!(verify_p256_low_s(&pub_spki, &tbs, &sig_high_s).is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_tenant_policy_sends_signed_headers_and_parses_policy_blob() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let ks = SoftwareDeviceKeyStore::generate();
+        let spki = ks.public_key_spki_der().unwrap();
+        let dev_id = [0x42u8; 16];
+        let ts = 1700000222u64;
+
+        let expected_blob = PolicyBlobJson {
+            tenant_id_hex: "758697a8b9cadbecfd0e1f3041526374".into(),
+            version: 7,
+            iat_unix: 1700000000,
+            exp_unix: 1700086400,
+            body_b64: B64.encode(hex::decode("010000003f00004e200000010000000100").unwrap()),
+            policy_hash_hex: "ca4d81511bca3f13dd017b64701b490d82225228dbb513e707232bbf52234d0b"
+                .into(),
+            sig_der_b64: B64.encode([0x30u8, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]),
+        };
+        let resp_body = serde_json::to_string(&expected_blob).unwrap();
+        let spki_srv = spki.clone();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(req.starts_with("GET /v2/tenants/policy HTTP/1.1\r\n"));
+            let mut got_dev = None;
+            let mut got_ts = None;
+            let mut got_sig = None;
+            for line in req.split("\r\n") {
+                if let Some((k, v)) = line.split_once(':') {
+                    match k.trim().to_ascii_lowercase().as_str() {
+                        "x-device-id" => got_dev = Some(v.trim().to_string()),
+                        "x-timestamp-unix" => got_ts = Some(v.trim().to_string()),
+                        "x-device-sig" => got_sig = Some(v.trim().to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(got_dev.as_deref(), Some(hex::encode(dev_id).as_str()));
+            assert_eq!(got_ts.as_deref(), Some("1700000222"));
+            let sig = B64.decode(got_sig.unwrap()).unwrap();
+            let tbs = build_policy_fetch_tbs(&dev_id, ts);
+            verify_p256_low_s(&spki_srv, &tbs, &sig).unwrap();
+
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            sock.write_all(http_resp.as_bytes()).await.unwrap();
+        });
+
+        let cp = ControlPlaneClient::new(&format!("http://{addr}"), None).unwrap();
+        let got = cp.fetch_tenant_policy(&dev_id, &ks, ts).await.unwrap();
+        assert_eq!(got, expected_blob);
+        srv.await.unwrap();
+
+        // RegisterDeviceResp parses both with and without optional policy_blob
+        let reg_without = r#"{"cert_id_hex":"00","key_epoch":1,"iat_unix":1,"exp_unix":2,"tbs_b64":"AA==","sig_der_b64":"AA=="}"#;
+        let parsed_wo: RegisterDeviceResp = serde_json::from_str(reg_without).unwrap();
+        assert!(parsed_wo.policy_blob.is_none());
+
+        let reg_with = serde_json::json!({
+            "cert_id_hex": "00",
+            "key_epoch": 1,
+            "iat_unix": 1,
+            "exp_unix": 2,
+            "tbs_b64": "AA==",
+            "sig_der_b64": "AA==",
+            "policy_blob": expected_blob,
+        });
+        let parsed_w: RegisterDeviceResp = serde_json::from_value(reg_with).unwrap();
+        assert_eq!(parsed_w.policy_blob, Some(expected_blob));
     }
 }

@@ -8,6 +8,7 @@ use crate::{
 };
 use rustls::ClientConfig;
 use std::{
+    collections::VecDeque,
     path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,8 +22,8 @@ use v2_transport::{
     compute_stream_mac64, derive_stream_role_key, seal_stream_v11, verify_mac64_ct, AccessFlags,
     AccessHeaderV11, BwHintController, DecodedStreamFrame, EdgeCtrlFrame, QueuedStreamSlice,
     StreamFrameParser, TcpStreamSendQueue, BW_EVENT_DROP_ACTIVE, BW_EVENT_PAUSE_FILE_CHUNK,
-    DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT, STREAM_FRAME_MAX_LEN, STREAM_FRAME_MIN_LEN,
-    STREAM_QUEUE_CAP_BYTES,
+    BW_EVENT_SURVIVAL_MODE, DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT, STREAM_FRAME_MAX_LEN,
+    STREAM_FRAME_MIN_LEN, STREAM_QUEUE_CAP_BYTES,
 };
 use zeroize::Zeroizing;
 
@@ -116,12 +117,18 @@ pub struct Tls443Stream {
     rx_key: Zeroizing<[u8; 32]>,
     next_leg_seq: u32,
     parser: StreamFrameParser,
+    pending_rx: VecDeque<StreamRecvEvent>,
     send_queue: TcpStreamSendQueue,
     queued_bytes: usize,
     poisoned: bool,
     pub bw_hint: BwHintController,
     pub bulk_paused: bool,
     pub hol_dropped_frames: u64,
+    pub p3_dropped: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
 }
 
 impl Tls443Stream {
@@ -174,12 +181,18 @@ impl Tls443Stream {
                 rx_key,
                 next_leg_seq: 1,
                 parser: StreamFrameParser::new(),
+                pending_rx: VecDeque::new(),
                 send_queue: TcpStreamSendQueue::default(),
                 queued_bytes: 0,
                 poisoned: false,
                 bw_hint: BwHintController::new(lease_bw_cap_kbps, lease_bw_cap_kbps),
                 bulk_paused: false,
                 hol_dropped_frames: 0,
+                p3_dropped: 0,
+                tx_packets: 0,
+                rx_packets: 0,
+                tx_bytes: 0,
+                rx_bytes: 0,
             };
 
             let rtt_us = conn.ping(TLS443_AUTH_DEADLINE).await?;
@@ -205,6 +218,24 @@ impl Tls443Stream {
 
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
+    }
+
+    pub fn route_cid(&self) -> [u8; 8] {
+        self.route_cid
+    }
+
+    pub fn p3_dropped(&self) -> u64 {
+        self.p3_dropped
+    }
+
+    fn validate_role_for_pp(&self, pp: u8) -> Result<(), ClientError> {
+        match self.role {
+            Tls443StreamRole::Realtime if pp <= 2 => Ok(()),
+            Tls443StreamRole::Bulk if pp == 3 => Ok(()),
+            other => Err(ClientError::Protocol(format!(
+                "TLS-443 role violation: pp={pp} forbidden on {other:?} stream"
+            ))),
+        }
     }
 
     fn ensure_healthy(&self) -> Result<(), ClientError> {
@@ -248,6 +279,8 @@ impl Tls443Stream {
         if let Err(e) = self.stream.flush().await {
             return self.poison_and_err(e.into()).await;
         }
+        self.tx_packets = self.tx_packets.saturating_add(1);
+        self.tx_bytes = self.tx_bytes.saturating_add(wire.len() as u64);
         Ok(())
     }
 
@@ -261,11 +294,15 @@ impl Tls443Stream {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("TLS-443 Ping timed out".into()));
             };
-            match self.recv_frame(rem).await? {
+            match self.recv_frame_raw(rem).await? {
                 StreamRecvEvent::EdgeCtrl(EdgeCtrlFrame::Pong { ts_us: echo }) if echo == ts_us => {
                     return Ok(start.elapsed().as_micros() as u64);
                 }
-                StreamRecvEvent::EdgeCtrl(_) | StreamRecvEvent::L3Data { .. } => continue,
+                ev @ StreamRecvEvent::L3Data { .. } => {
+                    self.pending_rx.push_back(ev);
+                    continue;
+                }
+                StreamRecvEvent::EdgeCtrl(_) => continue,
             }
         }
     }
@@ -273,6 +310,7 @@ impl Tls443Stream {
     /// Enqueues a stream slice into the bounded 256 KB send queue for HoL monitoring.
     /// Non-reference (`discardable == true`) complete frames (`frame_end == true`, `frame_id != 0`)
     /// are dropped whole when head-of-line delay exceeds 80ms.
+    /// `p3` (`Bulk`) frames are NEVER discardable and NEVER dropped (`p3_dropped == 0` invariant).
     pub fn enqueue_l3_slice(
         &mut self,
         pp: u8,
@@ -283,13 +321,23 @@ impl Tls443Stream {
         enqueue_ms: u64,
     ) -> Result<Vec<u8>, ClientError> {
         self.ensure_healthy()?;
+        self.validate_role_for_pp(pp)?;
         validate_stream_frame_len(false, 28 + 4 + l3_payload.len())?;
+        // Invariant: Bulk / p3 and non-video (frame_id == 0) are NEVER discardable.
+        let (eff_discardable, eff_frame_end, eff_frame_id) =
+            if pp == 3 || self.role == Tls443StreamRole::Bulk {
+                (false, true, 0)
+            } else if frame_id == 0 {
+                (false, frame_end, 0)
+            } else {
+                (discardable, frame_end, frame_id)
+            };
         let seq = self.next_leg_seq;
         self.next_leg_seq = self.next_leg_seq.wrapping_add(1);
         let flags = AccessFlags {
             pp,
-            discardable,
-            frame_end,
+            discardable: eff_discardable,
+            frame_end: eff_frame_end,
             is_ctrl_edge: false,
             dir_edge_to_client: false,
             rtx: false,
@@ -301,7 +349,7 @@ impl Tls443Stream {
             leg_seq: seq,
             mac_64: [0; 8],
         };
-        let wire = seal_stream_v11(&self.tx_key, hdr, frame_id, l3_payload)?;
+        let wire = seal_stream_v11(&self.tx_key, hdr, eff_frame_id, l3_payload)?;
         if self.queued_bytes.saturating_add(wire.len()) > STREAM_QUEUE_CAP_BYTES {
             let _ = self.prune_hol_queue(enqueue_ms);
             if self.queued_bytes.saturating_add(wire.len()) > STREAM_QUEUE_CAP_BYTES {
@@ -313,7 +361,7 @@ impl Tls443Stream {
         self.queued_bytes = self.queued_bytes.saturating_add(wire.len());
         self.send_queue.push(QueuedStreamSlice {
             enqueue_ms,
-            frame_id,
+            frame_id: eff_frame_id,
             flags,
             wire_bytes: wire.clone(),
         });
@@ -322,7 +370,11 @@ impl Tls443Stream {
 
     /// Runs the 80ms head-of-line non-reference frame discard rule on the Realtime send queue,
     /// reclaiming `queued_bytes` for all evicted frames.
+    /// Bulk (`p3`) streams NEVER drop frames under 80ms HoL (`p3_dropped == 0` invariant).
     pub fn prune_hol_queue(&mut self, now_ms_val: u64) -> (Vec<u32>, Option<EdgeCtrlFrame>) {
+        if self.role == Tls443StreamRole::Bulk {
+            return (Vec::new(), None);
+        }
         let before_bytes = self.send_queue.total_bytes();
         let (dropped, hint) = self
             .send_queue
@@ -364,7 +416,8 @@ impl Tls443Stream {
         Ok(written)
     }
 
-    /// Sends a single L3 payload immediately over this TLS-443 stream (checking HoL rules first).
+    /// Sends a single L3 payload immediately over this TLS-443 stream (checking role isolation and
+    /// HoL invariants first). Returns the assigned `leg_seq`.
     pub async fn send_l3_frame(
         &mut self,
         pp: u8,
@@ -372,16 +425,25 @@ impl Tls443Stream {
         frame_end: bool,
         frame_id: u32,
         l3_payload: &[u8],
-    ) -> Result<(), ClientError> {
+    ) -> Result<u32, ClientError> {
         self.ensure_healthy()?;
+        self.validate_role_for_pp(pp)?;
         validate_stream_frame_len(false, 28 + 4 + l3_payload.len())?;
+        let (eff_discardable, eff_frame_end, eff_frame_id) =
+            if pp == 3 || self.role == Tls443StreamRole::Bulk {
+                (false, true, 0)
+            } else if frame_id == 0 {
+                (false, frame_end, 0)
+            } else {
+                (discardable, frame_end, frame_id)
+            };
         let seq = self.next_leg_seq;
         self.next_leg_seq = self.next_leg_seq.wrapping_add(1);
         let hdr = AccessHeaderV11 {
             flags: AccessFlags {
                 pp,
-                discardable,
-                frame_end,
+                discardable: eff_discardable,
+                frame_end: eff_frame_end,
                 is_ctrl_edge: false,
                 dir_edge_to_client: false,
                 rtx: false,
@@ -391,20 +453,32 @@ impl Tls443Stream {
             leg_seq: seq,
             mac_64: [0; 8],
         };
-        let wire = seal_stream_v11(&self.tx_key, hdr, frame_id, l3_payload)?;
+        let wire = seal_stream_v11(&self.tx_key, hdr, eff_frame_id, l3_payload)?;
         if let Err(e) = self.stream.write_all(&wire).await {
             return self.poison_and_err(e.into()).await;
         }
         if let Err(e) = self.stream.flush().await {
             return self.poison_and_err(e.into()).await;
         }
-        Ok(())
+        self.tx_packets = self.tx_packets.saturating_add(1);
+        self.tx_bytes = self.tx_bytes.saturating_add(wire.len() as u64);
+        Ok(seq)
     }
 
-    /// Receives and authenticates the next stream frame. Enforces per-`c`-bit length bounds
-    /// (`c=0`: `64..=1232`, `c=1`: `34..=289`), poisons & disconnects on any framing violation,
-    /// and updates `BwHintController` / `bulk_paused` on `EdgeCtrl::BwHint`.
-    pub async fn recv_frame(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
+    /// Pops any already-buffered event or already-parsed frame without reading from the socket.
+    pub(crate) async fn try_pop_buffered(&mut self) -> Result<Option<StreamRecvEvent>, ClientError> {
+        self.ensure_healthy()?;
+        if let Some(ev) = self.pending_rx.pop_front() {
+            return Ok(Some(ev));
+        }
+        match self.parser.next_frame() {
+            Ok(Some(frame)) => self.verify_and_dispatch(frame).await.map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => self.poison_and_err(e.into()).await,
+        }
+    }
+
+    async fn recv_frame_raw(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
         self.ensure_healthy()?;
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 4096];
@@ -431,6 +505,17 @@ impl Tls443Stream {
         }
     }
 
+    /// Receives and authenticates the next stream frame. Enforces per-`c`-bit length bounds
+    /// (`c=0`: `64..=1232`, `c=1`: `34..=289`), poisons & disconnects on any framing violation,
+    /// and updates `BwHintController` / `bulk_paused` on `EdgeCtrl::BwHint`.
+    pub async fn recv_frame(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
+        self.ensure_healthy()?;
+        if let Some(ev) = self.pending_rx.pop_front() {
+            return Ok(ev);
+        }
+        self.recv_frame_raw(timeout).await
+    }
+
     async fn verify_and_dispatch(
         &mut self,
         frame: DecodedStreamFrame,
@@ -451,6 +536,11 @@ impl Tls443Stream {
                 ))
                 .await;
         }
+        if !frame.header.flags.is_ctrl_edge {
+            if let Err(e) = self.validate_role_for_pp(frame.header.flags.pp) {
+                return self.poison_and_err(e).await;
+            }
+        }
         let hdr_zero = frame.header.encode_mac_zero();
         let expected_mac =
             match compute_stream_mac64(&self.rx_key, &hdr_zero, frame.frame_id, &frame.payload) {
@@ -460,6 +550,9 @@ impl Tls443Stream {
         if let Err(e) = verify_mac64_ct(&expected_mac, &frame.header.mac_64) {
             return self.poison_and_err(e.into()).await;
         }
+
+        self.rx_packets = self.rx_packets.saturating_add(1);
+        self.rx_bytes = self.rx_bytes.saturating_add((4 + frame_len) as u64);
 
         if frame.header.flags.is_ctrl_edge {
             let ctrl = match EdgeCtrlFrame::decode(&frame.payload) {
@@ -486,8 +579,11 @@ impl Tls443Stream {
                         event_flags,
                         now_ms(),
                     );
-                    self.bulk_paused =
-                        (event_flags & (BW_EVENT_PAUSE_FILE_CHUNK | BW_EVENT_DROP_ACTIVE)) != 0;
+                    self.bulk_paused = (event_flags
+                        & (BW_EVENT_PAUSE_FILE_CHUNK
+                            | BW_EVENT_DROP_ACTIVE
+                            | BW_EVENT_SURVIVAL_MODE))
+                        != 0;
                 }
                 _ => {}
             }
@@ -543,9 +639,44 @@ impl DualTls443Client {
         })
     }
 
-    pub async fn send_l3(&mut self, pp: u8, discardable: bool, frame_end: bool, frame_id: u32, payload: &[u8]) -> Result<(), ClientError> {
+    pub fn route_cid(&self) -> [u8; 8] {
+        self.realtime.route_cid()
+    }
+
+    pub fn is_bulk_paused(&self) -> bool {
+        self.realtime.bulk_paused
+            || self.bulk.bulk_paused
+            || self.realtime.bw_hint.survival_mode
+            || self.bulk.bw_hint.survival_mode
+    }
+
+    pub fn p3_dropped(&self) -> u64 {
+        self.realtime
+            .p3_dropped
+            .saturating_add(self.bulk.p3_dropped)
+    }
+
+    pub async fn send_edge_ctrl(&mut self, ctrl: &EdgeCtrlFrame) -> Result<(), ClientError> {
+        self.realtime.send_edge_ctrl(ctrl).await
+    }
+
+    /// Application-layer keepalive ping across Realtime (and Bulk) for dead-link detection.
+    pub async fn ping(&mut self, timeout: Duration) -> Result<u64, ClientError> {
+        let rt_rtt = self.realtime.ping(timeout).await?;
+        self.realtime_ping_rtt_us = rt_rtt;
+        Ok(rt_rtt)
+    }
+
+    pub async fn send_l3(
+        &mut self,
+        pp: u8,
+        discardable: bool,
+        frame_end: bool,
+        frame_id: u32,
+        payload: &[u8],
+    ) -> Result<u32, ClientError> {
         if pp == 3 {
-            if self.realtime.bulk_paused || self.bulk.bulk_paused {
+            if self.is_bulk_paused() {
                 return Err(ClientError::Protocol(
                     "Bulk TLS-443 stream paused by EdgeCtrl::BwHint".into(),
                 ));
@@ -557,6 +688,71 @@ impl DualTls443Client {
             self.realtime
                 .send_l3_frame(pp, discardable, frame_end, frame_id, payload)
                 .await
+        }
+    }
+
+    /// Concurrently polls BOTH `Realtime` (`p0/p1/p2`) and `Bulk` (`p3`) TLS-443 streams using
+    /// cancel-safe socket reads so neither stream can starve or drop bytes from the other.
+    pub async fn recv_frame(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
+        self.realtime.ensure_healthy()?;
+        self.bulk.ensure_healthy()?;
+        let deadline = Instant::now() + timeout;
+        let mut buf_rt = [0u8; 4096];
+        let mut buf_bulk = [0u8; 4096];
+        loop {
+            if let Some(ev) = self.realtime.try_pop_buffered().await? {
+                return Ok(ev);
+            }
+            if let Some(ev) = self.bulk.try_pop_buffered().await? {
+                return Ok(ev);
+            }
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ClientError::Timeout("Dual TLS-443 recv_frame timed out".into()));
+            };
+            enum SelectOutcome {
+                Realtime(std::io::Result<usize>),
+                Bulk(std::io::Result<usize>),
+                TimedOut,
+            }
+            let outcome = tokio::select! {
+                biased;
+                res = self.realtime.stream.read(&mut buf_rt) => SelectOutcome::Realtime(res),
+                res = self.bulk.stream.read(&mut buf_bulk) => SelectOutcome::Bulk(res),
+                _ = tokio::time::sleep(rem) => SelectOutcome::TimedOut,
+            };
+            match outcome {
+                SelectOutcome::Realtime(Ok(0)) => {
+                    return self
+                        .realtime
+                        .poison_and_err(ClientError::Protocol(
+                            "TLS-443 Realtime stream closed by peer".into(),
+                        ))
+                        .await;
+                }
+                SelectOutcome::Realtime(Ok(n)) => {
+                    self.realtime.parser.feed(&buf_rt[..n]);
+                }
+                SelectOutcome::Realtime(Err(e)) => {
+                    return self.realtime.poison_and_err(e.into()).await;
+                }
+                SelectOutcome::Bulk(Ok(0)) => {
+                    return self
+                        .bulk
+                        .poison_and_err(ClientError::Protocol(
+                            "TLS-443 Bulk stream closed by peer".into(),
+                        ))
+                        .await;
+                }
+                SelectOutcome::Bulk(Ok(n)) => {
+                    self.bulk.parser.feed(&buf_bulk[..n]);
+                }
+                SelectOutcome::Bulk(Err(e)) => {
+                    return self.bulk.poison_and_err(e.into()).await;
+                }
+                SelectOutcome::TimedOut => {
+                    return Err(ClientError::Timeout("Dual TLS-443 recv_frame timed out".into()));
+                }
+            }
         }
     }
 }

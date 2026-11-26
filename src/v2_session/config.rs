@@ -5,6 +5,7 @@ use super::{
     input::{HID_WATCHDOG_MAX_MS, HID_WATCHDOG_MIN_MS},
     video::VideoCodec,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     fs::{self, DirBuilder, File, OpenOptions},
@@ -21,6 +22,40 @@ pub const DEFAULT_LEASE_RENEW_INTERVAL_SEC: u64 = 15;
 pub const MAX_LEASE_RENEW_INTERVAL_SEC: u64 = 15;
 pub const DEFAULT_FPS: u32 = 30;
 pub const DEFAULT_BW_CAP_KBPS: u32 = 50_000;
+pub const DEFAULT_UDP_PROBE_TIMEOUT_MS: u64 = 1_500;
+pub const MIN_UDP_PROBE_TIMEOUT_MS: u64 = 100;
+pub const MAX_UDP_PROBE_TIMEOUT_MS: u64 = 10_000;
+
+/// Access data-plane transport selection policy (`Auto` [default], `UdpOnly`, `Tls443Only`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    #[default]
+    Auto,
+    UdpOnly,
+    Tls443Only,
+}
+
+impl TransportMode {
+    pub fn parse_name(s: &str) -> Result<Self, V2ConfigError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "udp" | "udp_only" | "udponly" => Ok(Self::UdpOnly),
+            "tls443" | "tls443_only" | "tls443only" | "dual_tls443" => Ok(Self::Tls443Only),
+            other => Err(V2ConfigError::InvalidValue(format!(
+                "invalid transport mode '{other}' (expected auto|udp|tls443)"
+            ))),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::UdpOnly => "udp_only",
+            Self::Tls443Only => "tls443_only",
+        }
+    }
+}
 
 pub const IDENTITY_FILE_NAME: &str = "identity_v2.json";
 pub const DELEGATION_FILE_NAME: &str = "delegation_v2.json";
@@ -70,6 +105,11 @@ pub struct V2ClientConfig {
     pub keepalive_interval_ms: u64,
     pub lease_renew_interval_sec: u64,
     pub bw_cap_kbps: u32,
+    pub transport_mode: TransportMode,
+    pub udp_probe_timeout_ms: u64,
+    /// Test/E2E hook simulating a local firewall blocking UDP (`--drop-udp`) so `Auto`
+    /// exercises the real UDP probe failure -> Dual TLS-443 fallback path.
+    pub drop_udp_for_test: bool,
 }
 
 impl fmt::Debug for V2ClientConfig {
@@ -93,6 +133,9 @@ impl fmt::Debug for V2ClientConfig {
             .field("keepalive_interval_ms", &self.keepalive_interval_ms)
             .field("lease_renew_interval_sec", &self.lease_renew_interval_sec)
             .field("bw_cap_kbps", &self.bw_cap_kbps)
+            .field("transport_mode", &self.transport_mode)
+            .field("udp_probe_timeout_ms", &self.udp_probe_timeout_ms)
+            .field("drop_udp_for_test", &self.drop_udp_for_test)
             .finish()
     }
 }
@@ -184,6 +227,9 @@ impl V2ClientConfig {
             keepalive_interval_ms: DEFAULT_KEEPALIVE_INTERVAL_MS,
             lease_renew_interval_sec: DEFAULT_LEASE_RENEW_INTERVAL_SEC,
             bw_cap_kbps: DEFAULT_BW_CAP_KBPS,
+            transport_mode: TransportMode::Auto,
+            udp_probe_timeout_ms: DEFAULT_UDP_PROBE_TIMEOUT_MS,
+            drop_udp_for_test: false,
         }
     }
 
@@ -267,6 +313,14 @@ impl V2ClientConfig {
             return Err(V2ConfigError::InvalidValue(
                 "bw_cap_kbps must be > 0".into(),
             ));
+        }
+        if !(MIN_UDP_PROBE_TIMEOUT_MS..=MAX_UDP_PROBE_TIMEOUT_MS)
+            .contains(&self.udp_probe_timeout_ms)
+        {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "udp_probe_timeout_ms={} must be in {}..={}",
+                self.udp_probe_timeout_ms, MIN_UDP_PROBE_TIMEOUT_MS, MAX_UDP_PROBE_TIMEOUT_MS
+            )));
         }
         if self.identity_dir.as_os_str().is_empty() {
             return Err(V2ConfigError::InvalidValue(
@@ -594,6 +648,9 @@ mod tests {
             keepalive_interval_ms: 500,
             lease_renew_interval_sec: 15,
             bw_cap_kbps: 50_000,
+            transport_mode: TransportMode::Auto,
+            udp_probe_timeout_ms: DEFAULT_UDP_PROBE_TIMEOUT_MS,
+            drop_udp_for_test: false,
         }
     }
 

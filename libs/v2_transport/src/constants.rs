@@ -56,6 +56,8 @@ pub const CAP_ACCESS_LEG_SEQ_V11: u64 = 1 << 13;
 pub const CAP_SURVIVAL_MODE: u64 = 1 << 14;
 pub const CAP_MULTIPATH_ACTIVE_ACTIVE: u64 = 1 << 15;
 pub const CAP_REALTIME_ACTUATOR_CH: u64 = 1 << 16;
+pub const CAP_CLIPBOARD: u64 = 1 << 17;
+pub const CAP_FILE_TRANSFER: u64 = 1 << 18;
 
 pub const CHAN_TRANSPORT_CTRL: u8 = 0x00;
 pub const CHAN_INPUT_HID: u8 = 0x01;

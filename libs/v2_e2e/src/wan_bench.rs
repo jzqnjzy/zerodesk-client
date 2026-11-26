@@ -871,7 +871,10 @@ async fn run_wan_hid_round(
     bg_payload: &[u8],
     probe_timeout: Duration,
 ) -> Result<WanBenchRoundMetrics, SessionError> {
-    let is_ipv6 = host.session().link().edge_addr().is_ipv6();
+    let is_ipv6 = host
+        .session()
+        .udp_link()
+        .is_some_and(|u| u.edge_addr().is_ipv6());
     let window_hard_deadline = Duration::from_secs(180).max(
         Duration::from_secs((probes_per_round as u64).saturating_mul(2)),
     );
@@ -975,21 +978,13 @@ async fn run_wan_hid_round(
                 };
                 bg_frame_id = bg_frame_id.wrapping_add(1);
 
-                let tx_bytes_before = host.session().link().stats.tx_bytes;
-                let tx_pkts_before = host.session().link().stats.tx_packets;
+                let before_stats = host.session().data_plane().stats();
+                let tx_bytes_before = before_stats.tx_bytes;
+                let tx_pkts_before = before_stats.tx_packets;
                 host.publish_raw_video(&meta, bg_payload).await?;
-                let tx_bytes_delta = host
-                    .session()
-                    .link()
-                    .stats
-                    .tx_bytes
-                    .saturating_sub(tx_bytes_before);
-                let tx_pkts_delta = host
-                    .session()
-                    .link()
-                    .stats
-                    .tx_packets
-                    .saturating_sub(tx_pkts_before);
+                let after_stats = host.session().data_plane().stats();
+                let tx_bytes_delta = after_stats.tx_bytes.saturating_sub(tx_bytes_before);
+                let tx_pkts_delta = after_stats.tx_packets.saturating_sub(tx_pkts_before);
                 let burst_wire = actual_wire_bytes(tx_bytes_delta, tx_pkts_delta, is_ipv6);
                 measured_burst_wire = measured_burst_wire.max(burst_wire);
                 bg_raw_bytes = bg_raw_bytes.saturating_add(bg_payload.len() as u64);
@@ -1256,7 +1251,10 @@ pub async fn run_wan_video_telemetry(
     )?);
     controller.clear_pending_video();
 
-    let is_ipv6 = host.session().link().edge_addr().is_ipv6();
+    let is_ipv6 = host
+        .session()
+        .udp_link()
+        .is_some_and(|u| u.edge_addr().is_ipv6());
     let (meta_tx, mut meta_rx) = mpsc::unbounded_channel::<SentVideoMeta>();
     let send_done = Arc::new(AtomicBool::new(false));
     let recv_done = Arc::new(AtomicBool::new(false));
@@ -1328,8 +1326,9 @@ pub async fn run_wan_video_telemetry(
             };
 
             let src = Arc::new(generate_animated_i420(WIDTH, HEIGHT, idx as u32));
-            let tx_bytes_before = host.session().link().stats.tx_bytes;
-            let tx_pkts_before = host.session().link().stats.tx_packets;
+            let before_stats = host.session().data_plane().stats();
+            let tx_bytes_before = before_stats.tx_bytes;
+            let tx_pkts_before = before_stats.tx_packets;
             let info = host.publish_i420_frame(src, (idx as i64) * 33).await?;
             if prev_sent_frame_id.is_some_and(|prev| info.meta.frame_id <= prev) {
                 sent_frame_ids_strictly_monotonic = false;
@@ -1338,18 +1337,9 @@ pub async fn run_wan_video_telemetry(
             if was_forced_idr && info.meta.is_idr {
                 forced_idr_frame_ids.push(info.meta.frame_id);
             }
-            let tx_bytes_delta = host
-                .session()
-                .link()
-                .stats
-                .tx_bytes
-                .saturating_sub(tx_bytes_before);
-            let tx_pkts_delta = host
-                .session()
-                .link()
-                .stats
-                .tx_packets
-                .saturating_sub(tx_pkts_before);
+            let after_stats = host.session().data_plane().stats();
+            let tx_bytes_delta = after_stats.tx_bytes.saturating_sub(tx_bytes_before);
+            let tx_pkts_delta = after_stats.tx_packets.saturating_sub(tx_pkts_before);
             let frame_wire = actual_wire_bytes(tx_bytes_delta, tx_pkts_delta, is_ipv6);
             pacer.record_sent(frame_wire, 0, Instant::now());
 
@@ -1697,7 +1687,9 @@ pub async fn run_wan_bench(args: &WanBenchArgs) -> Result<WanBenchReport, Sessio
         renew_guard,
     } = bootstrap_live_pair(&cfg, args.ca_der.as_deref(), bootstrap_mbps).await?;
 
-    let is_ipv6 = pair_host.link().edge_addr().is_ipv6();
+    let is_ipv6 = pair_host
+        .udp_link()
+        .is_some_and(|u| u.edge_addr().is_ipv6());
     let init_enc = V2VideoEncoder::new(
         args.codec,
         WIDTH as u32,
@@ -2239,11 +2231,13 @@ mod tests {
             is_ref: false,
             max_age_ms: 200,
         };
-        let b0 = pair.host.session().link().stats.tx_bytes;
-        let p0 = pair.host.session().link().stats.tx_packets;
+        let s0 = pair.host.session().data_plane().stats();
+        let b0 = s0.tx_bytes;
+        let p0 = s0.tx_packets;
         pair.host.publish_raw_video(&meta, &payload).await.unwrap();
-        let db = pair.host.session().link().stats.tx_bytes - b0;
-        let dp = pair.host.session().link().stats.tx_packets - p0;
+        let s1 = pair.host.session().data_plane().stats();
+        let db = s1.tx_bytes - b0;
+        let dp = s1.tx_packets - p0;
         assert_eq!(
             actual_wire_bytes(db, dp, false),
             estimate_video_frame_wire_bytes(payload.len(), L3_MTU_DEFAULT, false)

@@ -18,7 +18,8 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinHandle};
 use v2_client::{
-    AccessControlTunnel, ClientError, ControlPlaneClient, SignalingSession, UdpE2eeSession,
+    AccessControlTunnel, ActiveTransportMode, ClientError, ControlPlaneClient, SignalingSession,
+    UdpE2eeSession,
 };
 use v2_identity::DeviceKeyStore;
 
@@ -84,6 +85,10 @@ pub struct QoeSnapshot {
     pub lease_renewals_ok: u64,
     pub lease_renewals_err: u64,
     pub transport_mode: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_transport_mode: Option<ActiveTransportMode>,
+    #[serde(default)]
+    pub p3_dropped: u64,
     pub rtt_ms: u64,
 }
 

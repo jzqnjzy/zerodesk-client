@@ -1,16 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
+pub mod audio;
+pub mod bridge;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
+pub mod file_transfer;
 pub mod hid;
 pub mod identity;
 pub mod input;
 pub mod manager;
+pub mod policy;
 pub mod runtime;
 pub mod session;
 pub mod video;
 
+pub use audio::{
+    audio_ts_delta, audio_ts_gt, measure_audio_quality, AudioChannelGate, AudioError,
+    AudioJitterBuffer, AudioJitterStats, AudioQualityMetrics, AudioSink, AudioSource,
+    EncodedAudioFrame, JitterPlayoutAction, JitterPushOutcome, OpusWireFrame, RecordingAudioSink,
+    SyntheticMultiToneSource, V2AudioDecoder, V2AudioEncoder, AUDIO_DEFAULT_BITRATE_BPS,
+    AUDIO_ERROR_INVALID_FRAMING, AUDIO_ERROR_POLICY_DENIED, AUDIO_FRAME_MS,
+    AUDIO_FRAME_SAMPLES_PER_CH, AUDIO_JITTER_MAX_FRAMES, AUDIO_JITTER_MIN_FRAMES,
+    AUDIO_LATE_DROP_MS, AUDIO_MAX_CONSECUTIVE_PLC, AUDIO_MAX_NORMAL_BITRATE_BPS,
+    AUDIO_MAX_OPUS_PACKET_BYTES, AUDIO_MIN_NORMAL_BITRATE_BPS, AUDIO_SAMPLE_RATE_HZ,
+    AUDIO_SURVIVAL_BITRATE_BPS, AUDIO_SURVIVAL_MAX_BITRATE_BPS, AUDIO_SURVIVAL_MIN_BITRATE_BPS,
+    AUDIO_WIRE_HDR_LEN,
+};
+pub use bridge::{
+    load_config_json, save_config_json, BridgeEvent, BridgePersistedConfig, BridgeResponseEnvelope,
+    BridgeSnapshot, BridgeState, PolicySummary, RedactedConfigView, V2BridgeController,
+    VerifiedCallerDisplay, BRIDGE_ABI_VERSION, BRIDGE_EVENT_QUEUE_CAP,
+};
 pub use capture::{
     bgra_to_i420_bt601, compute_y_variance, crop_and_validate_dimensions, detect_visual_marker,
     overlay_visual_marker, spawn_capture_pipeline, CaptureError, CapturePipelineHandle,
@@ -18,19 +40,57 @@ pub use capture::{
     SyntheticAnimatedSource, VisualMarkerCheck, DEFAULT_SYNTHETIC_HEIGHT, DEFAULT_SYNTHETIC_WIDTH,
     MIN_CAPTURE_DIM, ZERO_VARIANCE_WARN_THRESHOLD,
 };
+pub use clipboard::{
+    check_clipboard_policy_for_sync, decode_clipboard_l4, prepare_outbound_clipboard,
+    validate_clipboard_content, validate_png_ihdr, ChannelFramingErrorCounter, ClipAck, ClipChunk,
+    ClipMessage, ClipSync, ClipboardAntiEchoGuard, ClipboardError, ClipboardReceiver,
+    ClipboardRecvAction, DeliveredClipboard, OutboundClipboardTransfer,
+    CHANNEL_CONSECUTIVE_FRAMING_ERROR_LIMIT, CLIP_ACK_HASH_MISMATCH, CLIP_ACK_OK,
+    CLIP_ACK_POLICY_DENIED, CLIP_ACK_RATE_LIMITED, CLIP_ACK_TIMEOUT, CLIP_ACK_TOO_LARGE,
+    CLIP_ACK_UNSUPPORTED, CLIP_ACK_WIRE_LEN, CLIP_CHUNK_HDR_LEN, CLIP_CHUNK_MAX_PAYLOAD,
+    CLIP_CHUNK_MAX_WIRE_LEN, CLIP_CHUNK_MIN_WIRE_LEN, CLIP_ERROR_INVALID_FRAMING,
+    CLIP_HARD_MAX_BYTES, CLIP_MIME_FILE_URI_LIST, CLIP_MIME_IMAGE_PNG, CLIP_MIME_TEXT_UTF8,
+    CLIP_MSG_ACK, CLIP_MSG_CHUNK, CLIP_MSG_SYNC, CLIP_PNG_MAX_DIM, CLIP_PNG_MAX_PIXELS,
+    CLIP_REASSEMBLY_TIMEOUT, CLIP_SYNC_WIRE_LEN,
+};
 pub use config::{
     ensure_dir_0700, read_file_0600_to_string, verify_dir_permissions_0700,
-    verify_file_permissions_0600, write_file_atomic_0600, V2ClientConfig, V2ConfigError,
-    DEFAULT_BW_CAP_KBPS, DEFAULT_FPS, DEFAULT_KEEPALIVE_INTERVAL_MS,
-    DEFAULT_LEASE_RENEW_INTERVAL_SEC, DEFAULT_WATCHDOG_TIMEOUT_MS, DELEGATION_FILE_NAME,
-    IDENTITY_FILE_NAME, MAX_LEASE_RENEW_INTERVAL_SEC,
+    verify_file_permissions_0600, write_file_atomic_0600, TransportMode, V2ClientConfig,
+    V2ConfigError, DEFAULT_BW_CAP_KBPS, DEFAULT_FPS, DEFAULT_KEEPALIVE_INTERVAL_MS,
+    DEFAULT_LEASE_RENEW_INTERVAL_SEC, DEFAULT_UDP_PROBE_TIMEOUT_MS, DEFAULT_WATCHDOG_TIMEOUT_MS,
+    DELEGATION_FILE_NAME, IDENTITY_FILE_NAME, MAX_LEASE_RENEW_INTERVAL_SEC,
+    MAX_UDP_PROBE_TIMEOUT_MS, MIN_UDP_PROBE_TIMEOUT_MS,
+};
+pub use file_transfer::{
+    build_collision_filename, check_disk_space_for_file, check_file_policy, decode_file_l4,
+    validate_safe_filename, FileAbort, FileAccept, FileAck, FileChunk, FileComplete,
+    FileCompleteAck, FileMessage, FileOffer, FileOfferRaw, FileRecvAction, FileSenderWindow,
+    FileTransferAuditRecord, FileTransferError, FileTransferReceiver, FILE_ABORT_WIRE_LEN,
+    FILE_ACCEPT_WIRE_LEN, FILE_ACK_WIRE_LEN, FILE_CHUNK_HDR_LEN, FILE_CHUNK_MAX_SIZE,
+    FILE_CHUNK_MIN_SIZE, FILE_COLLISION_MAX_RETRIES, FILE_COMPLETE_ACK_HASH_MISMATCH,
+    FILE_COMPLETE_ACK_IO_ERROR, FILE_COMPLETE_ACK_OK, FILE_COMPLETE_ACK_WIRE_LEN,
+    FILE_COMPLETE_WIRE_LEN, FILE_DEFAULT_WINDOW_BYTES, FILE_ERR_AUDIT_UNAVAILABLE,
+    FILE_ERR_INVALID_FRAMING, FILE_ERR_OK, FILE_ERR_PATH_FAILED, FILE_ERR_POLICY_DENIED,
+    FILE_ERR_RATE_LIMITED, FILE_MAX_CONCURRENT_PER_DIR, FILE_MSG_ABORT, FILE_MSG_ACCEPT,
+    FILE_MSG_ACK, FILE_MSG_CHUNK, FILE_MSG_COMPLETE, FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER,
+    FILE_NAME_MAX_BYTES, FILE_OFFER_FIXED_LEN, FILE_RECOMMENDED_CHUNK_SIZE, FILE_STALL_TIMEOUT,
 };
 pub use identity::{IdentityStoreError, PersistentV2Identity};
 pub use manager::{
-    build_verified_policy_from_cert, AcceptedHostSession, CallDecision, ConnectedControllerSession,
-    DesktopControllerClient, DesktopHostDaemon, IncomingCall, ManagerError, NoopUiCallback,
-    SecurityEvent, SeenSessionCache, UiCallbackDispatcher, V2SessionManager, V2SessionState,
-    V2UiCallback, DEFAULT_V2_CAP_BITS, SEEN_SESSION_CACHE_CAP,
+    attach_access_data_plane, build_verified_policy_from_cert, AcceptedHostSession, CallDecision,
+    ConnectedControllerSession, DesktopControllerClient, DesktopHostDaemon, IncomingCall,
+    ManagerError, NoopUiCallback, SecurityEvent, SeenSessionCache, UdpNegativeCache,
+    UiCallbackDispatcher, V2SessionManager, V2SessionState, V2UiCallback, DEFAULT_V2_CAP_BITS,
+    SEEN_SESSION_CACHE_CAP, UDP_NEGATIVE_CACHE_TTL,
+};
+pub use policy::{
+    build_tenant_policy_tbs, verify_raw_tenant_policy_blob, verify_tenant_policy_blob,
+    EffectiveTenantPolicy, PolicyError, PolicyVerifyOutcome, RawTenantPolicyBlob, TenantPolicyBody,
+    DEGRADED_BASELINE_BW_KBPS, MAX_CLIPBOARD_HARD_CAP_BYTES, POLICY_CLOCK_SKEW_SECS,
+    POLICY_FLAGS_RESERVED_MASK, POLICY_FLAGS_VALID_MASK, POLICY_FLAG_ALLOW_AUDIO,
+    POLICY_FLAG_ALLOW_CLIPBOARD, POLICY_FLAG_ALLOW_FILE_CLIPBOARD, POLICY_FLAG_ALLOW_FILE_TRANSFER,
+    POLICY_FLAG_ALLOW_TCP_TUNNEL, POLICY_FLAG_ALLOW_TERMINAL, TENANT_POLICY_BODY_LEN,
+    TENANT_POLICY_SCHEMA_VER, TENANT_POLICY_TBS_LEN,
 };
 pub use runtime::{
     ordered_session_teardown, send_redundant_session_close_3x, CloseReason, LeaseRenewalConfig,

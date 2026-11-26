@@ -14,7 +14,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use v2_client::{
-    decode_hex_array, now_unix_secs, ClientError, ControlPlaneClient, SignalingDeviceCert,
+    decode_hex_array, now_unix_secs, ClientError, ControlPlaneClient, PolicyBlobJson,
+    SignalingDeviceCert,
 };
 use v2_identity::{
     DelegationStatement, DeviceKeyStore, IdentityError, RotatorPersistedState,
@@ -155,6 +156,8 @@ struct PersistedIdentityFile {
     tenant_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_cert_pb_b64: Option<String>,
+    #[serde(default)]
+    last_policy_version: u64,
 }
 
 impl fmt::Debug for PersistedIdentityFile {
@@ -168,12 +171,14 @@ impl fmt::Debug for PersistedIdentityFile {
                 "device_cert_pb_b64_present",
                 &self.device_cert_pb_b64.is_some(),
             )
+            .field("last_policy_version", &self.last_policy_version)
             .finish()
     }
 }
 
 /// Persistent ZeroDesk V2 device identity backed by atomic `0600` files in `identity_dir`:
-/// - `identity_v2.json`: `device_id`, P-256 `SoftwareDeviceKeyStore` PKCS#8 DER, cached `tenant_id` & CA-signed `DeviceCert`.
+/// - `identity_v2.json`: `device_id`, P-256 `SoftwareDeviceKeyStore` PKCS#8 DER, cached `tenant_id`,
+///   CA-signed `DeviceCert`, and monotonic anti-rollback `last_policy_version`.
 /// - `delegation_v2.json`: `X25519StaticKeyRotator` non-secret monotonic state (`delegation_seq`).
 pub struct PersistentV2Identity {
     identity_dir: PathBuf,
@@ -181,6 +186,7 @@ pub struct PersistentV2Identity {
     tenant_id: Option<[u8; 16]>,
     keystore: SoftwareDeviceKeyStore,
     device_cert: Option<SignalingDeviceCert>,
+    last_policy_version: u64,
     rotator: X25519StaticKeyRotator,
 }
 
@@ -240,6 +246,7 @@ impl PersistentV2Identity {
             tenant_id,
             keystore,
             device_cert,
+            last_policy_version: persisted.last_policy_version,
             rotator,
         })
     }
@@ -265,6 +272,7 @@ impl PersistentV2Identity {
                 tenant_id: None,
                 keystore,
                 device_cert: None,
+                last_policy_version: 0,
                 rotator,
             };
             let bytes = me.serialize_identity_bytes()?;
@@ -294,6 +302,34 @@ impl PersistentV2Identity {
         self.device_cert.as_ref()
     }
 
+    pub fn last_policy_version(&self) -> u64 {
+        self.last_policy_version
+    }
+
+    /// Atomically verifies `version >= persisted last_policy_version` under `identity_dir/.lock`
+    /// and persists the monotonic high-water mark (`0600` + parent-dir fsync).
+    pub fn advance_policy_version(&mut self, version: u64) -> Result<u64, IdentityStoreError> {
+        let _lock = IdentityDirLock::acquire(&self.identity_dir)?;
+        let id_path = self.identity_dir.join(IDENTITY_FILE_NAME);
+        let mut disk_last = self.last_policy_version;
+        if id_path.exists() {
+            let raw = read_file_0600_to_string(&id_path)?;
+            let persisted: PersistedIdentityFile = serde_json::from_str(&raw).map_err(|e| {
+                IdentityStoreError::Storage(format!("parse '{}': {e}", id_path.display()))
+            })?;
+            disk_last = disk_last.max(persisted.last_policy_version);
+        }
+        if version < disk_last {
+            return Err(IdentityStoreError::Storage(format!(
+                "policy version rollback refused: version={version} < persisted last_policy_version={disk_last}"
+            )));
+        }
+        self.last_policy_version = version;
+        let bytes = self.serialize_identity_bytes()?;
+        write_file_atomic_0600(&id_path, &bytes)?;
+        Ok(self.last_policy_version)
+    }
+
     pub fn public_spki_der(&self) -> Result<Vec<u8>, IdentityStoreError> {
         Ok(self.keystore.public_key_spki_der()?)
     }
@@ -310,6 +346,7 @@ impl PersistentV2Identity {
             p256_pkcs8_der_b64: B64.encode(pkcs8.as_slice()),
             tenant_id_hex: self.tenant_id.map(hex::encode),
             device_cert_pb_b64: cert_pb_b64,
+            last_policy_version: self.last_policy_version,
         };
         serde_json::to_vec_pretty(&file)
             .map_err(|e| IdentityStoreError::Storage(format!("serialize identity_v2.json: {e}")))
@@ -331,9 +368,6 @@ impl PersistentV2Identity {
     }
 
     /// Ensures this device holds a valid CA-verified `SignalingDeviceCert`.
-    /// Reuses a valid cached certificate (with `> 5min` TTL remaining) if present so
-    /// `enrollment_token` is optional after initial registration; otherwise registers with the
-    /// Control Plane, verifies the returned `DeviceCert` against `ca_spki_der`, and persists it.
     pub async fn ensure_registered(
         &mut self,
         cp: &ControlPlaneClient,
@@ -342,6 +376,22 @@ impl PersistentV2Identity {
         cap_bits: u64,
         home_region: &str,
     ) -> Result<SignalingDeviceCert, IdentityStoreError> {
+        let (cert, _blob) = self
+            .ensure_registered_with_policy(cp, ca_spki_der, enrollment_token, cap_bits, home_region)
+            .await?;
+        Ok(cert)
+    }
+
+    /// Ensures this device holds a valid CA-verified `SignalingDeviceCert` and also returns any
+    /// optional `PolicyBlobJson` returned inline by `POST /v2/devices/register`.
+    pub async fn ensure_registered_with_policy(
+        &mut self,
+        cp: &ControlPlaneClient,
+        ca_spki_der: &[u8],
+        enrollment_token: Option<&str>,
+        cap_bits: u64,
+        home_region: &str,
+    ) -> Result<(SignalingDeviceCert, Option<PolicyBlobJson>), IdentityStoreError> {
         let now_unix = now_unix_secs();
         if let Some(cached) = &self.device_cert {
             if cached.device_id == self.device_id
@@ -349,10 +399,23 @@ impl PersistentV2Identity {
                 && cached.verify(ca_spki_der, now_unix).is_ok()
             {
                 self.tenant_id = Some(cached.tenant_id);
-                return Ok(cached.clone());
+                return Ok((cached.clone(), None));
             }
         }
+        self.force_reregister_with_policy(cp, ca_spki_der, enrollment_token, cap_bits, home_region)
+            .await
+    }
 
+    /// Forces a fresh `POST /v2/devices/register` call (used for initial registration, expired
+    /// cert refresh, or the ONE bounded re-register refresh on valid-sig `policy_hash` mismatch).
+    pub async fn force_reregister_with_policy(
+        &mut self,
+        cp: &ControlPlaneClient,
+        ca_spki_der: &[u8],
+        enrollment_token: Option<&str>,
+        cap_bits: u64,
+        home_region: &str,
+    ) -> Result<(SignalingDeviceCert, Option<PolicyBlobJson>), IdentityStoreError> {
         let token = enrollment_token
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
@@ -389,7 +452,7 @@ impl PersistentV2Identity {
         self.tenant_id = Some(cert.tenant_id);
         self.device_cert = Some(cert.clone());
         self.persist_identity()?;
-        Ok(cert)
+        Ok((cert, reg.policy_blob))
     }
 
     /// Ensures a current 12-hour X25519 static key generation & signed `DelegationStatement`,
@@ -496,6 +559,15 @@ mod tests {
         let (_sec2, deleg2) = id2.ensure_delegation(now).unwrap();
         assert_eq!(deleg2.delegation_seq, 2);
 
+        // Monotonic last_policy_version persists atomically and rejects rollback
+        assert_eq!(id2.last_policy_version(), 0);
+        assert_eq!(id2.advance_policy_version(7).unwrap(), 7);
+        let mut id3 = PersistentV2Identity::load_or_create(&dir).unwrap();
+        assert_eq!(id3.last_policy_version(), 7);
+        assert!(id3.advance_policy_version(6).is_err());
+        assert_eq!(id3.advance_policy_version(7).unwrap(), 7);
+        assert_eq!(id3.advance_policy_version(8).unwrap(), 8);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -517,6 +589,7 @@ mod tests {
             p256_pkcs8_der_b64: "SECRET_PKCS8_KEY_MATERIAL".into(),
             tenant_id_hex: None,
             device_cert_pb_b64: None,
+            last_policy_version: 0,
         };
         let dbg = format!("{f:?}");
         assert!(dbg.contains("<redacted>"));

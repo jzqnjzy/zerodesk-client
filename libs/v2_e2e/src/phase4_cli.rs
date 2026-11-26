@@ -3,7 +3,9 @@
 
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -19,27 +21,53 @@ use tokio::{
     process::{Child, Command},
 };
 use v2_client::{
-    decode_hex_array, ClusterConfig, ControlPlaneClient, CreateTenantReq,
+    decode_hex_array, ClusterConfig, ControlPlaneClient, CreateTenantReq, V2RecvEvent,
 };
 use v2_e2e::{
-    decode_hid_frame, detect_visual_marker, encode_hid_frame, ensure_dir_0700,
-    ordered_session_teardown, parse_request_idr, parse_session_close,
-    send_redundant_session_close_3x, spawn_capture_pipeline, spawn_independent_release_watchdog,
-    write_audit_records_jsonl, write_file_atomic_0600, AuditKey, AuditRecord, CloseReason,
-    DecodedVideoDelivery, DesktopControllerClient, DesktopControllerSession, DesktopHostDaemon,
-    DesktopHostSession, DryRunSink, HidEchoAck, HidInputExecutor, HidPayload, InputError, KeyEvent,
-    MouseEvent, MouseKind, NoopUiCallback, SafeHidKey, SessionError, SharedVisualMarker,
-    SyntheticAnimatedSource, UiCallbackDispatcher, V2ClientConfig, V2VideoDecoder, V2VideoEncoder,
-    VideoCodec, DEFAULT_HID_RATE_LIMIT_PER_SEC, DEFAULT_SYNTHETIC_HEIGHT, DEFAULT_SYNTHETIC_WIDTH,
-    MOD_SHIFT, MOUSE_BUTTON_LEFT,
+    decode_clipboard_l4, decode_file_l4, decode_hid_frame, detect_visual_marker, encode_hid_frame,
+    ensure_dir_0700, measure_audio_quality, ordered_session_teardown, parse_request_idr,
+    parse_session_close, prepare_outbound_clipboard, send_redundant_session_close_3x,
+    spawn_capture_pipeline, spawn_independent_release_watchdog, write_audit_records_jsonl,
+    write_file_atomic_0600, AudioChannelGate, AudioJitterBuffer, AudioSource, AuditKey,
+    AuditRecord, ChannelFramingErrorCounter, ClipMessage, ClipSync, ClipboardReceiver,
+    ClipboardRecvAction, CloseReason, DecodedVideoDelivery, DesktopControllerClient,
+    DesktopControllerSession, DesktopHostDaemon, DesktopHostSession, DryRunSink, FileChunk,
+    FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver, HidEchoAck,
+    HidInputExecutor, HidPayload, InputError, JitterPlayoutAction, KeyEvent, MouseEvent, MouseKind,
+    NoopUiCallback, OpusWireFrame, SafeHidKey, SessionError, SharedVisualMarker,
+    SyntheticAnimatedSource, SyntheticMultiToneSource, TransportMode, UiCallbackDispatcher,
+    V2AudioDecoder, V2AudioEncoder, V2ClientConfig, V2VideoDecoder, V2VideoEncoder, VideoCodec,
+    AUDIO_DEFAULT_BITRATE_BPS, AUDIO_FRAME_SAMPLES_PER_CH, AUDIO_JITTER_MAX_FRAMES,
+    AUDIO_JITTER_MIN_FRAMES, CLIP_ACK_OK, CLIP_ACK_POLICY_DENIED, CLIP_MIME_IMAGE_PNG,
+    CLIP_MIME_TEXT_UTF8, CLIP_MSG_ACK, CLIP_MSG_CHUNK, CLIP_MSG_SYNC,
+    DEFAULT_HID_RATE_LIMIT_PER_SEC, DEFAULT_SYNTHETIC_HEIGHT, DEFAULT_SYNTHETIC_WIDTH,
+    FILE_ERR_POLICY_DENIED, FILE_MSG_ABORT, FILE_MSG_ACCEPT, FILE_MSG_ACK, FILE_MSG_CHUNK,
+    FILE_MSG_COMPLETE, FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER, MOD_SHIFT, MOUSE_BUTTON_LEFT,
 };
-use v2_transport::{TransportEvent, IDR_MIN_INTERVAL_MS};
+use v2_transport::{
+    TransportEvent, CHAN_AUDIO, CHAN_CLIPBOARD, CHAN_FILE_TRANSFER, IDR_MIN_INTERVAL_MS,
+};
 
 const ENCODER_QUALITY: f32 = 2.0;
 const KEYFRAME_INTERVAL: usize = 30;
 const MARKER_TARGET_X: i32 = 640;
 const MARKER_TARGET_Y: i32 = 360;
 const CTRL_MSG_KEEPALIVE: u8 = 0x03;
+const AUDIO_LEAD_ACTIVE_FRAMES: usize = 25;
+const AUDIO_SILENCE_DTX_FRAMES: usize = 15;
+const AUDIO_TAIL_ACTIVE_FRAMES: usize = 10;
+const FILE_E2E_CHUNK_SIZE: u32 = 1024;
+// Valid minimal 1x1 RGB PNG (67 bytes, passes IHDR + full PNG decoders).
+const VALID_MINIMAL_PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+    0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R', // IHDR length=13
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, // 8-bit RGB + CRC
+    0x00, 0x00, 0x00, 0x0C, b'I', b'D', b'A', b'T', // IDAT
+    0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
+    0x18, 0xDD, 0x8D, 0xB0, // IDAT CRC
+    0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+];
 
 #[cfg(unix)]
 extern "C" {
@@ -60,7 +88,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_flag_value(args: &[String], idx: &mut usize, flag: &str) -> Result<String, String> {
+pub(crate) fn parse_flag_value(
+    args: &[String],
+    idx: &mut usize,
+    flag: &str,
+) -> Result<String, String> {
     *idx += 1;
     args.get(*idx)
         .cloned()
@@ -68,62 +100,128 @@ fn parse_flag_value(args: &[String], idx: &mut usize, flag: &str) -> Result<Stri
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct HostReadyFile {
-    device_id_hex: String,
-    tenant_id_hex: String,
+pub(crate) struct HostReadyFile {
+    pub device_id_hex: String,
+    pub tenant_id_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct HostDaemonSummary {
-    pass: bool,
-    role: String,
-    codec: String,
-    device_id_hex: String,
-    tenant_id_hex: String,
-    handshake_hash_hex: String,
-    width: usize,
-    height: usize,
-    frames_sent: u64,
-    frames_captured: u64,
-    frames_overwritten: u64,
-    hid_executed: u64,
-    release_all_count: u64,
-    watchdog_release_count: u64,
-    final_pressed_buttons: u8,
-    final_pressed_keys: Vec<SafeHidKey>,
-    input_faulted: bool,
-    close_reason: String,
-    capture_thread_joined: bool,
-    watchdog_thread_joined: bool,
+pub(crate) struct HostDaemonSummary {
+    pub pass: bool,
+    pub role: String,
+    pub codec: String,
+    pub device_id_hex: String,
+    pub tenant_id_hex: String,
+    pub handshake_hash_hex: String,
+    pub width: usize,
+    pub height: usize,
+    pub frames_sent: u64,
+    pub frames_captured: u64,
+    pub frames_overwritten: u64,
+    pub hid_executed: u64,
+    pub release_all_count: u64,
+    pub watchdog_release_count: u64,
+    pub final_pressed_buttons: u8,
+    pub final_pressed_keys: Vec<SafeHidKey>,
+    pub input_faulted: bool,
+    pub close_reason: String,
+    pub capture_thread_joined: bool,
+    pub watchdog_thread_joined: bool,
+    #[serde(default)]
+    pub active_transport_mode: String,
+    #[serde(default)]
+    pub transport_attach_ms: u64,
+    #[serde(default)]
+    pub p3_dropped: u64,
+    #[serde(default)]
+    pub policy_version: u64,
+    #[serde(default)]
+    pub policy_degraded: bool,
+    #[serde(default)]
+    pub audio_frames_sent: u64,
+    #[serde(default)]
+    pub audio_dtx_frames_sent: u64,
+    #[serde(default)]
+    pub audio_policy_denied: u64,
+    #[serde(default)]
+    pub clipboard_received_text: u64,
+    #[serde(default)]
+    pub clipboard_received_png: u64,
+    #[serde(default)]
+    pub clipboard_acks_denied: u64,
+    #[serde(default)]
+    pub clipboard_anti_echo_suppressed: bool,
+    #[serde(default)]
+    pub file_transfers_completed: u64,
+    #[serde(default)]
+    pub file_transfers_aborted_policy: u64,
+    #[serde(default)]
+    pub file_saved_paths: Vec<String>,
+    #[serde(default)]
+    pub file_sha256_hex: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ControllerClientSummary {
-    pass: bool,
-    role: String,
-    codec: String,
-    device_id_hex: String,
-    target_device_id_hex: String,
-    tenant_id_hex: String,
-    handshake_hash_hex: String,
-    frames_decoded: u64,
-    frame_id_monotonic: bool,
-    decode_errors: u64,
-    decoder_flushed_frames: u64,
-    hid_events_sent: u64,
-    visual_marker_before_hid: bool,
-    visual_marker_detected_frames: u64,
-    lease_renewals_ok: u64,
-    lease_renewals_err: u64,
-    leave_stuck: bool,
+pub(crate) struct ControllerClientSummary {
+    pub pass: bool,
+    pub role: String,
+    pub codec: String,
+    pub device_id_hex: String,
+    pub target_device_id_hex: String,
+    pub tenant_id_hex: String,
+    pub handshake_hash_hex: String,
+    pub frames_decoded: u64,
+    pub frame_id_monotonic: bool,
+    pub decode_errors: u64,
+    pub decoder_flushed_frames: u64,
+    pub hid_events_sent: u64,
+    pub visual_marker_before_hid: bool,
+    pub visual_marker_detected_frames: u64,
+    pub lease_renewals_ok: u64,
+    pub lease_renewals_err: u64,
+    pub leave_stuck: bool,
+    #[serde(default)]
+    pub active_transport_mode: String,
+    #[serde(default)]
+    pub transport_attach_ms: u64,
+    #[serde(default)]
+    pub p3_dropped: u64,
+    #[serde(default)]
+    pub policy_version: u64,
+    #[serde(default)]
+    pub policy_degraded: bool,
+    #[serde(default)]
+    pub audio_frames_received: u64,
+    #[serde(default)]
+    pub audio_dtx_frames_received: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_snr_db: Option<f64>,
+    #[serde(default)]
+    pub audio_local_policy_denied: bool,
+    #[serde(default)]
+    pub clipboard_acks_ok: u64,
+    #[serde(default)]
+    pub clipboard_acks_denied: u64,
+    #[serde(default)]
+    pub clipboard_local_policy_denied: bool,
+    #[serde(default)]
+    pub clipboard_anti_echo_preserved: bool,
+    #[serde(default)]
+    pub file_transfers_completed: u64,
+    #[serde(default)]
+    pub file_transfers_aborted_policy: u64,
+    #[serde(default)]
+    pub file_local_policy_denied: bool,
+    #[serde(default)]
+    pub file_sha256_hex: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ComparableHidEvent {
+pub(crate) enum ComparableHidEvent {
     MouseMoveAbs { x: i32, y: i32 },
     MouseMoveRel { dx: i32, dy: i32 },
     MouseDown { button_bit: u8, x: i32, y: i32 },
@@ -133,7 +231,7 @@ enum ComparableHidEvent {
     KeyUp { key: AuditKey },
 }
 
-fn audit_to_comparable(rec: &AuditRecord) -> Option<ComparableHidEvent> {
+pub(crate) fn audit_to_comparable(rec: &AuditRecord) -> Option<ComparableHidEvent> {
     match rec {
         AuditRecord::MouseMoveAbs { x, y, .. } => {
             Some(ComparableHidEvent::MouseMoveAbs { x: *x, y: *y })
@@ -164,7 +262,7 @@ fn audit_to_comparable(rec: &AuditRecord) -> Option<ComparableHidEvent> {
     }
 }
 
-fn read_audit_jsonl(path: &Path) -> Result<Vec<AuditRecord>, String> {
+pub(crate) fn read_audit_jsonl(path: &Path) -> Result<Vec<AuditRecord>, String> {
     let f = File::open(path).map_err(|e| format!("open audit '{}': {e}", path.display()))?;
     let reader = BufReader::new(f);
     let mut records = Vec::new();
@@ -365,6 +463,11 @@ struct HostDaemonArgs {
     ready_file: Option<PathBuf>,
     enrollment_token: Option<String>,
     audit_key_identity: bool,
+    transport: TransportMode,
+    drop_udp: bool,
+    audio: bool,
+    clipboard: bool,
+    download_dir: Option<PathBuf>,
 }
 
 async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String> {
@@ -381,6 +484,8 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
     v2_cfg.codec = args.codec;
     v2_cfg.fps = args.fps;
     v2_cfg.watchdog_timeout_ms = args.watchdog_ms;
+    v2_cfg.transport_mode = args.transport;
+    v2_cfg.drop_udp_for_test = args.drop_udp;
     v2_cfg.validate().map_err(|e| e.to_string())?;
 
     let dispatcher = UiCallbackDispatcher::spawn(Arc::new(NoopUiCallback));
@@ -440,7 +545,49 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         .await
         .map_err(|e| e.to_string())?;
     let handshake_hash_hex = hex::encode(accepted.hs_hash);
+    let active_transport_mode = accepted.active_transport_mode.label().to_string();
+    let transport_attach_ms = accepted.transport_attach_ms;
+    let effective_policy = accepted.effective_policy;
+    let policy_version = effective_policy.version;
+    let policy_degraded = effective_policy.degraded;
     let host_lease_renewal = accepted.lease_renewal;
+
+    let mut framing_errs = ChannelFramingErrorCounter::new();
+    let audio_gate = AudioChannelGate::from_policy(&effective_policy);
+    let mut clip_rx = ClipboardReceiver::new(effective_policy.clone());
+    let download_dir = args
+        .download_dir
+        .clone()
+        .unwrap_or_else(|| args.identity_dir.join("downloads"));
+    let mut file_rx = FileTransferReceiver::new(effective_policy.clone(), download_dir);
+    let mut audio_tx_state: Option<(SyntheticMultiToneSource, V2AudioEncoder, u32, Instant)> =
+        if args.audio && audio_gate.policy_allows_audio() {
+            let src = SyntheticMultiToneSource::new(
+                1,
+                AUDIO_LEAD_ACTIVE_FRAMES,
+                AUDIO_SILENCE_DTX_FRAMES,
+                AUDIO_TAIL_ACTIVE_FRAMES,
+            )
+            .map_err(|e| e.to_string())?;
+            let enc = V2AudioEncoder::new(1, AUDIO_DEFAULT_BITRATE_BPS)
+                .map_err(|e| e.to_string())?;
+            Some((src, enc, 0u32, Instant::now()))
+        } else {
+            None
+        };
+    let mut audio_frames_sent = 0u64;
+    let mut audio_dtx_frames_sent = 0u64;
+    let mut audio_policy_denied = 0u64;
+    let mut clipboard_received_text = 0u64;
+    let mut clipboard_received_png = 0u64;
+    let mut clipboard_acks_denied = 0u64;
+    let mut clipboard_anti_echo_suppressed = false;
+    let mut host_sent_reply_clip = false;
+    let mut host_clip_seq = 1000u64;
+    let mut file_transfers_completed = 0u64;
+    let mut file_transfers_aborted_policy = 0u64;
+    let mut file_saved_paths = Vec::<String>::new();
+    let mut file_sha256_hex = Vec::<String>::new();
 
     let visual_marker: SharedVisualMarker = Arc::new(Mutex::new(None));
     let capture_stop = Arc::new(AtomicBool::new(false));
@@ -525,8 +672,8 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         let recv_wait = next_frame_at
             .saturating_duration_since(Instant::now())
             .clamp(Duration::from_millis(1), Duration::from_millis(10));
-        match host.session_mut().recv_event(recv_wait).await {
-            Ok(TransportEvent::Hid(frame)) => {
+        match host.session_mut().recv_v124_event(recv_wait).await {
+            Ok(V2RecvEvent::Transport(TransportEvent::Hid(frame))) => {
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 match decode_hid_frame(&frame) {
@@ -570,7 +717,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                     }
                 }
             }
-            Ok(TransportEvent::Control(ctrl)) => {
+            Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 if let Some(code) = parse_session_close(&ctrl) {
@@ -585,7 +732,180 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                     last_forced_idr = Some(Instant::now());
                 }
             }
-            Ok(_) => {
+            Ok(V2RecvEvent::AudioRaw(raw)) => {
+                last_peer_activity = Instant::now();
+                executor.touch_activity();
+                if !audio_gate.policy_allows_audio() {
+                    audio_policy_denied = audio_policy_denied.saturating_add(1);
+                } else if let Err(e) = OpusWireFrame::decode(&raw.body) {
+                    close_reason = CloseReason::InvalidFraming;
+                    fatal_error = Some(format!("audio framing error: {e}"));
+                    break;
+                }
+            }
+            Ok(V2RecvEvent::ClipboardRaw(raw)) => {
+                last_peer_activity = Instant::now();
+                executor.touch_activity();
+                match clip_rx.on_l4_frame(
+                    &raw.header,
+                    &raw.body,
+                    Instant::now(),
+                    &mut framing_errs,
+                ) {
+                    ClipboardRecvAction::None => {}
+                    ClipboardRecvAction::SendAck(ack) => {
+                        if ack.status == CLIP_ACK_POLICY_DENIED {
+                            clipboard_acks_denied = clipboard_acks_denied.saturating_add(1);
+                        }
+                        if let Ok(ack_bytes) = ack.encode() {
+                            let _ = host
+                                .session_mut()
+                                .send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &ack_bytes)
+                                .await;
+                        }
+                    }
+                    ClipboardRecvAction::DeliverAndAck { delivered, ack } => {
+                        if let Ok(ack_bytes) = ack.encode() {
+                            let _ = host
+                                .session_mut()
+                                .send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &ack_bytes)
+                                .await;
+                        }
+                        if delivered.mime_kind == CLIP_MIME_TEXT_UTF8 {
+                            clipboard_received_text = clipboard_received_text.saturating_add(1);
+                            if !clip_rx.anti_echo.should_sync_local(delivered.sha256) {
+                                clipboard_anti_echo_suppressed = true;
+                            }
+                            if args.clipboard
+                                && !host_sent_reply_clip
+                                && effective_policy.allow_clipboard()
+                            {
+                                host_sent_reply_clip = true;
+                                host_clip_seq = host_clip_seq.wrapping_add(1);
+                                let reply_text = b"ZeroDesk Host B->A clipboard reply";
+                                let bulk_paused = host.session_mut().is_bulk_paused();
+                                if let Ok(tx) = prepare_outbound_clipboard(
+                                    &effective_policy,
+                                    CLIP_MIME_TEXT_UTF8,
+                                    reply_text,
+                                    host_clip_seq,
+                                    0xBEEF_0001,
+                                    bulk_paused,
+                                ) {
+                                    if let Ok(sync_bytes) = tx.sync.encode() {
+                                        let _ = host
+                                            .session_mut()
+                                            .send_l4_raw(
+                                                CHAN_CLIPBOARD,
+                                                CLIP_MSG_SYNC,
+                                                0,
+                                                false,
+                                                &sync_bytes,
+                                            )
+                                            .await;
+                                    }
+                                    for ch in &tx.chunks {
+                                        if let Ok(ch_bytes) = ch.encode() {
+                                            let _ = host
+                                                .session_mut()
+                                                .send_l4_raw(
+                                                    CHAN_CLIPBOARD,
+                                                    CLIP_MSG_CHUNK,
+                                                    0,
+                                                    false,
+                                                    &ch_bytes,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if delivered.mime_kind == CLIP_MIME_IMAGE_PNG {
+                            clipboard_received_png = clipboard_received_png.saturating_add(1);
+                        }
+                    }
+                    ClipboardRecvAction::SessionFatal(reason) => {
+                        close_reason = CloseReason::InvalidFraming;
+                        fatal_error = Some(reason);
+                        break;
+                    }
+                }
+            }
+            Ok(V2RecvEvent::FileTransferRaw(raw)) => {
+                last_peer_activity = Instant::now();
+                executor.touch_activity();
+                match file_rx.on_l4_frame(
+                    &raw.header,
+                    &raw.body,
+                    Instant::now(),
+                    &mut framing_errs,
+                ) {
+                    FileRecvAction::None => {}
+                    FileRecvAction::SendAccept(acc) => {
+                        if let Ok(bytes) = acc.encode() {
+                            let _ = host
+                                .session_mut()
+                                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &bytes)
+                                .await;
+                        }
+                    }
+                    FileRecvAction::SendAck(ack) => {
+                        if let Ok(bytes) = ack.encode() {
+                            let _ = host
+                                .session_mut()
+                                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &bytes)
+                                .await;
+                        }
+                    }
+                    FileRecvAction::SendAbort(ab) => {
+                        if ab.error_code == FILE_ERR_POLICY_DENIED {
+                            file_transfers_aborted_policy =
+                                file_transfers_aborted_policy.saturating_add(1);
+                        }
+                        let _ = host
+                            .session_mut()
+                            .send_l4_raw(
+                                CHAN_FILE_TRANSFER,
+                                FILE_MSG_ABORT,
+                                0,
+                                false,
+                                &ab.encode(),
+                            )
+                            .await;
+                    }
+                    FileRecvAction::SendCompleteAck {
+                        ack,
+                        saved_path,
+                        audit,
+                    } => {
+                        if let Ok(bytes) = ack.encode() {
+                            let _ = host
+                                .session_mut()
+                                .send_l4_raw(
+                                    CHAN_FILE_TRANSFER,
+                                    FILE_MSG_COMPLETE_ACK,
+                                    0,
+                                    false,
+                                    &bytes,
+                                )
+                                .await;
+                        }
+                        if ack.status == 0 {
+                            file_transfers_completed = file_transfers_completed.saturating_add(1);
+                            if let Some(p) = saved_path {
+                                file_saved_paths.push(p.display().to_string());
+                            }
+                            file_sha256_hex.push(audit.sha256_hex);
+                        }
+                    }
+                    FileRecvAction::SessionFatal(reason) => {
+                        close_reason = CloseReason::InvalidFraming;
+                        fatal_error = Some(reason);
+                        break;
+                    }
+                }
+            }
+            Ok(V2RecvEvent::Transport(_)) => {
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
             }
@@ -595,6 +915,59 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                 fatal_error = Some(e.to_string());
                 break;
             }
+        }
+
+        if let Some((ref mut src, ref mut enc, ref mut ts_u32, ref mut next_audio_at)) =
+            audio_tx_state
+        {
+            if Instant::now() >= *next_audio_at {
+                *next_audio_at = Instant::now() + Duration::from_millis(20);
+                if let Some(pcm) = src.next_frame() {
+                    if let Ok(encoded) = enc.encode_frame(&pcm) {
+                        let wire = OpusWireFrame {
+                            ts_u32: *ts_u32,
+                            dtx: encoded.dtx,
+                            payload: encoded.payload,
+                        };
+                        if let Ok(bytes) = wire.encode() {
+                            if host
+                                .session_mut()
+                                .send_l4_raw(CHAN_AUDIO, 0x01, 0, false, &bytes)
+                                .await
+                                .is_ok()
+                            {
+                                audio_frames_sent = audio_frames_sent.saturating_add(1);
+                                if encoded.dtx {
+                                    audio_dtx_frames_sent =
+                                        audio_dtx_frames_sent.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                    *ts_u32 = ts_u32.wrapping_add(AUDIO_FRAME_SAMPLES_PER_CH as u32);
+                }
+            }
+        }
+
+        if let Some(timeout_ack) = clip_rx.poll_timeout(Instant::now()) {
+            if let Ok(ack_bytes) = timeout_ack.encode() {
+                let _ = host
+                    .session_mut()
+                    .send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &ack_bytes)
+                    .await;
+            }
+        }
+        for stall_abort in file_rx.poll_stalls(Instant::now()) {
+            let _ = host
+                .session_mut()
+                .send_l4_raw(
+                    CHAN_FILE_TRANSFER,
+                    FILE_MSG_ABORT,
+                    0,
+                    false,
+                    &stall_abort.encode(),
+                )
+                .await;
         }
 
         if Instant::now() >= next_frame_at {
@@ -626,6 +999,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
     let frames_captured = capture.stats().frames_captured.load(Ordering::Acquire);
     let frames_overwritten = capture.stats().frames_overwritten.load(Ordering::Acquire);
     let (e2ee_session, _enc) = host.into_inner();
+    let p3_dropped = e2ee_session.p3_dropped();
 
     // Strict ordered teardown: latch_closed + release_all -> stop capture (2s) -> 3x SESSION_CLOSE
     // -> shutdown Host Edge B LeaseRenewalTask -> close data plane
@@ -684,6 +1058,22 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         close_reason: close_reason.label(),
         capture_thread_joined: teardown.capture_joined,
         watchdog_thread_joined: watchdog_joined,
+        active_transport_mode,
+        transport_attach_ms,
+        p3_dropped,
+        policy_version,
+        policy_degraded,
+        audio_frames_sent,
+        audio_dtx_frames_sent,
+        audio_policy_denied,
+        clipboard_received_text,
+        clipboard_received_png,
+        clipboard_acks_denied,
+        clipboard_anti_echo_suppressed,
+        file_transfers_completed,
+        file_transfers_aborted_policy,
+        file_saved_paths,
+        file_sha256_hex,
         error: final_error,
     })
 }
@@ -701,6 +1091,11 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
     let mut ready_file: Option<PathBuf> = None;
     let mut enrollment_token: Option<String> = None;
     let mut audit_key_identity = false;
+    let mut transport = TransportMode::Auto;
+    let mut drop_udp = false;
+    let mut audio = false;
+    let mut clipboard = false;
+    let mut download_dir: Option<PathBuf> = None;
 
     let mut i = 2;
     while i < args.len() {
@@ -745,6 +1140,24 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
                 audit_key_identity = true;
                 Ok(())
             }
+            "--transport" => parse_flag_value(args, &mut i, "--transport")
+                .and_then(|v| TransportMode::parse_name(&v).map_err(|e| e.to_string()))
+                .map(|m| transport = m),
+            "--drop-udp" => {
+                drop_udp = true;
+                Ok(())
+            }
+            "--audio" => {
+                audio = true;
+                Ok(())
+            }
+            "--clipboard" => {
+                clipboard = true;
+                Ok(())
+            }
+            "--download-dir" => parse_flag_value(args, &mut i, "--download-dir").map(|v| {
+                download_dir = Some(PathBuf::from(v));
+            }),
             other => Err(format!("unknown argument '{other}'")),
         };
         if let Err(e) = res {
@@ -757,7 +1170,7 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
     let (Some(config), Some(identity_dir), Some(audit_out)) = (config, identity_dir, audit_out)
     else {
         eprintln!(
-            "usage: v2-hostd --config <cluster.json> [--ca-der <path>] [--signaling-tls] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>]"
+            "usage: v2-hostd --config <cluster.json> [--ca-der <path>] [--signaling-tls] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>] [--transport auto|udp|tls443] [--drop-udp] [--audio] [--clipboard] [--download-dir <dir>]"
         );
         return ExitCode::from(2);
     };
@@ -775,6 +1188,11 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
         ready_file,
         enrollment_token,
         audit_key_identity,
+        transport,
+        drop_udp,
+        audio,
+        clipboard,
+        download_dir,
     };
 
     match run_v2_hostd(&host_args).await {
@@ -817,6 +1235,335 @@ struct ControllerClientArgs {
     hold_after_stuck_ms: u64,
     stuck_ready_file: Option<PathBuf>,
     audit_key_identity: bool,
+    transport: TransportMode,
+    drop_udp: bool,
+    audio: bool,
+    clipboard: bool,
+    send_file: Option<PathBuf>,
+    send_file_twice: bool,
+    probe_denied_channels: bool,
+}
+
+struct AudioRecvTracker {
+    jb: AudioJitterBuffer,
+    dec: V2AudioDecoder,
+    decoded_by_idx: BTreeMap<usize, Vec<f32>>,
+    frames_received: u64,
+    dtx_frames_received: u64,
+}
+
+impl AudioRecvTracker {
+    fn new() -> Result<Self, String> {
+        let dec = V2AudioDecoder::new(1).map_err(|e| e.to_string())?;
+        Ok(Self {
+            jb: AudioJitterBuffer::new(AUDIO_JITTER_MIN_FRAMES, AUDIO_JITTER_MAX_FRAMES),
+            dec,
+            decoded_by_idx: BTreeMap::new(),
+            frames_received: 0,
+            dtx_frames_received: 0,
+        })
+    }
+
+    fn on_raw_body(&mut self, body: &[u8]) -> Result<(), String> {
+        let frame = OpusWireFrame::decode(body).map_err(|e| e.to_string())?;
+        self.frames_received = self.frames_received.saturating_add(1);
+        if frame.dtx {
+            self.dtx_frames_received = self.dtx_frames_received.saturating_add(1);
+        }
+        let _ = self.jb.push(frame);
+        while self.jb.buffered_len() >= AUDIO_JITTER_MIN_FRAMES {
+            self.playout_one()?;
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<(), String> {
+        while self.jb.buffered_len() > 0 {
+            self.playout_one()?;
+        }
+        Ok(())
+    }
+
+    fn playout_one(&mut self) -> Result<(), String> {
+        let cur_ts = self.jb.playout_ts();
+        let action = self.jb.pop_playout();
+        if matches!(action, JitterPlayoutAction::WaitingPrime) {
+            return Ok(());
+        }
+        let pcm = self.dec.execute_playout(action).map_err(|e| e.to_string())?;
+        if let Some(ts) = cur_ts {
+            let idx = (ts as usize) / AUDIO_FRAME_SAMPLES_PER_CH;
+            self.decoded_by_idx.insert(idx, pcm);
+        }
+        Ok(())
+    }
+
+    fn compute_active_snr_db(&self) -> Option<f64> {
+        let mut ref_pcm = Vec::new();
+        let mut dec_pcm = Vec::new();
+        for idx in 2..AUDIO_LEAD_ACTIVE_FRAMES.saturating_sub(2) {
+            if let Some(pcm) = self.decoded_by_idx.get(&idx) {
+                ref_pcm.extend_from_slice(&SyntheticMultiToneSource::frame_pcm(1, idx, false));
+                dec_pcm.extend_from_slice(pcm);
+            }
+        }
+        if ref_pcm.len() < AUDIO_FRAME_SAMPLES_PER_CH * 4 {
+            return None;
+        }
+        Some(measure_audio_quality(&ref_pcm, &dec_pcm, AUDIO_FRAME_SAMPLES_PER_CH).snr_db)
+    }
+}
+
+async fn maybe_send_keepalive(
+    session: &mut v2_client::UdpE2eeSession,
+    keepalive_interval: Duration,
+    last_tx: &mut Instant,
+) -> Result<(), String> {
+    if last_tx.elapsed() >= keepalive_interval {
+        session
+            .send_control(CTRL_MSG_KEEPALIVE, &now_ms().to_be_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        *last_tx = Instant::now();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recv_video_p4b_with_keepalive(
+    session: &mut v2_client::UdpE2eeSession,
+    decoder: &mut V2VideoDecoder,
+    need_idr: &mut bool,
+    last_frame_id: &mut Option<u32>,
+    frame_id_monotonic: &mut bool,
+    decode_errors: &mut u64,
+    audio_tracker: Option<&mut AudioRecvTracker>,
+    timeout: Duration,
+    keepalive_interval: Duration,
+    last_tx: &mut Instant,
+) -> Result<(u32, v2_e2e::I420Frame), String> {
+    let deadline = Instant::now() + timeout;
+    let mut audio_opt = audio_tracker;
+    loop {
+        maybe_send_keepalive(session, keepalive_interval, last_tx).await?;
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("controller p4b video recv timed out".into());
+        };
+        let until_ka = keepalive_interval
+            .saturating_sub(last_tx.elapsed())
+            .max(Duration::from_millis(1));
+        match session.recv_v124_event(rem.min(until_ka)).await {
+            Ok(V2RecvEvent::Transport(TransportEvent::VideoFrame(vf))) => {
+                if *need_idr && !vf.is_idr {
+                    continue;
+                }
+                if let Some(prev) = *last_frame_id {
+                    if vf.frame_id <= prev {
+                        *frame_id_monotonic = false;
+                        continue;
+                    }
+                }
+                match decoder.decode_raw(&vf.data) {
+                    Ok(i420) => {
+                        *need_idr = false;
+                        *last_frame_id = Some(vf.frame_id);
+                        return Ok((vf.frame_id, i420));
+                    }
+                    Err(_) => {
+                        *decode_errors = decode_errors.saturating_add(1);
+                        *need_idr = true;
+                    }
+                }
+            }
+            Ok(V2RecvEvent::AudioRaw(raw)) => {
+                if let Some(ref mut tr) = audio_opt {
+                    tr.on_raw_body(&raw.body)?;
+                }
+            }
+            Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
+                if let Some(code) = parse_session_close(&ctrl) {
+                    return Err(format!("peer closed session: 0x{code:04x}"));
+                }
+            }
+            Ok(_) => {}
+            Err(v2_client::ClientError::Timeout(_)) => {
+                if Instant::now() >= deadline {
+                    return Err("controller p4b video recv timed out".into());
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+async fn send_hid_and_await_echo_p4b(
+    session: &mut v2_client::UdpE2eeSession,
+    payload: &HidPayload,
+    expected_seq: u32,
+    audio_tracker: Option<&mut AudioRecvTracker>,
+    timeout: Duration,
+    keepalive_interval: Duration,
+    last_tx: &mut Instant,
+) -> Result<(), String> {
+    let frame = encode_hid_frame(payload).map_err(|e| e.to_string())?;
+    session.send_hid(&frame).await.map_err(|e| e.to_string())?;
+    *last_tx = Instant::now();
+    let deadline = Instant::now() + timeout;
+    let mut audio_opt = audio_tracker;
+    loop {
+        maybe_send_keepalive(session, keepalive_interval, last_tx).await?;
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(format!("HID seq {expected_seq} echo timed out"));
+        };
+        let until_ka = keepalive_interval
+            .saturating_sub(last_tx.elapsed())
+            .max(Duration::from_millis(1));
+        match session.recv_v124_event(rem.min(until_ka)).await {
+            Ok(V2RecvEvent::Transport(TransportEvent::Hid(hf))) => {
+                if let Ok(HidPayload::EchoAck(ack)) = decode_hid_frame(&hf) {
+                    if ack.echo_seq == expected_seq {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(V2RecvEvent::AudioRaw(raw)) => {
+                if let Some(ref mut tr) = audio_opt {
+                    tr.on_raw_body(&raw.body)?;
+                }
+            }
+            Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
+                if let Some(code) = parse_session_close(&ctrl) {
+                    return Err(format!("peer closed session during HID echo: 0x{code:04x}"));
+                }
+            }
+            Ok(_) => {}
+            Err(v2_client::ClientError::Timeout(_)) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("HID seq {expected_seq} echo timed out"));
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_file_transfer_p4b(
+    session: &mut v2_client::UdpE2eeSession,
+    policy: &v2_e2e::EffectiveTenantPolicy,
+    transfer_id: u64,
+    rel_name: &str,
+    data: &[u8],
+    audio_tracker: Option<&mut AudioRecvTracker>,
+    keepalive_interval: Duration,
+    last_tx: &mut Instant,
+) -> Result<[u8; 32], String> {
+    let sha256: [u8; 32] = Sha256::digest(data).into();
+    let (mut win, offer) = FileSenderWindow::new(
+        policy,
+        transfer_id,
+        rel_name,
+        data.len() as u64,
+        FILE_E2E_CHUNK_SIZE,
+        sha256,
+        Instant::now(),
+    )
+    .map_err(|e| format!("prepare FileOffer: {e}"))?;
+    session
+        .send_l4_raw(
+            CHAN_FILE_TRANSFER,
+            FILE_MSG_OFFER,
+            0,
+            false,
+            &offer.encode().map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    *last_tx = Instant::now();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut audio_opt = audio_tracker;
+    let mut complete_sent = false;
+    loop {
+        maybe_send_keepalive(session, keepalive_interval, last_tx).await?;
+        let bulk_paused = session.is_bulk_paused();
+        while let Some((offset, len)) = win.next_chunk_range(bulk_paused) {
+            let start = offset as usize;
+            let end = start + len;
+            let chunk = FileChunk {
+                transfer_id,
+                offset,
+                data: data[start..end].to_vec(),
+            };
+            let chunk_bytes = chunk.encode().map_err(|e| e.to_string())?;
+            session
+                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_CHUNK, 0, false, &chunk_bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+            win.mark_chunk_sent(offset, len, Instant::now());
+            *last_tx = Instant::now();
+        }
+        if !complete_sent && win.ready_for_complete() {
+            let comp = win.build_complete(Instant::now());
+            session
+                .send_l4_raw(
+                    CHAN_FILE_TRANSFER,
+                    FILE_MSG_COMPLETE,
+                    0,
+                    false,
+                    &comp.encode(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            complete_sent = true;
+            *last_tx = Instant::now();
+        }
+
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("file transfer timed out".into());
+        };
+        let wait = rem.min(Duration::from_millis(50));
+        match session.recv_v124_event(wait).await {
+            Ok(V2RecvEvent::FileTransferRaw(raw)) => {
+                match decode_file_l4(&raw.header, &raw.body).map_err(|e| e.to_string())? {
+                    FileMessage::Accept(acc) if acc.transfer_id == transfer_id => {
+                        win.on_accept(&acc, Instant::now())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    FileMessage::Ack(ack) if ack.transfer_id == transfer_id => {
+                        win.on_ack(&ack, Instant::now())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    FileMessage::CompleteAck(cack) if cack.transfer_id == transfer_id => {
+                        if cack.status != 0 {
+                            return Err(format!(
+                                "FILE_COMPLETE_ACK status={}",
+                                cack.status
+                            ));
+                        }
+                        return Ok(sha256);
+                    }
+                    FileMessage::Abort(ab) if ab.transfer_id == transfer_id => {
+                        return Err(format!("FILE_ABORT error_code=0x{:04x}", ab.error_code));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(V2RecvEvent::AudioRaw(raw)) => {
+                if let Some(ref mut tr) = audio_opt {
+                    tr.on_raw_body(&raw.body)?;
+                }
+            }
+            Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
+                if let Some(code) = parse_session_close(&ctrl) {
+                    return Err(format!("peer closed during file transfer: 0x{code:04x}"));
+                }
+            }
+            Ok(_) => {}
+            Err(v2_client::ClientError::Timeout(_)) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 async fn recv_video_with_keepalive(
@@ -876,6 +1623,8 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
         v2_cfg.signaling_tls = Some(true);
     }
     v2_cfg.codec = args.codec;
+    v2_cfg.transport_mode = args.transport;
+    v2_cfg.drop_udp_for_test = args.drop_udp;
     v2_cfg.validate().map_err(|e| e.to_string())?;
 
     let dispatcher = UiCallbackDispatcher::spawn(Arc::new(NoopUiCallback));
@@ -894,192 +1643,626 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
         .map_err(|e| e.to_string())?;
 
     let handshake_hash_hex = hex::encode(connected.hs_hash);
+    let active_transport_mode = connected.active_transport_mode.label().to_string();
+    let transport_attach_ms = connected.transport_attach_ms;
+    let effective_policy = connected.effective_policy;
+    let policy_version = effective_policy.version;
+    let policy_degraded = effective_policy.degraded;
     let keepalive_interval = connected.keepalive_interval;
     let lease_renewal = connected.lease_renewal;
-
-    let decoder = V2VideoDecoder::new(args.codec).map_err(|e| e.to_string())?;
-    let mut controller = DesktopControllerSession::new(connected.e2ee_session, decoder);
 
     let mut frames_decoded = 0u64;
     let mut last_frame_id: Option<u32> = None;
     let mut frame_id_monotonic = true;
+    let mut decode_errors = 0u64;
+    let mut decoder_flushed_frames = 0u64;
     let mut hid_events_sent = 0u64;
     let mut visual_marker_before_hid = false;
     let mut visual_marker_detected_frames = 0u64;
     let mut sent_audit = Vec::<AuditRecord>::new();
     let mut last_tx = Instant::now();
 
-    let run_res: Result<(), String> = if args.leave_stuck {
-        async {
-            let first = recv_video_with_keepalive(
-                &mut controller,
-                Duration::from_secs(10),
-                keepalive_interval,
-                &mut last_tx,
-            )
-            .await
-            .map_err(|e| format!("initial video recv failed: {e}"))?;
-            last_frame_id = Some(first.frame.frame_id);
-            frames_decoded += 1;
+    let mut audio_frames_received = 0u64;
+    let mut audio_dtx_frames_received = 0u64;
+    let mut audio_snr_db: Option<f64> = None;
+    let mut audio_local_policy_denied = !effective_policy.allow_audio();
+    let mut clipboard_acks_ok = 0u64;
+    let mut clipboard_acks_denied = 0u64;
+    let mut clipboard_local_policy_denied = !effective_policy.allow_clipboard();
+    let mut clipboard_anti_echo_preserved = false;
+    let mut file_transfers_completed = 0u64;
+    let mut file_transfers_aborted_policy = 0u64;
+    let mut file_local_policy_denied = !effective_policy.allow_file_transfer();
+    let mut file_sha256_hex = Vec::<String>::new();
 
-            let base_ts = now_ms();
-            let key_audit = |k: SafeHidKey| {
-                if args.audit_key_identity {
-                    AuditKey::Key(k)
-                } else {
-                    AuditKey::Redacted
+    let p4b_channels_active =
+        args.audio || args.clipboard || args.send_file.is_some() || args.probe_denied_channels;
+
+    let (run_res, p3_dropped): (Result<(), String>, u64) = if !p4b_channels_active {
+        let decoder = V2VideoDecoder::new(args.codec).map_err(|e| e.to_string())?;
+        let mut controller = DesktopControllerSession::new(connected.e2ee_session, decoder);
+
+        let res: Result<(), String> = if args.leave_stuck {
+            async {
+                let first = recv_video_with_keepalive(
+                    &mut controller,
+                    Duration::from_secs(10),
+                    keepalive_interval,
+                    &mut last_tx,
+                )
+                .await
+                .map_err(|e| format!("initial video recv failed: {e}"))?;
+                last_frame_id = Some(first.frame.frame_id);
+                frames_decoded += 1;
+
+                let base_ts = now_ms();
+                let key_audit = |k: SafeHidKey| {
+                    if args.audit_key_identity {
+                        AuditKey::Key(k)
+                    } else {
+                        AuditKey::Redacted
+                    }
+                };
+                let stuck_events = [
+                    (
+                        0u32,
+                        HidPayload::Key(KeyEvent {
+                            down: true,
+                            modifiers: MOD_SHIFT,
+                            usb_hid_usage: SafeHidKey::LeftShift.usb_hid_usage(),
+                            unicode_scalar: 0,
+                            client_ts_ms: base_ts,
+                        }),
+                        AuditRecord::KeyDown {
+                            seq: 0,
+                            key: key_audit(SafeHidKey::LeftShift),
+                            ts_ms: base_ts,
+                        },
+                    ),
+                    (
+                        1u32,
+                        HidPayload::Key(KeyEvent {
+                            down: true,
+                            modifiers: MOD_SHIFT,
+                            usb_hid_usage: SafeHidKey::KeyA.usb_hid_usage(),
+                            unicode_scalar: 'A' as u32,
+                            client_ts_ms: base_ts + 1,
+                        }),
+                        AuditRecord::KeyDown {
+                            seq: 1,
+                            key: key_audit(SafeHidKey::KeyA),
+                            ts_ms: base_ts + 1,
+                        },
+                    ),
+                    (
+                        2u32,
+                        HidPayload::Mouse(MouseEvent {
+                            kind: MouseKind::Down,
+                            buttons: MOUSE_BUTTON_LEFT,
+                            x_or_dx: MARKER_TARGET_X,
+                            y_or_dy: MARKER_TARGET_Y,
+                            wheel_dx: 0,
+                            wheel_dy: 0,
+                            client_ts_ms: base_ts + 2,
+                        }),
+                        AuditRecord::MouseDown {
+                            seq: 2,
+                            button_bit: MOUSE_BUTTON_LEFT,
+                            x: MARKER_TARGET_X,
+                            y: MARKER_TARGET_Y,
+                            ts_ms: base_ts + 2,
+                        },
+                    ),
+                ];
+                for (expected_seq, payload, rec) in stuck_events {
+                    let _ = controller
+                        .send_hid_and_await_echo(&payload, expected_seq, Duration::from_secs(5))
+                        .await
+                        .map_err(|e| format!("stuck HID seq {expected_seq} echo failed: {e}"))?;
+                    last_tx = Instant::now();
+                    hid_events_sent += 1;
+                    sent_audit.push(rec);
                 }
-            };
-            let stuck_events = [
-                (
-                    0u32,
-                    HidPayload::Key(KeyEvent {
-                        down: true,
-                        modifiers: MOD_SHIFT,
-                        usb_hid_usage: SafeHidKey::LeftShift.usb_hid_usage(),
-                        unicode_scalar: 0,
-                        client_ts_ms: base_ts,
-                    }),
-                    AuditRecord::KeyDown {
-                        seq: 0,
-                        key: key_audit(SafeHidKey::LeftShift),
-                        ts_ms: base_ts,
-                    },
-                ),
-                (
-                    1u32,
-                    HidPayload::Key(KeyEvent {
-                        down: true,
-                        modifiers: MOD_SHIFT,
-                        usb_hid_usage: SafeHidKey::KeyA.usb_hid_usage(),
-                        unicode_scalar: 'A' as u32,
-                        client_ts_ms: base_ts + 1,
-                    }),
-                    AuditRecord::KeyDown {
-                        seq: 1,
-                        key: key_audit(SafeHidKey::KeyA),
-                        ts_ms: base_ts + 1,
-                    },
-                ),
-                (
-                    2u32,
-                    HidPayload::Mouse(MouseEvent {
-                        kind: MouseKind::Down,
-                        buttons: MOUSE_BUTTON_LEFT,
-                        x_or_dx: MARKER_TARGET_X,
-                        y_or_dy: MARKER_TARGET_Y,
-                        wheel_dx: 0,
-                        wheel_dy: 0,
-                        client_ts_ms: base_ts + 2,
-                    }),
-                    AuditRecord::MouseDown {
-                        seq: 2,
-                        button_bit: MOUSE_BUTTON_LEFT,
-                        x: MARKER_TARGET_X,
-                        y: MARKER_TARGET_Y,
-                        ts_ms: base_ts + 2,
-                    },
-                ),
-            ];
-            for (expected_seq, payload, rec) in stuck_events {
-                let _ = controller
-                    .send_hid_and_await_echo(&payload, expected_seq, Duration::from_secs(5))
-                    .await
-                    .map_err(|e| format!("stuck HID seq {expected_seq} echo failed: {e}"))?;
-                last_tx = Instant::now();
-                hid_events_sent += 1;
-                sent_audit.push(rec);
-            }
-            write_audit_records_jsonl(&sent_audit, &args.audit_out)
-                .map_err(|e| format!("write controller audit: {e}"))?;
-            if let Some(path) = &args.stuck_ready_file {
-                write_file_atomic_0600(path, b"ready\n").map_err(|e| e.to_string())?;
-            }
-            eprintln!("[v2-ctl] stuck_ready");
+                write_audit_records_jsonl(&sent_audit, &args.audit_out)
+                    .map_err(|e| format!("write controller audit: {e}"))?;
+                if let Some(path) = &args.stuck_ready_file {
+                    write_file_atomic_0600(path, b"ready\n").map_err(|e| e.to_string())?;
+                }
+                eprintln!("[v2-ctl] stuck_ready");
 
-            if args.hold_after_stuck_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(args.hold_after_stuck_ms)).await;
+                if args.hold_after_stuck_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(args.hold_after_stuck_ms)).await;
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await
+            .await
+        } else {
+            async {
+                let target_frames = args.frames.max(1);
+                let pre_hid_frames = 2usize.min(target_frames);
+                for _ in 0..pre_hid_frames {
+                    let d = recv_video_with_keepalive(
+                        &mut controller,
+                        Duration::from_secs(10),
+                        keepalive_interval,
+                        &mut last_tx,
+                    )
+                    .await
+                    .map_err(|e| format!("pre-HID video recv: {e}"))?;
+                    if let Some(prev) = last_frame_id {
+                        if d.frame.frame_id <= prev {
+                            frame_id_monotonic = false;
+                        }
+                    }
+                    last_frame_id = Some(d.frame.frame_id);
+                    frames_decoded += 1;
+                    if detect_visual_marker(&d.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
+                        visual_marker_before_hid = true;
+                    }
+                }
+
+                let script = build_v123_hid_script(args.audit_key_identity);
+                for (idx, (payload, rec)) in script.into_iter().enumerate() {
+                    let _ = controller
+                        .send_hid_and_await_echo(&payload, idx as u32, Duration::from_secs(5))
+                        .await
+                        .map_err(|e| format!("HID seq {idx} echo failed: {e}"))?;
+                    last_tx = Instant::now();
+                    hid_events_sent += 1;
+                    sent_audit.push(rec);
+                }
+
+                while (frames_decoded as usize) < target_frames {
+                    let d = recv_video_with_keepalive(
+                        &mut controller,
+                        Duration::from_secs(10),
+                        keepalive_interval,
+                        &mut last_tx,
+                    )
+                    .await
+                    .map_err(|e| format!("post-HID video recv: {e}"))?;
+                    if let Some(prev) = last_frame_id {
+                        if d.frame.frame_id <= prev {
+                            frame_id_monotonic = false;
+                        }
+                    }
+                    last_frame_id = Some(d.frame.frame_id);
+                    frames_decoded += 1;
+                    if detect_visual_marker(&d.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
+                        visual_marker_detected_frames += 1;
+                    }
+                }
+
+                let _ = controller.flush_decoder();
+                write_audit_records_jsonl(&sent_audit, &args.audit_out)
+                    .map_err(|e| format!("write controller audit: {e}"))?;
+                Ok(())
+            }
+            .await
+        };
+
+        let p3_drop = controller.session().p3_dropped();
+        let _ = send_redundant_session_close_3x(controller.session_mut(), 0x0000).await;
+        decode_errors = controller.decode_errors;
+        decoder_flushed_frames = controller.decoder_flushed_frames;
+        (res, p3_drop)
     } else {
-        async {
+        let mut session = connected.e2ee_session;
+        let mut decoder = V2VideoDecoder::new(args.codec).map_err(|e| e.to_string())?;
+        let mut need_idr = true;
+        let mut audio_tracker = if args.audio && effective_policy.allow_audio() {
+            Some(AudioRecvTracker::new()?)
+        } else {
+            None
+        };
+
+        let res: Result<(), String> = async {
             let target_frames = args.frames.max(1);
             let pre_hid_frames = 2usize.min(target_frames);
             for _ in 0..pre_hid_frames {
-                let d = recv_video_with_keepalive(
-                    &mut controller,
+                let (_fid, i420) = recv_video_p4b_with_keepalive(
+                    &mut session,
+                    &mut decoder,
+                    &mut need_idr,
+                    &mut last_frame_id,
+                    &mut frame_id_monotonic,
+                    &mut decode_errors,
+                    audio_tracker.as_mut(),
                     Duration::from_secs(10),
                     keepalive_interval,
                     &mut last_tx,
                 )
                 .await
                 .map_err(|e| format!("pre-HID video recv: {e}"))?;
-                if let Some(prev) = last_frame_id {
-                    if d.frame.frame_id <= prev {
-                        frame_id_monotonic = false;
-                    }
-                }
-                last_frame_id = Some(d.frame.frame_id);
                 frames_decoded += 1;
-                if detect_visual_marker(&d.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
+                if detect_visual_marker(&i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
                     visual_marker_before_hid = true;
                 }
             }
 
             let script = build_v123_hid_script(args.audit_key_identity);
             for (idx, (payload, rec)) in script.into_iter().enumerate() {
-                let _ = controller
-                    .send_hid_and_await_echo(&payload, idx as u32, Duration::from_secs(5))
-                    .await
-                    .map_err(|e| format!("HID seq {idx} echo failed: {e}"))?;
-                last_tx = Instant::now();
+                send_hid_and_await_echo_p4b(
+                    &mut session,
+                    &payload,
+                    idx as u32,
+                    audio_tracker.as_mut(),
+                    Duration::from_secs(5),
+                    keepalive_interval,
+                    &mut last_tx,
+                )
+                .await
+                .map_err(|e| format!("HID seq {idx} echo failed: {e}"))?;
                 hid_events_sent += 1;
                 sent_audit.push(rec);
             }
 
             while (frames_decoded as usize) < target_frames {
-                let d = recv_video_with_keepalive(
-                    &mut controller,
+                let (_fid, i420) = recv_video_p4b_with_keepalive(
+                    &mut session,
+                    &mut decoder,
+                    &mut need_idr,
+                    &mut last_frame_id,
+                    &mut frame_id_monotonic,
+                    &mut decode_errors,
+                    audio_tracker.as_mut(),
                     Duration::from_secs(10),
                     keepalive_interval,
                     &mut last_tx,
                 )
                 .await
                 .map_err(|e| format!("post-HID video recv: {e}"))?;
-                if let Some(prev) = last_frame_id {
-                    if d.frame.frame_id <= prev {
-                        frame_id_monotonic = false;
-                    }
-                }
-                last_frame_id = Some(d.frame.frame_id);
                 frames_decoded += 1;
-                if detect_visual_marker(&d.i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
+                if detect_visual_marker(&i420, MARKER_TARGET_X, MARKER_TARGET_Y).detected {
                     visual_marker_detected_frames += 1;
                 }
             }
 
-            let _ = controller.flush_decoder();
+            if let Ok(flushed) = decoder.flush_pending() {
+                decoder_flushed_frames = flushed.len() as u64;
+            }
             write_audit_records_jsonl(&sent_audit, &args.audit_out)
                 .map_err(|e| format!("write controller audit: {e}"))?;
+
+            if args.probe_denied_channels {
+                // Verify Controller-side policy gate first:
+                audio_local_policy_denied = !effective_policy.allow_audio();
+                clipboard_local_policy_denied = !effective_policy.allow_clipboard();
+                file_local_policy_denied = !effective_policy.allow_file_transfer();
+
+                // Now intentionally send raw channel probes to verify Host-side defense-in-depth!
+                let clip_payload = b"denied-probe-text";
+                let clip_sync = ClipSync {
+                    mime_kind: CLIP_MIME_TEXT_UTF8,
+                    clip_id: 901,
+                    origin_nonce: 0xDEAD_0001,
+                    total_len: clip_payload.len() as u32,
+                    total_chunks: 1,
+                    sha256: Sha256::digest(clip_payload).into(),
+                };
+                let clip_sync_bytes = clip_sync.encode().map_err(|e| e.to_string())?;
+                session
+                    .send_l4_raw(
+                        CHAN_CLIPBOARD,
+                        CLIP_MSG_SYNC,
+                        0,
+                        false,
+                        &clip_sync_bytes,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let file_offer = FileOffer {
+                    transfer_id: 902,
+                    file_size: 16,
+                    chunk_size: FILE_E2E_CHUNK_SIZE,
+                    sha256: Sha256::digest(b"0123456789abcdef").into(),
+                    rel_name: "denied.txt".into(),
+                };
+                session
+                    .send_l4_raw(
+                        CHAN_FILE_TRANSFER,
+                        FILE_MSG_OFFER,
+                        0,
+                        false,
+                        &file_offer.encode().map_err(|e| e.to_string())?,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let audio_probe = OpusWireFrame {
+                    ts_u32: 0,
+                    dtx: true,
+                    payload: Vec::new(),
+                };
+                session
+                    .send_l4_raw(
+                        CHAN_AUDIO,
+                        0x01,
+                        0,
+                        false,
+                        &audio_probe.encode().map_err(|e| e.to_string())?,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                last_tx = Instant::now();
+
+                let probe_deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < probe_deadline
+                    && (clipboard_acks_denied == 0 || file_transfers_aborted_policy == 0)
+                {
+                    maybe_send_keepalive(&mut session, keepalive_interval, &mut last_tx).await?;
+                    match session.recv_v124_event(Duration::from_millis(50)).await {
+                        Ok(V2RecvEvent::ClipboardRaw(raw)) => {
+                            if let Ok(ClipMessage::Ack(ack)) =
+                                decode_clipboard_l4(&raw.header, &raw.body)
+                            {
+                                if ack.status == CLIP_ACK_POLICY_DENIED {
+                                    clipboard_acks_denied = clipboard_acks_denied.saturating_add(1);
+                                }
+                            }
+                        }
+                        Ok(V2RecvEvent::FileTransferRaw(raw)) => {
+                            if let Ok(FileMessage::Abort(ab)) =
+                                decode_file_l4(&raw.header, &raw.body)
+                            {
+                                if ab.error_code == FILE_ERR_POLICY_DENIED {
+                                    file_transfers_aborted_policy =
+                                        file_transfers_aborted_policy.saturating_add(1);
+                                }
+                            }
+                        }
+                        Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
+                            if let Some(code) = parse_session_close(&ctrl) {
+                                return Err(format!("peer closed during denied probe: 0x{code:04x}"));
+                            }
+                        }
+                        Ok(_) | Err(v2_client::ClientError::Timeout(_)) => {}
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                // Brief settle so Host processes the audio probe frame before SESSION_CLOSE.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            } else {
+                if args.clipboard {
+                    let mut clip_rx = ClipboardReceiver::new(effective_policy.clone());
+                    let mut clip_framing = ChannelFramingErrorCounter::new();
+                    let text_a = "ZeroDesk Phase 4B UTF-8 clipboard 🚀".as_bytes();
+                    let hash_a: [u8; 32] = Sha256::digest(text_a).into();
+
+                    // Step 1: A -> B UTF-8 text (clip_id=1)
+                    let tx1 = prepare_outbound_clipboard(
+                        &effective_policy,
+                        CLIP_MIME_TEXT_UTF8,
+                        text_a,
+                        1,
+                        0xCAFE_0001,
+                        session.is_bulk_paused(),
+                    )
+                    .map_err(|e| format!("prepare clip 1: {e}"))?;
+                    let tx1_sync_bytes = tx1.sync.encode().map_err(|e| e.to_string())?;
+                    session
+                        .send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &tx1_sync_bytes)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    for ch in &tx1.chunks {
+                        let ch_bytes = ch.encode().map_err(|e| e.to_string())?;
+                        session
+                            .send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &ch_bytes)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    last_tx = Instant::now();
+
+                    // Await CLIP_ACK(1, OK) AND Host B->A reply clipboard item
+                    let mut ack1_ok = false;
+                    let mut got_host_reply_hash: Option<[u8; 32]> = None;
+                    let clip_deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < clip_deadline && (!ack1_ok || got_host_reply_hash.is_none())
+                    {
+                        maybe_send_keepalive(&mut session, keepalive_interval, &mut last_tx)
+                            .await?;
+                        match session.recv_v124_event(Duration::from_millis(50)).await {
+                            Ok(V2RecvEvent::ClipboardRaw(raw)) => {
+                                if let Ok(ClipMessage::Ack(ack)) =
+                                    decode_clipboard_l4(&raw.header, &raw.body)
+                                {
+                                    if ack.clip_id == 1 && ack.status == CLIP_ACK_OK {
+                                        ack1_ok = true;
+                                        clipboard_acks_ok = clipboard_acks_ok.saturating_add(1);
+                                    } else if ack.status == CLIP_ACK_POLICY_DENIED {
+                                        clipboard_acks_denied =
+                                            clipboard_acks_denied.saturating_add(1);
+                                    }
+                                    continue;
+                                }
+                                match clip_rx.on_l4_frame(
+                                    &raw.header,
+                                    &raw.body,
+                                    Instant::now(),
+                                    &mut clip_framing,
+                                ) {
+                                    ClipboardRecvAction::DeliverAndAck { delivered, ack } => {
+                                        if let Ok(ack_bytes) = ack.encode() {
+                                            let _ = session
+                                                .send_l4_raw(
+                                                    CHAN_CLIPBOARD,
+                                                    CLIP_MSG_ACK,
+                                                    0,
+                                                    false,
+                                                    &ack_bytes,
+                                                )
+                                                .await;
+                                        }
+                                        got_host_reply_hash = Some(delivered.sha256);
+                                    }
+                                    ClipboardRecvAction::SendAck(ack) => {
+                                        if let Ok(ack_bytes) = ack.encode() {
+                                            let _ = session
+                                                .send_l4_raw(
+                                                    CHAN_CLIPBOARD,
+                                                    CLIP_MSG_ACK,
+                                                    0,
+                                                    false,
+                                                    &ack_bytes,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                    ClipboardRecvAction::None => {}
+                                    ClipboardRecvAction::SessionFatal(r) => return Err(r),
+                                }
+                            }
+                            Ok(V2RecvEvent::AudioRaw(raw)) => {
+                                if let Some(ref mut tr) = audio_tracker {
+                                    tr.on_raw_body(&raw.body)?;
+                                }
+                            }
+                            Ok(_) | Err(v2_client::ClientError::Timeout(_)) => {}
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    if !ack1_ok {
+                        return Err("timed out awaiting CLIP_ACK(1, OK)".into());
+                    }
+                    if let Some(hash_b) = got_host_reply_hash {
+                        let echo_suppressed = !clip_rx.anti_echo.should_sync_local(hash_b);
+                        let aba_preserved = clip_rx.anti_echo.should_sync_local(hash_a);
+                        clipboard_anti_echo_preserved = echo_suppressed && aba_preserved;
+                    }
+
+                    // Step 2: Re-send A -> B UTF-8 (clip_id=2, proving A->B->A flows cleanly)
+                    // and Step 3: A -> B valid PNG (clip_id=3)
+                    let items: &[(u64, u8, &[u8])] = &[
+                        (2, CLIP_MIME_TEXT_UTF8, text_a),
+                        (3, CLIP_MIME_IMAGE_PNG, VALID_MINIMAL_PNG),
+                    ];
+                    for &(cid, mime, data) in items {
+                        let tx = prepare_outbound_clipboard(
+                            &effective_policy,
+                            mime,
+                            data,
+                            cid,
+                            0xCAFE_0000 + cid,
+                            session.is_bulk_paused(),
+                        )
+                        .map_err(|e| format!("prepare clip {cid}: {e}"))?;
+                        let sync_bytes = tx.sync.encode().map_err(|e| e.to_string())?;
+                        session
+                            .send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        for ch in &tx.chunks {
+                            let ch_bytes = ch.encode().map_err(|e| e.to_string())?;
+                            session
+                                .send_l4_raw(
+                                    CHAN_CLIPBOARD,
+                                    CLIP_MSG_CHUNK,
+                                    0,
+                                    false,
+                                    &ch_bytes,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        last_tx = Instant::now();
+                        let ack_deadline = Instant::now() + Duration::from_secs(10);
+                        let mut got_ack = false;
+                        while Instant::now() < ack_deadline && !got_ack {
+                            maybe_send_keepalive(&mut session, keepalive_interval, &mut last_tx)
+                                .await?;
+                            match session.recv_v124_event(Duration::from_millis(50)).await {
+                                Ok(V2RecvEvent::ClipboardRaw(raw)) => {
+                                    if let Ok(ClipMessage::Ack(ack)) =
+                                        decode_clipboard_l4(&raw.header, &raw.body)
+                                    {
+                                        if ack.clip_id == cid && ack.status == CLIP_ACK_OK {
+                                            got_ack = true;
+                                            clipboard_acks_ok = clipboard_acks_ok.saturating_add(1);
+                                        }
+                                    }
+                                }
+                                Ok(V2RecvEvent::AudioRaw(raw)) => {
+                                    if let Some(ref mut tr) = audio_tracker {
+                                        tr.on_raw_body(&raw.body)?;
+                                    }
+                                }
+                                Ok(_) | Err(v2_client::ClientError::Timeout(_)) => {}
+                                Err(e) => return Err(e.to_string()),
+                            }
+                        }
+                        if !got_ack {
+                            return Err(format!("timed out awaiting CLIP_ACK({cid}, OK)"));
+                        }
+                    }
+                }
+
+                if let Some(ref file_path) = args.send_file {
+                    let bytes = fs::read(file_path)
+                        .map_err(|e| format!("read --send-file '{}': {e}", file_path.display()))?;
+                    let rel_name = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| "invalid --send-file filename".to_string())?;
+                    let sends = if args.send_file_twice { 2u64 } else { 1u64 };
+                    for send_idx in 1..=sends {
+                        let sha = push_file_transfer_p4b(
+                            &mut session,
+                            &effective_policy,
+                            100 + send_idx,
+                            rel_name,
+                            &bytes,
+                            audio_tracker.as_mut(),
+                            keepalive_interval,
+                            &mut last_tx,
+                        )
+                        .await?;
+                        file_transfers_completed = file_transfers_completed.saturating_add(1);
+                        file_sha256_hex.push(hex::encode(sha));
+                    }
+                }
+
+                if let Some(ref mut tr) = audio_tracker {
+                    let target_audio =
+                        (AUDIO_LEAD_ACTIVE_FRAMES + AUDIO_SILENCE_DTX_FRAMES) as u64;
+                    let audio_deadline = Instant::now() + Duration::from_secs(3);
+                    while tr.frames_received < target_audio && Instant::now() < audio_deadline {
+                        maybe_send_keepalive(&mut session, keepalive_interval, &mut last_tx)
+                            .await?;
+                        match session.recv_v124_event(Duration::from_millis(50)).await {
+                            Ok(V2RecvEvent::AudioRaw(raw)) => {
+                                tr.on_raw_body(&raw.body)?;
+                            }
+                            Ok(_) | Err(v2_client::ClientError::Timeout(_)) => {}
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    tr.drain()?;
+                    audio_frames_received = tr.frames_received;
+                    audio_dtx_frames_received = tr.dtx_frames_received;
+                    audio_snr_db = tr.compute_active_snr_db();
+                }
+            }
+
             Ok(())
         }
-        .await
+        .await;
+
+        let p3_drop = session.p3_dropped();
+        let _ = send_redundant_session_close_3x(&mut session, 0x0000).await;
+        (res, p3_drop)
     };
 
-    let _ = send_redundant_session_close_3x(controller.session_mut(), 0x0000).await;
     let lease_shut = lease_renewal.shutdown().await;
     if let Some(mut sig) = client.take_signaling() {
         let _ = sig.shutdown().await;
     }
 
-    let decode_errors = controller.decode_errors;
-    let decoder_flushed_frames = controller.decoder_flushed_frames;
     let final_error = run_res.err().or(lease_shut.join_error);
     let pass = final_error.is_none()
         && frame_id_monotonic
         && decode_errors == 0
+        && p3_dropped == 0
         && (args.leave_stuck
             || (frames_decoded as usize >= args.frames.max(1)
                 && !visual_marker_before_hid
@@ -1103,6 +2286,23 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
         lease_renewals_ok: lease_shut.renewals_ok,
         lease_renewals_err: lease_shut.renewals_err,
         leave_stuck: args.leave_stuck,
+        active_transport_mode,
+        transport_attach_ms,
+        p3_dropped,
+        policy_version,
+        policy_degraded,
+        audio_frames_received,
+        audio_dtx_frames_received,
+        audio_snr_db,
+        audio_local_policy_denied,
+        clipboard_acks_ok,
+        clipboard_acks_denied,
+        clipboard_local_policy_denied,
+        clipboard_anti_echo_preserved,
+        file_transfers_completed,
+        file_transfers_aborted_policy,
+        file_local_policy_denied,
+        file_sha256_hex,
         error: final_error,
     })
 }
@@ -1122,6 +2322,13 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
     let mut hold_after_stuck_ms = 0u64;
     let mut stuck_ready_file: Option<PathBuf> = None;
     let mut audit_key_identity = false;
+    let mut transport = TransportMode::Auto;
+    let mut drop_udp = false;
+    let mut audio = false;
+    let mut clipboard = false;
+    let mut send_file: Option<PathBuf> = None;
+    let mut send_file_twice = false;
+    let mut probe_denied_channels = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -1178,6 +2385,32 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
                 audit_key_identity = true;
                 Ok(())
             }
+            "--transport" => parse_flag_value(args, &mut i, "--transport")
+                .and_then(|v| TransportMode::parse_name(&v).map_err(|e| e.to_string()))
+                .map(|m| transport = m),
+            "--drop-udp" => {
+                drop_udp = true;
+                Ok(())
+            }
+            "--audio" => {
+                audio = true;
+                Ok(())
+            }
+            "--clipboard" => {
+                clipboard = true;
+                Ok(())
+            }
+            "--send-file" => parse_flag_value(args, &mut i, "--send-file").map(|v| {
+                send_file = Some(PathBuf::from(v));
+            }),
+            "--send-file-twice" => {
+                send_file_twice = true;
+                Ok(())
+            }
+            "--probe-denied-channels" => {
+                probe_denied_channels = true;
+                Ok(())
+            }
             other => Err(format!("unknown argument '{other}'")),
         };
         if let Err(e) = res {
@@ -1204,7 +2437,7 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
     )
     else {
         eprintln!(
-            "usage: v2-ctl --config <cluster.json> [--ca-der <path>] [--signaling-tls] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>]"
+            "usage: v2-ctl --config <cluster.json> [--ca-der <path>] [--signaling-tls] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>] [--transport auto|udp|tls443] [--drop-udp] [--audio] [--clipboard] [--send-file <path>] [--send-file-twice] [--probe-denied-channels]"
         );
         return ExitCode::from(2);
     };
@@ -1239,6 +2472,13 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
         hold_after_stuck_ms,
         stuck_ready_file,
         audit_key_identity,
+        transport,
+        drop_udp,
+        audio,
+        clipboard,
+        send_file,
+        send_file_twice,
+        probe_denied_channels,
     };
 
     match run_v2_ctl(&ctl_args).await {
@@ -1266,13 +2506,13 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
     }
 }
 
-struct ChildGroupGuard {
+pub(crate) struct ChildGroupGuard {
     child: Option<Child>,
     pgid: Option<i32>,
 }
 
 impl ChildGroupGuard {
-    fn spawn_in_group(cmd: &mut Command) -> Result<Self, String> {
+    pub(crate) fn spawn_in_group(cmd: &mut Command) -> Result<Self, String> {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         unsafe {
@@ -1289,7 +2529,7 @@ impl ChildGroupGuard {
         })
     }
 
-    fn sigkill_group(&mut self) {
+    pub(crate) fn sigkill_group(&mut self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             unsafe {
@@ -1301,7 +2541,7 @@ impl ChildGroupGuard {
         }
     }
 
-    async fn wait_with_output(
+    pub(crate) async fn wait_with_output(
         mut self,
         timeout: Duration,
     ) -> Result<(std::process::ExitStatus, String, String), String> {
@@ -1355,7 +2595,7 @@ impl Drop for ChildGroupGuard {
     }
 }
 
-async fn wait_for_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
+pub(crate) async fn wait_for_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(bytes) = fs::read(path) {
@@ -1370,7 +2610,7 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String
     }
 }
 
-struct TempDirGuard(PathBuf);
+pub(crate) struct TempDirGuard(pub(crate) PathBuf);
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
@@ -1378,7 +2618,7 @@ impl Drop for TempDirGuard {
     }
 }
 
-fn contains_rendezvous_file(root: &Path) -> Result<Option<PathBuf>, String> {
+pub(crate) fn contains_rendezvous_file(root: &Path) -> Result<Option<PathBuf>, String> {
     let entries = fs::read_dir(root)
         .map_err(|e| format!("scan dir '{}': {e}", root.display()))?;
     for entry_res in entries {
@@ -1980,6 +3220,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         enrollment_token: enrollment_token.clone(),
         enrollment_ttl_sec: 3600,
         policy_hash_hex: None,
+        ..Default::default()
     };
     if let Err(e) = cp.create_tenant(admin_token, &tenant_req).await {
         eprintln!("create tenant failed: {e}");

@@ -2287,6 +2287,7 @@ mod tests {
             exp_unix: cert.exp_unix,
             tbs_b64: B64.encode(&tbs),
             sig_der_b64: B64.encode(&cert.ca_sig),
+            policy_blob: None,
         };
         let cert_from_resp = SignalingDeviceCert::from_register_resp(&reg_resp).unwrap();
         assert_eq!(cert_from_resp.to_tbs_bytes().unwrap(), tbs);

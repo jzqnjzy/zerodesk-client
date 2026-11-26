@@ -2,16 +2,21 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 use super::{
-    config::{V2ClientConfig, V2ConfigError},
+    config::{TransportMode, V2ClientConfig, V2ConfigError},
     identity::{IdentityStoreError, PersistentV2Identity},
     input::SafeHidKey,
+    policy::{
+        verify_tenant_policy_blob, EffectiveTenantPolicy, PolicyVerifyOutcome,
+        DEGRADED_BASELINE_BW_KBPS,
+    },
     runtime::{CloseReason, LeaseRenewalConfig, LeaseRenewalLeg, LeaseRenewalTask, QoeSnapshot},
     video::I420Frame,
 };
 use rand_core::{OsRng, RngCore};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -20,23 +25,30 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use v2_client::{
-    now_unix_secs, AccessControlTunnel, ClientError, ControlPlaneClient, HeartbeatMsg,
-    PeerRouteCandidate, PresenceState, SignalingConnectAccept, SignalingConnectOffer,
-    SignalingConnectReq, SignalingDeviceCert, SignalingMsgKind, SignalingReconnectBackoff,
-    SignalingRegisterReq, SignalingSession, UdpAccessLink, UdpE2eeSession,
+    now_unix_secs, AccessControlTunnel, AccessDataPlane, AccessKeys, ActiveTransportMode,
+    ClientError, ControlPlaneClient, DualTls443Client, EdgeEndpointConfig, HeartbeatMsg,
+    PeerRouteCandidate, PolicyBlobJson, PresenceState, SignalingConnectAccept,
+    SignalingConnectOffer, SignalingConnectReq, SignalingDeviceCert, SignalingMsgKind,
+    SignalingReconnectBackoff, SignalingRegisterReq, SignalingSession, UdpAccessLink,
+    UdpE2eeSession,
 };
 use v2_identity::{DelegationCache, DeviceKeyStore, SoftwareDeviceKeyStore};
 use v2_transport::{
     PrologueInput, QuotaExhaustPolicy, VerifiedTenantPolicy, CAP_ACCESS_LEG_SEQ_V11,
-    CAP_CODEC_AV1, CAP_CODEC_VP9, CAP_SURVIVAL_MODE, CAP_TRANSPORT_TCP443_DUAL, CIPHER_AESGCM,
-    L3_MTU_DEFAULT, PATTERN_IK, TRANSPORT_MODE_RELAY_UDP, VER_MAJOR, VER_MAJOR_MINOR, VER_MINOR,
+    CAP_AUDIO_OPUS_DTX, CAP_CLIPBOARD, CAP_CODEC_AV1, CAP_CODEC_VP9, CAP_FILE_TRANSFER,
+    CAP_SURVIVAL_MODE, CAP_TRANSPORT_TCP443_DUAL, CIPHER_AESGCM, L3_MTU_DEFAULT, PATTERN_IK,
+    TRANSPORT_MODE_RELAY_UDP, VER_MAJOR, VER_MAJOR_MINOR, VER_MINOR,
 };
 
 pub const DEFAULT_V2_CAP_BITS: u64 = CAP_CODEC_AV1
     | CAP_CODEC_VP9
+    | CAP_AUDIO_OPUS_DTX
     | CAP_TRANSPORT_TCP443_DUAL
     | CAP_ACCESS_LEG_SEQ_V11
-    | CAP_SURVIVAL_MODE;
+    | CAP_SURVIVAL_MODE
+    | CAP_CLIPBOARD
+    | CAP_FILE_TRANSFER;
+pub const UDP_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(600);
 pub const SEEN_SESSION_CACHE_CAP: usize = 4096;
 const UI_CONTROL_CHANNEL_CAP: usize = 256;
 const UI_FRAME_CHANNEL_CAP: usize = 4;
@@ -144,6 +156,9 @@ pub enum SecurityEvent {
         reason: String,
     },
     SignalingDisconnected {
+        reason: String,
+    },
+    PolicyDegraded {
         reason: String,
     },
 }
@@ -331,12 +346,251 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
+/// 10-minute per-endpoint negative UDP probe cache (`UDP_NEGATIVE_CACHE_TTL = 600s`).
+/// When UDP probing fails on a network/endpoint, subsequent connections within 10 minutes skip
+/// UDP probe delay and connect Dual TLS-443 directly.
+#[derive(Debug, Default)]
+pub struct UdpNegativeCache {
+    blocked_until: HashMap<String, Instant>,
+}
+
+impl UdpNegativeCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_udp_blocked(&mut self, endpoint_key: &str, now: Instant) -> bool {
+        if let Some(&until) = self.blocked_until.get(endpoint_key) {
+            if now < until {
+                return true;
+            }
+            self.blocked_until.remove(endpoint_key);
+        }
+        false
+    }
+
+    pub fn mark_udp_blocked(&mut self, endpoint_key: &str, now: Instant) {
+        self.blocked_until
+            .insert(endpoint_key.to_string(), now + UDP_NEGATIVE_CACHE_TTL);
+    }
+
+    pub fn clear(&mut self) {
+        self.blocked_until.clear();
+    }
+}
+
+/// Attaches the Layer 2 data plane (`AccessDataPlane::Udp` or `AccessDataPlane::DualTls443`)
+/// to an existing `RelayBind` (`keys.route_cid` + `keys.hs_hash`) according to `TransportMode`:
+/// - `UdpOnly`: probes UDP (2 pings at 0ms/600ms, deadline `udp_probe_timeout_ms`); fails closed if blocked.
+/// - `Tls443Only`: attaches `DualTls443Client` (`Realtime` + `Bulk`) directly.
+/// - `Auto`: checks 10-min negative UDP cache; otherwise probes UDP with 2 pings (0ms/600ms,
+///   deadline `udp_probe_timeout_ms`) and automatically falls back to `DualTls443Client` on the
+///   SAME `RelayBind` `route_cid` + `hs_hash` if UDP fails.
+#[allow(clippy::too_many_arguments)]
+pub async fn attach_access_data_plane(
+    mode: TransportMode,
+    udp_probe_timeout_ms: u64,
+    drop_udp_for_test: bool,
+    edge: &EdgeEndpointConfig,
+    keys: &AccessKeys,
+    ca_der_path: Option<&Path>,
+    bw_cap_kbps: u32,
+    neg_cache: &mut UdpNegativeCache,
+) -> Result<(AccessDataPlane, u64), ClientError> {
+    let probe_timeout = Duration::from_millis(udp_probe_timeout_ms);
+    let cache_key = format!("{}|{}", edge.udp_addr, edge.tls443_addr);
+
+    match mode {
+        TransportMode::Tls443Only => {
+            let dual =
+                DualTls443Client::connect(&edge.tls443_addr, keys, ca_der_path, bw_cap_kbps)
+                    .await?;
+            let rtt_us = dual.realtime_ping_rtt_us;
+            Ok((AccessDataPlane::from(dual), rtt_us))
+        }
+        TransportMode::UdpOnly => {
+            if drop_udp_for_test {
+                // Simulate blackholed UDP firewall to verify UdpOnly fails closed
+                let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+                let bh_addr = blackhole.local_addr()?.to_string();
+                let mut udp = UdpAccessLink::connect(&bh_addr, keys, bw_cap_kbps).await?;
+                let _ = udp.probe_udp_two_pings(probe_timeout).await?;
+                return Err(ClientError::Timeout(
+                    "UDP blocked in UdpOnly mode".into(),
+                ));
+            }
+            let mut udp = UdpAccessLink::connect(&edge.udp_addr, keys, bw_cap_kbps).await?;
+            let rtt_us = udp.probe_udp_two_pings(probe_timeout).await?;
+            Ok((AccessDataPlane::from(udp), rtt_us))
+        }
+        TransportMode::Auto => {
+            if neg_cache.is_udp_blocked(&cache_key, Instant::now()) {
+                let dual =
+                    DualTls443Client::connect(&edge.tls443_addr, keys, ca_der_path, bw_cap_kbps)
+                        .await?;
+                let rtt_us = dual.realtime_ping_rtt_us;
+                return Ok((AccessDataPlane::from(dual), rtt_us));
+            }
+
+            let probe_res = if drop_udp_for_test {
+                // Bind a local non-responding UDP socket so Auto runs the real 2-ping probe
+                // deadline path and automatically attaches DualTls443 on the same RelayBind.
+                let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+                let bh_addr = blackhole.local_addr()?.to_string();
+                let mut udp = UdpAccessLink::connect(&bh_addr, keys, bw_cap_kbps).await?;
+                udp.probe_udp_two_pings(probe_timeout)
+                    .await
+                    .map(|rtt| (udp, rtt))
+            } else {
+                match UdpAccessLink::connect(&edge.udp_addr, keys, bw_cap_kbps).await {
+                    Ok(mut udp) => udp
+                        .probe_udp_two_pings(probe_timeout)
+                        .await
+                        .map(|rtt| (udp, rtt)),
+                    Err(e) => Err(e),
+                }
+            };
+
+            match probe_res {
+                Ok((udp, rtt_us)) => Ok((AccessDataPlane::from(udp), rtt_us)),
+                Err(_) => {
+                    neg_cache.mark_udp_blocked(&cache_key, Instant::now());
+                    let dual = DualTls443Client::connect(
+                        &edge.tls443_addr,
+                        keys,
+                        ca_der_path,
+                        bw_cap_kbps,
+                    )
+                    .await?;
+                    let rtt_us = dual.realtime_ping_rtt_us;
+                    Ok((AccessDataPlane::from(dual), rtt_us))
+                }
+            }
+        }
+    }
+}
+
+/// Resolves, verifies, and persists anti-rollback state for the local device's CA-signed
+/// `TenantPolicyBlob` (`spec/06` §3.8). Performs at most ONE bounded re-register when a CA-valid
+/// blob's `policy_hash` differs from the cached `DeviceCert.policy_hash`. On any verification
+/// failure, drops the blob (never caches), degrades fail-closed (`max_bw_kbps = 2000`, all 6
+/// privilege flags false), and emits `SecurityEvent::PolicyDegraded`.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_verified_tenant_policy(
+    cp: &ControlPlaneClient,
+    identity: &mut PersistentV2Identity,
+    ca_spki_der: &[u8],
+    enrollment_token: Option<&str>,
+    cap_bits: u64,
+    home_region: &str,
+    inline_blob: Option<PolicyBlobJson>,
+    callbacks: &UiCallbackDispatcher,
+) -> Result<(SignalingDeviceCert, EffectiveTenantPolicy), ManagerError> {
+    let mut cert = identity
+        .device_cert()
+        .cloned()
+        .ok_or_else(|| ManagerError::Protocol("missing DeviceCert during policy verification".into()))?;
+
+    let mut blob_opt = match inline_blob {
+        Some(b) => Some(b),
+        None => cp
+            .fetch_tenant_policy(&identity.device_id(), identity.keystore(), now_unix_secs())
+            .await
+            .ok(),
+    };
+
+    let outcome = verify_tenant_policy_blob(
+        blob_opt.as_ref(),
+        ca_spki_der,
+        &cert.tenant_id,
+        &cert.policy_hash,
+        identity.last_policy_version(),
+        now_unix_secs(),
+    );
+
+    match outcome {
+        PolicyVerifyOutcome::Verified(pol) => {
+            if let Err(e) = identity.advance_policy_version(pol.version) {
+                let reason = format!("policy anti-rollback persistence failed: {e}");
+                callbacks.emit_security_event(SecurityEvent::PolicyDegraded {
+                    reason: reason.clone(),
+                });
+                return Ok((
+                    cert.clone(),
+                    EffectiveTenantPolicy::degraded(cert.tenant_id, cert.policy_hash, reason),
+                ));
+            }
+            Ok((cert, pol))
+        }
+        PolicyVerifyOutcome::Degraded {
+            should_reregister: true,
+            ..
+        } => {
+            // ONE bounded re-register attempt to atomically synchronize DeviceCert + policy_blob
+            if let Ok((fresh_cert, fresh_inline)) = identity
+                .force_reregister_with_policy(cp, ca_spki_der, enrollment_token, cap_bits, home_region)
+                .await
+            {
+                cert = fresh_cert;
+                blob_opt = match fresh_inline {
+                    Some(b) => Some(b),
+                    None => cp
+                        .fetch_tenant_policy(
+                            &identity.device_id(),
+                            identity.keystore(),
+                            now_unix_secs(),
+                        )
+                        .await
+                        .ok(),
+                };
+                if let PolicyVerifyOutcome::Verified(pol) = verify_tenant_policy_blob(
+                    blob_opt.as_ref(),
+                    ca_spki_der,
+                    &cert.tenant_id,
+                    &cert.policy_hash,
+                    identity.last_policy_version(),
+                    now_unix_secs(),
+                ) {
+                    if let Err(e) = identity.advance_policy_version(pol.version) {
+                        let reason = format!("policy anti-rollback persistence failed: {e}");
+                        callbacks.emit_security_event(SecurityEvent::PolicyDegraded {
+                            reason: reason.clone(),
+                        });
+                        return Ok((
+                            cert.clone(),
+                            EffectiveTenantPolicy::degraded(
+                                cert.tenant_id,
+                                cert.policy_hash,
+                                reason,
+                            ),
+                        ));
+                    }
+                    return Ok((cert, pol));
+                }
+            }
+            let reason =
+                "policy_hash mismatch persisted after single bounded re-register refresh".to_string();
+            callbacks.emit_security_event(SecurityEvent::PolicyDegraded {
+                reason: reason.clone(),
+            });
+            Ok((
+                cert.clone(),
+                EffectiveTenantPolicy::degraded(cert.tenant_id, cert.policy_hash, reason),
+            ))
+        }
+        PolicyVerifyOutcome::Degraded { policy, error, .. } => {
+            callbacks.emit_security_event(SecurityEvent::PolicyDegraded {
+                reason: error.to_string(),
+            });
+            Ok((cert, policy))
+        }
+    }
+}
+
 /// Builds a fail-closed `VerifiedTenantPolicy` anchored to mutually CA-verified `DeviceCert`.
 ///
-/// Phase 4A enforces Video + HID baseline only (`allow_file_transfer`, `allow_clipboard`,
-/// `allow_file_clipboard`, `allow_tcp_tunnel`, `allow_terminal`, `allow_realtime_actuator` are
-/// all `false`) until Phase 4B fetches and hash-verifies the full tenant policy body from the
-/// Control Plane.
+/// Kept for Phase 4A backward compatibility; Phase 4B sessions verify the full CA-signed
+/// `TenantPolicyBlob` via `resolve_verified_tenant_policy` and `EffectiveTenantPolicy`.
 pub fn build_verified_policy_from_cert(
     cert: &SignalingDeviceCert,
     bw_cap_kbps: u32,
@@ -351,7 +605,7 @@ pub fn build_verified_policy_from_cert(
         allow_tcp_tunnel: false,
         allow_terminal: false,
         allow_realtime_actuator: false,
-        bw_cap_kbps: bw_cap_kbps.max(256),
+        bw_cap_kbps: bw_cap_kbps.clamp(256, DEGRADED_BASELINE_BW_KBPS),
         exhaust_policy: QuotaExhaustPolicy::Throttle256Kbps,
     }
 }
@@ -432,23 +686,29 @@ pub struct AcceptedHostSession {
     pub lease_renewal: LeaseRenewalTask,
     pub hs_hash: [u8; 32],
     pub policy: VerifiedTenantPolicy,
+    pub effective_policy: EffectiveTenantPolicy,
+    pub active_transport_mode: ActiveTransportMode,
+    pub transport_attach_ms: u64,
     pub peer_route: PeerRouteCandidate,
     pub negotiated_cap_bits: u64,
     pub negotiated_l3_mtu: usize,
 }
 
 /// Persistent Host signaling daemon: stays online via `SignalingSession` + periodic `Heartbeat`,
-/// enforces mutual CA cert verification, same-tenant isolation, anti-replay `session_id` dedup,
-/// mandatory `Noise_IK` responder handshake, and background Edge B lease renewal.
+/// enforces mutual CA cert verification, verified `TenantPolicyBlob`, same-tenant isolation,
+/// anti-replay `session_id` dedup, UDP -> Dual TLS-443 Auto-Fallback, mandatory `Noise_IK`
+/// responder handshake, and background Edge B lease renewal.
 pub struct DesktopHostDaemon {
     config: V2ClientConfig,
     cp: ControlPlaneClient,
     identity: PersistentV2Identity,
     ca_spki_der: Vec<u8>,
+    effective_policy: EffectiveTenantPolicy,
     cap_bits: u64,
     callbacks: UiCallbackDispatcher,
     seen_sessions: SeenSessionCache,
     delegation_cache: DelegationCache,
+    udp_neg_cache: UdpNegativeCache,
     signaling: Option<SignalingSession>,
     heartbeat_interval: Duration,
     backoff: SignalingReconnectBackoff,
@@ -470,8 +730,8 @@ impl DesktopHostDaemon {
         let ca_spki_der = cp.get_ca_pubkey().await?.spki_der()?;
 
         let mut identity = PersistentV2Identity::load_or_create(&config.identity_dir)?;
-        let cert = identity
-            .ensure_registered(
+        let (_cert, inline_blob) = identity
+            .ensure_registered_with_policy(
                 &cp,
                 &ca_spki_der,
                 config.enrollment_token.as_deref(),
@@ -479,6 +739,17 @@ impl DesktopHostDaemon {
                 &config.home_region,
             )
             .await?;
+        let (cert, effective_policy) = resolve_verified_tenant_policy(
+            &cp,
+            &mut identity,
+            &ca_spki_der,
+            config.enrollment_token.as_deref(),
+            DEFAULT_V2_CAP_BITS,
+            &config.home_region,
+            inline_blob,
+            &callbacks,
+        )
+        .await?;
         let (_secret, deleg) = identity.ensure_delegation(now_unix_secs())?;
 
         let reg_req = SignalingRegisterReq {
@@ -510,14 +781,20 @@ impl DesktopHostDaemon {
             cp,
             identity,
             ca_spki_der,
+            effective_policy,
             cap_bits: DEFAULT_V2_CAP_BITS,
             callbacks,
             seen_sessions: SeenSessionCache::new(SEEN_SESSION_CACHE_CAP),
             delegation_cache: DelegationCache::new(),
+            udp_neg_cache: UdpNegativeCache::new(),
             signaling: Some(sig),
             heartbeat_interval: hb_dur,
             backoff: SignalingReconnectBackoff::new(),
         })
+    }
+
+    pub fn effective_policy(&self) -> &EffectiveTenantPolicy {
+        &self.effective_policy
     }
 
     pub fn device_id(&self) -> [u8; 16] {
@@ -899,10 +1176,20 @@ impl DesktopHostDaemon {
             .min(host_lease_b.bw_cap_kbps.max(256))
             .min(self.config.bw_cap_kbps)
             .max(256);
-        let mut udp_b =
-            UdpAccessLink::connect(&self.config.edge_b.udp_addr, &keys_b, effective_bw_cap_kbps)
-                .await?;
-        let _ = udp_b.ping_with_retry(3, Duration::from_secs(1)).await?;
+        let attach_t0 = Instant::now();
+        let (data_plane_b, _probe_rtt_us) = attach_access_data_plane(
+            self.config.transport_mode,
+            self.config.udp_probe_timeout_ms,
+            self.config.drop_udp_for_test,
+            &self.config.edge_b,
+            &keys_b,
+            self.config.ca_der_path.as_deref(),
+            effective_bw_cap_kbps,
+            &mut self.udp_neg_cache,
+        )
+        .await?;
+        let transport_attach_ms = attach_t0.elapsed().as_millis() as u64;
+        let active_transport_mode = data_plane_b.active_mode();
 
         // Send ConnectAccept over signaling BEFORE entering Noise_IK responder so Controller
         // immediately receives Host's CA-verified cert & delegation and sends IK msg1.
@@ -939,10 +1226,11 @@ impl DesktopHostDaemon {
             negotiated_cap_bits,
             session_id: offer.session_id,
         };
-        let policy = build_verified_policy_from_cert(&host_cert, effective_bw_cap_kbps);
+        let effective_policy = self.effective_policy.clone();
+        let policy = effective_policy.to_transport_policy(effective_bw_cap_kbps);
 
         let (e2ee_session, hs_out) = UdpE2eeSession::handshake_responder(
-            udp_b,
+            data_plane_b,
             &prologue_input,
             &x25519_priv_host,
             &ctrl_deleg,
@@ -1000,6 +1288,9 @@ impl DesktopHostDaemon {
             lease_renewal,
             hs_hash: *hs_out.hs_hash,
             policy,
+            effective_policy,
+            active_transport_mode,
+            transport_attach_ms,
             peer_route,
             negotiated_cap_bits,
             negotiated_l3_mtu,
@@ -1007,8 +1298,8 @@ impl DesktopHostDaemon {
     }
 }
 
-/// Active Controller session established via real `v2-signaling` + CA cert verification + `Noise_IK`
-/// initiator + background `spec/06` (`<= 15s`) `LeaseRenewalTask`.
+/// Active Controller session established via real `v2-signaling` + CA cert & policy verification +
+/// UDP / Dual TLS-443 Auto-Fallback + `Noise_IK` initiator + background `spec/06` (`<= 15s`) `LeaseRenewalTask`.
 pub struct ConnectedControllerSession {
     pub session_id: [u8; 16],
     pub target_device_id: [u8; 16],
@@ -1017,23 +1308,29 @@ pub struct ConnectedControllerSession {
     pub lease_renewal: LeaseRenewalTask,
     pub hs_hash: [u8; 32],
     pub policy: VerifiedTenantPolicy,
+    pub effective_policy: EffectiveTenantPolicy,
+    pub active_transport_mode: ActiveTransportMode,
+    pub transport_attach_ms: u64,
     pub peer_route: PeerRouteCandidate,
     pub negotiated_cap_bits: u64,
     pub negotiated_l3_mtu: usize,
     pub keepalive_interval: Duration,
 }
 
-/// Production Controller client: registers with Control Plane + `v2-signaling`, acquires relay
-/// leases, dials target device by `device_id` (ZERO `rendezvous.json`), verifies Host CA cert &
-/// delegation, executes mandatory `Noise_IK` initiator handshake, and launches 15s `LeaseRenewalTask`.
+/// Production Controller client: registers with Control Plane + `v2-signaling`, verifies CA-signed
+/// `TenantPolicyBlob`, acquires relay leases, dials target device by `device_id` (ZERO `rendezvous.json`),
+/// probes UDP with Auto-Fallback to Dual TLS-443, verifies Host CA cert & delegation, executes mandatory
+/// `Noise_IK` initiator handshake, and launches 15s `LeaseRenewalTask`.
 pub struct DesktopControllerClient {
     config: V2ClientConfig,
     cp: ControlPlaneClient,
     identity: PersistentV2Identity,
     ca_spki_der: Vec<u8>,
+    effective_policy: EffectiveTenantPolicy,
     cap_bits: u64,
     callbacks: UiCallbackDispatcher,
     delegation_cache: DelegationCache,
+    udp_neg_cache: UdpNegativeCache,
     signaling: Option<SignalingSession>,
     heartbeat_interval: Duration,
 }
@@ -1054,8 +1351,8 @@ impl DesktopControllerClient {
         let ca_spki_der = cp.get_ca_pubkey().await?.spki_der()?;
 
         let mut identity = PersistentV2Identity::load_or_create(&config.identity_dir)?;
-        let cert = identity
-            .ensure_registered(
+        let (_cert, inline_blob) = identity
+            .ensure_registered_with_policy(
                 &cp,
                 &ca_spki_der,
                 config.enrollment_token.as_deref(),
@@ -1063,6 +1360,17 @@ impl DesktopControllerClient {
                 &config.home_region,
             )
             .await?;
+        let (cert, effective_policy) = resolve_verified_tenant_policy(
+            &cp,
+            &mut identity,
+            &ca_spki_der,
+            config.enrollment_token.as_deref(),
+            DEFAULT_V2_CAP_BITS,
+            &config.home_region,
+            inline_blob,
+            &callbacks,
+        )
+        .await?;
         let (_sec, deleg) = identity.ensure_delegation(now_unix_secs())?;
 
         let reg_req = SignalingRegisterReq {
@@ -1094,12 +1402,18 @@ impl DesktopControllerClient {
             cp,
             identity,
             ca_spki_der,
+            effective_policy,
             cap_bits: DEFAULT_V2_CAP_BITS,
             callbacks,
             delegation_cache: DelegationCache::new(),
+            udp_neg_cache: UdpNegativeCache::new(),
             signaling: Some(sig),
             heartbeat_interval,
         })
+    }
+
+    pub fn effective_policy(&self) -> &EffectiveTenantPolicy {
+        &self.effective_policy
     }
 
     pub fn device_id(&self) -> [u8; 16] {
@@ -1202,10 +1516,20 @@ impl DesktopControllerClient {
             .bw_cap_kbps
             .min(self.config.bw_cap_kbps)
             .max(256);
-        let mut udp_a =
-            UdpAccessLink::connect(&self.config.edge_a.udp_addr, &keys_a, effective_bw_cap_kbps)
-                .await?;
-        let _ = udp_a.ping_with_retry(3, Duration::from_secs(1)).await?;
+        let attach_t0 = Instant::now();
+        let (data_plane_a, _probe_rtt_us) = attach_access_data_plane(
+            self.config.transport_mode,
+            self.config.udp_probe_timeout_ms,
+            self.config.drop_udp_for_test,
+            &self.config.edge_a,
+            &keys_a,
+            self.config.ca_der_path.as_deref(),
+            effective_bw_cap_kbps,
+            &mut self.udp_neg_cache,
+        )
+        .await?;
+        let transport_attach_ms = attach_t0.elapsed().as_millis() as u64;
+        let active_transport_mode = data_plane_a.active_mode();
 
         let peer_route = PeerRouteCandidate {
             pop_a,
@@ -1373,10 +1697,11 @@ impl DesktopControllerClient {
             negotiated_cap_bits,
             session_id,
         };
-        let policy = build_verified_policy_from_cert(&host_cert, effective_bw_cap_kbps);
+        let effective_policy = self.effective_policy.clone();
+        let policy = effective_policy.to_transport_policy(effective_bw_cap_kbps);
 
         let (e2ee_session, hs_out) = UdpE2eeSession::handshake_initiator(
-            udp_a,
+            data_plane_a,
             &prologue_input,
             &x25519_priv_ctrl,
             &host_deleg.x25519_pub,
@@ -1431,6 +1756,9 @@ impl DesktopControllerClient {
             lease_renewal,
             hs_hash: *hs_out.hs_hash,
             policy,
+            effective_policy,
+            active_transport_mode,
+            transport_attach_ms,
             peer_route,
             negotiated_cap_bits,
             negotiated_l3_mtu,
@@ -2009,5 +2337,36 @@ mod tests {
         assert_eq!(echo_res.unwrap().0.echo_seq, 7);
         assert_eq!(host_res.unwrap(), mouse);
         relay.abort();
+    }
+
+    #[test]
+    fn udp_negative_cache_expires_after_10_minutes_and_phase4a_4b_cap_interop() {
+        let mut cache = UdpNegativeCache::new();
+        let t0 = Instant::now();
+        let key = "127.0.0.1:4430|127.0.0.1:4432";
+        assert!(!cache.is_udp_blocked(key, t0));
+        cache.mark_udp_blocked(key, t0);
+        assert!(cache.is_udp_blocked(key, t0 + Duration::from_secs(599)));
+        assert!(!cache.is_udp_blocked(key, t0 + UDP_NEGATIVE_CACHE_TTL));
+
+        // Phase 4A/4B mixed-version capability negotiation:
+        // Phase 4A peer lacks CAP_AUDIO_OPUS_DTX, CAP_CLIPBOARD, CAP_FILE_TRANSFER;
+        // Phase 4B peer advertises all 3 additive bits; intersection retains Video + Transport + HID!
+        let p4a_caps: u64 = CAP_CODEC_AV1
+            | CAP_CODEC_VP9
+            | CAP_TRANSPORT_TCP443_DUAL
+            | CAP_ACCESS_LEG_SEQ_V11
+            | CAP_SURVIVAL_MODE;
+        let p4b_caps: u64 = DEFAULT_V2_CAP_BITS;
+        assert_ne!(p4b_caps & CAP_AUDIO_OPUS_DTX, 0);
+        assert_ne!(p4b_caps & CAP_CLIPBOARD, 0);
+        assert_ne!(p4b_caps & CAP_FILE_TRANSFER, 0);
+
+        let negotiated = p4a_caps & p4b_caps;
+        assert_eq!(negotiated, p4a_caps);
+        assert_ne!(negotiated & CAP_CODEC_VP9, 0);
+        assert_eq!(negotiated & CAP_CLIPBOARD, 0);
+        assert_eq!(negotiated & CAP_FILE_TRANSFER, 0);
+        assert_eq!(negotiated & CAP_AUDIO_OPUS_DTX, 0);
     }
 }

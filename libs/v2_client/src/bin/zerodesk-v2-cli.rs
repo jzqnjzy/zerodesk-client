@@ -167,6 +167,7 @@ async fn bootstrap_pair(
             enrollment_token: enrollment_token.clone(),
             enrollment_ttl_sec: 3600,
             policy_hash_hex: None,
+            ..Default::default()
         };
         cp.create_tenant(admin_token, &tenant_req).await?;
     } else {
@@ -737,7 +738,11 @@ async fn cmd_e2e(
         .await?;
     // LegCiphertextCache enforces the protocol-spec 250ms single-leg TTL (Leg-1 Edge NACK),
     // so verify it immediately after send_control before awaiting the 3-leg end-to-end traversal.
-    let rtx_pkts = pair.sess_a.link_mut().handle_local_leg_nack(last_seq_a, 1);
+    let rtx_pkts = pair
+        .sess_a
+        .udp_link_mut()
+        .ok_or_else(|| ClientError::Protocol("expected UDP data plane".into()))?
+        .handle_local_leg_nack(last_seq_a, 1);
     let _ = pair.sess_b.recv_event(Duration::from_secs(2)).await?;
     let leg_nack_rtx_verified = if let Some(pkt) = rtx_pkts.first() {
         let hdr = v2_transport::AccessHeaderV11::decode(pkt)?;
@@ -746,7 +751,7 @@ async fn cmd_e2e(
         false
     };
     pair.sess_a
-        .link_mut()
+        .data_plane_mut()
         .send_edge_ctrl(&EdgeCtrlFrame::LegNack {
             base_leg_seq: last_seq_a,
             loss_bitmap: 0,

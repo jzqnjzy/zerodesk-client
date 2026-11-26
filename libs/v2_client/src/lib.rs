@@ -25,10 +25,11 @@ pub use config::{
 };
 pub use control_plane::{
     build_client_meter_tbs, build_dev_pop_tbs, build_dev_rotate_tbs, build_lease_renew_tbs,
-    build_tls_client_config, is_loopback_host, now_unix_secs, tls_server_name_for_host,
-    CaPubkeyResp, ClientMeterReportReq, ClientMeterReportResp, ControlPlaneClient,
-    CreateTenantReq, LeaseRenewReq, LeaseRenewResp, RegisterDeviceReq, RegisterDeviceResp,
-    RelayTicketWire,
+    build_policy_fetch_tbs, build_tls_client_config, is_loopback_host, now_unix_secs,
+    tls_server_name_for_host, CaPubkeyResp, ClientMeterReportReq, ClientMeterReportResp,
+    ControlPlaneClient, CreateTenantReq, LeaseRenewReq, LeaseRenewResp, PolicyBlobJson,
+    RegisterDeviceReq, RegisterDeviceResp, RelayTicketWire, POLICY_FETCH_DOMAIN,
+    POLICY_FETCH_TBS_LEN,
 };
 pub use error::ClientError;
 pub use signaling::{
@@ -47,6 +48,7 @@ pub use tls443::{
     STREAM_DATA_MIN_LEN, TLS443_AUTH_DEADLINE, TLS443_HOL_THRESHOLD_MS, TLS443_PREFACE_LEN,
 };
 pub use udp_session::{
-    bind_addr_for_edge, decode_survival_rs64_shards, encode_survival_rs64_shards, LegGapTracker,
-    UdpAccessLink, UdpE2eeSession, UdpLinkStats, UdpRecvEvent, MAX_LEG_GAP_MISSING,
+    bind_addr_for_edge, decode_survival_rs64_shards, encode_survival_rs64_shards, AccessDataPlane,
+    ActiveTransportMode, LegGapTracker, RawL4Frame, UdpAccessLink, UdpE2eeSession, UdpLinkStats,
+    UdpRecvEvent, V2E2eeSession, V2RecvEvent, MAX_LEG_GAP_MISSING,
 };
