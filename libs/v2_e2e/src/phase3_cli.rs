@@ -3419,6 +3419,7 @@ mod tests {
             cp_addr: "127.0.0.1:443".into(),
             cp_use_tls: true,
             signaling_addr: "127.0.0.1:4".into(),
+            signaling_tls: None,
             admin_token: None,
             ca_der_path: None,
             edge_a: edge.clone(),

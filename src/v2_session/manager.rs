@@ -475,10 +475,14 @@ impl DesktopHostDaemon {
             home_region: config.home_region.clone(),
             ver_major: u32::from(VER_MAJOR),
             ver_minor: u32::from(VER_MINOR),
+            pop_sig: Vec::new(),
         };
         let (sig, resp) = SignalingSession::connect_and_register(
             &config.signaling_addr,
             &reg_req,
+            identity.keystore(),
+            config.ca_der_path.as_deref(),
+            config.signaling_tls,
             Duration::from_secs(10),
         )
         .await?;
@@ -541,10 +545,14 @@ impl DesktopHostDaemon {
             home_region: self.config.home_region.clone(),
             ver_major: u32::from(VER_MAJOR),
             ver_minor: u32::from(VER_MINOR),
+            pop_sig: Vec::new(),
         };
         let (sig, resp) = SignalingSession::connect_and_register(
             &self.config.signaling_addr,
             &reg_req,
+            self.identity.keystore(),
+            self.config.ca_der_path.as_deref(),
+            self.config.signaling_tls,
             Duration::from_secs(10),
         )
         .await?;
@@ -952,10 +960,14 @@ impl DesktopControllerClient {
             home_region: config.home_region.clone(),
             ver_major: u32::from(VER_MAJOR),
             ver_minor: u32::from(VER_MINOR),
+            pop_sig: Vec::new(),
         };
         let (sig, _resp) = SignalingSession::connect_and_register(
             &config.signaling_addr,
             &reg_req,
+            identity.keystore(),
+            config.ca_der_path.as_deref(),
+            config.signaling_tls,
             Duration::from_secs(10),
         )
         .await?;
@@ -1448,6 +1460,19 @@ mod tests {
         );
         assert_eq!(rb.unwrap_err().0, 0x0203);
 
+        // Mismatched expected peer device_id MUST fail closed with 0x0201
+        let wrong_dev = verify_peer_cert_and_delegation(
+            &cert_b_same,
+            &d2,
+            &cert_a,
+            Some([0xCC; 16]),
+            &ca_spki,
+            &mut cache,
+            now,
+            &disp,
+        );
+        assert_eq!(wrong_dev.unwrap_err().0, 0x0201);
+
         // Cross-tenant MUST fail closed with 0x0401
         let xt = verify_peer_cert_and_delegation(
             &cert_b_cross,
@@ -1502,8 +1527,10 @@ mod tests {
             net::{TcpListener, UdpSocket},
         };
         use v2_client::{
-            encode_signaling_frame, AccessKeys, SignalingRegisterResp, UdpAccessLink,
+            build_register_pop_tbs, encode_signaling_frame, AccessKeys, SignalingRegisterChallenge,
+            SignalingRegisterResp, UdpAccessLink,
         };
+        use v2_identity::verify_p256_low_s;
         use v2_transport::{
             seal_udp_v11, AccessEpochState, AccessFlags, AccessHeaderV11, DIR_CLIENT_TO_EDGE,
             DIR_EDGE_TO_CLIENT, TRANSPORT_DATAGRAM, UDP_MAX_LEN,
@@ -1539,11 +1566,37 @@ mod tests {
 
         let sig_srv = tokio::spawn(async move {
             let (mut sock, _) = sig_listener.accept().await.unwrap();
+            let challenge = SignalingRegisterChallenge {
+                server_nonce: [0x5A; 16],
+                server_unix: now,
+            };
+            let ch_wire = encode_signaling_frame(
+                SignalingMsgKind::RegisterChallenge,
+                &challenge.encode_pb(),
+            )
+            .unwrap();
+            sock.write_all(&ch_wire).await.unwrap();
+            sock.flush().await.unwrap();
+
             let mut len_buf = [0u8; 4];
             sock.read_exact(&mut len_buf).await.unwrap();
             let total = u32::from_be_bytes(len_buf) as usize;
             let mut body = vec![0u8; total];
             sock.read_exact(&mut body).await.unwrap();
+            assert_eq!(body[0], SignalingMsgKind::RegisterReq as u8);
+            let decoded_req = SignalingRegisterReq::decode_pb(&body[1..]).unwrap();
+            let tbs = build_register_pop_tbs(
+                &challenge.server_nonce,
+                &decoded_req.device_cert.device_id,
+                challenge.server_unix,
+            );
+            verify_p256_low_s(
+                &decoded_req.device_cert.p256_pub_der,
+                &tbs,
+                &decoded_req.pop_sig,
+            )
+            .unwrap();
+
             let resp = SignalingRegisterResp {
                 error_code: 0,
                 server_unix: now,
@@ -1566,10 +1619,14 @@ mod tests {
             home_region: "local".into(),
             ver_major: 2,
             ver_minor: 1,
+            pop_sig: Vec::new(),
         };
         let (mut sig_sess, _resp) = SignalingSession::connect_and_register(
             &sig_addr.to_string(),
             &reg_req,
+            &dev,
+            None,
+            Some(false),
             Duration::from_secs(2),
         )
         .await

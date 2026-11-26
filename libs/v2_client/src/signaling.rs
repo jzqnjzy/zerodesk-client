@@ -2,28 +2,104 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 use crate::{
-    control_plane::{RegisterDeviceResp, RelayTicketWire},
+    control_plane::{
+        build_tls_client_config, is_loopback_host, tls_server_name_for_host, RegisterDeviceResp,
+        RelayTicketWire,
+    },
     error::ClientError,
 };
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::{
+    io,
     net::SocketAddr,
+    path::Path,
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::TcpStream,
 };
-use v2_identity::{DelegationStatement, DeviceCert, DEVCERT_DOMAIN};
+use tokio_rustls::{client::TlsStream, TlsConnector};
+use v2_identity::{DelegationStatement, DeviceCert, DeviceKeyStore, DEVCERT_DOMAIN};
 
 pub const MAX_SIGNALING_FRAME_BYTES: usize = 64 * 1024;
 pub const SIGNALING_BACKOFF_INITIAL_MS: u64 = 500;
 pub const SIGNALING_BACKOFF_MAX_MS: u64 = 30_000;
+pub const SIGNALING_POP_DOMAIN: &[u8; 13] = b"V2-SIG-POP-v1";
+pub const SIGNALING_POP_TBS_LEN: usize = 53;
+const _: () = assert!(SIGNALING_POP_DOMAIN.len() + 16 + 16 + 8 == SIGNALING_POP_TBS_LEN);
 const PEER_ROUTE_PREFIX: &str = "v2-peer:";
+
+/// Builds the canonical 53-byte Proof-of-Possession signing preimage for `RegisterReq`:
+/// `"V2-SIG-POP-v1" (13B) || server_nonce (16B) || device_id (16B) || u64_be(server_unix) (8B)`.
+pub fn build_register_pop_tbs(
+    server_nonce: &[u8; 16],
+    device_id: &[u8; 16],
+    server_unix: u64,
+) -> [u8; SIGNALING_POP_TBS_LEN] {
+    let mut out = [0u8; SIGNALING_POP_TBS_LEN];
+    out[0..13].copy_from_slice(SIGNALING_POP_DOMAIN);
+    out[13..29].copy_from_slice(server_nonce);
+    out[29..45].copy_from_slice(device_id);
+    out[45..53].copy_from_slice(&server_unix.to_be_bytes());
+    out
+}
+
+/// Extracts the host portion (IP literal or DNS hostname, without brackets or port) from a
+/// `host:port` or `[ipv6]:port` signaling address.
+pub fn parse_signaling_host(addr: &str) -> Result<String, ClientError> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return Err(ClientError::Config("signaling_addr must not be empty".into()));
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((host, port_part)) = rest.split_once("]:") else {
+            return Err(ClientError::Config(format!(
+                "invalid IPv6 signaling_addr '{addr}' (expected [host]:port)"
+            )));
+        };
+        if host.is_empty() || port_part.parse::<u16>().is_err() {
+            return Err(ClientError::Config(format!(
+                "invalid IPv6 host/port in signaling_addr '{addr}'"
+            )));
+        }
+        return Ok(host.to_string());
+    }
+    let Some((host, port_part)) = trimmed.rsplit_once(':') else {
+        return Err(ClientError::Config(format!(
+            "signaling_addr '{addr}' must include :port"
+        )));
+    };
+    if host.is_empty() || port_part.parse::<u16>().is_err() {
+        return Err(ClientError::Config(format!(
+            "invalid host/port in signaling_addr '{addr}'"
+        )));
+    }
+    Ok(host.to_string())
+}
+
+/// Resolves whether TLS 1.3 must be used for `addr`.
+///
+/// Fail-closed rule:
+/// - Non-loopback host + `use_tls == Some(false)` -> REJECTED (`ClientError::Config`)
+/// - Non-loopback host + `use_tls == None | Some(true)` -> `Ok(true)` (mandatory TLS 1.3)
+/// - Loopback host + `use_tls == Some(true)` -> `Ok(true)` (TLS 1.3 on loopback)
+/// - Loopback host + `use_tls == None | Some(false)` -> `Ok(false)` (dev loopback plaintext)
+pub fn resolve_signaling_tls(addr: &str, use_tls: Option<bool>) -> Result<bool, ClientError> {
+    let host = parse_signaling_host(addr)?;
+    let loopback = is_loopback_host(&host);
+    match (loopback, use_tls) {
+        (false, Some(false)) => Err(ClientError::Config(format!(
+            "plaintext signaling is forbidden on non-loopback host '{host}'; TLS 1.3 is mandatory"
+        ))),
+        (false, None | Some(true)) => Ok(true),
+        (true, Some(true)) => Ok(true),
+        (true, None | Some(false)) => Ok(false),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -63,6 +139,25 @@ pub struct SignalingDeviceCert {
 }
 
 impl SignalingDeviceCert {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.cert_id == [0u8; 16] {
+            return Err(ClientError::Protocol("DeviceCert.cert_id must not be zero".into()));
+        }
+        if self.device_id == [0u8; 16] {
+            return Err(ClientError::Protocol("DeviceCert.device_id must not be zero".into()));
+        }
+        if self.tenant_id == [0u8; 16] {
+            return Err(ClientError::Protocol("DeviceCert.tenant_id must not be zero".into()));
+        }
+        if self.p256_pub_der.is_empty() {
+            return Err(ClientError::Protocol("DeviceCert.p256_pub_der must not be empty".into()));
+        }
+        if self.ca_sig.is_empty() {
+            return Err(ClientError::Protocol("DeviceCert.ca_sig must not be empty".into()));
+        }
+        Ok(())
+    }
+
     /// Parses a `SignalingDeviceCert` from canonical `"V2-DEVCERT-v1"` TBS bytes and its CA signature.
     pub fn from_tbs_and_sig(
         tbs: &[u8],
@@ -190,6 +285,7 @@ impl SignalingDeviceCert {
     }
 
     pub fn verify(&self, ca_spki_der: &[u8], now_unix: u64) -> Result<(), ClientError> {
+        self.validate()?;
         Ok(self.to_identity_cert().verify(ca_spki_der, now_unix)?)
     }
 
@@ -273,6 +369,25 @@ impl SignalingDeviceCert {
     }
 }
 
+fn validate_delegation_wire(stmt: &DelegationStatement) -> Result<(), ClientError> {
+    if stmt.device_id == [0u8; 16] {
+        return Err(ClientError::Protocol(
+            "DelegationStatement.device_id must not be zero".into(),
+        ));
+    }
+    if stmt.x25519_pub == [0u8; 32] {
+        return Err(ClientError::Protocol(
+            "DelegationStatement.x25519_pub must not be zero".into(),
+        ));
+    }
+    if stmt.sig_der.is_empty() {
+        return Err(ClientError::Protocol(
+            "DelegationStatement.device_sig must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Encodes `v2.control.DelegationStatement` per `proto/v2/identity.proto` fields `1..=6`.
 pub fn encode_delegation_pb(stmt: &DelegationStatement) -> Vec<u8> {
     let mut out = Vec::with_capacity(144);
@@ -337,6 +452,16 @@ pub fn decode_delegation_pb(bytes: &[u8]) -> Result<DelegationStatement, ClientE
 }
 
 impl RelayTicketWire {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.body.is_empty() {
+            return Err(ClientError::Protocol("RelayTicket.body must not be empty".into()));
+        }
+        if self.mac == [0u8; 32] {
+            return Err(ClientError::Protocol("RelayTicket.mac must not be zero".into()));
+        }
+        Ok(())
+    }
+
     /// Encodes `v2.control.RelayTicket` per `proto/v2/relay_lease.proto` fields `1..=3`.
     pub fn encode_pb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(48 + self.body.len());
@@ -373,7 +498,9 @@ impl RelayTicketWire {
                 "RelayTicket missing required body or 32B mac".into(),
             ));
         }
-        Ok(Self { key_id, body, mac })
+        let ticket = Self { key_id, body, mac };
+        ticket.validate()?;
+        Ok(ticket)
     }
 }
 
@@ -386,6 +513,20 @@ pub struct MovedRedirect {
 }
 
 impl MovedRedirect {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.target_home_region.is_empty() {
+            return Err(ClientError::Protocol(
+                "MovedRedirect.target_home_region must not be empty".into(),
+            ));
+        }
+        if self.target_pop_id == [0u8; 8] {
+            return Err(ClientError::Protocol(
+                "MovedRedirect.target_pop_id must not be zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn encode_pb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32 + self.target_home_region.len());
         encode_pb_bytes(1, self.target_home_region.as_bytes(), &mut out);
@@ -436,6 +577,69 @@ impl MovedRedirect {
     }
 }
 
+/// Server-sent initial Proof-of-Possession challenge (`msg_kind = 0x08`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalingRegisterChallenge {
+    pub server_nonce: [u8; 16],
+    pub server_unix: u64,
+}
+
+impl SignalingRegisterChallenge {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.server_nonce == [0u8; 16] {
+            return Err(ClientError::Protocol(
+                "RegisterChallenge.server_nonce must not be all-zero".into(),
+            ));
+        }
+        if self.server_unix == 0 {
+            return Err(ClientError::Protocol(
+                "RegisterChallenge.server_unix must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn encode_pb(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        encode_pb_bytes(1, &self.server_nonce, &mut out);
+        encode_pb_varint(2, self.server_unix, &mut out);
+        out
+    }
+
+    pub fn decode_pb(bytes: &[u8]) -> Result<Self, ClientError> {
+        let mut pos = 0;
+        let mut server_nonce = [0u8; 16];
+        let mut has_nonce = false;
+        let mut server_unix = 0u64;
+
+        while pos < bytes.len() {
+            let tag = decode_varint(bytes, &mut pos)?;
+            let field_no = (tag >> 3) as u32;
+            let wire_type = tag & 0x07;
+            match (field_no, wire_type) {
+                (1, 2) => {
+                    server_nonce =
+                        read_fixed_bytes::<16>(bytes, &mut pos, "RegisterChallenge.server_nonce")?;
+                    has_nonce = true;
+                }
+                (2, 0) => server_unix = decode_varint(bytes, &mut pos)?,
+                _ => skip_pb_field(wire_type, bytes, &mut pos)?,
+            }
+        }
+        if !has_nonce {
+            return Err(ClientError::Protocol(
+                "RegisterChallenge missing 16B server_nonce".into(),
+            ));
+        }
+        let msg = Self {
+            server_nonce,
+            server_unix,
+        };
+        msg.validate()?;
+        Ok(msg)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalingRegisterReq {
     pub device_cert: SignalingDeviceCert,
@@ -445,11 +649,13 @@ pub struct SignalingRegisterReq {
     pub home_region: String,
     pub ver_major: u32,
     pub ver_minor: u32,
+    /// Additive field 8: low-S DER ECDSA-P256 PoP signature over `build_register_pop_tbs(...)`.
+    pub pop_sig: Vec<u8>,
 }
 
 impl SignalingRegisterReq {
     pub fn encode_pb(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(420);
+        let mut out = Vec::with_capacity(512);
         let cert_pb = self.device_cert.encode_pb();
         encode_pb_bytes(1, &cert_pb, &mut out);
         let deleg_pb = encode_delegation_pb(&self.delegation);
@@ -459,6 +665,7 @@ impl SignalingRegisterReq {
         encode_pb_bytes(5, self.home_region.as_bytes(), &mut out);
         encode_pb_varint(6, self.ver_major as u64, &mut out);
         encode_pb_varint(7, self.ver_minor as u64, &mut out);
+        encode_pb_bytes(8, &self.pop_sig, &mut out);
         out
     }
 
@@ -471,6 +678,7 @@ impl SignalingRegisterReq {
         let mut home_region = String::new();
         let mut ver_major = 0u32;
         let mut ver_minor = 0u32;
+        let mut pop_sig = Vec::new();
 
         while pos < bytes.len() {
             let tag = decode_varint(bytes, &mut pos)?;
@@ -500,6 +708,7 @@ impl SignalingRegisterReq {
                 }
                 (6, 0) => ver_major = decode_u32_varint(bytes, &mut pos, "RegisterReq.ver_major")?,
                 (7, 0) => ver_minor = decode_u32_varint(bytes, &mut pos, "RegisterReq.ver_minor")?,
+                (8, 2) => pop_sig = read_pb_bytes(bytes, &mut pos)?.to_vec(),
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
@@ -515,6 +724,7 @@ impl SignalingRegisterReq {
             home_region,
             ver_major,
             ver_minor,
+            pop_sig,
         })
     }
 }
@@ -528,6 +738,18 @@ pub struct SignalingRegisterResp {
 }
 
 impl SignalingRegisterResp {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.error_code == 0 && self.server_unix == 0 {
+            return Err(ClientError::Protocol(
+                "RegisterResp.server_unix must be > 0 when error_code == 0".into(),
+            ));
+        }
+        if let Some(redir) = &self.redirect {
+            redir.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn encode_pb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         encode_pb_varint(1, self.error_code as u64, &mut out);
@@ -567,12 +789,14 @@ impl SignalingRegisterResp {
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
-        Ok(Self {
+        let resp = Self {
             error_code,
             server_unix,
             redirect,
             heartbeat_interval_sec,
-        })
+        };
+        resp.validate()?;
+        Ok(resp)
     }
 }
 
@@ -664,11 +888,13 @@ impl SignalingStaticKeyHint {
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
+        let deleg = latest_delegation.ok_or_else(|| {
+            ClientError::Protocol("StaticKeyHint missing latest_delegation".into())
+        })?;
+        validate_delegation_wire(&deleg)?;
         Ok(Self {
             device_id,
-            latest_delegation: latest_delegation.ok_or_else(|| {
-                ClientError::Protocol("StaticKeyHint missing latest_delegation".into())
-            })?,
+            latest_delegation: deleg,
             hint_unix,
         })
     }
@@ -854,6 +1080,7 @@ pub enum SignalingMsgKind {
     ConnectOffer = 0x05,
     ConnectAccept = 0x06,
     StaticKeyHint = 0x07,
+    RegisterChallenge = 0x08,
 }
 
 impl SignalingMsgKind {
@@ -866,6 +1093,7 @@ impl SignalingMsgKind {
             0x05 => Ok(Self::ConnectOffer),
             0x06 => Ok(Self::ConnectAccept),
             0x07 => Ok(Self::StaticKeyHint),
+            0x08 => Ok(Self::RegisterChallenge),
             other => Err(ClientError::Protocol(format!(
                 "unknown signaling message kind {other:#04x}"
             ))),
@@ -1166,6 +1394,24 @@ impl SignalingConnectReq {
 }
 
 impl SignalingConnectOffer {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.session_id == [0u8; 16] {
+            return Err(ClientError::Protocol(
+                "ConnectOffer.session_id must not be zero".into(),
+            ));
+        }
+        if let Some(cert) = &self.controller_cert {
+            cert.validate()?;
+        }
+        if let Some(deleg) = &self.controller_delegation {
+            validate_delegation_wire(deleg)?;
+        }
+        if let Some(ticket) = &self.relay_ticket {
+            ticket.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn encode_pb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
         encode_pb_bytes(1, &self.session_id, &mut out);
@@ -1235,7 +1481,7 @@ impl SignalingConnectOffer {
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
-        Ok(Self {
+        let offer = Self {
             session_id,
             controller_cert,
             controller_delegation,
@@ -1243,11 +1489,31 @@ impl SignalingConnectOffer {
             proposed_l3_mtu,
             controller_cap_bits,
             ice_candidates,
-        })
+        };
+        offer.validate()?;
+        Ok(offer)
     }
 }
 
 impl SignalingConnectAccept {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.session_id == [0u8; 16] {
+            return Err(ClientError::Protocol(
+                "ConnectAccept.session_id must not be zero".into(),
+            ));
+        }
+        if let Some(cert) = &self.controlled_cert {
+            cert.validate()?;
+        }
+        if let Some(deleg) = &self.controlled_delegation {
+            validate_delegation_wire(deleg)?;
+        }
+        if let Some(redir) = &self.redirect {
+            redir.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn encode_pb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(420);
         encode_pb_bytes(1, &self.session_id, &mut out);
@@ -1330,7 +1596,7 @@ impl SignalingConnectAccept {
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
-        Ok(Self {
+        let acc = Self {
             session_id,
             error_code,
             controlled_cert,
@@ -1340,7 +1606,9 @@ impl SignalingConnectAccept {
             negotiated_cipher_suite,
             ice_candidates,
             redirect,
-        })
+        };
+        acc.validate()?;
+        Ok(acc)
     }
 }
 
@@ -1417,7 +1685,6 @@ impl SignalingReconnectBackoff {
             .saturating_mul(1u64 << shift)
             .min(self.max_ms);
         self.attempt = self.attempt.saturating_add(1);
-        // Apply +/-20% jitter centered on base_ms, clamped to [initial_ms/2, max_ms].
         let jitter_span = (base_ms / 5).max(1);
         let offset = jitter_sample % (jitter_span.saturating_mul(2).saturating_add(1));
         let jittered = base_ms
@@ -1428,38 +1695,135 @@ impl SignalingReconnectBackoff {
     }
 }
 
-/// Persistent async framed signaling session over a single live TCP connection.
-/// Uses an internal receive buffer so `recv_frame(timeout)` is cancel-safe across timeouts.
+enum SignalingStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for SignalingStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SignalingStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Persistent async framed signaling session over TLS 1.3 (mandatory on non-loopback hosts) or
+/// loopback plaintext TCP. Uses an internal receive buffer so `recv_frame(timeout)` is cancel-safe.
 pub struct SignalingSession {
-    reader: OwnedReadHalf,
-    writer: OwnedWriteHalf,
+    stream: SignalingStream,
     read_buf: Vec<u8>,
     peer_addr: SocketAddr,
+    is_tls: bool,
 }
 
 impl SignalingSession {
+    /// Connects to `v2-signaling` (enforcing TLS 1.3 on all non-loopback hosts), receives the
+    /// mandatory server `RegisterChallenge (0x08)`, computes and signs the 53-byte `V2-SIG-POP-v1`
+    /// Proof-of-Possession with `keystore`, sends `RegisterReq (0x01)`, and verifies `RegisterResp (0x02)`.
     pub async fn connect_and_register(
         addr: &str,
         req: &SignalingRegisterReq,
+        keystore: &dyn DeviceKeyStore,
+        ca_der: Option<&Path>,
+        use_tls: Option<bool>,
         timeout: Duration,
     ) -> Result<(Self, SignalingRegisterResp), ClientError> {
+        let host = parse_signaling_host(addr)?;
+        let tls_enabled = resolve_signaling_tls(addr, use_tls)?;
+        let tls_cfg = if tls_enabled {
+            Some(build_tls_client_config(ca_der)?)
+        } else {
+            None
+        };
+
         let deadline = Instant::now() + timeout;
-        let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        let tcp = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| {
                 ClientError::Timeout(format!("signaling TCP connect to {addr} timed out"))
             })??;
-        let _ = stream.set_nodelay(true);
-        let peer_addr = stream.peer_addr()?;
-        let (reader, writer) = stream.into_split();
-        let mut session = Self {
-            reader,
-            writer,
-            read_buf: Vec::with_capacity(4096),
-            peer_addr,
+        let _ = tcp.set_nodelay(true);
+        let peer_addr = tcp.peer_addr()?;
+
+        let stream = if let Some(cfg) = tls_cfg {
+            let server_name = tls_server_name_for_host(&host)?;
+            let connector = TlsConnector::from(cfg);
+            let rem = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| ClientError::Timeout("signaling TLS handshake timed out".into()))?;
+            let tls = tokio::time::timeout(rem, connector.connect(server_name, tcp))
+                .await
+                .map_err(|_| ClientError::Timeout("signaling TLS handshake timed out".into()))?
+                .map_err(|e| ClientError::Tls(format!("signaling TLS 1.3 handshake failed: {e}")))?;
+            SignalingStream::Tls(Box::new(tls))
+        } else {
+            SignalingStream::Plain(tcp)
         };
 
-        let reg_payload = req.encode_pb();
+        let mut session = Self {
+            stream,
+            read_buf: Vec::with_capacity(4096),
+            peer_addr,
+            is_tls: tls_enabled,
+        };
+
+        // Step 1: Mandatory server-initiated RegisterChallenge (0x08) for replay-proof PoP.
+        let chal_rem = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| ClientError::Timeout("signaling RegisterChallenge timed out".into()))?;
+        let (chal_kind, chal_payload) = session.recv_frame(chal_rem).await?;
+        if chal_kind != SignalingMsgKind::RegisterChallenge {
+            return Err(ClientError::Protocol(format!(
+                "expected initial RegisterChallenge (0x08), got {chal_kind:?}"
+            )));
+        }
+        let challenge = SignalingRegisterChallenge::decode_pb(&chal_payload)?;
+
+        // Step 2: Sign canonical 53-byte V2-SIG-POP-v1 preimage with device P-256 key.
+        let pop_tbs = build_register_pop_tbs(
+            &challenge.server_nonce,
+            &req.device_cert.device_id,
+            challenge.server_unix,
+        );
+        let pop_sig = keystore.sign_p256_low_s(&pop_tbs)?;
+        let mut signed_req = req.clone();
+        signed_req.pop_sig = pop_sig;
+
+        // Step 3: Send RegisterReq (0x01) with PoP signature.
+        let reg_payload = signed_req.encode_pb();
         let write_rem = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| ClientError::Timeout("signaling RegisterReq timed out".into()))?;
@@ -1470,6 +1834,7 @@ impl SignalingSession {
         .await
         .map_err(|_| ClientError::Timeout("signaling RegisterReq write timed out".into()))??;
 
+        // Step 4: Read and validate RegisterResp (0x02).
         let read_rem = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| ClientError::Timeout("signaling RegisterResp timed out".into()))?;
@@ -1493,14 +1858,18 @@ impl SignalingSession {
         self.peer_addr
     }
 
+    pub fn is_tls(&self) -> bool {
+        self.is_tls
+    }
+
     pub async fn send_frame(
         &mut self,
         kind: SignalingMsgKind,
         payload: &[u8],
     ) -> Result<(), ClientError> {
         let frame = encode_signaling_frame(kind, payload)?;
-        self.writer.write_all(&frame).await?;
-        self.writer.flush().await?;
+        self.stream.write_all(&frame).await?;
+        self.stream.flush().await?;
         Ok(())
     }
 
@@ -1530,7 +1899,9 @@ impl SignalingSession {
             .await
     }
 
-    fn try_pop_buffered_frame(&mut self) -> Result<Option<(SignalingMsgKind, Vec<u8>)>, ClientError> {
+    fn try_pop_buffered_frame(
+        &mut self,
+    ) -> Result<Option<(SignalingMsgKind, Vec<u8>)>, ClientError> {
         if self.read_buf.len() < 4 {
             return Ok(None);
         }
@@ -1571,7 +1942,7 @@ impl SignalingSession {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("signaling recv_frame timed out".into()));
             };
-            let n = tokio::time::timeout(rem, self.reader.read(&mut tmp))
+            let n = tokio::time::timeout(rem, self.stream.read(&mut tmp))
                 .await
                 .map_err(|_| ClientError::Timeout("signaling recv_frame timed out".into()))??;
             if n == 0 {
@@ -1594,7 +1965,7 @@ impl SignalingSession {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), ClientError> {
-        self.writer.shutdown().await?;
+        self.stream.shutdown().await?;
         Ok(())
     }
 }
@@ -1631,8 +2002,19 @@ impl SignalingClient {
     pub async fn connect_and_register(
         &self,
         req: &SignalingRegisterReq,
+        keystore: &dyn DeviceKeyStore,
+        ca_der: Option<&Path>,
+        use_tls: Option<bool>,
     ) -> Result<(SignalingSession, SignalingRegisterResp), ClientError> {
-        SignalingSession::connect_and_register(&self.addr, req, self.timeout).await
+        SignalingSession::connect_and_register(
+            &self.addr,
+            req,
+            keystore,
+            ca_der,
+            use_tls,
+            self.timeout,
+        )
+        .await
     }
 
     /// Performs a real TCP reachability/connect probe against `v2-signaling`.
@@ -1687,8 +2069,18 @@ impl SignalingClient {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
+    use rustls::ServerConfig;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::Arc,
+    };
     use tokio::net::TcpListener;
-    use v2_identity::{DeviceKeyStore, SoftwareDeviceKeyStore, X25519StaticKeyRotator};
+    use tokio_rustls::TlsAcceptor;
+    use v2_identity::{
+        verify_p256_low_s, DeviceKeyStore, SoftwareDeviceKeyStore, X25519StaticKeyRotator,
+    };
 
     fn make_signed_cert_and_deleg() -> (
         SoftwareDeviceKeyStore,
@@ -1726,11 +2118,108 @@ mod tests {
         (dev, cert, gen.delegation.clone(), ca_spki)
     }
 
+    fn generate_test_ca_and_server_tls() -> (Vec<u8>, Arc<ServerConfig>) {
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "ZeroDesk Signaling Test CA");
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut srv_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        srv_params
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let srv_key = KeyPair::generate().unwrap();
+        let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_cfg = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(srv_cert.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(srv_key.serialize_der())),
+            )
+            .unwrap();
+
+        (ca_cert.der().to_vec(), Arc::new(server_cfg))
+    }
+
+    #[test]
+    fn register_challenge_pop_tbs_and_field8_pop_sig_roundtrip() {
+        let (dev, cert, deleg, _ca_spki) = make_signed_cert_and_deleg();
+        let chal = SignalingRegisterChallenge {
+            server_nonce: [0xA5u8; 16],
+            server_unix: 1_700_000_555,
+        };
+        let chal_pb = chal.encode_pb();
+        assert_eq!(SignalingRegisterChallenge::decode_pb(&chal_pb).unwrap(), chal);
+
+        // Fail-closed malformed RegisterChallenge cases
+        assert!(SignalingRegisterChallenge::decode_pb(&[]).is_err()); // missing nonce & unix
+        assert!(SignalingRegisterChallenge::decode_pb(&[0x0A, 0x04, 1, 2, 3, 4, 0x10, 0x01]).is_err()); // nonce != 16B
+        assert!(SignalingRegisterChallenge::decode_pb(&[0x0A, 0x10, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]).is_err()); // server_unix == 0
+        assert!(SignalingRegisterChallenge::decode_pb(&[0x0A, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x01]).is_err()); // all-zero nonce
+
+        // Exact 53-byte canonical preimage + low-S P-256 verify
+        let tbs = build_register_pop_tbs(&chal.server_nonce, &cert.device_id, chal.server_unix);
+        assert_eq!(tbs.len(), 53);
+        assert_eq!(&tbs[0..13], b"V2-SIG-POP-v1");
+        assert_eq!(&tbs[13..29], &chal.server_nonce);
+        assert_eq!(&tbs[29..45], &cert.device_id);
+        assert_eq!(&tbs[45..53], &chal.server_unix.to_be_bytes());
+
+        let pop_sig = dev.sign_p256_low_s(&tbs).unwrap();
+        verify_p256_low_s(&cert.p256_pub_der, &tbs, &pop_sig).unwrap();
+
+        // RegisterReq field 8 pop_sig Protobuf3 round-trip
+        let reg_req = SignalingRegisterReq {
+            device_cert: cert,
+            delegation: deleg,
+            presence: PresenceState::Online,
+            cap_bits: 0x3FFF,
+            home_region: "local".into(),
+            ver_major: 2,
+            ver_minor: 1,
+            pop_sig: pop_sig.clone(),
+        };
+        let dec = SignalingRegisterReq::decode_pb(&reg_req.encode_pb()).unwrap();
+        assert_eq!(dec, reg_req);
+        assert_eq!(dec.pop_sig, pop_sig);
+    }
+
+    #[test]
+    fn non_loopback_signaling_refuses_plaintext_and_ticket_debug_is_redacted() {
+        // Non-loopback MUST fail closed if plaintext requested, and default to TLS 1.3
+        assert!(resolve_signaling_tls("203.0.113.10:18090", Some(false)).is_err());
+        assert!(resolve_signaling_tls("sig.zerodesk.example:443", Some(false)).is_err());
+        assert!(resolve_signaling_tls("203.0.113.10:18090", None).unwrap());
+        assert!(resolve_signaling_tls("sig.zerodesk.example:443", Some(true)).unwrap());
+
+        // Loopback allows plaintext by default and TLS when explicitly requested
+        assert!(!resolve_signaling_tls("127.0.0.1:18090", None).unwrap());
+        assert!(!resolve_signaling_tls("[::1]:18090", Some(false)).unwrap());
+        assert!(resolve_signaling_tls("localhost:18090", Some(true)).unwrap());
+
+        // RelayTicketWire Debug MUST NOT leak MAC or body bytes
+        let ticket = RelayTicketWire {
+            key_id: 7,
+            body: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            mac: [0xCA; 32],
+        };
+        let dbg = format!("{ticket:?}");
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("202")); // 0xCA decimal
+        assert!(!dbg.contains("222")); // 0xDE decimal
+    }
+
     #[test]
     fn device_cert_delegation_ticket_redirect_and_signaling_pb_roundtrips() {
         let (_dev, cert, deleg, ca_spki) = make_signed_cert_and_deleg();
 
-        // DeviceCert roundtrip + verify + from_register_resp
         let cert_pb = cert.encode_pb();
         let cert_dec = SignalingDeviceCert::decode_pb(&cert_pb).unwrap();
         assert_eq!(cert_dec, cert);
@@ -1747,15 +2236,11 @@ mod tests {
         };
         let cert_from_resp = SignalingDeviceCert::from_register_resp(&reg_resp).unwrap();
         assert_eq!(cert_from_resp.to_tbs_bytes().unwrap(), tbs);
-        assert_eq!(cert_from_resp.device_id, cert.device_id);
-        assert_eq!(cert_from_resp.tenant_id, cert.tenant_id);
         cert_from_resp.verify(&ca_spki, 1_700_000_100).unwrap();
 
-        // DelegationStatement roundtrip
         let deleg_dec = decode_delegation_pb(&encode_delegation_pb(&deleg)).unwrap();
         assert_eq!(deleg_dec, deleg);
 
-        // RelayTicketWire roundtrip
         let ticket = RelayTicketWire {
             key_id: 3,
             body: vec![0x01, 0x02, 0x03, 0x04],
@@ -1766,7 +2251,6 @@ mod tests {
             ticket
         );
 
-        // MovedRedirect roundtrip
         let redirect = MovedRedirect {
             target_home_region: "ap-east-1".into(),
             target_pop_id: *b"edge-b02",
@@ -1778,7 +2262,6 @@ mod tests {
             redirect
         );
 
-        // RegisterReq / RegisterResp roundtrip
         let reg_req = SignalingRegisterReq {
             device_cert: cert.clone(),
             delegation: deleg.clone(),
@@ -1787,6 +2270,7 @@ mod tests {
             home_region: "local".into(),
             ver_major: 2,
             ver_minor: 1,
+            pop_sig: vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
         };
         assert_eq!(
             SignalingRegisterReq::decode_pb(&reg_req.encode_pb()).unwrap(),
@@ -1804,7 +2288,6 @@ mod tests {
             sig_reg_resp
         );
 
-        // PeerRouteCandidate strict encode/decode
         let peer_route = PeerRouteCandidate {
             pop_a: *b"edge-a01",
             cid_a: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
@@ -1819,7 +2302,6 @@ mod tests {
         );
         assert_eq!(PeerRouteCandidate::parse(&encoded_route).unwrap(), peer_route);
 
-        // ConnectReq / ConnectOffer / ConnectAccept / StaticKeyHint roundtrips
         let conn_req = SignalingConnectReq {
             session_id: [0x77; 16],
             controller_device_id: [0x11; 16],
@@ -1881,21 +2363,20 @@ mod tests {
 
     #[test]
     fn malformed_frames_and_peer_route_candidates_fail_closed() {
-        // Frame bounds and truncation
         assert!(decode_signaling_frame(&[]).is_err());
         assert!(decode_signaling_frame(&[0, 0, 0, 0, 1]).is_err());
-        assert!(decode_signaling_frame(&[0, 1, 0, 1, 1]).is_err()); // > 65536
-        assert!(decode_signaling_frame(&[0, 0, 0, 2, 0xFF, 0x00]).is_err()); // unknown kind
+        assert!(decode_signaling_frame(&[0, 1, 0, 1, 1]).is_err());
+        assert!(decode_signaling_frame(&[0, 0, 0, 2, 0xFF, 0x00]).is_err());
         assert!(encode_signaling_frame(SignalingMsgKind::Heartbeat, &vec![0u8; 65536]).is_err());
 
-        // Truncated protobufs
         assert!(SignalingDeviceCert::decode_pb(&[0x12, 0x10, 0x01, 0x02]).is_err());
-        assert!(SignalingDeviceCert::decode_pb(&[0x12, 0x04, 1, 2, 3, 4]).is_err()); // cert_id != 16B
-        assert!(decode_delegation_pb(&[0x18, 0x02]).is_err()); // bool = 2
-        assert!(RelayTicketWire::decode_pb(&[0x08, 0x01]).is_err()); // missing body & mac
-        assert!(SignalingRegisterReq::decode_pb(&[]).is_err()); // missing cert & deleg
+        assert!(SignalingDeviceCert::decode_pb(&[0x12, 0x04, 1, 2, 3, 4]).is_err());
+        assert!(decode_delegation_pb(&[0x18, 0x02]).is_err());
+        assert!(RelayTicketWire::decode_pb(&[0x08, 0x01]).is_err());
+        assert!(SignalingRegisterReq::decode_pb(&[]).is_err());
+        assert!(SignalingConnectOffer::decode_pb(&[]).is_err()); // zero session_id rejected
+        assert!(SignalingConnectAccept::decode_pb(&[]).is_err()); // zero session_id rejected
 
-        // Invalid peer-route candidates
         for bad in [
             "wrong:pop_a=edge-a01;cid_a=0123456789abcdef;pop_b=edge-b02;cid_b=fedcba9876543210;bw_cap_kbps=100",
             "v2-peer:pop_a=short;cid_a=0123456789abcdef;pop_b=edge-b02;cid_b=fedcba9876543210;bw_cap_kbps=100",
@@ -1927,22 +2408,44 @@ mod tests {
         assert_eq!(backoff.attempts(), 0);
     }
 
+    async fn read_one_frame<S: AsyncRead + Unpin>(s: &mut S) -> (SignalingMsgKind, Vec<u8>) {
+        let mut len_buf = [0u8; 4];
+        s.read_exact(&mut len_buf).await.unwrap();
+        let total = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; total];
+        s.read_exact(&mut body).await.unwrap();
+        (SignalingMsgKind::from_u8(body[0]).unwrap(), body[1..].to_vec())
+    }
+
     #[tokio::test]
-    async fn signaling_session_register_heartbeat_offer_accept_and_error_reject() {
-        let (_dev, cert, deleg, _ca_spki) = make_signed_cert_and_deleg();
+    async fn signaling_session_loopback_challenge_pop_offer_accept_and_rejects() {
+        let (dev, cert, deleg, _ca_spki) = make_signed_cert_and_deleg();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let srv = tokio::spawn(async move {
-            // Conn 1: succeeds and exchanges Heartbeat -> ConnectOffer -> ConnectAccept
+            // Conn 1: full RegisterChallenge -> PoP verify -> RegisterResp -> Heartbeat -> split ConnectOffer -> ConnectAccept
             let (mut s1, _) = listener.accept().await.unwrap();
-            let mut len_buf = [0u8; 4];
-            s1.read_exact(&mut len_buf).await.unwrap();
-            let total = u32::from_be_bytes(len_buf) as usize;
-            let mut body = vec![0u8; total];
-            s1.read_exact(&mut body).await.unwrap();
-            assert_eq!(body[0], SignalingMsgKind::RegisterReq as u8);
-            let reg_req = SignalingRegisterReq::decode_pb(&body[1..]).unwrap();
+            let chal = SignalingRegisterChallenge {
+                server_nonce: [0x5A; 16],
+                server_unix: 1_700_000_200,
+            };
+            s1.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterChallenge, &chal.encode_pb())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let (kind, payload) = read_one_frame(&mut s1).await;
+            assert_eq!(kind, SignalingMsgKind::RegisterReq);
+            let reg_req = SignalingRegisterReq::decode_pb(&payload).unwrap();
+            let tbs = build_register_pop_tbs(
+                &chal.server_nonce,
+                &reg_req.device_cert.device_id,
+                chal.server_unix,
+            );
+            verify_p256_low_s(&reg_req.device_cert.p256_pub_der, &tbs, &reg_req.pop_sig).unwrap();
 
             let resp = SignalingRegisterResp {
                 error_code: 0,
@@ -1950,18 +2453,15 @@ mod tests {
                 redirect: None,
                 heartbeat_interval_sec: 15,
             };
-            let f = encode_signaling_frame(SignalingMsgKind::RegisterResp, &resp.encode_pb())
-                .unwrap();
-            s1.write_all(&f).await.unwrap();
+            s1.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterResp, &resp.encode_pb()).unwrap(),
+            )
+            .await
+            .unwrap();
 
-            // Read Heartbeat
-            s1.read_exact(&mut len_buf).await.unwrap();
-            let total = u32::from_be_bytes(len_buf) as usize;
-            let mut hb_body = vec![0u8; total];
-            s1.read_exact(&mut hb_body).await.unwrap();
-            assert_eq!(hb_body[0], SignalingMsgKind::Heartbeat as u8);
+            let (hb_kind, _) = read_one_frame(&mut s1).await;
+            assert_eq!(hb_kind, SignalingMsgKind::Heartbeat);
 
-            // Send ConnectOffer in 2 split TCP chunks to test cancel-safe buffering
             let offer = SignalingConnectOffer {
                 session_id: [0x99; 16],
                 controller_cert: Some(reg_req.device_cert),
@@ -1978,30 +2478,46 @@ mod tests {
             s1.write_all(&offer_wire[7..]).await.unwrap();
             s1.flush().await.unwrap();
 
-            // Read ConnectAccept
-            s1.read_exact(&mut len_buf).await.unwrap();
-            let total = u32::from_be_bytes(len_buf) as usize;
-            let mut acc_body = vec![0u8; total];
-            s1.read_exact(&mut acc_body).await.unwrap();
-            assert_eq!(acc_body[0], SignalingMsgKind::ConnectAccept as u8);
-            let acc = SignalingConnectAccept::decode_pb(&acc_body[1..]).unwrap();
+            let (acc_kind, acc_payload) = read_one_frame(&mut s1).await;
+            assert_eq!(acc_kind, SignalingMsgKind::ConnectAccept);
+            let acc = SignalingConnectAccept::decode_pb(&acc_payload).unwrap();
             assert_eq!(acc.session_id, [0x99; 16]);
 
-            // Conn 2: non-zero error_code without redirect MUST be rejected by connect_and_register
+            // Conn 2: server sends wrong initial frame (RegisterResp instead of RegisterChallenge) -> client MUST fail closed!
             let (mut s2, _) = listener.accept().await.unwrap();
-            s2.read_exact(&mut len_buf).await.unwrap();
-            let total = u32::from_be_bytes(len_buf) as usize;
-            let mut b2 = vec![0u8; total];
-            s2.read_exact(&mut b2).await.unwrap();
+            let bogus = SignalingRegisterResp {
+                error_code: 0,
+                server_unix: 1_700_000_201,
+                redirect: None,
+                heartbeat_interval_sec: 15,
+            };
+            s2.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterResp, &bogus.encode_pb()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // Conn 3: valid challenge, then RegisterResp with non-zero error_code and no redirect -> client MUST fail closed!
+            let (mut s3, _) = listener.accept().await.unwrap();
+            s3.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterChallenge, &chal.encode_pb())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let _ = read_one_frame(&mut s3).await;
             let err_resp = SignalingRegisterResp {
                 error_code: 0x0401,
                 server_unix: 1_700_000_201,
                 redirect: None,
                 heartbeat_interval_sec: 15,
             };
-            let f2 = encode_signaling_frame(SignalingMsgKind::RegisterResp, &err_resp.encode_pb())
-                .unwrap();
-            s2.write_all(&f2).await.unwrap();
+            s3.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterResp, &err_resp.encode_pb())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         });
 
         let reg_req = SignalingRegisterReq {
@@ -2012,12 +2528,20 @@ mod tests {
             home_region: "local".into(),
             ver_major: 2,
             ver_minor: 1,
+            pop_sig: Vec::new(),
         };
 
-        let (mut sess, resp) =
-            SignalingSession::connect_and_register(&addr.to_string(), &reg_req, Duration::from_secs(2))
-                .await
-                .unwrap();
+        let (mut sess, resp) = SignalingSession::connect_and_register(
+            &addr.to_string(),
+            &reg_req,
+            &dev,
+            None,
+            Some(false),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!sess.is_tls());
         assert_eq!(resp.error_code, 0);
         assert_eq!(resp.heartbeat_interval_sec, 15);
 
@@ -2031,7 +2555,6 @@ mod tests {
         .await
         .unwrap();
 
-        // First call with tiny timeout may time out mid-chunk; second call MUST still assemble cleanly!
         let (kind, payload) = match sess.recv_frame(Duration::from_millis(5)).await {
             Ok(v) => v,
             Err(ClientError::Timeout(_)) => sess.recv_frame(Duration::from_secs(2)).await.unwrap(),
@@ -2055,15 +2578,126 @@ mod tests {
         .await
         .unwrap();
 
-        // Conn 2 must fail closed on non-zero error_code without redirect
-        let rej = SignalingSession::connect_and_register(
+        // Conn 2: missing RegisterChallenge rejected fail-closed
+        assert!(SignalingSession::connect_and_register(
             &addr.to_string(),
             &reg_req,
+            &dev,
+            None,
+            Some(false),
             Duration::from_secs(2),
         )
-        .await;
-        assert!(rej.is_err());
+        .await
+        .is_err());
+
+        // Conn 3: non-zero error_code without redirect rejected fail-closed
+        assert!(SignalingSession::connect_and_register(
+            &addr.to_string(),
+            &reg_req,
+            &dev,
+            None,
+            Some(false),
+            Duration::from_secs(2),
+        )
+        .await
+        .is_err());
+
+        // Non-loopback plaintext MUST fail closed before any socket I/O
+        assert!(SignalingSession::connect_and_register(
+            "203.0.113.10:18090",
+            &reg_req,
+            &dev,
+            None,
+            Some(false),
+            Duration::from_secs(1),
+        )
+        .await
+        .is_err());
 
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signaling_session_tls13_with_custom_ca_and_pop_verification() {
+        let (dev, cert, deleg, _ca_spki) = make_signed_cert_and_deleg();
+        let (ca_der, srv_tls) = generate_test_ca_and_server_tls();
+        let ca_path = std::env::temp_dir().join(format!(
+            "zd-sig-tls-ca-{}-{}.der",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        std::fs::write(&ca_path, &ca_der).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(srv_tls);
+
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let chal = SignalingRegisterChallenge {
+                server_nonce: [0xC3; 16],
+                server_unix: 1_700_000_999,
+            };
+            tls.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterChallenge, &chal.encode_pb())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            tls.flush().await.unwrap();
+
+            let (kind, payload) = read_one_frame(&mut tls).await;
+            assert_eq!(kind, SignalingMsgKind::RegisterReq);
+            let reg_req = SignalingRegisterReq::decode_pb(&payload).unwrap();
+            let tbs = build_register_pop_tbs(
+                &chal.server_nonce,
+                &reg_req.device_cert.device_id,
+                chal.server_unix,
+            );
+            verify_p256_low_s(&reg_req.device_cert.p256_pub_der, &tbs, &reg_req.pop_sig).unwrap();
+
+            let resp = SignalingRegisterResp {
+                error_code: 0,
+                server_unix: 1_700_000_999,
+                redirect: None,
+                heartbeat_interval_sec: 15,
+            };
+            tls.write_all(
+                &encode_signaling_frame(SignalingMsgKind::RegisterResp, &resp.encode_pb()).unwrap(),
+            )
+            .await
+            .unwrap();
+            tls.flush().await.unwrap();
+        });
+
+        let reg_req = SignalingRegisterReq {
+            device_cert: cert,
+            delegation: deleg,
+            presence: PresenceState::Online,
+            cap_bits: 0x3FFF,
+            home_region: "local".into(),
+            ver_major: 2,
+            ver_minor: 1,
+            pop_sig: Vec::new(),
+        };
+
+        let (mut sess, resp) = SignalingSession::connect_and_register(
+            &addr.to_string(),
+            &reg_req,
+            &dev,
+            Some(&ca_path),
+            Some(true),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(sess.is_tls());
+        assert_eq!(resp.error_code, 0);
+        assert_eq!(resp.server_unix, 1_700_000_999);
+        let _ = sess.shutdown().await;
+
+        srv.await.unwrap();
+        let _ = std::fs::remove_file(&ca_path);
     }
 }

@@ -355,6 +355,7 @@ fn build_v123_hid_script(audit_key_identity: bool) -> Vec<(HidPayload, AuditReco
 struct HostDaemonArgs {
     config: PathBuf,
     ca_der: Option<PathBuf>,
+    signaling_tls: bool,
     identity_dir: PathBuf,
     audit_out: PathBuf,
     codec: VideoCodec,
@@ -374,6 +375,9 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         args.ca_der.clone(),
         args.enrollment_token.clone(),
     );
+    if args.signaling_tls {
+        v2_cfg.signaling_tls = Some(true);
+    }
     v2_cfg.codec = args.codec;
     v2_cfg.fps = args.fps;
     v2_cfg.watchdog_timeout_ms = args.watchdog_ms;
@@ -678,6 +682,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
 pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
     let mut config: Option<PathBuf> = None;
     let mut ca_der: Option<PathBuf> = None;
+    let mut signaling_tls = false;
     let mut identity_dir: Option<PathBuf> = None;
     let mut audit_out: Option<PathBuf> = None;
     let mut codec = VideoCodec::Vp9;
@@ -697,6 +702,10 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
             "--ca-der" => parse_flag_value(args, &mut i, "--ca-der").map(|v| {
                 ca_der = Some(PathBuf::from(v));
             }),
+            "--signaling-tls" => {
+                signaling_tls = true;
+                Ok(())
+            }
             "--identity-dir" => parse_flag_value(args, &mut i, "--identity-dir").map(|v| {
                 identity_dir = Some(PathBuf::from(v));
             }),
@@ -739,7 +748,7 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
     let (Some(config), Some(identity_dir), Some(audit_out)) = (config, identity_dir, audit_out)
     else {
         eprintln!(
-            "usage: v2-hostd --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>]"
+            "usage: v2-hostd --config <cluster.json> [--ca-der <path>] [--signaling-tls] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>]"
         );
         return ExitCode::from(2);
     };
@@ -747,6 +756,7 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
     let host_args = HostDaemonArgs {
         config,
         ca_der,
+        signaling_tls,
         identity_dir,
         audit_out,
         codec,
@@ -786,6 +796,7 @@ pub async fn cmd_v2_hostd(args: &[String]) -> ExitCode {
 struct ControllerClientArgs {
     config: PathBuf,
     ca_der: Option<PathBuf>,
+    signaling_tls: bool,
     identity_dir: PathBuf,
     target_device_id: [u8; 16],
     tenant_id: [u8; 16],
@@ -852,6 +863,9 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
         args.ca_der.clone(),
         Some(args.enrollment_token.clone()),
     );
+    if args.signaling_tls {
+        v2_cfg.signaling_tls = Some(true);
+    }
     v2_cfg.codec = args.codec;
     v2_cfg.validate().map_err(|e| e.to_string())?;
 
@@ -1086,6 +1100,7 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
 pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
     let mut config: Option<PathBuf> = None;
     let mut ca_der: Option<PathBuf> = None;
+    let mut signaling_tls = false;
     let mut identity_dir: Option<PathBuf> = None;
     let mut target_device_id_hex: Option<String> = None;
     let mut tenant_id_hex: Option<String> = None;
@@ -1107,6 +1122,10 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
             "--ca-der" => parse_flag_value(args, &mut i, "--ca-der").map(|v| {
                 ca_der = Some(PathBuf::from(v));
             }),
+            "--signaling-tls" => {
+                signaling_tls = true;
+                Ok(())
+            }
             "--identity-dir" => parse_flag_value(args, &mut i, "--identity-dir").map(|v| {
                 identity_dir = Some(PathBuf::from(v));
             }),
@@ -1168,7 +1187,7 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
     )
     else {
         eprintln!(
-            "usage: v2-ctl --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>]"
+            "usage: v2-ctl --config <cluster.json> [--ca-der <path>] [--signaling-tls] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>]"
         );
         return ExitCode::from(2);
     };
@@ -1191,6 +1210,7 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
     let ctl_args = ControllerClientArgs {
         config,
         ca_der,
+        signaling_tls,
         identity_dir,
         target_device_id,
         tenant_id,
@@ -1384,6 +1404,7 @@ async fn run_signaling_normal_scenario(
     name: &str,
     config_path: &Path,
     ca_der: Option<&Path>,
+    signaling_tls: bool,
     host_id_dir: &Path,
     ctrl_id_dir: &Path,
     work_dir: &Path,
@@ -1420,6 +1441,9 @@ async fn run_signaling_normal_scenario(
         .arg("--audit-key-identity");
     if let Some(ca) = ca_der {
         host_cmd.arg("--ca-der").arg(ca);
+    }
+    if signaling_tls {
+        host_cmd.arg("--signaling-tls");
     }
 
     let host_child = match ChildGroupGuard::spawn_in_group(&mut host_cmd) {
@@ -1496,6 +1520,9 @@ async fn run_signaling_normal_scenario(
         .arg("--audit-key-identity");
     if let Some(ca) = ca_der {
         ctl_cmd.arg("--ca-der").arg(ca);
+    }
+    if signaling_tls {
+        ctl_cmd.arg("--signaling-tls");
     }
 
     let ctl_child = match ChildGroupGuard::spawn_in_group(&mut ctl_cmd) {
@@ -1598,6 +1625,7 @@ async fn run_signaling_sigkill_watchdog_scenario(
     exe: &Path,
     config_path: &Path,
     ca_der: Option<&Path>,
+    signaling_tls: bool,
     host_id_dir: &Path,
     ctrl_id_dir: &Path,
     work_dir: &Path,
@@ -1634,6 +1662,9 @@ async fn run_signaling_sigkill_watchdog_scenario(
         .arg("--audit-key-identity");
     if let Some(ca) = ca_der {
         host_cmd.arg("--ca-der").arg(ca);
+    }
+    if signaling_tls {
+        host_cmd.arg("--signaling-tls");
     }
 
     let host_child = match ChildGroupGuard::spawn_in_group(&mut host_cmd) {
@@ -1713,6 +1744,9 @@ async fn run_signaling_sigkill_watchdog_scenario(
         .arg("--audit-key-identity");
     if let Some(ca) = ca_der {
         ctl_cmd.arg("--ca-der").arg(ca);
+    }
+    if signaling_tls {
+        ctl_cmd.arg("--signaling-tls");
     }
 
     let mut ctl_child = match ChildGroupGuard::spawn_in_group(&mut ctl_cmd) {
@@ -1819,6 +1853,7 @@ async fn run_signaling_sigkill_watchdog_scenario(
 pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
     let mut config_path: Option<PathBuf> = None;
     let mut ca_der: Option<PathBuf> = None;
+    let mut signaling_tls = false;
     let mut codec = VideoCodec::Vp9;
     let mut frames = 30usize;
 
@@ -1831,6 +1866,10 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
             "--ca-der" => parse_flag_value(args, &mut i, "--ca-der").map(|v| {
                 ca_der = Some(PathBuf::from(v));
             }),
+            "--signaling-tls" => {
+                signaling_tls = true;
+                Ok(())
+            }
             "--codec" => parse_flag_value(args, &mut i, "--codec")
                 .and_then(|v| VideoCodec::parse_name(&v).map_err(|e| e.to_string()))
                 .map(|c| codec = c),
@@ -1848,7 +1887,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
 
     let Some(config_path) = config_path else {
         eprintln!(
-            "usage: signaling-e2e --config <cluster.json> [--ca-der <path>] [--codec vp9] [--frames 30]"
+            "usage: signaling-e2e --config <cluster.json> [--ca-der <path>] [--signaling-tls] [--codec vp9] [--frames 30]"
         );
         return ExitCode::from(2);
     };
@@ -1928,6 +1967,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         "scenario_1_vp9",
         &config_path,
         ca_der.as_deref(),
+        signaling_tls,
         &host_id_dir,
         &ctrl_id_dir,
         &work_dir,
@@ -1943,6 +1983,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         "scenario_2_av1",
         &config_path,
         ca_der.as_deref(),
+        signaling_tls,
         &host_id_dir,
         &ctrl_id_dir,
         &work_dir,
@@ -1957,6 +1998,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         &exe,
         &config_path,
         ca_der.as_deref(),
+        signaling_tls,
         &host_id_dir,
         &ctrl_id_dir,
         &work_dir,

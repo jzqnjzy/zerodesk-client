@@ -88,11 +88,21 @@ pub fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RelayTicketWire {
     pub key_id: u32,
     pub body: Vec<u8>,
     pub mac: [u8; 32],
+}
+
+impl std::fmt::Debug for RelayTicketWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayTicketWire")
+            .field("key_id", &self.key_id)
+            .field("body_len", &self.body.len())
+            .field("mac", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

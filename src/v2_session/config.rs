@@ -13,7 +13,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use v2_client::{ClusterConfig, EdgeEndpointConfig};
+use v2_client::{resolve_signaling_tls, ClusterConfig, EdgeEndpointConfig};
 
 pub const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 3_000;
 pub const DEFAULT_KEEPALIVE_INTERVAL_MS: u64 = 500;
@@ -53,6 +53,11 @@ impl std::error::Error for V2ConfigError {}
 pub struct V2ClientConfig {
     pub control_plane_endpoint: String,
     pub signaling_addr: String,
+    /// Optional TLS override for `v2-signaling`:
+    /// - `None`: auto (TLS 1.3 on non-loopback, plaintext allowed on loopback)
+    /// - `Some(true)`: always require TLS 1.3
+    /// - `Some(false)`: loopback plaintext only (non-loopback fails closed)
+    pub signaling_tls: Option<bool>,
     pub edge_a: EdgeEndpointConfig,
     pub edge_b: EdgeEndpointConfig,
     pub enrollment_token: Option<String>,
@@ -83,6 +88,7 @@ impl V2ClientConfig {
         Self {
             control_plane_endpoint: cfg.cp_base_url(),
             signaling_addr: cfg.signaling_addr.clone(),
+            signaling_tls: cfg.signaling_tls,
             edge_a: cfg.edge_a.clone(),
             edge_b: cfg.edge_b.clone(),
             enrollment_token,
@@ -126,6 +132,8 @@ impl V2ClientConfig {
                 "signaling_addr must not be empty".into(),
             ));
         }
+        resolve_signaling_tls(&self.signaling_addr, self.signaling_tls)
+            .map_err(|e| V2ConfigError::InvalidValue(format!("signaling TLS policy invalid: {e}")))?;
         self.edge_a
             .pop_id_bytes()
             .and_then(|_| self.edge_a.x25519_pub())
@@ -365,6 +373,7 @@ mod tests {
         V2ClientConfig {
             control_plane_endpoint: "http://127.0.0.1:18080".into(),
             signaling_addr: "127.0.0.1:18090".into(),
+            signaling_tls: None,
             edge_a: sample_edge("edge-a01"),
             edge_b: sample_edge("edge-b02"),
             enrollment_token: Some("tok".into()),
@@ -388,6 +397,16 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("zd-cfg-test-{}-{uniq}", std::process::id()));
         let mut cfg = sample_config(dir.clone());
+        cfg.validate().unwrap();
+
+        // Non-loopback signaling with explicit plaintext MUST fail closed
+        cfg.signaling_addr = "203.0.113.10:18090".into();
+        cfg.signaling_tls = Some(false);
+        assert!(cfg.validate().is_err());
+        cfg.signaling_tls = None;
+        cfg.validate().unwrap();
+        cfg.signaling_addr = "127.0.0.1:18090".into();
+        cfg.signaling_tls = None;
         cfg.validate().unwrap();
 
         // Watchdog bounds [1000, 10000]

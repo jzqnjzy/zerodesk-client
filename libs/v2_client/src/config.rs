@@ -68,6 +68,8 @@ pub struct ClusterConfig {
     pub cp_use_tls: bool,
     pub signaling_addr: String,
     #[serde(default)]
+    pub signaling_tls: Option<bool>,
+    #[serde(default)]
     pub admin_token: Option<String>,
     #[serde(default)]
     pub ca_der_path: Option<String>,
