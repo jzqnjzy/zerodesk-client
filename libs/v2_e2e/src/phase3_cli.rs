@@ -29,7 +29,8 @@ use v2_e2e::EnigoOsSink;
 use v2_e2e::{
     compute_y_variance, decode_hid_frame, detect_visual_marker, encode_hid_frame,
     parse_session_close, spawn_capture_pipeline, spawn_release_watchdog, AuditKey, AuditRecord,
-    CaptureError, CapturePipelineHandle, DesktopControllerSession, DesktopHostSession, DryRunSink,
+    CaptureError, CapturePipelineHandle, DecodedVideoDelivery, DesktopControllerSession,
+    DesktopHostSession, DryRunSink,
     HidEchoAck, HidInputExecutor, HidInputSink, HidPayload, InputError, KeyEvent, MouseEvent,
     MouseKind, SafeHidKey, ScrapDisplaySource, SessionError, SharedVisualMarker,
     SyntheticAnimatedSource, V2VideoDecoder, V2VideoEncoder, VideoCodec, DEFAULT_SYNTHETIC_HEIGHT,
@@ -1136,16 +1137,18 @@ async fn run_host_with_sink<S: HidInputSink + 'static>(
                 }
             }
             Ok(TransportEvent::Control(ctrl)) => {
+                if parse_session_close(&ctrl).is_some() {
+                    close_reason = "session_close".into();
+                    break 'session_loop;
+                }
+                // Authenticated Control frames (including 0x03 KEEPALIVE) refresh both idle
+                // tracking and the input-release watchdog per protocol-spec v1.2.3 P0-2.
                 last_peer_activity = Instant::now();
                 {
                     let guard = executor
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     guard.touch_activity();
-                }
-                if parse_session_close(&ctrl).is_some() {
-                    close_reason = "session_close".into();
-                    break 'session_loop;
                 }
             }
             Ok(
@@ -1481,8 +1484,54 @@ struct ControllerArgs {
     audit_key_identity: bool,
 }
 
+const CTRL_MSG_KEEPALIVE: u8 = 0x03;
+const CONTROLLER_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 const SESSION_CLOSE_REDUNDANT_SENDS: usize = 3;
 const SESSION_CLOSE_REDUNDANT_INTERVAL: Duration = Duration::from_millis(20);
+
+async fn recv_video_with_keepalive(
+    controller: &mut DesktopControllerSession,
+    timeout: Duration,
+    last_tx_to_host: &mut Instant,
+) -> Result<DecodedVideoDelivery, SessionError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if last_tx_to_host.elapsed() >= CONTROLLER_KEEPALIVE_INTERVAL {
+            controller
+                .session_mut()
+                .send_control(CTRL_MSG_KEEPALIVE, &now_ms().to_be_bytes())
+                .await?;
+            *last_tx_to_host = Instant::now();
+        }
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(ClientError::Timeout("controller video recv timed out".into()).into());
+        };
+        let until_keepalive = CONTROLLER_KEEPALIVE_INTERVAL
+            .saturating_sub(last_tx_to_host.elapsed())
+            .max(Duration::from_millis(1));
+        let wait = rem.min(until_keepalive);
+        match controller.recv_and_decode_video(wait).await {
+            Ok(delivery) => {
+                if last_tx_to_host.elapsed() >= CONTROLLER_KEEPALIVE_INTERVAL {
+                    controller
+                        .session_mut()
+                        .send_control(CTRL_MSG_KEEPALIVE, &now_ms().to_be_bytes())
+                        .await?;
+                    *last_tx_to_host = Instant::now();
+                }
+                return Ok(delivery);
+            }
+            Err(SessionError::Client(ClientError::Timeout(_))) => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        ClientError::Timeout("controller video recv timed out".into()).into(),
+                    );
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 async fn send_redundant_session_close(
     controller: &mut DesktopControllerSession,
@@ -1858,11 +1907,15 @@ async fn run_controller(
     } else {
         let target_frames = args.frames.max(1);
         let pre_hid_frames = 2usize.min(target_frames);
+        let mut last_tx_to_host = Instant::now();
         for idx in 0..pre_hid_frames {
-            let delivery = controller
-                .recv_and_decode_video(Duration::from_secs(10))
-                .await
-                .map_err(|e| format!("controller video recv #{idx} failed: {e}"))?;
+            let delivery = recv_video_with_keepalive(
+                &mut controller,
+                Duration::from_secs(10),
+                &mut last_tx_to_host,
+            )
+            .await
+            .map_err(|e| format!("controller video recv #{idx} failed: {e}"))?;
             if let Some(prev) = prev_frame_id {
                 if delivery.frame.frame_id <= prev {
                     frame_id_monotonic = false;
@@ -1883,16 +1936,21 @@ async fn run_controller(
                 .send_hid_and_await_echo(&payload, idx as u32, Duration::from_secs(5))
                 .await
                 .map_err(|e| format!("controller HID seq {idx} echo failed: {e}"))?;
+            last_tx_to_host = Instant::now();
             sent_audit.push(audit_rec);
         }
         write_audit_jsonl_atomic(&args.audit_out, &sent_audit)?;
 
-        // Decode remaining video frames and verify closed-loop visual marker at (640, 360).
+        // Decode remaining video frames and verify closed-loop visual marker at (640, 360),
+        // emitting 0x03 KEEPALIVE every >=500ms so Host never hits idle_timeout during slow AV1.
         while (frames_decoded as usize) < target_frames {
-            let delivery = controller
-                .recv_and_decode_video(Duration::from_secs(10))
-                .await
-                .map_err(|e| format!("controller video recv #{frames_decoded} failed: {e}"))?;
+            let delivery = recv_video_with_keepalive(
+                &mut controller,
+                Duration::from_secs(10),
+                &mut last_tx_to_host,
+            )
+            .await
+            .map_err(|e| format!("controller video recv #{frames_decoded} failed: {e}"))?;
             if let Some(prev) = prev_frame_id {
                 if delivery.frame.frame_id <= prev {
                     frame_id_monotonic = false;
@@ -2489,7 +2547,7 @@ async fn run_scenario_b(
         "--watchdog-ms".into(),
         "1200".into(),
         "--idle-exit-ms".into(),
-        "6000".into(),
+        "10000".into(),
         "--audit-key-identity".into(),
     ];
     let mut ctrl_args = vec![
