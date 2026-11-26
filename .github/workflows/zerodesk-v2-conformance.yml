@@ -6,16 +6,18 @@ on:
     paths:
       - "libs/v2_identity/**"
       - "libs/v2_transport/**"
+      - "libs/v2_client/**"
       - ".github/workflows/zerodesk-v2-conformance.yml"
   push:
     paths:
       - "libs/v2_identity/**"
       - "libs/v2_transport/**"
+      - "libs/v2_client/**"
       - ".github/workflows/zerodesk-v2-conformance.yml"
 
 jobs:
   v2-crates-test:
-    name: Test v2_identity and v2_transport
+    name: Test and Clippy v2_identity, v2_transport, and v2_client
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-D warnings"
@@ -26,19 +28,28 @@ jobs:
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-      - name: Run v2_identity tests
+      - name: Run v2_identity tests and clippy
         run: |
           if [ -n "$ZERODESK_VECTORS_DIR" ] && [ -d "$ZERODESK_VECTORS_DIR" ]; then
             cargo test --manifest-path libs/v2_identity/Cargo.toml
           else
             cargo test --manifest-path libs/v2_identity/Cargo.toml -- --skip golden_vector_
           fi
+          cargo clippy --manifest-path libs/v2_identity/Cargo.toml --all-targets -- -D warnings
 
-      - name: Run v2_transport tests
+      - name: Run v2_transport tests and clippy
         run: |
           if [ -n "$ZERODESK_VECTORS_DIR" ] && [ -d "$ZERODESK_VECTORS_DIR" ]; then
             cargo test --manifest-path libs/v2_transport/Cargo.toml
           else
             cargo test --manifest-path libs/v2_transport/Cargo.toml --test transport_tests
           fi
+          cargo clippy --manifest-path libs/v2_transport/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run v2_client tests and clippy
+        run: |
+          cargo test --manifest-path libs/v2_client/Cargo.toml
+          cargo clippy --manifest-path libs/v2_client/Cargo.toml --all-targets -- -D warnings

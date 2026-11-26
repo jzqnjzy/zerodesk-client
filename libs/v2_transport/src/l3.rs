@@ -244,11 +244,11 @@ impl ReplayWindow2048 {
         let word_shift = shift / 64;
         let bit_shift = shift % 64;
         let mut next = [0u64; REPLAY_WINDOW_BITS / 64];
-        for i in word_shift..words {
+        for (i, slot) in next.iter_mut().enumerate().take(words).skip(word_shift) {
             let src = i - word_shift;
-            next[i] |= self.bits[src] << bit_shift;
+            *slot |= self.bits[src] << bit_shift;
             if bit_shift > 0 && src > 0 {
-                next[i] |= self.bits[src - 1] >> (64 - bit_shift);
+                *slot |= self.bits[src - 1] >> (64 - bit_shift);
             }
         }
         self.bits = next;

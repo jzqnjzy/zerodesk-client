@@ -512,6 +512,7 @@ impl ZeroRttGuard {
             .unwrap_or(u64::MAX);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate_0rtt(
         &mut self,
         initiator_delegation: &DelegationStatement,

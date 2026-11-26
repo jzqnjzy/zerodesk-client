@@ -7,7 +7,8 @@ use v2_identity::{
 use v2_transport::{
     anchor_rs_parity_count, build_sack_bitmap, check_arq_retry_limit, compute_rto_ms,
     compute_stream_mac64, compute_udp_mac64, derive_access_key, derive_access_key_with_prk,
-    effective_p3_credit, open_l3, process_hid_queue, seal_l3, seal_stream_v11, seal_udp_v11,
+    effective_p3_credit, open_l3, process_hid_queue, rs64_decode_block, rs64_encode_block, seal_l3,
+    seal_stream_v11, seal_udp_v11,
     seq_u32_gt, verify_mac64_ct, AccessEpochState, AccessFlags, AccessHeaderV10, AccessHeaderV11,
     ActuatorCmd, ActuatorReceiver, BwHintController, E2eeNoiseHandshake, EdgeCtrlFrame, ErrorCode,
     HidEvent, L3Header, L3Receiver, L4Header, LegCiphertextCache, LegSeqDedupWindow,
@@ -16,8 +17,8 @@ use v2_transport::{
     TelemetryFrame, TenantPolicyRules, TransportError, VerifiedTenantPolicy, VideoReassembler,
     VideoSlice, ZeroRttGuard, ACCESS_HDR_V10_LEN, ACCESS_HDR_V11_LEN, BACKBONE_MAX_WIRE_BYTES,
     BW_EVENT_SURVIVAL_MODE, CIPHER_AESGCM, CIPHER_CHACHAPOLY, DIR_CLIENT_TO_EDGE,
-    DIR_EDGE_TO_CLIENT, L3_MTU_DEFAULT, LTR_REASON_SLICE_LOST_TIMEOUT, TRANSPORT_DATAGRAM,
-    TRANSPORT_STREAM,
+    DIR_EDGE_TO_CLIENT, L3_MTU_DEFAULT, LTR_REASON_SLICE_LOST_TIMEOUT, SURVIVAL_RS_K,
+    TRANSPORT_DATAGRAM, TRANSPORT_STREAM,
 };
 
 /// Golden vector directory resolution:
@@ -1485,4 +1486,28 @@ fn vector_v24_realtime_actuator_telemetry_and_survival() {
     let (cap_on_exhaust, rth_alert) = pol.on_quota_exhausted();
     assert_eq!(cap_on_exhaust == 256, exp["mission_locked_throttled_on_exhaust"].as_bool().unwrap());
     assert_eq!(rth_alert, exp["mission_locked_rth_alert"].as_bool().unwrap());
+
+    // RS(6,4) Survival Mode Cauchy parity & 4-erasure recovery (V24 byte-exact check)
+    let rs_data: Vec<Vec<u8>> = inp["rs64_data_shards_hex"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| hex_bytes(s.as_str().unwrap()))
+        .collect();
+    let rs_all = rs64_encode_block(&rs_data).unwrap();
+    let exp_parities: Vec<String> = exp["rs64_parity_shards_hex"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    for (i, exp_hex) in exp_parities.iter().enumerate() {
+        assert_eq!(hex::encode(&rs_all[SURVIVAL_RS_K + i]), *exp_hex);
+    }
+    let mut surviving: Vec<Option<Vec<u8>>> = rs_all.into_iter().map(Some).collect();
+    for idx in inp["rs64_dropped_indices"].as_array().unwrap() {
+        surviving[idx.as_u64().unwrap() as usize] = None;
+    }
+    let recovered = rs64_decode_block(&surviving).unwrap();
+    assert_eq!(recovered, rs_data);
 }

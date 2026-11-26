@@ -2,6 +2,7 @@ pub mod access;
 pub mod constants;
 pub mod diagnostics;
 pub mod error;
+pub mod fec;
 pub mod handshake;
 pub mod l3;
 pub mod l4;
@@ -11,7 +12,7 @@ pub mod transport;
 
 pub use access::{
     compute_stream_mac64, compute_udp_mac64, derive_access_key, derive_access_key_with_prk,
-    seal_stream_v11, seal_udp_v11, verify_mac64_ct, AccessEpochState, AccessFlags,
+    derive_stream_role_key, seal_stream_v11, seal_udp_v11, verify_mac64_ct, AccessEpochState, AccessFlags,
     AccessHeaderV10, AccessHeaderV11, BwHintController, DecodedStreamFrame, EdgeCtrlFrame,
     LegCiphertextCache, LegSeqDedupWindow, QueuedStreamSlice, StreamFrameParser,
     TcpStreamSendQueue, ACCESS_HKDF_LABEL, DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT,
@@ -43,6 +44,10 @@ pub use diagnostics::{
     sanitize_log_line, DiagnosticBundle, DiagnosticsRing, QoeSnapshot, DIAGNOSTICS_RING_CAPACITY,
 };
 pub use error::TransportError;
+pub use fec::{
+    cauchy_coeff, gf_inv, gf_mul, rs64_decode_block, rs64_encode_block, rs_cauchy_decode_unequal,
+    rs_cauchy_encode_unequal, SURVIVAL_RS_K, SURVIVAL_RS_M,
+};
 pub use handshake::{
     AccessHandshakeOutput, AccessNoiseHandshake, E2eeHandshakeOutput, E2eeNoiseHandshake,
     PrologueInput, ZeroRttDecision, ZeroRttGuard, PROLOGUE_DOMAIN, PROLOGUE_PREIMAGE_LEN,

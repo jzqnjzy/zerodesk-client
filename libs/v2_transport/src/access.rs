@@ -242,6 +242,29 @@ pub fn derive_access_key(
     Ok(derive_access_key_with_prk(route_cid, hs_hash, transport, dir, access_epoch)?.1)
 }
 
+/// Derives a role-isolated L2c TLS-443 stream directional MAC key (`transport = 1`, `stream_role = 1|2`):
+/// `info (15B) = "v2mac-v1" || u8(1) || u8(dir) || u32_be(access_epoch) || u8(stream_role)`.
+pub fn derive_stream_role_key(
+    route_cid: &[u8; 8],
+    hs_hash: &[u8; 32],
+    dir: u8,
+    access_epoch: u32,
+    stream_role: u8,
+) -> Result<[u8; 32], TransportError> {
+    let (_, hkdf) = Hkdf::<Sha256>::extract(Some(route_cid), hs_hash);
+    let mut info = [0u8; 15];
+    info[0..8].copy_from_slice(ACCESS_HKDF_LABEL);
+    info[8] = TRANSPORT_STREAM;
+    info[9] = dir;
+    info[10..14].copy_from_slice(&access_epoch.to_be_bytes());
+    info[14] = stream_role;
+
+    let mut key_dir = [0u8; 32];
+    hkdf.expand(&info, &mut key_dir)
+        .map_err(|_| TransportError::InvalidFraming("hkdf expand failed".into()))?;
+    Ok(key_dir)
+}
+
 pub fn compute_udp_mac64(
     key_dir: &[u8; 32],
     hdr_mac_zero: &[u8],
@@ -618,12 +641,12 @@ impl LegSeqDedupWindow {
         let word_shift = shift / 64;
         let bit_shift = shift % 64;
         let mut next = [0u64; 4];
-        for i in 0..4 {
+        for (i, slot) in next.iter_mut().enumerate() {
             if i >= word_shift {
                 let src = i - word_shift;
-                next[i] |= self.bitmap[src] << bit_shift;
+                *slot |= self.bitmap[src] << bit_shift;
                 if bit_shift > 0 && src > 0 {
-                    next[i] |= self.bitmap[src - 1] >> (64 - bit_shift);
+                    *slot |= self.bitmap[src - 1] >> (64 - bit_shift);
                 }
             }
         }
