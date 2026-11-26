@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use std::fmt;
-use v2_transport::{HidFrame, HID_STALE_DROP_MS};
+use v2_transport::{HidFrame, L4Header, HID_STALE_DROP_MS, L4_HDR_LEN};
 
 pub const HID_MSG_MOUSE: u8 = 0x01;
 pub const HID_MSG_KEY: u8 = 0x02;
@@ -19,6 +19,13 @@ pub const KEY_EVENT_WIRE_LEN: usize = 18;
 /// `echo_seq(4) + client_ts_ms(8) = 12`.
 pub const HID_ECHO_ACK_WIRE_LEN: usize = 12;
 
+/// Hard upper bound on contiguous `MoveRel` events coalesced into a single emission (spec/04 §6.2.3).
+pub const HID_MOVEREL_COALESCE_MAX: usize = 128;
+/// Zero hold time: coalesced `MoveRel` runs flush immediately at end of batch or non-`MoveRel` boundary.
+pub const HID_MAX_COALESCE_HOLD_MS: u64 = 0;
+/// Session-fatal `ErrorCode::InvalidFraming` (`0x0103` = 259) per spec/04 §5 & §6.
+pub const ERROR_CODE_INVALID_FRAMING: u16 = 0x0103;
+
 pub const MOD_SHIFT: u8 = 1 << 0;
 pub const MOD_CTRL: u8 = 1 << 1;
 pub const MOD_ALT: u8 = 1 << 2;
@@ -28,49 +35,20 @@ pub const MOUSE_BUTTONS_VALID_MASK: u8 = 0x1F;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HidCodecError {
-    UnknownMsgType(u8),
-    InvalidLength {
-        msg_type: u8,
-        expected: usize,
-        actual: usize,
-    },
-    InvalidMouseKind(u8),
-    InvalidMouseButtons(u8),
-    UnexpectedWheelDelta {
-        kind: MouseKind,
-        wheel_dx: i16,
-        wheel_dy: i16,
-    },
-    InvalidBoolFlag(u8),
-    InvalidModifiers(u8),
-    InvalidUnicodeScalar(u32),
+    /// Any `0x01 InputHID` wire/framing violation corresponding to session-fatal `0x0103 INVALID_FRAMING`.
+    InvalidFraming(String),
+}
+
+impl HidCodecError {
+    pub fn error_code(&self) -> u16 {
+        ERROR_CODE_INVALID_FRAMING
+    }
 }
 
 impl fmt::Display for HidCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownMsgType(t) => write!(f, "unknown HID msg_type {t:#04x}"),
-            Self::InvalidLength {
-                msg_type,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "invalid HID payload length for msg_type {msg_type:#04x}: expected {expected}, got {actual}"
-            ),
-            Self::InvalidMouseKind(k) => write!(f, "invalid mouse event kind discriminant {k}"),
-            Self::InvalidMouseButtons(b) => write!(f, "reserved mouse button bits set: {b:#04x}"),
-            Self::UnexpectedWheelDelta {
-                kind,
-                wheel_dx,
-                wheel_dy,
-            } => write!(
-                f,
-                "non-zero wheel delta ({wheel_dx}, {wheel_dy}) on non-Wheel mouse event {kind:?}"
-            ),
-            Self::InvalidBoolFlag(v) => write!(f, "invalid boolean flag value {v} (expected 0 or 1)"),
-            Self::InvalidModifiers(m) => write!(f, "reserved key modifier bits set: {m:#04x}"),
-            Self::InvalidUnicodeScalar(u) => write!(f, "invalid unicode scalar {u:#010x}"),
+            Self::InvalidFraming(msg) => write!(f, "INVALID_FRAMING (0x0103): {msg}"),
         }
     }
 }
@@ -95,7 +73,9 @@ impl MouseKind {
             2 => Ok(Self::Down),
             3 => Ok(Self::Up),
             4 => Ok(Self::Wheel),
-            other => Err(HidCodecError::InvalidMouseKind(other)),
+            other => Err(HidCodecError::InvalidFraming(format!(
+                "invalid mouse event kind discriminant {other}"
+            ))),
         }
     }
 }
@@ -114,14 +94,16 @@ pub struct MouseEvent {
 impl MouseEvent {
     pub fn validate(&self) -> Result<(), HidCodecError> {
         if self.buttons & !MOUSE_BUTTONS_VALID_MASK != 0 {
-            return Err(HidCodecError::InvalidMouseButtons(self.buttons));
+            return Err(HidCodecError::InvalidFraming(format!(
+                "reserved mouse button bits set: {:#04x}",
+                self.buttons
+            )));
         }
         if self.kind != MouseKind::Wheel && (self.wheel_dx != 0 || self.wheel_dy != 0) {
-            return Err(HidCodecError::UnexpectedWheelDelta {
-                kind: self.kind,
-                wheel_dx: self.wheel_dx,
-                wheel_dy: self.wheel_dy,
-            });
+            return Err(HidCodecError::InvalidFraming(format!(
+                "non-zero wheel delta ({}, {}) on non-Wheel mouse event {:?}",
+                self.wheel_dx, self.wheel_dy, self.kind
+            )));
         }
         Ok(())
     }
@@ -141,11 +123,10 @@ impl MouseEvent {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, HidCodecError> {
         if bytes.len() != MOUSE_EVENT_WIRE_LEN {
-            return Err(HidCodecError::InvalidLength {
-                msg_type: HID_MSG_MOUSE,
-                expected: MOUSE_EVENT_WIRE_LEN,
-                actual: bytes.len(),
-            });
+            return Err(HidCodecError::InvalidFraming(format!(
+                "invalid MouseEvent payload length: expected {MOUSE_EVENT_WIRE_LEN}, got {}",
+                bytes.len()
+            )));
         }
         let kind = MouseKind::from_u8(bytes[0])?;
         let ev = Self {
@@ -174,13 +155,41 @@ pub struct KeyEvent {
     pub client_ts_ms: u64,
 }
 
+/// Returns the required `modifiers` bitmap bit when pressing (`down == true`) a USB HID modifier
+/// key (`0xE0..=0xE7`, with or without Usage Page `0x07` prefix) per `spec/04` §6.1.2.
+pub fn required_modifier_bit_for_usage(usb_hid_usage: u32) -> Option<u8> {
+    match usb_hid_usage {
+        0xE0 | 0xE4 | 0x0007_00E0 | 0x0007_00E4 => Some(MOD_CTRL),
+        0xE1 | 0xE5 | 0x0007_00E1 | 0x0007_00E5 => Some(MOD_SHIFT),
+        0xE2 | 0xE6 | 0x0007_00E2 | 0x0007_00E6 => Some(MOD_ALT),
+        0xE3 | 0xE7 | 0x0007_00E3 | 0x0007_00E7 => Some(MOD_META),
+        _ => None,
+    }
+}
+
 impl KeyEvent {
     pub fn validate(&self) -> Result<(), HidCodecError> {
         if self.modifiers & !MOD_VALID_MASK != 0 {
-            return Err(HidCodecError::InvalidModifiers(self.modifiers));
+            return Err(HidCodecError::InvalidFraming(format!(
+                "reserved key modifier bits set: {:#04x}",
+                self.modifiers
+            )));
         }
         if self.unicode_scalar != 0 && char::from_u32(self.unicode_scalar).is_none() {
-            return Err(HidCodecError::InvalidUnicodeScalar(self.unicode_scalar));
+            return Err(HidCodecError::InvalidFraming(format!(
+                "invalid unicode scalar {:#010x}",
+                self.unicode_scalar
+            )));
+        }
+        if self.down {
+            if let Some(required_bit) = required_modifier_bit_for_usage(self.usb_hid_usage) {
+                if (self.modifiers & required_bit) == 0 {
+                    return Err(HidCodecError::InvalidFraming(format!(
+                        "modifier key down usage {:#x} missing required modifier bit {required_bit:#04x} (got {:#04x})",
+                        self.usb_hid_usage, self.modifiers
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -198,16 +207,19 @@ impl KeyEvent {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, HidCodecError> {
         if bytes.len() != KEY_EVENT_WIRE_LEN {
-            return Err(HidCodecError::InvalidLength {
-                msg_type: HID_MSG_KEY,
-                expected: KEY_EVENT_WIRE_LEN,
-                actual: bytes.len(),
-            });
+            return Err(HidCodecError::InvalidFraming(format!(
+                "invalid KeyEvent payload length: expected {KEY_EVENT_WIRE_LEN}, got {}",
+                bytes.len()
+            )));
         }
         let down = match bytes[0] {
             0 => false,
             1 => true,
-            other => return Err(HidCodecError::InvalidBoolFlag(other)),
+            other => {
+                return Err(HidCodecError::InvalidFraming(format!(
+                    "invalid KeyEvent.down flag {other} (expected 0 or 1)"
+                )));
+            }
         };
         let ev = Self {
             down,
@@ -240,11 +252,10 @@ impl HidEchoAck {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, HidCodecError> {
         if bytes.len() != HID_ECHO_ACK_WIRE_LEN {
-            return Err(HidCodecError::InvalidLength {
-                msg_type: HID_MSG_ECHO_ACK,
-                expected: HID_ECHO_ACK_WIRE_LEN,
-                actual: bytes.len(),
-            });
+            return Err(HidCodecError::InvalidFraming(format!(
+                "invalid HidEchoAck payload length: expected {HID_ECHO_ACK_WIRE_LEN}, got {}",
+                bytes.len()
+            )));
         }
         Ok(Self {
             echo_seq: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -294,8 +305,65 @@ pub fn decode_hid_frame(frame: &HidFrame) -> Result<HidPayload, HidCodecError> {
         HID_MSG_MOUSE => Ok(HidPayload::Mouse(MouseEvent::decode(&frame.payload)?)),
         HID_MSG_KEY => Ok(HidPayload::Key(KeyEvent::decode(&frame.payload)?)),
         HID_MSG_ECHO_ACK => Ok(HidPayload::EchoAck(HidEchoAck::decode(&frame.payload)?)),
-        other => Err(HidCodecError::UnknownMsgType(other)),
+        other => Err(HidCodecError::InvalidFraming(format!(
+            "unknown InputHID msg_type {other:#04x}"
+        ))),
     }
+}
+
+/// Encodes an L4-framed `0x01 InputHID` packet (`8B L4Header + exact body`, `flags = 0`).
+pub fn encode_l4_hid_frame(
+    stream_seq: u32,
+    payload: &HidPayload,
+) -> Result<Vec<u8>, HidCodecError> {
+    let frame = encode_hid_frame(payload)?;
+    let body_len = u16::try_from(frame.payload.len()).map_err(|_| {
+        HidCodecError::InvalidFraming("InputHID payload exceeds u16::MAX".into())
+    })?;
+    let hdr = L4Header {
+        msg_type: frame.msg_type,
+        flags: 0,
+        body_len,
+        stream_seq,
+    };
+    let mut out = Vec::with_capacity(L4_HDR_LEN + frame.payload.len());
+    out.extend_from_slice(&hdr.encode());
+    out.extend_from_slice(&frame.payload);
+    Ok(out)
+}
+
+/// Decodes and strictly validates an L4-framed `0x01 InputHID` packet per `spec/04` §6.
+/// Any truncated header, non-zero `L4Header.flags`, `body_len` mismatch, trailing bytes,
+/// unknown `msg_type`, or invalid inner field returns `Err(HidCodecError::InvalidFraming(_))`.
+pub fn decode_l4_hid_frame(bytes: &[u8]) -> Result<(u32, HidPayload), HidCodecError> {
+    if bytes.len() < L4_HDR_LEN {
+        return Err(HidCodecError::InvalidFraming(format!(
+            "L4 InputHID frame truncated: {} bytes < {L4_HDR_LEN}",
+            bytes.len()
+        )));
+    }
+    let hdr = L4Header::decode(bytes)
+        .map_err(|e| HidCodecError::InvalidFraming(e.to_string()))?;
+    if hdr.flags != 0 {
+        return Err(HidCodecError::InvalidFraming(format!(
+            "L4 InputHID reserved flags non-zero: {:#04x}",
+            hdr.flags
+        )));
+    }
+    let body = &bytes[L4_HDR_LEN..];
+    if body.len() != hdr.body_len as usize {
+        return Err(HidCodecError::InvalidFraming(format!(
+            "L4 InputHID body_len {} != actual payload length {}",
+            hdr.body_len,
+            body.len()
+        )));
+    }
+    let frame = HidFrame {
+        msg_type: hdr.msg_type,
+        payload: Bytes::copy_from_slice(body),
+    };
+    let payload = decode_hid_frame(&frame)?;
+    Ok((hdr.stream_seq, payload))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -328,11 +396,12 @@ impl HidBatchOutcome {
     }
 }
 
-/// Applies `protocol-spec/spec/04-inner-channels.md` §2 stale-drop and relative mouse
-/// vector coalescing rules over a batch of `(stream_seq, payload, enqueue_ms)`:
+/// Applies `protocol-spec/spec/04-inner-channels.md` §2 & §6.2.3 stale-drop and bounded
+/// contiguous relative-mouse vector coalescing over a batch of `(stream_seq, payload, enqueue_ms)`:
 /// - Every event is ACKed regardless of staleness.
-/// - `MouseKind::MoveRel` deltas are NEVER dropped; contiguous runs coalesce into a single
-///   `(dx, dy)` vector and flush before any non-`MoveRel` boundary to preserve spatial order.
+/// - `MouseKind::MoveRel` deltas are NEVER dropped; contiguous runs coalesce left-to-right via
+///   `i32::saturating_add`, capped at `HID_MOVEREL_COALESCE_MAX = 128`, and flush before any
+///   non-`MoveRel` boundary to preserve spatial order.
 /// - Release events (`MouseKind::Up` and `KeyEvent { down: false }`) are NEVER dropped so
 ///   network jitter cannot leave buttons or keys stuck.
 /// - Other non-relative mouse events and key-down events queued `> 150ms` are dropped without
@@ -342,9 +411,9 @@ pub fn coalesce_hid_batch(
     now_ms: u64,
 ) -> HidBatchOutcome {
     let mut out = HidBatchOutcome::default();
-    let mut pending_rel: Option<(u32, MouseEvent)> = None;
-    let flush_rel = |pending: &mut Option<(u32, MouseEvent)>, out: &mut HidBatchOutcome| {
-        if let Some((rel_seq, rel_ev)) = pending.take() {
+    let mut pending_rel: Option<(u32, MouseEvent, usize)> = None;
+    let flush_rel = |pending: &mut Option<(u32, MouseEvent, usize)>, out: &mut HidBatchOutcome| {
+        if let Some((rel_seq, rel_ev, _)) = pending.take() {
             out.executed.push((rel_seq, HidPayload::Mouse(rel_ev)));
         }
     };
@@ -354,14 +423,20 @@ pub fn coalesce_hid_batch(
         match payload {
             HidPayload::Mouse(ev) if ev.kind == MouseKind::MoveRel => {
                 out.coalesced_rel_count += 1;
-                if let Some((last_seq, acc)) = &mut pending_rel {
+                if let Some((_, _, count)) = pending_rel {
+                    if count >= HID_MOVEREL_COALESCE_MAX {
+                        flush_rel(&mut pending_rel, &mut out);
+                    }
+                }
+                if let Some((last_seq, acc, count)) = &mut pending_rel {
                     *last_seq = seq;
                     acc.x_or_dx = acc.x_or_dx.saturating_add(ev.x_or_dx);
                     acc.y_or_dy = acc.y_or_dy.saturating_add(ev.y_or_dy);
                     acc.buttons = ev.buttons;
                     acc.client_ts_ms = ev.client_ts_ms;
+                    *count += 1;
                 } else {
-                    pending_rel = Some((seq, ev));
+                    pending_rel = Some((seq, ev, 1));
                 }
             }
             HidPayload::Mouse(ev) if ev.kind == MouseKind::Up => {
@@ -393,6 +468,7 @@ pub fn coalesce_hid_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn mouse_key_echo_wire_roundtrip_and_strict_validation() {
@@ -431,32 +507,28 @@ mod tests {
         assert_eq!(a_frame.payload.len(), HID_ECHO_ACK_WIRE_LEN);
         assert_eq!(decode_hid_frame(&a_frame).unwrap(), ack);
 
-        // Strict discriminant, reserved bits, wheel-delta, and length rejections
+        // Strict discriminant, reserved bits, wheel-delta, length, and modifier-consistency rejections
         let mut bad_mouse = m_frame.payload.to_vec();
         bad_mouse[0] = 9;
         assert!(matches!(
             MouseEvent::decode(&bad_mouse),
-            Err(HidCodecError::InvalidMouseKind(9))
+            Err(HidCodecError::InvalidFraming(_))
         ));
         assert!(matches!(
             MouseEvent::decode(&bad_mouse[..20]),
-            Err(HidCodecError::InvalidLength { .. })
+            Err(HidCodecError::InvalidFraming(_))
         ));
         bad_mouse[0] = MouseKind::Wheel as u8;
         bad_mouse[1] = 0x20;
         assert!(matches!(
             MouseEvent::decode(&bad_mouse),
-            Err(HidCodecError::InvalidMouseButtons(0x20))
+            Err(HidCodecError::InvalidFraming(_))
         ));
         bad_mouse[0] = MouseKind::MoveAbs as u8;
         bad_mouse[1] = 0x01;
         assert!(matches!(
             MouseEvent::decode(&bad_mouse),
-            Err(HidCodecError::UnexpectedWheelDelta {
-                kind: MouseKind::MoveAbs,
-                wheel_dx: -12,
-                wheel_dy: 24,
-            })
+            Err(HidCodecError::InvalidFraming(_))
         ));
         assert!(matches!(
             encode_hid_frame(&HidPayload::Mouse(MouseEvent {
@@ -468,7 +540,7 @@ mod tests {
                 wheel_dy: 0,
                 client_ts_ms: 1,
             })),
-            Err(HidCodecError::InvalidMouseButtons(0x40))
+            Err(HidCodecError::InvalidFraming(_))
         ));
         assert!(matches!(
             encode_hid_frame(&HidPayload::Mouse(MouseEvent {
@@ -480,31 +552,242 @@ mod tests {
                 wheel_dy: 3,
                 client_ts_ms: 1,
             })),
-            Err(HidCodecError::UnexpectedWheelDelta {
-                kind: MouseKind::MoveRel,
-                wheel_dx: 0,
-                wheel_dy: 3,
-            })
+            Err(HidCodecError::InvalidFraming(_))
         ));
 
         let mut bad_key = k_frame.payload.to_vec();
         bad_key[0] = 2;
         assert!(matches!(
             KeyEvent::decode(&bad_key),
-            Err(HidCodecError::InvalidBoolFlag(2))
+            Err(HidCodecError::InvalidFraming(_))
         ));
         bad_key[0] = 1;
         bad_key[1] = 0x80;
         assert!(matches!(
             KeyEvent::decode(&bad_key),
-            Err(HidCodecError::InvalidModifiers(0x80))
+            Err(HidCodecError::InvalidFraming(_))
         ));
         bad_key[1] = 0;
         bad_key[6..10].copy_from_slice(&0xD800u32.to_be_bytes());
         assert!(matches!(
             KeyEvent::decode(&bad_key),
-            Err(HidCodecError::InvalidUnicodeScalar(0xD800))
+            Err(HidCodecError::InvalidFraming(_))
         ));
+
+        // Modifier consistency: pressing LeftShift (0xE1) with modifiers=0 MUST fail with 0x0103
+        for (usage, bad_mods, good_mods) in [
+            (0xE0u32, 0u8, MOD_CTRL),
+            (0xE4, MOD_SHIFT, MOD_CTRL),
+            (0xE1, 0, MOD_SHIFT),
+            (0xE5, MOD_ALT, MOD_SHIFT),
+            (0xE2, 0, MOD_ALT),
+            (0xE6, MOD_META, MOD_ALT),
+            (0xE3, 0, MOD_META),
+            (0xE7, MOD_ALT, MOD_META),
+        ] {
+            let err = KeyEvent {
+                down: true,
+                modifiers: bad_mods,
+                usb_hid_usage: usage,
+                unicode_scalar: 0,
+                client_ts_ms: 1000,
+            }
+            .encode()
+            .unwrap_err();
+            assert_eq!(err.error_code(), ERROR_CODE_INVALID_FRAMING);
+
+            assert!(KeyEvent {
+                down: true,
+                modifiers: good_mods,
+                usb_hid_usage: usage,
+                unicode_scalar: 0,
+                client_ts_ms: 1000,
+            }
+            .encode()
+            .is_ok());
+
+            // KeyUp (down == false) allows modifier bit to remain 1 (opposite side held) or 0
+            assert!(KeyEvent {
+                down: false,
+                modifiers: good_mods,
+                usb_hid_usage: usage,
+                unicode_scalar: 0,
+                client_ts_ms: 1001,
+            }
+            .encode()
+            .is_ok());
+            assert!(KeyEvent {
+                down: false,
+                modifiers: 0,
+                usb_hid_usage: usage,
+                unicode_scalar: 0,
+                client_ts_ms: 1001,
+            }
+            .encode()
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn v26_wire_vectors_and_l4_negative_cases() {
+        // Inline V26 spot checks (run everywhere)
+        let mouse_abs_hex = "0100001600000001000000000780000004380000000000000000000f4241";
+        let (seq, payload) = decode_l4_hid_frame(&hex::decode(mouse_abs_hex).unwrap()).unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(
+            hex::encode(encode_l4_hid_frame(seq, &payload).unwrap()),
+            mouse_abs_hex
+        );
+        // L4 non-zero flags rejected with 0x0103
+        let bad_flags = hex::decode("0301000c000000640000002a00000000000f42a3").unwrap();
+        assert_eq!(
+            decode_l4_hid_frame(&bad_flags).unwrap_err().error_code(),
+            0x0103
+        );
+
+        // Full V26 JSON golden vector verification when protocol-spec is present
+        let v26_path = Path::new("/Volumes/data/github/zerodesk/protocol-spec/vectors/v26_input_hid_wire.json");
+        if !v26_path.exists() {
+            return;
+        }
+        let raw = std::fs::read_to_string(v26_path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        for case in doc["valid_wire_cases"].as_array().unwrap() {
+            let name = case["case"].as_str().unwrap();
+            let l4_hex = case["l4_frame_hex"].as_str().unwrap();
+            let body_hex = case["body_hex"].as_str().unwrap();
+            let expected_seq = case["stream_seq"].as_u64().unwrap() as u32;
+            let raw_l4 = hex::decode(l4_hex).unwrap();
+            let (seq, payload) = decode_l4_hid_frame(&raw_l4)
+                .unwrap_or_else(|e| panic!("V26 valid case '{name}' failed decode: {e}"));
+            assert_eq!(seq, expected_seq, "case {name}");
+            let reencoded = encode_l4_hid_frame(seq, &payload).unwrap();
+            assert_eq!(hex::encode(&reencoded), l4_hex, "case {name} l4 re-encode");
+            let frame = encode_hid_frame(&payload).unwrap();
+            assert_eq!(hex::encode(&frame.payload), body_hex, "case {name} body re-encode");
+        }
+
+        for case in doc["negative_wire_cases"].as_array().unwrap() {
+            let name = case["case"].as_str().unwrap();
+            let msg_type = case["msg_type"].as_u64().unwrap() as u8;
+            let expected_err = case["expected_err"].as_u64().unwrap() as u16;
+            let body = hex::decode(case["body_hex"].as_str().unwrap()).unwrap();
+            let frame = HidFrame {
+                msg_type,
+                payload: Bytes::from(body),
+            };
+            let err = decode_hid_frame(&frame)
+                .expect_err(&format!("V26 negative wire case '{name}' unexpectedly passed"));
+            assert_eq!(err.error_code(), expected_err, "case {name}");
+        }
+
+        for case in doc["l4_negative_cases"].as_array().unwrap() {
+            let name = case["case"].as_str().unwrap();
+            let expected_err = case["expected_err"].as_u64().unwrap() as u16;
+            let raw_l4 = hex::decode(case["l4_frame_hex"].as_str().unwrap()).unwrap();
+            let err = decode_l4_hid_frame(&raw_l4)
+                .expect_err(&format!("V26 L4 negative case '{name}' unexpectedly passed"));
+            assert_eq!(err.error_code(), expected_err, "case {name}");
+        }
+    }
+
+    #[test]
+    fn coalescer_caps_at_128_and_uses_streaming_left_to_right_saturation() {
+        let mut events = Vec::new();
+        for seq in 1..=129u32 {
+            events.push((
+                seq,
+                HidPayload::Mouse(MouseEvent {
+                    kind: MouseKind::MoveRel,
+                    buttons: 0,
+                    x_or_dx: 1,
+                    y_or_dy: 2,
+                    wheel_dx: 0,
+                    wheel_dy: 0,
+                    client_ts_ms: 4000 + u64::from(seq),
+                }),
+                4000 + u64::from(seq),
+            ));
+        }
+        let out = coalesce_hid_batch(&events, 4200);
+        assert_eq!(out.executed.len(), 2);
+        assert_eq!(out.executed[0].0, 128);
+        assert_eq!(out.executed[1].0, 129);
+        assert_eq!(
+            out.executed[0].1,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::MoveRel,
+                buttons: 0,
+                x_or_dx: 128,
+                y_or_dy: 256,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 4128,
+            })
+        );
+        assert_eq!(
+            out.executed[1].1,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::MoveRel,
+                buttons: 0,
+                x_or_dx: 1,
+                y_or_dy: 2,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 4129,
+            })
+        );
+
+        // Streaming saturation: [i32::MAX, +10, -10] -> 2147483637 (NOT i32::MAX!)
+        let sat = coalesce_hid_batch(
+            &[
+                (
+                    20,
+                    HidPayload::Mouse(MouseEvent {
+                        kind: MouseKind::MoveRel,
+                        buttons: 0,
+                        x_or_dx: i32::MAX,
+                        y_or_dy: i32::MIN,
+                        wheel_dx: 0,
+                        wheel_dy: 0,
+                        client_ts_ms: 3000,
+                    }),
+                    3000,
+                ),
+                (
+                    21,
+                    HidPayload::Mouse(MouseEvent {
+                        kind: MouseKind::MoveRel,
+                        buttons: 0,
+                        x_or_dx: 10,
+                        y_or_dy: -10,
+                        wheel_dx: 0,
+                        wheel_dy: 0,
+                        client_ts_ms: 3005,
+                    }),
+                    3005,
+                ),
+                (
+                    22,
+                    HidPayload::Mouse(MouseEvent {
+                        kind: MouseKind::MoveRel,
+                        buttons: 0,
+                        x_or_dx: -10,
+                        y_or_dy: 10,
+                        wheel_dx: 0,
+                        wheel_dy: 0,
+                        client_ts_ms: 3010,
+                    }),
+                    3010,
+                ),
+            ],
+            3010,
+        );
+        assert_eq!(sat.executed.len(), 1);
+        assert_eq!(sat.executed[0].0, 22);
+        assert_eq!(sat.total_rel_dx(), 2_147_483_637);
+        assert_eq!(sat.total_rel_dy(), -2_147_483_638);
     }
 
     #[test]

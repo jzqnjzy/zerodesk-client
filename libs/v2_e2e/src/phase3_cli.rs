@@ -36,7 +36,7 @@ use v2_e2e::{
     DesktopControllerSession, DesktopHostSession, DryRunSink, HidEchoAck, HidInputExecutor,
     HidInputSink, HidPayload, InputError, KeyEvent, MouseEvent, MouseKind, SafeHidKey,
     ScrapDisplaySource, SessionError, SharedVisualMarker, SyntheticAnimatedSource, V2VideoDecoder,
-    V2VideoEncoder, VideoCodec, DEFAULT_SYNTHETIC_HEIGHT, DEFAULT_SYNTHETIC_WIDTH,
+    V2VideoEncoder, VideoCodec, DEFAULT_SYNTHETIC_HEIGHT, DEFAULT_SYNTHETIC_WIDTH, MOD_SHIFT,
     MOUSE_BUTTON_LEFT,
 };
 use v2_identity::{
@@ -587,7 +587,7 @@ fn build_interactive_hid_sequence(
     );
     push_mouse(
         MouseKind::Up,
-        MOUSE_BUTTON_LEFT,
+        0,
         340,
         230,
         0,
@@ -623,11 +623,19 @@ fn build_interactive_hid_sequence(
         (false, SafeHidKey::KeyB),
         (false, SafeHidKey::LeftShift),
     ];
+    let mut active_mods = 0u8;
     for &(down, key) in key_steps {
         let ts = base_ts + u64::from(seq);
+        if key == SafeHidKey::LeftShift {
+            if down {
+                active_mods |= MOD_SHIFT;
+            } else {
+                active_mods &= !MOD_SHIFT;
+            }
+        }
         let ev = KeyEvent {
             down,
-            modifiers: 0,
+            modifiers: active_mods,
             usb_hid_usage: key.usb_hid_usage(),
             unicode_scalar: 0,
             client_ts_ms: ts,
@@ -1887,7 +1895,7 @@ async fn run_controller(
                 0u32,
                 HidPayload::Key(KeyEvent {
                     down: true,
-                    modifiers: 0,
+                    modifiers: MOD_SHIFT,
                     usb_hid_usage: SafeHidKey::LeftShift.usb_hid_usage(),
                     unicode_scalar: 0,
                     client_ts_ms: base_ts,

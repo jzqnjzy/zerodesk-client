@@ -32,9 +32,12 @@ pub use control_plane::{
 };
 pub use error::ClientError;
 pub use signaling::{
-    decode_signaling_frame, encode_signaling_frame, HeartbeatMsg, MovedRedirect, PresenceState,
-    SignalingClient, SignalingConnectAccept, SignalingConnectOffer, SignalingConnectReq,
-    SignalingMsgKind, SignalingProbeResult,
+    decode_delegation_pb, decode_signaling_frame, encode_delegation_pb, encode_signaling_frame,
+    HeartbeatMsg, MovedRedirect, PeerRouteCandidate, PresenceState, SignalingClient,
+    SignalingConnectAccept, SignalingConnectOffer, SignalingConnectReq, SignalingDeviceCert,
+    SignalingMsgKind, SignalingProbeResult, SignalingReconnectBackoff, SignalingRegisterReq,
+    SignalingRegisterResp, SignalingSession, SignalingStaticKeyHint, MAX_SIGNALING_FRAME_BYTES,
+    SIGNALING_BACKOFF_INITIAL_MS, SIGNALING_BACKOFF_MAX_MS,
 };
 pub use tls443::{
     encode_stream_preface, validate_stream_frame_len, DualTls443Client, StreamRecvEvent,

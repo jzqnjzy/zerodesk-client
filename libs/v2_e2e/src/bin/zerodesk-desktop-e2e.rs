@@ -3,6 +3,8 @@
 
 #[path = "../phase3_cli.rs"]
 mod phase3_cli;
+#[path = "../phase4_cli.rs"]
+mod phase4_cli;
 #[path = "../wan_bench.rs"]
 mod wan_bench;
 
@@ -1237,7 +1239,7 @@ async fn cmd_e2e(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e wan-bench --config <cluster.json> [--ca-der <ca.der>] [--frames 120] [--codec vp9|av1] [--bg-mbps 8] [--rounds 3] [--probes-per-round 200] [--max-wire-mbps 8]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--allow-idle-exit] [--audit-key-identity] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1] [--leave-stuck] [--hold-after-stuck-ms 0] [--no-visual-marker] [--audit-key-identity]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]"
+        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e wan-bench --config <cluster.json> [--ca-der <ca.der>] [--frames 120] [--codec vp9|av1] [--bg-mbps 8] [--rounds 3] [--probes-per-round 200] [--max-wire-mbps 8]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--allow-idle-exit] [--audit-key-identity] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1] [--leave-stuck] [--hold-after-stuck-ms 0] [--no-visual-marker] [--audit-key-identity]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]\n  zerodesk-desktop-e2e v2-hostd --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>]\n  zerodesk-desktop-e2e v2-ctl --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>]\n  zerodesk-desktop-e2e signaling-e2e --config <cluster.json> [--ca-der <path>] [--codec vp9] [--frames 30]"
     );
 }
 
@@ -1409,6 +1411,9 @@ async fn main() -> ExitCode {
         "controller" => phase3_cli::cmd_controller(&args).await,
         "dual-e2e" => phase3_cli::cmd_dual_e2e(&args).await,
         "capture-probe" => phase3_cli::cmd_capture_probe(&args).await,
+        "v2-hostd" => phase4_cli::cmd_v2_hostd(&args).await,
+        "v2-ctl" => phase4_cli::cmd_v2_ctl(&args).await,
+        "signaling-e2e" => phase4_cli::cmd_signaling_e2e(&args).await,
         other => {
             eprintln!("unknown subcommand '{other}'");
             print_usage();

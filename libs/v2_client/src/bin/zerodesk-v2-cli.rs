@@ -231,10 +231,14 @@ async fn bootstrap_pair(
         session_id,
         controller_device_id: dev_a_id,
         controlled_device_id: dev_b_id,
+        controller_cert: None,
+        controller_delegation: None,
         proposed_l3_mtu: l3_mtu as u32,
         cap_bits: DEFAULT_CAP_BITS,
         preferred_cipher_suite: CIPHER_AESGCM as u32,
         requested_exhaust_policy: 0,
+        relay_ticket: None,
+        ice_candidates: vec![],
     };
     let conn_req_dec = SignalingConnectReq::decode_pb(&conn_req.encode_pb())?;
     if conn_req_dec.session_id != session_id {
@@ -243,10 +247,13 @@ async fn bootstrap_pair(
     let conn_acc = SignalingConnectAccept {
         session_id,
         error_code: 0,
+        controlled_cert: None,
+        controlled_delegation: None,
         negotiated_l3_mtu: l3_mtu as u32,
         negotiated_cap_bits: DEFAULT_CAP_BITS,
         negotiated_cipher_suite: CIPHER_AESGCM as u32,
         ice_candidates: vec![cfg.edge_b.udp_addr.clone()],
+        redirect: None,
     };
     let conn_acc_dec = SignalingConnectAccept::decode_pb(&conn_acc.encode_pb())?;
     if conn_acc_dec.negotiated_l3_mtu != l3_mtu as u32 {

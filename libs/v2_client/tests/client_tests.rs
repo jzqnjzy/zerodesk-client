@@ -263,10 +263,13 @@ async fn signaling_tcp_probe_and_proto_wire_roundtrip() {
         let acc = SignalingConnectAccept {
             session_id: req.session_id,
             error_code: 0,
+            controlled_cert: None,
+            controlled_delegation: None,
             negotiated_l3_mtu: req.proposed_l3_mtu,
             negotiated_cap_bits: req.cap_bits,
             negotiated_cipher_suite: req.preferred_cipher_suite,
             ice_candidates: vec!["127.0.0.1:4430".into()],
+            redirect: None,
         };
         let frame = v2_client::encode_signaling_frame(SignalingMsgKind::ConnectAccept, &acc.encode_pb())
             .unwrap();
@@ -291,10 +294,14 @@ async fn signaling_tcp_probe_and_proto_wire_roundtrip() {
         session_id: [0x99; 16],
         controller_device_id: [0x11; 16],
         controlled_device_id: [0x22; 16],
+        controller_cert: None,
+        controller_delegation: None,
         proposed_l3_mtu: 1200,
         cap_bits: 0x1_7001,
         preferred_cipher_suite: 1,
         requested_exhaust_policy: 0,
+        relay_ticket: None,
+        ice_candidates: vec![],
     };
     let (resp_kind, resp_payload) = client
         .exchange_frame(SignalingMsgKind::ConnectReq, &req.encode_pb())
