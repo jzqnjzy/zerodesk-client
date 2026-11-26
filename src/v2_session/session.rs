@@ -271,8 +271,10 @@ pub struct DesktopControllerSession {
     decoder: Arc<Mutex<V2VideoDecoder>>,
     decoder_codec: VideoCodec,
     pending_video: VecDeque<AssembledVideoFrame>,
+    last_delivered_frame_id: Option<u32>,
     pub video_frames_received: u64,
     pub pending_video_dropped: u64,
+    pub stale_video_frames_dropped: u64,
     pub decode_errors: u64,
     pub decoder_flushed_frames: u64,
     pub hid_frames_sent: u64,
@@ -290,8 +292,10 @@ impl DesktopControllerSession {
             decoder: Arc::new(Mutex::new(decoder)),
             decoder_codec,
             pending_video: VecDeque::with_capacity(PENDING_VIDEO_QUEUE_CAP),
+            last_delivered_frame_id: None,
             video_frames_received: 0,
             pending_video_dropped: 0,
+            stale_video_frames_dropped: 0,
             decode_errors: 0,
             decoder_flushed_frames: 0,
             hid_frames_sent: 0,
@@ -326,6 +330,7 @@ impl DesktopControllerSession {
         self.decoder_codec = decoder.codec();
         self.decoder = Arc::new(Mutex::new(decoder));
         self.pending_video.clear();
+        self.last_delivered_frame_id = None;
     }
 
     pub fn into_inner(self) -> (UdpE2eeSession, Arc<Mutex<V2VideoDecoder>>) {
@@ -395,6 +400,7 @@ impl DesktopControllerSession {
         };
 
         self.video_frames_received = self.video_frames_received.saturating_add(1);
+        self.last_delivered_frame_id = Some(frame.frame_id);
         Ok(DecodedVideoDelivery {
             frame,
             sha256,
@@ -402,15 +408,26 @@ impl DesktopControllerSession {
         })
     }
 
+    fn is_stale_video_frame(&self, frame_id: u32) -> bool {
+        self.last_delivered_frame_id
+            .is_some_and(|last| frame_id <= last)
+    }
+
     /// Receives the next assembled `0x03 Video` frame (draining any buffered frames from
     /// `pending_video` first), computes its SHA-256, and decodes it to I420 on Tokio's blocking
-    /// pool. Late/unexpected HID or Control events are skipped and counted; `0x04 SESSION_CLOSE`
-    /// returns `Err(SessionError::SessionClosed { error_code })`.
+    /// pool. Out-of-order stale frames (`frame_id <= last_delivered_frame_id`) and late/unexpected
+    /// HID or Control events are skipped and counted; `0x04 SESSION_CLOSE` returns
+    /// `Err(SessionError::SessionClosed { error_code })`.
     pub async fn recv_and_decode_video(
         &mut self,
         timeout: Duration,
     ) -> Result<DecodedVideoDelivery, SessionError> {
-        if let Some(frame) = self.pending_video.pop_front() {
+        while let Some(frame) = self.pending_video.pop_front() {
+            if self.is_stale_video_frame(frame.frame_id) {
+                self.stale_video_frames_dropped =
+                    self.stale_video_frames_dropped.saturating_add(1);
+                continue;
+            }
             return self.decode_video_frame(frame).await;
         }
         let deadline = Instant::now() + timeout;
@@ -419,7 +436,14 @@ impl DesktopControllerSession {
                 return Err(ClientError::Timeout("controller video recv timed out".into()).into());
             };
             match self.session.recv_event(rem).await? {
-                TransportEvent::VideoFrame(frame) => break frame,
+                TransportEvent::VideoFrame(frame) => {
+                    if self.is_stale_video_frame(frame.frame_id) {
+                        self.stale_video_frames_dropped =
+                            self.stale_video_frames_dropped.saturating_add(1);
+                        continue;
+                    }
+                    break frame;
+                }
                 TransportEvent::Control(ctrl) => {
                     if let Some(error_code) = parse_session_close(&ctrl) {
                         return Err(SessionError::SessionClosed { error_code });
@@ -928,5 +952,103 @@ mod tests {
             payload: Bytes::from_static(&[0x00, 0x00]),
         };
         assert_eq!(parse_session_close(&other), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_video_drops_out_of_order_stale_frames_and_decodes_monotonically() {
+        let mut pair = spawn_loopback_pair().await;
+
+        let mut enc = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(1)).unwrap();
+        let f1 = enc.encode_i420(&generate_animated_i420(64, 64, 0), 0).unwrap();
+        let f2 = enc.encode_i420(&generate_animated_i420(64, 64, 1), 33).unwrap();
+        let f3 = enc.encode_i420(&generate_animated_i420(64, 64, 2), 66).unwrap();
+        let f4 = enc.encode_i420(&generate_animated_i420(64, 64, 3), 99).unwrap();
+        let f5 = enc.encode_i420(&generate_animated_i420(64, 64, 4), 132).unwrap();
+        assert_eq!(
+            (
+                f1.meta.frame_id,
+                f2.meta.frame_id,
+                f3.meta.frame_id,
+                f4.meta.frame_id,
+                f5.meta.frame_id
+            ),
+            (1, 2, 3, 4, 5)
+        );
+
+        // Deliver frame 1, then frame 3 ahead of frame 2 (simulating trans-Pacific UDP reorder).
+        pair.host.publish_raw_video(&f1.meta, &f1.data).await.unwrap();
+        let d1 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d1.frame.frame_id, 1);
+
+        pair.host.publish_raw_video(&f3.meta, &f3.data).await.unwrap();
+        let d3 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d3.frame.frame_id, 3);
+
+        // Late older frame 2 and duplicate frame 3 arrive on UDP before frame 4 -> both dropped.
+        pair.host.publish_raw_video(&f2.meta, &f2.data).await.unwrap();
+        pair.host.publish_raw_video(&f3.meta, &f3.data).await.unwrap();
+        pair.host.publish_raw_video(&f4.meta, &f4.data).await.unwrap();
+        let d4 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d4.frame.frame_id, 4);
+        assert_eq!(pair.controller.stale_video_frames_dropped, 2);
+        assert_eq!(pair.controller.decode_errors, 0);
+        assert_eq!(pair.controller.video_frames_received, 3);
+
+        // Stale frame buffered into `pending_video` during HID echo is also dropped before decode.
+        pair.host.publish_raw_video(&f2.meta, &f2.data).await.unwrap();
+        pair.host.publish_raw_video(&f5.meta, &f5.data).await.unwrap();
+        let ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
+            echo_seq: 1,
+            client_ts_ms: 42,
+        }))
+        .unwrap();
+        pair.host.session_mut().send_hid(&ack).await.unwrap();
+        let probe = HidPayload::Key(KeyEvent {
+            down: true,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 'a' as u32,
+            client_ts_ms: 42,
+        });
+        let (_, _, interleaved) = pair
+            .controller
+            .send_hid_and_await_echo(&probe, 1, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(interleaved, 2);
+        assert_eq!(pair.controller.pending_video_len(), 2);
+
+        let d5 = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d5.frame.frame_id, 5);
+        assert_eq!(pair.controller.stale_video_frames_dropped, 3);
+        assert_eq!(pair.controller.decode_errors, 0);
+
+        // Replacing decoder resets `last_delivered_frame_id` so frame_id=1 is accepted again.
+        pair.controller
+            .replace_decoder(V2VideoDecoder::new(VideoCodec::Vp9).unwrap());
+        pair.host.publish_raw_video(&f1.meta, &f1.data).await.unwrap();
+        let d_reset = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d_reset.frame.frame_id, 1);
+        assert_eq!(pair.controller.stale_video_frames_dropped, 3);
     }
 }

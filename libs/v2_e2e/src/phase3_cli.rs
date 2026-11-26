@@ -1481,6 +1481,37 @@ struct ControllerArgs {
     audit_key_identity: bool,
 }
 
+const SESSION_CLOSE_REDUNDANT_SENDS: usize = 3;
+const SESSION_CLOSE_REDUNDANT_INTERVAL: Duration = Duration::from_millis(20);
+
+async fn send_redundant_session_close(
+    controller: &mut DesktopControllerSession,
+    error_code: u16,
+) -> Result<(), SessionError> {
+    let mut first_err: Option<SessionError> = None;
+    let mut sent_any = false;
+    for attempt in 0..SESSION_CLOSE_REDUNDANT_SENDS {
+        if attempt > 0 {
+            tokio::time::sleep(SESSION_CLOSE_REDUNDANT_INTERVAL).await;
+        }
+        match controller.send_session_close(error_code).await {
+            Ok(_) => sent_any = true,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if sent_any {
+        Ok(())
+    } else if let Some(err) = first_err {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
 async fn run_controller(
     args: &ControllerArgs,
     cfg: &ClusterConfig,
@@ -1823,7 +1854,7 @@ async fn run_controller(
             tokio::time::sleep(Duration::from_millis(args.hold_after_stuck_ms)).await;
         }
         // Graceful close (if not SIGKILLed during hold_after_stuck_ms).
-        let _ = controller.send_session_close(0x0000).await;
+        let _ = send_redundant_session_close(&mut controller, 0x0000).await;
     } else {
         let target_frames = args.frames.max(1);
         let pre_hid_frames = 2usize.min(target_frames);
@@ -1874,9 +1905,8 @@ async fn run_controller(
             }
         }
 
-        // Graceful SESSION_CLOSE (`0x04`)
-        controller
-            .send_session_close(0x0000)
+        // Graceful SESSION_CLOSE (`0x04`) with 3x redundancy spaced 20ms apart for lossy WAN UDP.
+        send_redundant_session_close(&mut controller, 0x0000)
             .await
             .map_err(|e| format!("send_session_close failed: {e}"))?;
     }
@@ -2309,7 +2339,7 @@ async fn run_scenario_a(
         "--watchdog-ms".into(),
         "1200".into(),
         "--idle-exit-ms".into(),
-        "4000".into(),
+        "6000".into(),
         "--audit-key-identity".into(),
     ];
     let mut ctrl_args = vec![
@@ -2459,7 +2489,7 @@ async fn run_scenario_b(
         "--watchdog-ms".into(),
         "1200".into(),
         "--idle-exit-ms".into(),
-        "5000".into(),
+        "6000".into(),
         "--audit-key-identity".into(),
     ];
     let mut ctrl_args = vec![
@@ -2595,7 +2625,7 @@ async fn run_scenario_stuck(
     let ctrl_audit = work_dir.join(format!("{tag}.ctrl.jsonl"));
 
     let watchdog_ms: u64 = if sigkill_mode { 500 } else { 1500 };
-    let idle_exit_ms: u64 = if sigkill_mode { 1500 } else { 3000 };
+    let idle_exit_ms: u64 = if sigkill_mode { 1500 } else { 6000 };
     let hold_ms = if sigkill_mode { "8000" } else { "0" };
 
     let mut host_args = vec![
