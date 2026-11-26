@@ -101,7 +101,14 @@ fn create_dir_0700(dir: &Path) -> Result<(), String> {
     }
     builder
         .create(dir)
-        .map_err(|e| format!("create directory '{}': {e}", dir.display()))
+        .map_err(|e| format!("create directory '{}': {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("set 0700 permissions on '{}': {e}", dir.display()))?;
+    }
+    Ok(())
 }
 
 fn write_bytes_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2142,10 +2149,12 @@ impl ManagedChild {
     }
 
     async fn sigkill_and_reap(&mut self) -> Result<Option<i32>, String> {
-        self.kill_process_group();
         let Some(mut child) = self.child.take() else {
             return Ok(None);
         };
+        self.kill_process_group();
+        #[cfg(not(unix))]
+        let _ = child.start_kill();
         let status = child
             .wait()
             .await
