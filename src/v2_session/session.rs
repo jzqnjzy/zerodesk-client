@@ -10,15 +10,28 @@ use std::{
     time::{Duration, Instant},
 };
 use v2_client::{ClientError, UdpE2eeSession};
-use v2_transport::{AssembledVideoFrame, TransportEvent, VideoFrameMeta};
+use v2_transport::{AssembledVideoFrame, ControlFrame, TransportEvent, VideoFrameMeta};
 
 pub const PENDING_VIDEO_QUEUE_CAP: usize = 8;
+pub const CTRL_MSG_SESSION_CLOSE: u8 = 0x04;
+
+pub fn parse_session_close(ctrl: &ControlFrame) -> Option<u16> {
+    if ctrl.msg_type != CTRL_MSG_SESSION_CLOSE {
+        return None;
+    }
+    if ctrl.payload.len() >= 2 {
+        Some(u16::from_be_bytes([ctrl.payload[0], ctrl.payload[1]]))
+    } else {
+        Some(0)
+    }
+}
 
 #[derive(Debug)]
 pub enum SessionError {
     Client(ClientError),
     Hid(HidCodecError),
     Video(VideoError),
+    SessionClosed { error_code: u16 },
     Protocol(String),
 }
 
@@ -28,6 +41,9 @@ impl fmt::Display for SessionError {
             Self::Client(e) => write!(f, "v2 client error: {e}"),
             Self::Hid(e) => write!(f, "v2 HID codec error: {e}"),
             Self::Video(e) => write!(f, "v2 video error: {e}"),
+            Self::SessionClosed { error_code } => {
+                write!(f, "v2 session closed by peer (error_code={error_code:#06x})")
+            }
             Self::Protocol(msg) => write!(f, "v2 session protocol error: {msg}"),
         }
     }
@@ -126,20 +142,20 @@ impl DesktopHostSession {
 
     /// Encodes an I420 frame via `scrap` and computes SHA-256 on Tokio's blocking pool so the
     /// async worker never stalls P0 HID or packet I/O, then transmits the raw bitstream over
-    /// `UdpE2eeSession::send_video_frame` (`0x03 Video`).
+    /// `UdpE2eeSession::send_video_frame` (`0x03 Video`). Accepts `Arc<I420Frame>` to avoid
+    /// copying multi-megabyte raw planes on the async worker thread.
     pub async fn publish_i420_frame(
         &mut self,
-        frame: &I420Frame,
+        frame: Arc<I420Frame>,
         pts_ms: i64,
     ) -> Result<PublishedFrameInfo, SessionError> {
         let enc = Arc::clone(&self.encoder);
-        let frame_owned = frame.clone();
         let (encoded, sha256) = tokio::task::spawn_blocking(
             move || -> Result<(EncodedV2Frame, [u8; 32]), SessionError> {
                 let mut guard = enc
                     .lock()
                     .map_err(|_| SessionError::Protocol("video encoder mutex poisoned".into()))?;
-                let encoded = guard.encode_i420(&frame_owned, pts_ms)?;
+                let encoded = guard.encode_i420(&frame, pts_ms)?;
                 let sha256: [u8; 32] = Sha256::digest(&encoded.data).into();
                 Ok((encoded, sha256))
             },
@@ -163,6 +179,14 @@ impl DesktopHostSession {
         })
     }
 
+    pub async fn send_session_close(&mut self, error_code: u16) -> Result<u32, SessionError> {
+        let seq = self
+            .session
+            .send_control(CTRL_MSG_SESSION_CLOSE, &error_code.to_be_bytes())
+            .await?;
+        Ok(seq)
+    }
+
     /// Transmits a pre-encoded raw video frame directly over `0x03 Video`.
     pub async fn publish_raw_video(
         &mut self,
@@ -178,7 +202,8 @@ impl DesktopHostSession {
 
     /// Receives the next valid `0x01 InputHID` frame, strictly decodes it without injecting any OS
     /// synthetic input, and echoes a `HidEchoAck` back on P0. Malformed HID frames and
-    /// unexpected non-HID events are counted and skipped without aborting the receive loop.
+    /// unexpected non-HID events are counted and skipped without aborting the receive loop;
+    /// `0x04 SESSION_CLOSE` returns `Err(SessionError::SessionClosed { error_code })`.
     pub async fn recv_hid_and_echo(
         &mut self,
         echo_seq: u32,
@@ -208,7 +233,24 @@ impl DesktopHostSession {
                     self.session.send_hid(&ack_frame).await?;
                     return Ok(payload);
                 }
-                _ => {
+                TransportEvent::Control(ctrl) => {
+                    if let Some(error_code) = parse_session_close(&ctrl) {
+                        return Err(SessionError::SessionClosed { error_code });
+                    }
+                    self.skipped_non_hid_events = self.skipped_non_hid_events.saturating_add(1);
+                    continue;
+                }
+                TransportEvent::Audio(_)
+                | TransportEvent::VideoFrame(_)
+                | TransportEvent::Clipboard(_)
+                | TransportEvent::FileTransfer(_)
+                | TransportEvent::Diagnostics(_)
+                | TransportEvent::RealtimeActuator(_)
+                | TransportEvent::Telemetry(_)
+                | TransportEvent::TransportModeChanged(_)
+                | TransportEvent::BandwidthEstimate { .. }
+                | TransportEvent::RequestIdr { .. }
+                | TransportEvent::PolicyUpdated(_) => {
                     self.skipped_non_hid_events = self.skipped_non_hid_events.saturating_add(1);
                     continue;
                 }
@@ -227,6 +269,8 @@ pub struct DesktopControllerSession {
     pending_video: VecDeque<AssembledVideoFrame>,
     pub video_frames_received: u64,
     pub pending_video_dropped: u64,
+    pub decode_errors: u64,
+    pub decoder_flushed_frames: u64,
     pub hid_frames_sent: u64,
     pub skipped_hid_events: u64,
     pub skipped_stale_echo_acks: u64,
@@ -244,6 +288,8 @@ impl DesktopControllerSession {
             pending_video: VecDeque::with_capacity(PENDING_VIDEO_QUEUE_CAP),
             video_frames_received: 0,
             pending_video_dropped: 0,
+            decode_errors: 0,
+            decoder_flushed_frames: 0,
             hid_frames_sent: 0,
             skipped_hid_events: 0,
             skipped_stale_echo_acks: 0,
@@ -282,6 +328,32 @@ impl DesktopControllerSession {
         (self.session, self.decoder)
     }
 
+    pub fn flush_decoder(&mut self) -> Result<Vec<I420Frame>, SessionError> {
+        let mut guard = self
+            .decoder
+            .lock()
+            .map_err(|_| SessionError::Protocol("video decoder mutex poisoned".into()))?;
+        let flushed = match guard.flush_pending() {
+            Ok(frames) => frames,
+            Err(e) => {
+                self.decode_errors = self.decode_errors.saturating_add(1);
+                return Err(SessionError::Video(e));
+            }
+        };
+        self.decoder_flushed_frames = self
+            .decoder_flushed_frames
+            .saturating_add(flushed.len() as u64);
+        Ok(flushed)
+    }
+
+    pub async fn send_session_close(&mut self, error_code: u16) -> Result<u32, SessionError> {
+        let seq = self
+            .session
+            .send_control(CTRL_MSG_SESSION_CLOSE, &error_code.to_be_bytes())
+            .await?;
+        Ok(seq)
+    }
+
     fn push_pending_video(&mut self, frame: AssembledVideoFrame) {
         while self.pending_video.len() >= PENDING_VIDEO_QUEUE_CAP {
             self.pending_video.pop_front();
@@ -295,7 +367,7 @@ impl DesktopControllerSession {
         frame: AssembledVideoFrame,
     ) -> Result<DecodedVideoDelivery, SessionError> {
         let dec = Arc::clone(&self.decoder);
-        let (frame, sha256, i420) = tokio::task::spawn_blocking(
+        let decoded = tokio::task::spawn_blocking(
             move || -> Result<(AssembledVideoFrame, [u8; 32], I420Frame), SessionError> {
                 let sha256: [u8; 32] = Sha256::digest(&frame.data).into();
                 let mut guard = dec
@@ -306,7 +378,17 @@ impl DesktopControllerSession {
             },
         )
         .await
-        .map_err(|e| SessionError::Protocol(format!("video decode blocking task failed: {e}")))??;
+        .map_err(|e| SessionError::Protocol(format!("video decode blocking task failed: {e}")))?;
+
+        let (frame, sha256, i420) = match decoded {
+            Ok(v) => v,
+            Err(e) => {
+                if matches!(e, SessionError::Video(_)) {
+                    self.decode_errors = self.decode_errors.saturating_add(1);
+                }
+                return Err(e);
+            }
+        };
 
         self.video_frames_received = self.video_frames_received.saturating_add(1);
         Ok(DecodedVideoDelivery {
@@ -318,7 +400,8 @@ impl DesktopControllerSession {
 
     /// Receives the next assembled `0x03 Video` frame (draining any buffered frames from
     /// `pending_video` first), computes its SHA-256, and decodes it to I420 on Tokio's blocking
-    /// pool. Late/unexpected HID or Control events are skipped and counted instead of aborting.
+    /// pool. Late/unexpected HID or Control events are skipped and counted; `0x04 SESSION_CLOSE`
+    /// returns `Err(SessionError::SessionClosed { error_code })`.
     pub async fn recv_and_decode_video(
         &mut self,
         timeout: Duration,
@@ -333,7 +416,10 @@ impl DesktopControllerSession {
             };
             match self.session.recv_event(rem).await? {
                 TransportEvent::VideoFrame(frame) => break frame,
-                TransportEvent::Control(_) => {
+                TransportEvent::Control(ctrl) => {
+                    if let Some(error_code) = parse_session_close(&ctrl) {
+                        return Err(SessionError::SessionClosed { error_code });
+                    }
                     self.skipped_control_events = self.skipped_control_events.saturating_add(1);
                     continue;
                 }
@@ -341,7 +427,16 @@ impl DesktopControllerSession {
                     self.skipped_hid_events = self.skipped_hid_events.saturating_add(1);
                     continue;
                 }
-                _ => {
+                TransportEvent::Audio(_)
+                | TransportEvent::Clipboard(_)
+                | TransportEvent::FileTransfer(_)
+                | TransportEvent::Diagnostics(_)
+                | TransportEvent::RealtimeActuator(_)
+                | TransportEvent::Telemetry(_)
+                | TransportEvent::TransportModeChanged(_)
+                | TransportEvent::BandwidthEstimate { .. }
+                | TransportEvent::RequestIdr { .. }
+                | TransportEvent::PolicyUpdated(_) => {
                     self.skipped_other_events = self.skipped_other_events.saturating_add(1);
                     continue;
                 }
@@ -361,6 +456,7 @@ impl DesktopControllerSession {
     /// Sends a typed P0 HID event and awaits the matching `HidEchoAck` on P0 while buffering any
     /// interleaved P2 video frames into `pending_video` (without incrementing
     /// `video_frames_received` until decoded) and skipping stale `echo_seq < expected_echo_seq`.
+    /// Returns `Err(SessionError::SessionClosed { error_code })` on `0x04 SESSION_CLOSE`.
     pub async fn send_hid_and_await_echo(
         &mut self,
         payload: &HidPayload,
@@ -400,11 +496,23 @@ impl DesktopControllerSession {
                     interleaved_video_frames = interleaved_video_frames.saturating_add(1);
                     self.push_pending_video(frame);
                 }
-                TransportEvent::Control(_) => {
+                TransportEvent::Control(ctrl) => {
+                    if let Some(error_code) = parse_session_close(&ctrl) {
+                        return Err(SessionError::SessionClosed { error_code });
+                    }
                     self.skipped_control_events = self.skipped_control_events.saturating_add(1);
                     continue;
                 }
-                _ => {
+                TransportEvent::Audio(_)
+                | TransportEvent::Clipboard(_)
+                | TransportEvent::FileTransfer(_)
+                | TransportEvent::Diagnostics(_)
+                | TransportEvent::RealtimeActuator(_)
+                | TransportEvent::Telemetry(_)
+                | TransportEvent::TransportModeChanged(_)
+                | TransportEvent::BandwidthEstimate { .. }
+                | TransportEvent::RequestIdr { .. }
+                | TransportEvent::PolicyUpdated(_) => {
                     self.skipped_other_events = self.skipped_other_events.saturating_add(1);
                     continue;
                 }
@@ -559,8 +667,8 @@ mod tests {
             .await
             .unwrap();
 
-        let src = generate_animated_i420(64, 64, 0);
-        let pub_info = pair.host.publish_i420_frame(&src, 0).await.unwrap();
+        let src = Arc::new(generate_animated_i420(64, 64, 0));
+        let pub_info = pair.host.publish_i420_frame(src, 0).await.unwrap();
 
         let delivered = pair
             .controller
@@ -586,10 +694,10 @@ mod tests {
         .unwrap();
         pair.host.session_mut().send_hid(&stale_ack).await.unwrap();
 
-        let f0 = generate_animated_i420(64, 64, 0);
-        let f1 = generate_animated_i420(64, 64, 1);
-        let info0 = pair.host.publish_i420_frame(&f0, 0).await.unwrap();
-        let info1 = pair.host.publish_i420_frame(&f1, 33).await.unwrap();
+        let f0 = Arc::new(generate_animated_i420(64, 64, 0));
+        let f1 = Arc::new(generate_animated_i420(64, 64, 1));
+        let info0 = pair.host.publish_i420_frame(f0, 0).await.unwrap();
+        let info1 = pair.host.publish_i420_frame(f1, 33).await.unwrap();
 
         let good_ack = encode_hid_frame(&HidPayload::EchoAck(HidEchoAck {
             echo_seq: 5,
@@ -643,10 +751,10 @@ mod tests {
 
         let total = PENDING_VIDEO_QUEUE_CAP + 2;
         for idx in 0..total {
-            let src = generate_animated_i420(64, 64, idx as u32);
+            let src = Arc::new(generate_animated_i420(64, 64, idx as u32));
             let _ = pair
                 .host
-                .publish_i420_frame(&src, (idx as i64) * 33)
+                .publish_i420_frame(src, (idx as i64) * 33)
                 .await
                 .unwrap();
         }
@@ -718,18 +826,77 @@ mod tests {
     async fn replace_encoder_keeps_frame_id_monotonic() {
         let mut pair = spawn_loopback_pair().await;
 
-        let f0 = generate_animated_i420(64, 64, 0);
-        let f1 = generate_animated_i420(64, 64, 1);
-        let p0 = pair.host.publish_i420_frame(&f0, 0).await.unwrap();
-        let p1 = pair.host.publish_i420_frame(&f1, 33).await.unwrap();
+        let f0 = Arc::new(generate_animated_i420(64, 64, 0));
+        let f1 = Arc::new(generate_animated_i420(64, 64, 1));
+        let p0 = pair.host.publish_i420_frame(Arc::clone(&f0), 0).await.unwrap();
+        let p1 = pair.host.publish_i420_frame(f1, 33).await.unwrap();
         assert_eq!(p0.meta.frame_id, 1);
         assert_eq!(p1.meta.frame_id, 2);
 
         let av1 = V2VideoEncoder::new(VideoCodec::Av1, 64, 64, 2.0, Some(30)).unwrap();
         pair.host.replace_encoder(av1);
-        let p2 = pair.host.publish_i420_frame(&f0, 66).await.unwrap();
+        let p2 = pair.host.publish_i420_frame(f0, 66).await.unwrap();
         assert_eq!(p2.meta.frame_id, 3);
         assert_eq!(p2.meta.ref_frame_id, 3);
         assert_eq!(p2.meta.ltr_slot, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_close_control_frame_breaks_receive_loops_cleanly() {
+        let mut pair = spawn_loopback_pair().await;
+
+        pair.controller.send_session_close(0x0000).await.unwrap();
+        let host_res = pair.host.recv_hid_and_echo(1, Duration::from_secs(2)).await;
+        assert!(matches!(
+            host_res,
+            Err(SessionError::SessionClosed { error_code: 0 })
+        ));
+
+        pair.host.send_session_close(0x0401).await.unwrap();
+        let ctrl_res = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await;
+        assert!(matches!(
+            ctrl_res,
+            Err(SessionError::SessionClosed { error_code: 0x0401 })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controller_counts_decode_errors_and_flushes_decoder() {
+        let mut pair = spawn_loopback_pair().await;
+
+        let f0 = Arc::new(generate_animated_i420(64, 64, 0));
+        let _ = pair.host.publish_i420_frame(f0, 0).await.unwrap();
+        let _ = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let bad_meta = VideoFrameMeta {
+            display_idx: 0,
+            codec_id: VideoCodec::Vp9.codec_id(),
+            frame_id: 99,
+            ref_frame_id: 99,
+            ltr_slot: 0,
+            is_idr: true,
+            is_ref: true,
+            max_age_ms: 200,
+        };
+        pair.host
+            .publish_raw_video(&bad_meta, &[0xFF, 0x00, 0x13, 0x37])
+            .await
+            .unwrap();
+        let err = pair
+            .controller
+            .recv_and_decode_video(Duration::from_secs(2))
+            .await;
+        assert!(matches!(err, Err(SessionError::Video(_))));
+        assert_eq!(pair.controller.decode_errors, 1);
+
+        let flushed = pair.controller.flush_decoder().unwrap();
+        assert_eq!(pair.controller.decoder_flushed_frames, flushed.len() as u64);
     }
 }

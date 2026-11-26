@@ -47,6 +47,7 @@ unix-file-copy-paste = [
 ]
 screencapturekit = ["cpal/screencapturekit"]
 zerodesk-v2 = ["dep:v2_identity", "dep:v2_transport", "dep:v2_client", "dep:tokio"]
+os-input = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -90,7 +91,7 @@ totp-rs = { version = "5.4", default-features = false, features = ["gen_secret",
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys", branch = "rustdesk-patches" }
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd"], default-features=false }
-tokio = { version = "1.44", features = ["rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1.44", features = ["rt-multi-thread", "sync", "time"], optional = true }
 v2_identity = { path = "libs/v2_identity", optional = true }
 v2_transport = { path = "libs/v2_transport", optional = true }
 v2_client = { path = "libs/v2_client", optional = true }
@@ -296,7 +297,6 @@ osx_info_plist_exts = ["res/osx_camera_info.plist"]
 [profile.release]
 lto = true
 codegen-units = 1
-panic = 'abort'
 strip = true
 #opt-level = 'z' # only have smaller size after strip
 rpath = true

@@ -9,15 +9,21 @@ description = "Headless ZeroDesk V2 Phase 2 desktop media (real scrap VP9/AV1) a
 name = "zerodesk-desktop-e2e"
 path = "src/bin/zerodesk-desktop-e2e.rs"
 
+[features]
+default = []
+os-input = ["dep:enigo"]
+
 [dependencies]
+base64 = "0.22.1"
 bytes = "1.9"
+enigo = { path = "../enigo", optional = true }
 hex = "0.4"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 scrap = { path = "../scrap" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 v2_client = { path = "../v2_client" }
 v2_identity = { path = "../v2_identity" }
 v2_transport = { path = "../v2_transport" }

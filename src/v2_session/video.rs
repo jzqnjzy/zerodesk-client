@@ -824,6 +824,29 @@ impl V2VideoDecoder {
         let ssim = compute_y_ssim(reference, &decoded)?;
         Ok((decoded, FrameQualityMetrics { psnr_db, ssim }))
     }
+
+    pub fn flush_pending(&mut self) -> Result<Vec<I420Frame>, VideoError> {
+        let mut flushed = Vec::new();
+        match &mut self.inner {
+            InnerDecoder::Vp9(dec) => {
+                for img in dec
+                    .flush()
+                    .map_err(|e| VideoError::Decoder(e.to_string()))?
+                {
+                    flushed.push(extract_vpx_i420(&img)?);
+                }
+            }
+            InnerDecoder::Av1(dec) => {
+                for img in dec
+                    .flush()
+                    .map_err(|e| VideoError::Decoder(e.to_string()))?
+                {
+                    flushed.push(extract_aom_i420(&img)?);
+                }
+            }
+        }
+        Ok(flushed)
+    }
 }
 
 #[cfg(test)]

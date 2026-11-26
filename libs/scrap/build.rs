@@ -1,3 +1,6 @@
+#[path = "build_env.rs"]
+mod build_env;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -86,7 +89,7 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
     let entries = if let Ok(dir) = std::fs::read_dir(&path) {
         dir
     } else {
-        panic!("Could not find package in {}. Make sure your homebrew and package {} are all installed.", path.to_str().unwrap(),&name);
+        panic!("{}", build_env::homebrew_missing_message(name, &path, false));
     };
     let mut directories = entries
         .into_iter()
@@ -97,10 +100,7 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
     // Find the newest version.
     directories.sort_unstable();
     if directories.is_empty() {
-        panic!(
-            "There's no installed version of {} in /opt/homebrew/Cellar",
-            name
-        );
+        panic!("{}", build_env::homebrew_missing_message(name, &path, true));
     }
     path.push(directories.pop().unwrap());
     // Link the library.
@@ -121,10 +121,14 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
         // leaving undefined `_vmaf_*` symbols (e.g. `_vmaf_init`, `_vmaf_model_load_from_path`)
         // that require linking `libvmaf.a` statically.
         println!("cargo:rerun-if-env-changed=ZERODESK_LINK_VMAF");
-        let link_vmaf = match std::env::var("ZERODESK_LINK_VMAF").as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => Path::new("/opt/homebrew/Cellar/libvmaf").exists(),
+        let vmaf_env = std::env::var("ZERODESK_LINK_VMAF").ok();
+        let link_vmaf = match build_env::parse_zerodesk_link_flag(
+            "ZERODESK_LINK_VMAF",
+            vmaf_env.as_deref(),
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => Path::new("/opt/homebrew/Cellar/libvmaf").exists(),
+            Err(msg) => panic!("{}", msg),
         };
         if link_vmaf {
             let _ = link_homebrew_m1("libvmaf");
@@ -134,18 +138,10 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
 }
 
 fn link_custom_libyuv(prefix: PathBuf) -> PathBuf {
-    let lib_dir = prefix.join("lib");
-    let lib_archive = lib_dir.join("libyuv.a");
-    let include_dir = prefix.join("include");
-    let header = include_dir.join("libyuv.h");
-    if !lib_archive.is_file() || !header.is_file() {
-        panic!(
-            "ZERODESK_LIBYUV_PREFIX='{}' is invalid: expected both '{}' and '{}' to exist",
-            prefix.display(),
-            lib_archive.display(),
-            header.display()
-        );
-    }
+    let (lib_dir, include_dir) = match build_env::validate_libyuv_prefix(&prefix) {
+        Ok(dirs) => dirs,
+        Err(msg) => panic!("{}", msg),
+    };
     println!("cargo:rustc-link-lib=static=yuv");
     println!("cargo:rustc-link-search={}", lib_dir.to_str().unwrap());
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
@@ -271,6 +267,19 @@ fn ffmpeg() {
 */
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=ZERODESK_LINK_VMAF");
+    let link_vars: Vec<(String, String)> = env::vars()
+        .filter(|(k, _)| k.starts_with("ZERODESK_LINK_"))
+        .collect();
+    for (k, _) in &link_vars {
+        println!("cargo:rerun-if-env-changed={k}");
+    }
+    if let Err(msg) = build_env::validate_all_zerodesk_link_vars(
+        link_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    ) {
+        panic!("{}", msg);
+    }
+
     // in this crate, these are also valid configurations
     println!("cargo:rustc-check-cfg=cfg(dxgi,quartz,x11)");
 

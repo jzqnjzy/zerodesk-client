@@ -1,3 +1,35 @@
+#[path = "../phase3_cli.rs"]
+mod phase3_cli;
+
+// Standalone headless `v2_e2e` does not link `src/platform/macos.mm`, which normally provides
+// `BackingScaleFactor` for `scrap::quartz::Display::scale()`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn BackingScaleFactor(display: u32) -> f32 {
+    use std::ffi::c_void;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGDisplayPixelsWide(display: u32) -> usize;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *const c_void;
+        fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *const c_void);
+    }
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(display);
+        if mode.is_null() {
+            return 1.0;
+        }
+        let pixel_w = CGDisplayModeGetPixelWidth(mode);
+        CGDisplayModeRelease(mode);
+        let point_w = CGDisplayPixelsWide(display);
+        if point_w == 0 || pixel_w == 0 {
+            1.0
+        } else {
+            (pixel_w as f32 / point_w as f32).max(1.0)
+        }
+    }
+}
+
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -587,8 +619,8 @@ async fn run_live_video_stream(
         let mut total_raw_bytes = 0u64;
         let mut total_slices = 0u64;
         for idx in 0..frames {
-            let src = generate_animated_i420(WIDTH, HEIGHT, idx as u32);
-            let info = host.publish_i420_frame(&src, (idx as i64) * 33).await?;
+            let src = Arc::new(generate_animated_i420(WIDTH, HEIGHT, idx as u32));
+            let info = host.publish_i420_frame(src, (idx as i64) * 33).await?;
             total_raw_bytes = total_raw_bytes.saturating_add(info.raw_bytes as u64);
             total_slices = total_slices.saturating_add(info.slices_sent as u64);
             meta_tx
@@ -1010,7 +1042,7 @@ async fn cmd_e2e(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]"
+        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1] [--leave-stuck] [--hold-after-stuck-ms 0]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]"
     );
 }
 
@@ -1177,6 +1209,10 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        "host" => phase3_cli::cmd_host(&args).await,
+        "controller" => phase3_cli::cmd_controller(&args).await,
+        "dual-e2e" => phase3_cli::cmd_dual_e2e(&args).await,
+        "capture-probe" => phase3_cli::cmd_capture_probe(&args).await,
         other => {
             eprintln!("unknown subcommand '{other}'");
             print_usage();

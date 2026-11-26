@@ -300,9 +300,29 @@ pub struct HidBatchOutcome {
     pub acked_seqs: Vec<u32>,
     pub executed: Vec<(u32, HidPayload)>,
     pub dropped_stale_seqs: Vec<u32>,
-    pub accumulated_rel_dx: i32,
-    pub accumulated_rel_dy: i32,
     pub coalesced_rel_count: usize,
+}
+
+impl HidBatchOutcome {
+    pub fn total_rel_dx(&self) -> i32 {
+        self.executed
+            .iter()
+            .filter_map(|(_, payload)| match payload {
+                HidPayload::Mouse(ev) if ev.kind == MouseKind::MoveRel => Some(ev.x_or_dx),
+                _ => None,
+            })
+            .fold(0i32, i32::saturating_add)
+    }
+
+    pub fn total_rel_dy(&self) -> i32 {
+        self.executed
+            .iter()
+            .filter_map(|(_, payload)| match payload {
+                HidPayload::Mouse(ev) if ev.kind == MouseKind::MoveRel => Some(ev.y_or_dy),
+                _ => None,
+            })
+            .fold(0i32, i32::saturating_add)
+    }
 }
 
 /// Applies `protocol-spec/spec/04-inner-channels.md` §2 stale-drop and relative mouse
@@ -330,8 +350,6 @@ pub fn coalesce_hid_batch(
         out.acked_seqs.push(seq);
         match payload {
             HidPayload::Mouse(ev) if ev.kind == MouseKind::MoveRel => {
-                out.accumulated_rel_dx = out.accumulated_rel_dx.saturating_add(ev.x_or_dx);
-                out.accumulated_rel_dy = out.accumulated_rel_dy.saturating_add(ev.y_or_dy);
                 out.coalesced_rel_count += 1;
                 if let Some((last_seq, acc)) = &mut pending_rel {
                     *last_seq = seq;
@@ -549,8 +567,8 @@ mod tests {
             out.executed,
             vec![(3, stale_rel_1), (4, fresh_abs), (5, fresh_rel_2)]
         );
-        assert_eq!(out.accumulated_rel_dx, 10);
-        assert_eq!(out.accumulated_rel_dy, 12);
+        assert_eq!(out.total_rel_dx(), 10);
+        assert_eq!(out.total_rel_dy(), 12);
         assert_eq!(out.coalesced_rel_count, 2);
     }
 
@@ -707,8 +725,8 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(out.accumulated_rel_dx, 21);
-        assert_eq!(out.accumulated_rel_dy, 15);
+        assert_eq!(out.total_rel_dx(), 21);
+        assert_eq!(out.total_rel_dy(), 15);
         assert_eq!(out.coalesced_rel_count, 4);
     }
 }
