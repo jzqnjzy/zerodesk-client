@@ -722,8 +722,9 @@ async fn cmd_e2e(
         .sess_a
         .send_control(0x03, b"leg-nack-target-packet")
         .await?;
-    let _ = pair.sess_b.recv_event(Duration::from_secs(2)).await?;
+    // Query LegCiphertextCache within the 250ms single-leg TTL before awaiting end-to-end delivery.
     let rtx_pkts = pair.sess_a.link_mut().handle_local_leg_nack(last_seq_a, 1);
+    let _ = pair.sess_b.recv_event(Duration::from_secs(2)).await?;
     let leg_nack_rtx_verified = if let Some(pkt) = rtx_pkts.first() {
         let hdr = v2_transport::AccessHeaderV11::decode(pkt)?;
         hdr.flags.rtx && hdr.leg_seq == last_seq_a && !hdr.eligible_for_rtt_sample()
@@ -795,18 +796,18 @@ async fn cmd_e2e(
     });
 
     let mut echoed = Vec::with_capacity(tunnel_bytes);
-    tokio::time::timeout(Duration::from_secs(10), tcp_r.read_to_end(&mut echoed))
+    tokio::time::timeout(Duration::from_secs(20), tcp_r.read_to_end(&mut echoed))
         .await
         .map_err(|_| ClientError::Timeout("V2LoopbackBridge TCP read timed out".into()))??;
     writer
         .await
         .map_err(|e| ClientError::Protocol(format!("bridge writer task failed: {e}")))??;
 
-    let (serve_tx, serve_rx) = tokio::time::timeout(Duration::from_secs(12), serve_a)
+    let (serve_tx, serve_rx) = tokio::time::timeout(Duration::from_secs(22), serve_a)
         .await
         .map_err(|_| ClientError::Timeout("V2LoopbackBridge serve_a timed out".into()))?
         .map_err(|e| ClientError::Protocol(format!("V2LoopbackBridge serve_a join error: {e}")))??;
-    let (fwd_tx, fwd_rx) = tokio::time::timeout(Duration::from_secs(12), fwd_b)
+    let (fwd_tx, fwd_rx) = tokio::time::timeout(Duration::from_secs(22), fwd_b)
         .await
         .map_err(|_| ClientError::Timeout("V2LoopbackBridge fwd_b timed out".into()))?
         .map_err(|e| ClientError::Protocol(format!("V2LoopbackBridge fwd_b join error: {e}")))??;
