@@ -348,7 +348,8 @@ impl UdpAccessLink {
             }
         }
         Err(ClientError::Timeout(format!(
-            "UDP EdgeCtrl::Ping failed after {attempts} attempts"
+            "UDP EdgeCtrl::Ping to {} failed after {attempts} attempts",
+            self.edge_addr
         )))
     }
 
@@ -507,6 +508,21 @@ pub fn decode_survival_rs64_shards(
     Ok(rs64_decode_block(&slots)?)
 }
 
+const HANDSHAKE_RTX_INTERVAL: Duration = Duration::from_millis(400);
+const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_secs(5);
+
+enum HandshakeReplayCache {
+    Initiator {
+        msg2: Vec<u8>,
+        created: Instant,
+    },
+    Responder {
+        msg1: Vec<u8>,
+        msg2: Vec<u8>,
+        created: Instant,
+    },
+}
+
 /// Complete client ↔ client E2EE session running over `UdpAccessLink` with:
 /// - `Noise_IK` handshake + 204B anti-downgrade prologue + P-256 `DelegationStatement` verification
 /// - L3 AEAD + 2048-bit replay window + `chan_id <-> pp` validation
@@ -521,6 +537,7 @@ pub struct UdpE2eeSession {
     actuator_receiver: ActuatorReceiver,
     stream_dedup: StreamSeqDedup,
     next_stream_seq: [u32; 9],
+    hs_replay: Option<HandshakeReplayCache>,
 }
 
 impl UdpE2eeSession {
@@ -551,13 +568,40 @@ impl UdpE2eeSession {
         link.send_l3_packet(0, false, &msg1).await?;
 
         let deadline = Instant::now() + timeout;
+        let mut next_rtx = Instant::now() + HANDSHAKE_RTX_INTERVAL;
         let msg2 = loop {
-            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            let now = Instant::now();
+            let Some(rem) = deadline
+                .checked_duration_since(now)
+                .filter(|d| !d.is_zero())
+            else {
                 return Err(ClientError::Timeout("E2EE Noise_IK msg2 timed out".into()));
             };
-            match link.recv_packet(rem).await? {
-                UdpRecvEvent::L3Data { payload, .. } => break payload,
-                UdpRecvEvent::EdgeCtrl(_) => continue,
+            let slice = match next_rtx
+                .checked_duration_since(now)
+                .filter(|d| !d.is_zero())
+            {
+                Some(until_rtx) => rem.min(until_rtx),
+                None => {
+                    link.send_l3_packet(0, false, &msg1).await?;
+                    next_rtx = Instant::now() + HANDSHAKE_RTX_INTERVAL;
+                    continue;
+                }
+            };
+            match link.recv_packet(slice).await {
+                Ok(UdpRecvEvent::L3Data { payload, .. }) => break payload,
+                Ok(UdpRecvEvent::EdgeCtrl(_)) => continue,
+                Err(ClientError::Timeout(_)) => {
+                    let now = Instant::now();
+                    if deadline.checked_duration_since(now).is_none() {
+                        return Err(ClientError::Timeout("E2EE Noise_IK msg2 timed out".into()));
+                    }
+                    if next_rtx.checked_duration_since(now).is_none() {
+                        link.send_l3_packet(0, false, &msg1).await?;
+                        next_rtx = Instant::now() + HANDSHAKE_RTX_INTERVAL;
+                    }
+                }
+                Err(e) => return Err(e),
             }
         };
         let _ = hs.read_message(&msg2)?;
@@ -568,7 +612,11 @@ impl UdpE2eeSession {
             peer_device_cert_exp_unix,
             now_unix,
         )?;
-        let session = Self::from_handshake(link, &out, policy, local_device_id, l3_mtu);
+        let mut session = Self::from_handshake(link, &out, policy, local_device_id, l3_mtu);
+        session.hs_replay = Some(HandshakeReplayCache::Initiator {
+            msg2,
+            created: Instant::now(),
+        });
         Ok((session, out))
     }
 
@@ -615,7 +663,12 @@ impl UdpE2eeSession {
             peer_device_cert_exp_unix,
             now_unix,
         )?;
-        let session = Self::from_handshake(link, &out, policy, local_device_id, l3_mtu);
+        let mut session = Self::from_handshake(link, &out, policy, local_device_id, l3_mtu);
+        session.hs_replay = Some(HandshakeReplayCache::Responder {
+            msg1,
+            msg2,
+            created: Instant::now(),
+        });
         Ok((session, out))
     }
 
@@ -637,6 +690,7 @@ impl UdpE2eeSession {
             actuator_receiver: ActuatorReceiver::new(tenant_id, local_device_id, 1),
             stream_dedup: StreamSeqDedup::default(),
             next_stream_seq: [0; 9],
+            hs_replay: None,
         }
     }
 
@@ -659,6 +713,7 @@ impl UdpE2eeSession {
             actuator_receiver: ActuatorReceiver::new(tenant_id, local_device_id, 1),
             stream_dedup: StreamSeqDedup::default(),
             next_stream_seq: [0; 9],
+            hs_replay: None,
         }
     }
 
@@ -805,13 +860,40 @@ impl UdpE2eeSession {
                 UdpRecvEvent::EdgeCtrl(_) => continue,
                 UdpRecvEvent::L3Data { header, payload } => (header, payload),
             };
+            if let Some(cache) = &self.hs_replay {
+                let expired = match cache {
+                    HandshakeReplayCache::Responder { created, .. }
+                    | HandshakeReplayCache::Initiator { created, .. } => {
+                        created.elapsed() >= HANDSHAKE_REPLAY_TTL
+                    }
+                };
+                if expired {
+                    self.hs_replay = None;
+                } else {
+                    match cache {
+                        HandshakeReplayCache::Responder { msg1, msg2, .. }
+                            if l3_bytes == *msg1 =>
+                        {
+                            self.link.send_l3_packet(0, false, msg2).await?;
+                            continue;
+                        }
+                        HandshakeReplayCache::Initiator { msg2, .. } if l3_bytes == *msg2 => {
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let now = now_ms();
             let (l3_hdr, pt) = match self.receiver.decrypt_and_verify(
                 &l3_bytes,
                 Some(hdr.flags.pp),
                 now,
             ) {
-                Ok(v) => v,
+                Ok(v) => {
+                    self.hs_replay = None;
+                    v
+                }
                 Err(TransportError::ReplayDetected) => continue,
                 Err(e) => return Err(e.into()),
             };
@@ -903,5 +985,530 @@ impl UdpE2eeSession {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::mpsc;
+    use v2_identity::{
+        DeviceCert, DeviceKeyStore, SoftwareDeviceKeyStore, TenantPolicyBlob,
+        X25519StaticKeyRotator,
+    };
+    use v2_transport::{
+        QuotaExhaustPolicy, TenantPolicyRules, PATTERN_IK, TRANSPORT_MODE_RELAY_UDP,
+        VER_MAJOR_MINOR,
+    };
+
+    struct RelayFixture {
+        link_a: UdpAccessLink,
+        link_b: UdpAccessLink,
+        stop_tx: mpsc::Sender<()>,
+        relay_task: tokio::task::JoinHandle<()>,
+        a2b_seen: Arc<AtomicUsize>,
+        b2a_seen: Arc<AtomicUsize>,
+    }
+
+    async fn spawn_lossy_udp_relay_pair(
+        drop_first_a2b: usize,
+        drop_first_b2a: usize,
+        dup_first_delivered_b2a: bool,
+    ) -> RelayFixture {
+        let relay_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = relay_a.local_addr().unwrap();
+        let addr_b = relay_b.local_addr().unwrap();
+
+        let cid_a = [0x11; 8];
+        let cid_b = [0x22; 8];
+        let hs_a = [0x33; 32];
+        let hs_b = [0x44; 32];
+        let keys_a = AccessKeys::derive(cid_a, hs_a, 0).unwrap();
+        let keys_b = AccessKeys::derive(cid_b, hs_b, 0).unwrap();
+
+        let a2b_seen = Arc::new(AtomicUsize::new(0));
+        let b2a_seen = Arc::new(AtomicUsize::new(0));
+        let a2b_cnt = Arc::clone(&a2b_seen);
+        let b2a_cnt = Arc::clone(&b2a_seen);
+
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let ka = keys_a.clone();
+        let kb = keys_b.clone();
+        let relay_task = tokio::spawn(async move {
+            let mut rx_a =
+                AccessEpochState::new(cid_a, hs_a, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut rx_b =
+                AccessEpochState::new(cid_b, hs_b, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut peer_a: Option<SocketAddr> = None;
+            let mut peer_b: Option<SocketAddr> = None;
+            let mut seq_to_a = 1u32;
+            let mut seq_to_b = 1u32;
+            let mut b2a_delivered = 0usize;
+            let mut ba = [0u8; 2048];
+            let mut bb = [0u8; 2048];
+
+            loop {
+                tokio::select! {
+                    _ = stop_rx.recv() => break,
+                    Ok((n, src)) = relay_a.recv_from(&mut ba) => {
+                        peer_a = Some(src);
+                        if let Ok((hdr, body)) = rx_a.verify_udp_packet(&ba[..n], 100) {
+                            if hdr.flags.is_ctrl_edge {
+                                if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
+                                    let ph = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: 0,
+                                            discardable: false,
+                                            frame_end: false,
+                                            is_ctrl_edge: true,
+                                            dir_edge_to_client: true,
+                                            rtx: false,
+                                        },
+                                        route_cid: cid_a,
+                                        access_epoch: 0,
+                                        leg_seq: 0,
+                                        mac_64: [0; 8],
+                                    };
+                                    let w = seal_udp_v11(
+                                        &ka.udp_key_e2c,
+                                        ph,
+                                        &EdgeCtrlFrame::Pong { ts_us }.encode(),
+                                    )
+                                    .unwrap();
+                                    let _ = relay_a.send_to(&w, src).await;
+                                }
+                            } else if let Some(dst) = peer_b {
+                                let idx = a2b_cnt.fetch_add(1, Ordering::SeqCst) + 1;
+                                if idx <= drop_first_a2b {
+                                    continue;
+                                }
+                                let fh = AccessHeaderV11 {
+                                    flags: AccessFlags {
+                                        pp: hdr.flags.pp,
+                                        discardable: hdr.flags.discardable,
+                                        frame_end: false,
+                                        is_ctrl_edge: false,
+                                        dir_edge_to_client: true,
+                                        rtx: false,
+                                    },
+                                    route_cid: cid_b,
+                                    access_epoch: 0,
+                                    leg_seq: seq_to_b,
+                                    mac_64: [0; 8],
+                                };
+                                seq_to_b = seq_to_b.wrapping_add(1);
+                                let w = seal_udp_v11(&kb.udp_key_e2c, fh, body).unwrap();
+                                let _ = relay_b.send_to(&w, dst).await;
+                            }
+                        }
+                    }
+                    Ok((n, src)) = relay_b.recv_from(&mut bb) => {
+                        peer_b = Some(src);
+                        if let Ok((hdr, body)) = rx_b.verify_udp_packet(&bb[..n], 100) {
+                            if hdr.flags.is_ctrl_edge {
+                                if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
+                                    let ph = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: 0,
+                                            discardable: false,
+                                            frame_end: false,
+                                            is_ctrl_edge: true,
+                                            dir_edge_to_client: true,
+                                            rtx: false,
+                                        },
+                                        route_cid: cid_b,
+                                        access_epoch: 0,
+                                        leg_seq: 0,
+                                        mac_64: [0; 8],
+                                    };
+                                    let w = seal_udp_v11(
+                                        &kb.udp_key_e2c,
+                                        ph,
+                                        &EdgeCtrlFrame::Pong { ts_us }.encode(),
+                                    )
+                                    .unwrap();
+                                    let _ = relay_b.send_to(&w, src).await;
+                                }
+                            } else if let Some(dst) = peer_a {
+                                let idx = b2a_cnt.fetch_add(1, Ordering::SeqCst) + 1;
+                                if idx <= drop_first_b2a {
+                                    continue;
+                                }
+                                b2a_delivered += 1;
+                                let copies = if dup_first_delivered_b2a && b2a_delivered == 1 {
+                                    2
+                                } else {
+                                    1
+                                };
+                                for _ in 0..copies {
+                                    let fh = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: hdr.flags.pp,
+                                            discardable: hdr.flags.discardable,
+                                            frame_end: false,
+                                            is_ctrl_edge: false,
+                                            dir_edge_to_client: true,
+                                            rtx: false,
+                                        },
+                                        route_cid: cid_a,
+                                        access_epoch: 0,
+                                        leg_seq: seq_to_a,
+                                        mac_64: [0; 8],
+                                    };
+                                    seq_to_a = seq_to_a.wrapping_add(1);
+                                    let w = seal_udp_v11(&ka.udp_key_e2c, fh, body).unwrap();
+                                    let _ = relay_a.send_to(&w, dst).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut link_a = UdpAccessLink::connect(&addr_a.to_string(), &keys_a, 10_000)
+            .await
+            .unwrap();
+        let mut link_b = UdpAccessLink::connect(&addr_b.to_string(), &keys_b, 10_000)
+            .await
+            .unwrap();
+        link_a
+            .ping_with_retry(2, Duration::from_secs(1))
+            .await
+            .unwrap();
+        link_b
+            .ping_with_retry(2, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        RelayFixture {
+            link_a,
+            link_b,
+            stop_tx,
+            relay_task,
+            a2b_seen,
+            b2a_seen,
+        }
+    }
+
+    struct HandshakeFixture {
+        prologue: PrologueInput,
+        priv_a: [u8; 32],
+        priv_b: [u8; 32],
+        pub_b: [u8; 32],
+        deleg_a: DelegationStatement,
+        deleg_b: DelegationStatement,
+        dev_a: [u8; 16],
+        dev_b: [u8; 16],
+        spki_a: Vec<u8>,
+        spki_b: Vec<u8>,
+        policy_a: VerifiedTenantPolicy,
+        policy_b: VerifiedTenantPolicy,
+        now_u: u64,
+        exp_u: u64,
+    }
+
+    fn make_signed_policy(
+        ca: &SoftwareDeviceKeyStore,
+        dev_spki: &[u8],
+        tenant_id: [u8; 16],
+        dev_id: [u8; 16],
+        now_u: u64,
+        rules: TenantPolicyRules,
+    ) -> VerifiedTenantPolicy {
+        let ca_spki = ca.public_key_spki_der().unwrap();
+        let mut cert = DeviceCert {
+            version: 1,
+            cert_id: dev_id,
+            device_id: dev_id,
+            tenant_id,
+            p256_pub_der: dev_spki.to_vec(),
+            key_epoch: 1,
+            policy_hash: rules.canonical_hash(),
+            cap_bits: 0x1_7FFF,
+            iat_unix: now_u - 10,
+            exp_unix: now_u + 3600,
+            hardware_backed: false,
+            sig_der: Vec::new(),
+        };
+        cert.sig_der = ca.sign_p256_low_s(&cert.tbs_bytes().unwrap()).unwrap();
+        let mut blob = TenantPolicyBlob {
+            tenant_id,
+            version: 1,
+            policy_hash: rules.canonical_hash(),
+            iat_unix: now_u - 10,
+            exp_unix: now_u + 3600,
+            sig_der: Vec::new(),
+        };
+        blob.sig_der = ca.sign_p256_low_s(&blob.tbs_bytes()).unwrap();
+        VerifiedTenantPolicy::from_verified_blob(&blob, &cert, &rules, &ca_spki, now_u).unwrap()
+    }
+
+    fn build_handshake_fixture() -> HandshakeFixture {
+        let ca = SoftwareDeviceKeyStore::generate();
+        let ks_a = SoftwareDeviceKeyStore::generate();
+        let ks_b = SoftwareDeviceKeyStore::generate();
+        let spki_a = ks_a.public_key_spki_der().unwrap();
+        let spki_b = ks_b.public_key_spki_der().unwrap();
+        let tenant_id = [0x71; 16];
+        let dev_a = [0xA0; 16];
+        let dev_b = [0xB0; 16];
+        let now_u = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp_u = now_u + 3600;
+
+        let mut rot_a = X25519StaticKeyRotator::new(dev_a, false, 0);
+        let mut rot_b = X25519StaticKeyRotator::new(dev_b, false, 0);
+        let gen_a = rot_a.ensure_current(&ks_a, now_u, exp_u).unwrap();
+        let gen_b = rot_b.ensure_current(&ks_b, now_u, exp_u).unwrap();
+        let priv_a = *gen_a.secret_bytes();
+        let priv_b = *gen_b.secret_bytes();
+        let pub_b = gen_b.public_key;
+        let deleg_a = gen_a.delegation.clone();
+        let deleg_b = gen_b.delegation.clone();
+
+        let rules = TenantPolicyRules {
+            allow_file_transfer: true,
+            allow_clipboard: true,
+            allow_file_clipboard: true,
+            allow_tcp_tunnel: true,
+            allow_terminal: true,
+            allow_realtime_actuator: false,
+            bw_cap_kbps: 20_000,
+            exhaust_policy: QuotaExhaustPolicy::Throttle256Kbps,
+        };
+        let policy_a = make_signed_policy(&ca, &spki_a, tenant_id, dev_a, now_u, rules.clone());
+        let policy_b = make_signed_policy(&ca, &spki_b, tenant_id, dev_b, now_u, rules);
+
+        let prologue = PrologueInput {
+            ver_major_minor: VER_MAJOR_MINOR,
+            handshake_pattern: PATTERN_IK,
+            cipher_suite: CIPHER_AESGCM,
+            transport_mode: TRANSPORT_MODE_RELAY_UDP,
+            device_id_ctrl: dev_a,
+            device_id_host: dev_b,
+            ctrl_devcert_tbs_sha256: Sha256::digest(&spki_a).into(),
+            host_devcert_tbs_sha256: Sha256::digest(&spki_b).into(),
+            policy_hash: policy_a.policy_hash,
+            edge_cert_tbs_sha256_or_zero: [0xEE; 32],
+            negotiated_cap_bits: 0x1_7FFF,
+            session_id: [0x99; 16],
+        };
+
+        HandshakeFixture {
+            prologue,
+            priv_a,
+            priv_b,
+            pub_b,
+            deleg_a,
+            deleg_b,
+            dev_a,
+            dev_b,
+            spki_a,
+            spki_b,
+            policy_a,
+            policy_b,
+            now_u,
+            exp_u,
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_ik_handshake_recovers_when_first_msg1_is_dropped() {
+        let relay = spawn_lossy_udp_relay_pair(1, 0, false).await;
+        let fx = build_handshake_fixture();
+
+        let hs_a = UdpE2eeSession::handshake_initiator(
+            relay.link_a,
+            &fx.prologue,
+            &fx.priv_a,
+            &fx.pub_b,
+            &fx.deleg_b,
+            &fx.dev_b,
+            &fx.spki_b,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_a,
+            fx.dev_a,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        );
+        let hs_b = UdpE2eeSession::handshake_responder(
+            relay.link_b,
+            &fx.prologue,
+            &fx.priv_b,
+            &fx.deleg_a,
+            &fx.dev_a,
+            &fx.spki_a,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_b,
+            fx.dev_b,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        );
+        let ((mut sess_a, out_a), (mut sess_b, out_b)) = tokio::try_join!(hs_a, hs_b).unwrap();
+        assert_eq!(out_a.hs_hash, out_b.hs_hash);
+        assert!(relay.a2b_seen.load(Ordering::SeqCst) >= 2);
+
+        sess_a
+            .send_hid(&HidFrame {
+                msg_type: 0x01,
+                payload: Bytes::from_static(b"MSG1-DROP-RECOVERED"),
+            })
+            .await
+            .unwrap();
+        let ev_b = sess_b.recv_event(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            ev_b,
+            TransportEvent::Hid(ref f) if f.payload.as_ref() == b"MSG1-DROP-RECOVERED"
+        ));
+
+        let _ = relay.stop_tx.send(()).await;
+        let _ = relay.relay_task.await;
+    }
+
+    #[tokio::test]
+    async fn noise_ik_handshake_recovers_when_first_msg2_is_dropped_while_responder_in_recv_event()
+    {
+        let relay = spawn_lossy_udp_relay_pair(0, 1, false).await;
+        let fx = build_handshake_fixture();
+
+        let prologue_b = fx.prologue.clone();
+        let priv_b = fx.priv_b;
+        let deleg_a = fx.deleg_a;
+        let dev_a = fx.dev_a;
+        let dev_b = fx.dev_b;
+        let spki_a = fx.spki_a;
+        let exp_u = fx.exp_u;
+        let now_u = fx.now_u;
+        let policy_b = fx.policy_b;
+
+        let responder_task = tokio::spawn(async move {
+            let (mut sess_b, out_b) = UdpE2eeSession::handshake_responder(
+                relay.link_b,
+                &prologue_b,
+                &priv_b,
+                &deleg_a,
+                &dev_a,
+                &spki_a,
+                exp_u,
+                now_u,
+                policy_b,
+                dev_b,
+                L3_MTU_DEFAULT,
+                Duration::from_secs(3),
+            )
+            .await?;
+            let ev_b = sess_b.recv_event(Duration::from_secs(3)).await?;
+            sess_b.send_control(0x05, b"MSG2-DROP-CTRL-OK").await?;
+            Ok::<(E2eeHandshakeOutput, TransportEvent), ClientError>((out_b, ev_b))
+        });
+
+        let (mut sess_a, out_a) = UdpE2eeSession::handshake_initiator(
+            relay.link_a,
+            &fx.prologue,
+            &fx.priv_a,
+            &fx.pub_b,
+            &fx.deleg_b,
+            &fx.dev_b,
+            &fx.spki_b,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_a,
+            fx.dev_a,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+
+        sess_a
+            .send_hid(&HidFrame {
+                msg_type: 0x01,
+                payload: Bytes::from_static(b"MSG2-DROP-HID-OK"),
+            })
+            .await
+            .unwrap();
+        let ev_a = sess_a.recv_event(Duration::from_secs(2)).await.unwrap();
+        let (out_b, ev_b) = responder_task.await.unwrap().unwrap();
+
+        assert_eq!(out_a.hs_hash, out_b.hs_hash);
+        assert!(relay.a2b_seen.load(Ordering::SeqCst) >= 3);
+        assert!(relay.b2a_seen.load(Ordering::SeqCst) >= 3);
+        assert!(matches!(
+            ev_b,
+            TransportEvent::Hid(ref f) if f.payload.as_ref() == b"MSG2-DROP-HID-OK"
+        ));
+        assert!(matches!(
+            ev_a,
+            TransportEvent::Control(ref f)
+                if f.msg_type == 0x05 && f.payload.as_ref() == b"MSG2-DROP-CTRL-OK"
+        ));
+
+        let _ = relay.stop_tx.send(()).await;
+        let _ = relay.relay_task.await;
+    }
+
+    #[tokio::test]
+    async fn noise_ik_initiator_ignores_duplicate_msg2_in_recv_event() {
+        let relay = spawn_lossy_udp_relay_pair(0, 0, true).await;
+        let fx = build_handshake_fixture();
+
+        let hs_a = UdpE2eeSession::handshake_initiator(
+            relay.link_a,
+            &fx.prologue,
+            &fx.priv_a,
+            &fx.pub_b,
+            &fx.deleg_b,
+            &fx.dev_b,
+            &fx.spki_b,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_a,
+            fx.dev_a,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        );
+        let hs_b = UdpE2eeSession::handshake_responder(
+            relay.link_b,
+            &fx.prologue,
+            &fx.priv_b,
+            &fx.deleg_a,
+            &fx.dev_a,
+            &fx.spki_a,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_b,
+            fx.dev_b,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(3),
+        );
+        let ((mut sess_a, out_a), (mut sess_b, out_b)) = tokio::try_join!(hs_a, hs_b).unwrap();
+        assert_eq!(out_a.hs_hash, out_b.hs_hash);
+
+        sess_b
+            .send_control(0x06, b"DUP-MSG2-IGNORED-OK")
+            .await
+            .unwrap();
+        let ev_a = sess_a.recv_event(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            ev_a,
+            TransportEvent::Control(ref f)
+                if f.msg_type == 0x06 && f.payload.as_ref() == b"DUP-MSG2-IGNORED-OK"
+        ));
+
+        let _ = relay.stop_tx.send(()).await;
+        let _ = relay.relay_task.await;
     }
 }

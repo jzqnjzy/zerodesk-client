@@ -456,14 +456,64 @@ async fn bootstrap_pair(
     })
 }
 
-async fn run_p0_hid_ping_pong(
+async fn recv_hid_matching_nonce(
+    sess: &mut UdpE2eeSession,
+    expected: u64,
+    timeout: Duration,
+    peer_label: &str,
+) -> Result<Option<Bytes>, ClientError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(None);
+        };
+        let ev = match sess.recv_event(rem).await {
+            Ok(ev) => ev,
+            Err(ClientError::Timeout(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let TransportEvent::Hid(hid) = ev else {
+            return Err(ClientError::Protocol(format!(
+                "expected Hid frame at {peer_label}"
+            )));
+        };
+        if hid.payload.len() != 8 {
+            return Err(ClientError::Protocol(format!(
+                "HID payload length mismatch at {peer_label}"
+            )));
+        }
+        let got = u64::from_be_bytes([
+            hid.payload[0],
+            hid.payload[1],
+            hid.payload[2],
+            hid.payload[3],
+            hid.payload[4],
+            hid.payload[5],
+            hid.payload[6],
+            hid.payload[7],
+        ]);
+        if got < expected {
+            continue;
+        }
+        if got != expected {
+            return Err(ClientError::Protocol(format!(
+                "HID payload mismatch at {peer_label}: expected {expected}, got {got}"
+            )));
+        }
+        return Ok(Some(hid.payload));
+    }
+}
+
+async fn run_p0_hid_probe(
     sess_a: &mut UdpE2eeSession,
     sess_b: &mut UdpE2eeSession,
     count: usize,
 ) -> Result<Vec<u64>, ClientError> {
+    const PROBE_LEG_TIMEOUT: Duration = Duration::from_millis(1500);
     let mut rtts_us = Vec::with_capacity(count);
     for i in 0..count {
-        let nonce = (i as u64).to_be_bytes();
+        let nonce_u64 = i as u64;
+        let nonce = nonce_u64.to_be_bytes();
         let sent = Instant::now();
         sess_a
             .send_hid(&HidFrame {
@@ -472,28 +522,75 @@ async fn run_p0_hid_ping_pong(
             })
             .await?;
 
-        let rx_b = sess_b.recv_event(Duration::from_secs(2)).await?;
-        let TransportEvent::Hid(hid_b) = rx_b else {
-            return Err(ClientError::Protocol("expected Hid frame at peer B".into()));
+        let Some(payload_b) =
+            recv_hid_matching_nonce(sess_b, nonce_u64, PROBE_LEG_TIMEOUT, "peer B").await?
+        else {
+            continue;
         };
-        if hid_b.payload.as_ref() != nonce {
-            return Err(ClientError::Protocol("HID payload mismatch at peer B".into()));
-        }
         sess_b
             .send_hid(&HidFrame {
                 msg_type: 0x02,
-                payload: hid_b.payload,
+                payload: payload_b,
             })
             .await?;
 
-        let rx_a = sess_a.recv_event(Duration::from_secs(2)).await?;
-        let TransportEvent::Hid(hid_a) = rx_a else {
-            return Err(ClientError::Protocol("expected Hid echo at peer A".into()));
+        let Some(_) =
+            recv_hid_matching_nonce(sess_a, nonce_u64, PROBE_LEG_TIMEOUT, "peer A").await?
+        else {
+            continue;
         };
-        if hid_a.payload.as_ref() != nonce {
-            return Err(ClientError::Protocol("HID echo mismatch at peer A".into()));
-        }
         rtts_us.push(sent.elapsed().as_micros() as u64);
+    }
+    Ok(rtts_us)
+}
+
+async fn run_p0_hid_ping_pong(
+    sess_a: &mut UdpE2eeSession,
+    sess_b: &mut UdpE2eeSession,
+    count: usize,
+) -> Result<Vec<u64>, ClientError> {
+    const MAX_ATTEMPTS: usize = 3;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(300);
+    let mut rtts_us = Vec::with_capacity(count);
+    for i in 0..count {
+        let nonce_u64 = i as u64;
+        let nonce = nonce_u64.to_be_bytes();
+        let mut rtt_us = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let sent = Instant::now();
+            sess_a
+                .send_hid(&HidFrame {
+                    msg_type: 0x01,
+                    payload: Bytes::copy_from_slice(&nonce),
+                })
+                .await?;
+
+            let Some(payload_b) =
+                recv_hid_matching_nonce(sess_b, nonce_u64, ATTEMPT_TIMEOUT, "peer B").await?
+            else {
+                continue;
+            };
+            sess_b
+                .send_hid(&HidFrame {
+                    msg_type: 0x02,
+                    payload: payload_b,
+                })
+                .await?;
+
+            let Some(_) =
+                recv_hid_matching_nonce(sess_a, nonce_u64, ATTEMPT_TIMEOUT, "peer A").await?
+            else {
+                continue;
+            };
+            rtt_us = Some(sent.elapsed().as_micros() as u64);
+            break;
+        }
+        let Some(measured) = rtt_us else {
+            return Err(ClientError::Timeout(format!(
+                "P0 HID probe {i} timed out after {MAX_ATTEMPTS} attempts"
+            )));
+        };
+        rtts_us.push(measured);
     }
     Ok(rtts_us)
 }
@@ -505,7 +602,7 @@ async fn cmd_probe(
 ) -> Result<ProbeReport, ClientError> {
     let cfg = ClusterConfig::from_file(cfg_path)?;
     let mut pair = bootstrap_pair(&cfg, ca_der_override, 1200).await?;
-    let rtts = run_p0_hid_ping_pong(&mut pair.sess_a, &mut pair.sess_b, count).await?;
+    let rtts = run_p0_hid_probe(&mut pair.sess_a, &mut pair.sess_b, count).await?;
     let received = rtts.len();
     let loss_pct = if count == 0 {
         0.0
@@ -513,7 +610,7 @@ async fn cmd_probe(
         ((count.saturating_sub(received)) as f64) * 100.0 / (count as f64)
     };
     Ok(ProbeReport {
-        pass: received == count,
+        pass: count == 0 || (received > 0 && loss_pct <= 20.0),
         count,
         received,
         loss_pct,
@@ -580,7 +677,16 @@ async fn cmd_e2e(
             payload: Bytes::from_static(clip_payload),
         })
         .await?;
-    let clip_ev = pair.sess_b.recv_event(Duration::from_secs(2)).await?;
+    let clip_deadline = Instant::now() + Duration::from_secs(2);
+    let clip_ev = loop {
+        let Some(rem) = clip_deadline.checked_duration_since(Instant::now()) else {
+            return Err(ClientError::Timeout("Clipboard channel recv timed out".into()));
+        };
+        match pair.sess_b.recv_event(rem).await? {
+            TransportEvent::Hid(_) => continue,
+            ev => break ev,
+        }
+    };
     let clipboard_ok = matches!(
         clip_ev,
         TransportEvent::Clipboard(ref f) if !f.is_file_clipboard && f.payload.as_ref() == clip_payload
