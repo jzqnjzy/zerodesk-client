@@ -21,6 +21,7 @@ pub const MOD_CTRL: u8 = 1 << 1;
 pub const MOD_ALT: u8 = 1 << 2;
 pub const MOD_META: u8 = 1 << 3;
 const MOD_VALID_MASK: u8 = MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_META;
+pub const MOUSE_BUTTONS_VALID_MASK: u8 = 0x1F;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HidCodecError {
@@ -31,6 +32,12 @@ pub enum HidCodecError {
         actual: usize,
     },
     InvalidMouseKind(u8),
+    InvalidMouseButtons(u8),
+    UnexpectedWheelDelta {
+        kind: MouseKind,
+        wheel_dx: i16,
+        wheel_dy: i16,
+    },
     InvalidBoolFlag(u8),
     InvalidModifiers(u8),
     InvalidUnicodeScalar(u32),
@@ -49,6 +56,15 @@ impl fmt::Display for HidCodecError {
                 "invalid HID payload length for msg_type {msg_type:#04x}: expected {expected}, got {actual}"
             ),
             Self::InvalidMouseKind(k) => write!(f, "invalid mouse event kind discriminant {k}"),
+            Self::InvalidMouseButtons(b) => write!(f, "reserved mouse button bits set: {b:#04x}"),
+            Self::UnexpectedWheelDelta {
+                kind,
+                wheel_dx,
+                wheel_dy,
+            } => write!(
+                f,
+                "non-zero wheel delta ({wheel_dx}, {wheel_dy}) on non-Wheel mouse event {kind:?}"
+            ),
             Self::InvalidBoolFlag(v) => write!(f, "invalid boolean flag value {v} (expected 0 or 1)"),
             Self::InvalidModifiers(m) => write!(f, "reserved key modifier bits set: {m:#04x}"),
             Self::InvalidUnicodeScalar(u) => write!(f, "invalid unicode scalar {u:#010x}"),
@@ -93,7 +109,22 @@ pub struct MouseEvent {
 }
 
 impl MouseEvent {
-    pub fn encode(&self) -> [u8; MOUSE_EVENT_WIRE_LEN] {
+    pub fn validate(&self) -> Result<(), HidCodecError> {
+        if self.buttons & !MOUSE_BUTTONS_VALID_MASK != 0 {
+            return Err(HidCodecError::InvalidMouseButtons(self.buttons));
+        }
+        if self.kind != MouseKind::Wheel && (self.wheel_dx != 0 || self.wheel_dy != 0) {
+            return Err(HidCodecError::UnexpectedWheelDelta {
+                kind: self.kind,
+                wheel_dx: self.wheel_dx,
+                wheel_dy: self.wheel_dy,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<[u8; MOUSE_EVENT_WIRE_LEN], HidCodecError> {
+        self.validate()?;
         let mut out = [0u8; MOUSE_EVENT_WIRE_LEN];
         out[0] = self.kind as u8;
         out[1] = self.buttons;
@@ -102,7 +133,7 @@ impl MouseEvent {
         out[10..12].copy_from_slice(&self.wheel_dx.to_be_bytes());
         out[12..14].copy_from_slice(&self.wheel_dy.to_be_bytes());
         out[14..22].copy_from_slice(&self.client_ts_ms.to_be_bytes());
-        out
+        Ok(out)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, HidCodecError> {
@@ -114,7 +145,7 @@ impl MouseEvent {
             });
         }
         let kind = MouseKind::from_u8(bytes[0])?;
-        Ok(Self {
+        let ev = Self {
             kind,
             buttons: bytes[1],
             x_or_dx: i32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
@@ -125,7 +156,9 @@ impl MouseEvent {
                 bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
                 bytes[21],
             ]),
-        })
+        };
+        ev.validate()?;
+        Ok(ev)
     }
 }
 
@@ -240,7 +273,7 @@ pub fn encode_hid_frame(payload: &HidPayload) -> Result<HidFrame, HidCodecError>
     match payload {
         HidPayload::Mouse(ev) => Ok(HidFrame {
             msg_type: HID_MSG_MOUSE,
-            payload: Bytes::copy_from_slice(&ev.encode()),
+            payload: Bytes::copy_from_slice(&ev.encode()?),
         }),
         HidPayload::Key(ev) => Ok(HidFrame {
             msg_type: HID_MSG_KEY,
@@ -275,13 +308,24 @@ pub struct HidBatchOutcome {
 /// Applies `protocol-spec/spec/04-inner-channels.md` §2 stale-drop and relative mouse
 /// vector coalescing rules over a batch of `(stream_seq, payload, enqueue_ms)`:
 /// - Every event is ACKed regardless of staleness.
-/// - `MouseKind::MoveRel` deltas are NEVER dropped; they accumulate as a `(dx, dy)` vector.
-/// - Non-relative mouse events and key events queued `> 150ms` are dropped without execution.
+/// - `MouseKind::MoveRel` deltas are NEVER dropped; contiguous runs coalesce into a single
+///   `(dx, dy)` vector and flush before any non-`MoveRel` boundary to preserve spatial order.
+/// - Release events (`MouseKind::Up` and `KeyEvent { down: false }`) are NEVER dropped so
+///   network jitter cannot leave buttons or keys stuck.
+/// - Other non-relative mouse events and key-down events queued `> 150ms` are dropped without
+///   execution.
 pub fn coalesce_hid_batch(
     events: &[(u32, HidPayload, u64)],
     now_ms: u64,
 ) -> HidBatchOutcome {
     let mut out = HidBatchOutcome::default();
+    let mut pending_rel: Option<(u32, MouseEvent)> = None;
+    let flush_rel = |pending: &mut Option<(u32, MouseEvent)>, out: &mut HidBatchOutcome| {
+        if let Some((rel_seq, rel_ev)) = pending.take() {
+            out.executed.push((rel_seq, HidPayload::Mouse(rel_ev)));
+        }
+    };
+
     for &(seq, payload, enqueue_ms) in events {
         out.acked_seqs.push(seq);
         match payload {
@@ -289,8 +333,26 @@ pub fn coalesce_hid_batch(
                 out.accumulated_rel_dx = out.accumulated_rel_dx.saturating_add(ev.x_or_dx);
                 out.accumulated_rel_dy = out.accumulated_rel_dy.saturating_add(ev.y_or_dy);
                 out.coalesced_rel_count += 1;
+                if let Some((last_seq, acc)) = &mut pending_rel {
+                    *last_seq = seq;
+                    acc.x_or_dx = acc.x_or_dx.saturating_add(ev.x_or_dx);
+                    acc.y_or_dy = acc.y_or_dy.saturating_add(ev.y_or_dy);
+                    acc.buttons = ev.buttons;
+                    acc.client_ts_ms = ev.client_ts_ms;
+                } else {
+                    pending_rel = Some((seq, ev));
+                }
+            }
+            HidPayload::Mouse(ev) if ev.kind == MouseKind::Up => {
+                flush_rel(&mut pending_rel, &mut out);
+                out.executed.push((seq, payload));
+            }
+            HidPayload::Key(ev) if !ev.down => {
+                flush_rel(&mut pending_rel, &mut out);
+                out.executed.push((seq, payload));
             }
             HidPayload::Mouse(_) | HidPayload::Key(_) => {
+                flush_rel(&mut pending_rel, &mut out);
                 if now_ms.saturating_sub(enqueue_ms) > HID_STALE_DROP_MS {
                     out.dropped_stale_seqs.push(seq);
                 } else {
@@ -298,10 +360,12 @@ pub fn coalesce_hid_batch(
                 }
             }
             HidPayload::EchoAck(_) => {
+                flush_rel(&mut pending_rel, &mut out);
                 out.executed.push((seq, payload));
             }
         }
     }
+    flush_rel(&mut pending_rel, &mut out);
     out
 }
 
@@ -346,7 +410,7 @@ mod tests {
         assert_eq!(a_frame.payload.len(), HID_ECHO_ACK_WIRE_LEN);
         assert_eq!(decode_hid_frame(&a_frame).unwrap(), ack);
 
-        // Strict discriminant and length rejections
+        // Strict discriminant, reserved bits, wheel-delta, and length rejections
         let mut bad_mouse = m_frame.payload.to_vec();
         bad_mouse[0] = 9;
         assert!(matches!(
@@ -356,6 +420,50 @@ mod tests {
         assert!(matches!(
             MouseEvent::decode(&bad_mouse[..20]),
             Err(HidCodecError::InvalidLength { .. })
+        ));
+        bad_mouse[0] = MouseKind::Wheel as u8;
+        bad_mouse[1] = 0x20;
+        assert!(matches!(
+            MouseEvent::decode(&bad_mouse),
+            Err(HidCodecError::InvalidMouseButtons(0x20))
+        ));
+        bad_mouse[0] = MouseKind::MoveAbs as u8;
+        bad_mouse[1] = 0x01;
+        assert!(matches!(
+            MouseEvent::decode(&bad_mouse),
+            Err(HidCodecError::UnexpectedWheelDelta {
+                kind: MouseKind::MoveAbs,
+                wheel_dx: -12,
+                wheel_dy: 24,
+            })
+        ));
+        assert!(matches!(
+            encode_hid_frame(&HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::Down,
+                buttons: 0x40,
+                x_or_dx: 0,
+                y_or_dy: 0,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 1,
+            })),
+            Err(HidCodecError::InvalidMouseButtons(0x40))
+        ));
+        assert!(matches!(
+            encode_hid_frame(&HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::MoveRel,
+                buttons: 0,
+                x_or_dx: 1,
+                y_or_dy: 2,
+                wheel_dx: 0,
+                wheel_dy: 3,
+                client_ts_ms: 1,
+            })),
+            Err(HidCodecError::UnexpectedWheelDelta {
+                kind: MouseKind::MoveRel,
+                wheel_dx: 0,
+                wheel_dy: 3,
+            })
         ));
 
         let mut bad_key = k_frame.payload.to_vec();
@@ -437,9 +545,170 @@ mod tests {
         );
         assert_eq!(out.acked_seqs, vec![1, 2, 3, 4, 5]);
         assert_eq!(out.dropped_stale_seqs, vec![1, 2]);
-        assert_eq!(out.executed, vec![(4, fresh_abs)]);
+        assert_eq!(
+            out.executed,
+            vec![(3, stale_rel_1), (4, fresh_abs), (5, fresh_rel_2)]
+        );
         assert_eq!(out.accumulated_rel_dx, 10);
         assert_eq!(out.accumulated_rel_dy, 12);
         assert_eq!(out.coalesced_rel_count, 2);
+    }
+
+    #[test]
+    fn coalescer_never_drops_stale_release_events() {
+        let now_ms = 2_000;
+        let stale_ts = now_ms - HID_STALE_DROP_MS - 50;
+
+        let stale_mouse_down = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::Down,
+            buttons: 0x01,
+            x_or_dx: 100,
+            y_or_dy: 200,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: stale_ts,
+        });
+        let stale_mouse_abs = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::MoveAbs,
+            buttons: 0x01,
+            x_or_dx: 120,
+            y_or_dy: 210,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: stale_ts,
+        });
+        let stale_mouse_up = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::Up,
+            buttons: 0x00,
+            x_or_dx: 120,
+            y_or_dy: 210,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: stale_ts,
+        });
+        let stale_key_down = HidPayload::Key(KeyEvent {
+            down: true,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 'a' as u32,
+            client_ts_ms: stale_ts,
+        });
+        let stale_key_up = HidPayload::Key(KeyEvent {
+            down: false,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 'a' as u32,
+            client_ts_ms: stale_ts,
+        });
+
+        let out = coalesce_hid_batch(
+            &[
+                (1, stale_mouse_down, stale_ts),
+                (2, stale_mouse_abs, stale_ts),
+                (3, stale_mouse_up, stale_ts),
+                (4, stale_key_down, stale_ts),
+                (5, stale_key_up, stale_ts),
+            ],
+            now_ms,
+        );
+        assert_eq!(out.acked_seqs, vec![1, 2, 3, 4, 5]);
+        assert_eq!(out.dropped_stale_seqs, vec![1, 2, 4]);
+        assert_eq!(out.executed, vec![(3, stale_mouse_up), (5, stale_key_up)]);
+    }
+
+    #[test]
+    fn coalescer_preserves_spatial_order_across_non_rel_boundaries() {
+        let now_ms = 1_000;
+        let rel_a = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::MoveRel,
+            buttons: 0,
+            x_or_dx: 10,
+            y_or_dy: -4,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 950,
+        });
+        let rel_b = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::MoveRel,
+            buttons: 0,
+            x_or_dx: 6,
+            y_or_dy: 9,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 955,
+        });
+        let down = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::Down,
+            buttons: 0x01,
+            x_or_dx: 0,
+            y_or_dy: 0,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 960,
+        });
+        let rel_c = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::MoveRel,
+            buttons: 0x01,
+            x_or_dx: -3,
+            y_or_dy: 12,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 965,
+        });
+        let rel_d = HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::MoveRel,
+            buttons: 0x01,
+            x_or_dx: 8,
+            y_or_dy: -2,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 970,
+        });
+
+        let out = coalesce_hid_batch(
+            &[
+                (1, rel_a, 950),
+                (2, rel_b, 955),
+                (3, down, 960),
+                (4, rel_c, 965),
+                (5, rel_d, 970),
+            ],
+            now_ms,
+        );
+        assert_eq!(out.acked_seqs, vec![1, 2, 3, 4, 5]);
+        assert!(out.dropped_stale_seqs.is_empty());
+        assert_eq!(
+            out.executed,
+            vec![
+                (
+                    2,
+                    HidPayload::Mouse(MouseEvent {
+                        kind: MouseKind::MoveRel,
+                        buttons: 0,
+                        x_or_dx: 16,
+                        y_or_dy: 5,
+                        wheel_dx: 0,
+                        wheel_dy: 0,
+                        client_ts_ms: 955,
+                    }),
+                ),
+                (3, down),
+                (
+                    5,
+                    HidPayload::Mouse(MouseEvent {
+                        kind: MouseKind::MoveRel,
+                        buttons: 0x01,
+                        x_or_dx: 5,
+                        y_or_dy: 10,
+                        wheel_dx: 0,
+                        wheel_dy: 0,
+                        client_ts_ms: 970,
+                    }),
+                ),
+            ]
+        );
+        assert_eq!(out.accumulated_rel_dx, 21);
+        assert_eq!(out.accumulated_rel_dy, 15);
+        assert_eq!(out.coalesced_rel_count, 4);
     }
 }

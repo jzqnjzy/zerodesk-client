@@ -116,24 +116,43 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
     // Add the include path.
     let include = path.join("include");
     println!("cargo:include={}", include.to_str().unwrap());
-    if name == "aom" && Path::new("/opt/homebrew/Cellar/libvmaf").exists() {
-        let _ = link_homebrew_m1("libvmaf");
+    if name == "aom" {
+        // Homebrew's macOS aarch64 `aom` formula builds `libaom.a` with `-DCONFIG_TUNE_VMAF=1`,
+        // leaving undefined `_vmaf_*` symbols (e.g. `_vmaf_init`, `_vmaf_model_load_from_path`)
+        // that require linking `libvmaf.a` statically.
+        println!("cargo:rerun-if-env-changed=ZERODESK_LINK_VMAF");
+        let link_vmaf = match std::env::var("ZERODESK_LINK_VMAF").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => Path::new("/opt/homebrew/Cellar/libvmaf").exists(),
+        };
+        if link_vmaf {
+            let _ = link_homebrew_m1("libvmaf");
+        }
     }
     include
 }
 
 fn link_custom_libyuv(prefix: PathBuf) -> PathBuf {
+    let lib_dir = prefix.join("lib");
+    let lib_archive = lib_dir.join("libyuv.a");
+    let include_dir = prefix.join("include");
+    let header = include_dir.join("libyuv.h");
+    if !lib_archive.is_file() || !header.is_file() {
+        panic!(
+            "ZERODESK_LIBYUV_PREFIX='{}' is invalid: expected both '{}' and '{}' to exist",
+            prefix.display(),
+            lib_archive.display(),
+            header.display()
+        );
+    }
     println!("cargo:rustc-link-lib=static=yuv");
-    println!(
-        "cargo:rustc-link-search={}",
-        prefix.join("lib").to_str().unwrap()
-    );
+    println!("cargo:rustc-link-search={}", lib_dir.to_str().unwrap());
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=c++");
     }
-    let include = prefix.join("include");
-    println!("cargo:include={}", include.to_str().unwrap());
-    include
+    println!("cargo:include={}", include_dir.to_str().unwrap());
+    include_dir
 }
 
 /// Find package. By default, it will try to find vcpkg first, then homebrew(currently only for Mac M1).
@@ -157,14 +176,6 @@ fn find_package(name: &str) -> Vec<PathBuf> {
     } else if let Ok(vcpkg_root) = std::env::var("VCPKG_ROOT") {
         vec![link_vcpkg(vcpkg_root.into(), name)]
     } else {
-        if name == "libyuv" && !Path::new("/opt/homebrew/Cellar/libyuv").exists() {
-            if let Ok(home) = std::env::var("HOME") {
-                let candidate = PathBuf::from(home).join(".local").join("libyuv");
-                if candidate.join("lib").exists() && candidate.join("include").exists() {
-                    return vec![link_custom_libyuv(candidate)];
-                }
-            }
-        }
         // Try using homebrew
         vec![link_homebrew_m1(name)]
     }

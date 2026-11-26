@@ -1,14 +1,15 @@
 use scrap::{
-    aom::{AomDecoder, AomEncoder, AomEncoderConfig},
+    aom::{aom_img_fmt, AomDecoder, AomEncoder, AomEncoderConfig},
     codec::{EncoderApi, EncoderCfg},
-    EncodeYuvFormat, GoogleImage, VpxDecoder, VpxDecoderConfig, VpxEncoder, VpxEncoderConfig,
-    VpxVideoCodecId, STRIDE_ALIGN,
+    EncodeYuvFormat, GoogleImage, Pixfmt, VpxDecoder, VpxDecoderConfig, VpxEncoder,
+    VpxEncoderConfig, VpxVideoCodecId, STRIDE_ALIGN,
 };
 use std::fmt;
 use v2_transport::{AssembledVideoFrame, VideoFrameMeta, VIDEO_REASSEMBLER_MAX_AGE_MS};
 
 pub const CODEC_ID_AV1: u8 = 1;
 pub const CODEC_ID_VP9: u8 = 2;
+pub const MAX_FRAME_DIM: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
@@ -85,32 +86,59 @@ pub struct I420Frame {
 }
 
 impl I420Frame {
+    pub fn validate(&self) -> Result<(), VideoError> {
+        if self.width == 0
+            || self.height == 0
+            || (self.width & 1) != 0
+            || (self.height & 1) != 0
+            || self.width > MAX_FRAME_DIM
+            || self.height > MAX_FRAME_DIM
+        {
+            return Err(VideoError::InvalidInput(format!(
+                "I420 dimensions must be positive, even, and <= {MAX_FRAME_DIM}, got {}x{}",
+                self.width, self.height
+            )));
+        }
+        let y_len = self
+            .width
+            .checked_mul(self.height)
+            .ok_or_else(|| VideoError::InvalidInput("I420 Y plane size overflow".into()))?;
+        let uv_len = (self.width / 2)
+            .checked_mul(self.height / 2)
+            .ok_or_else(|| VideoError::InvalidInput("I420 UV plane size overflow".into()))?;
+        if self.y.len() != y_len || self.u.len() != uv_len || self.v.len() != uv_len {
+            return Err(VideoError::InvalidInput(format!(
+                "I420 plane sizes mismatch for {}x{}: y={} (expected {y_len}), u={} (expected {uv_len}), v={} (expected {uv_len})",
+                self.width,
+                self.height,
+                self.y.len(),
+                self.u.len(),
+                self.v.len()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(width: usize, height: usize, y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> Result<Self, VideoError> {
-        if width == 0 || height == 0 || (width & 1) != 0 || (height & 1) != 0 {
-            return Err(VideoError::InvalidInput(format!(
-                "I420 dimensions must be positive and even, got {width}x{height}"
-            )));
-        }
-        let y_len = width.saturating_mul(height);
-        let uv_len = (width / 2).saturating_mul(height / 2);
-        if y.len() != y_len || u.len() != uv_len || v.len() != uv_len {
-            return Err(VideoError::InvalidInput(format!(
-                "I420 plane sizes mismatch for {width}x{height}: y={}, u={}, v={}",
-                y.len(),
-                u.len(),
-                v.len()
-            )));
-        }
-        Ok(Self {
+        let frame = Self {
             width,
             height,
             y,
             u,
             v,
-        })
+        };
+        frame.validate()?;
+        Ok(frame)
     }
 
     pub fn pack_for_encoder(&self, fmt: &EncodeYuvFormat) -> Result<Vec<u8>, VideoError> {
+        self.validate()?;
+        if fmt.pixfmt != Pixfmt::I420 {
+            return Err(VideoError::InvalidInput(format!(
+                "expected I420 encoder format, got {:?}",
+                fmt.pixfmt
+            )));
+        }
         if self.width != fmt.w || self.height != fmt.h {
             return Err(VideoError::InvalidInput(format!(
                 "frame dimensions {}x{} do not match encoder {}x{}",
@@ -128,9 +156,23 @@ impl I420Frame {
         if y_stride < self.width || u_stride < uv_w || v_stride < uv_w {
             return Err(VideoError::InvalidInput("encoder stride smaller than plane width".into()));
         }
-        let y_end = y_stride.saturating_mul(self.height);
-        let u_end = fmt.u.saturating_add(u_stride.saturating_mul(uv_h));
-        let v_end = fmt.v.saturating_add(v_stride.saturating_mul(uv_h));
+        let y_end = y_stride
+            .checked_mul(self.height)
+            .ok_or_else(|| VideoError::InvalidInput("encoder Y plane byte length overflow".into()))?;
+        let u_size = u_stride
+            .checked_mul(uv_h)
+            .ok_or_else(|| VideoError::InvalidInput("encoder U plane byte length overflow".into()))?;
+        let v_size = v_stride
+            .checked_mul(uv_h)
+            .ok_or_else(|| VideoError::InvalidInput("encoder V plane byte length overflow".into()))?;
+        let u_end = fmt
+            .u
+            .checked_add(u_size)
+            .ok_or_else(|| VideoError::InvalidInput("encoder U plane offset overflow".into()))?;
+        let v_end = fmt
+            .v
+            .checked_add(v_size)
+            .ok_or_else(|| VideoError::InvalidInput("encoder V plane offset overflow".into()))?;
         let total = y_end.max(u_end).max(v_end);
 
         let mut buf = vec![0u8; total];
@@ -152,11 +194,23 @@ impl I420Frame {
     }
 
     pub fn from_google_image(img: &impl GoogleImage) -> Result<Self, VideoError> {
+        let chroma = format!("{:?}", img.chroma());
+        if chroma != "I420" {
+            return Err(VideoError::Decoder(format!(
+                "decoded image has unsupported chroma format {chroma} (expected I420)"
+            )));
+        }
         let width = img.width();
         let height = img.height();
-        if width == 0 || height == 0 || (width & 1) != 0 || (height & 1) != 0 {
+        if width == 0
+            || height == 0
+            || (width & 1) != 0
+            || (height & 1) != 0
+            || width > MAX_FRAME_DIM
+            || height > MAX_FRAME_DIM
+        {
             return Err(VideoError::Decoder(format!(
-                "decoded image has invalid I420 dimensions {width}x{height}"
+                "decoded image has invalid I420 dimensions {width}x{height} (max {MAX_FRAME_DIM})"
             )));
         }
         let strides = img.stride();
@@ -171,11 +225,31 @@ impl I420Frame {
         if y_stride < width || u_stride < uv_w || v_stride < uv_w {
             return Err(VideoError::Decoder("decoded image stride smaller than width".into()));
         }
-        let (y_src, u_src, v_src) = img.data();
-        if y_src.len() < y_stride * height
-            || u_src.len() < u_stride * uv_h
-            || v_src.len() < v_stride * uv_h
+        if u_stride != v_stride {
+            return Err(VideoError::Decoder(format!(
+                "decoded image has mismatched UV strides: u={u_stride}, v={v_stride}"
+            )));
+        }
+        let planes = img.planes();
+        if planes.len() < 3
+            || planes[0].is_null()
+            || planes[1].is_null()
+            || planes[2].is_null()
         {
+            return Err(VideoError::Decoder("decoded image has missing or null plane pointers".into()));
+        }
+        let y_needed = y_stride
+            .checked_mul(height)
+            .ok_or_else(|| VideoError::Decoder("decoded Y plane size overflow".into()))?;
+        let u_needed = u_stride
+            .checked_mul(uv_h)
+            .ok_or_else(|| VideoError::Decoder("decoded U plane size overflow".into()))?;
+        let v_needed = v_stride
+            .checked_mul(uv_h)
+            .ok_or_else(|| VideoError::Decoder("decoded V plane size overflow".into()))?;
+
+        let (y_src, u_src, v_src) = img.data();
+        if y_src.len() < y_needed || u_src.len() < u_needed || v_src.len() < v_needed {
             return Err(VideoError::Decoder("decoded image plane buffer truncated".into()));
         }
 
@@ -202,6 +276,8 @@ impl I420Frame {
 /// high-contrast moving geometric blocks, a bottom frame-counter progress bar, and top-left
 /// frame-index indicator tiles so inter-frame prediction is genuinely exercised.
 pub fn generate_animated_i420(width: usize, height: usize, frame_idx: u32) -> I420Frame {
+    let width = width.clamp(2, MAX_FRAME_DIM) & !1;
+    let height = height.clamp(2, MAX_FRAME_DIM) & !1;
     let f = frame_idx as usize;
     let mut y = vec![0u8; width * height];
     let uv_w = width / 2;
@@ -209,39 +285,59 @@ pub fn generate_animated_i420(width: usize, height: usize, frame_idx: u32) -> I4
     let mut u = vec![128u8; uv_w * uv_h];
     let mut v = vec![128u8; uv_w * uv_h];
 
-    let x_shift = (f * 3) % width.max(1);
-    let y_shift = (f * 2) % height.max(1);
+    let x_shift = (f * 3) % width;
+    let y_shift = (f * 2) % height;
 
     // Smooth moving gradient background (keeps high spatial correlation like a real desktop).
     for row in 0..height {
         let row_off = row * width;
-        let gy = ((row + y_shift) * 90) / height.max(1);
+        let gy = ((row + y_shift) * 90) / height;
         for col in 0..width {
-            let gx = ((col + x_shift) * 110) / width.max(1);
+            let gx = ((col + x_shift) * 110) / width;
             y[row_off + col] = (32 + ((gx + gy) % 160)) as u8;
         }
     }
 
     // Moving high-contrast UI window rectangle #1 (bright card with dark border).
-    let box_w = (width / 5).max(32);
-    let box_h = (height / 4).max(32);
-    let box_x = (f * 7) % (width.saturating_sub(box_w).max(1));
-    let box_y = (height / 6 + (f * 3) % (height / 2).max(1)).min(height.saturating_sub(box_h));
+    let box_w = (width / 5).max(32).min(width);
+    let box_h = (height / 4).max(32).min(height);
+    let max_box_x = width.saturating_sub(box_w);
+    let max_box_y = height.saturating_sub(box_h);
+    let box_x = if max_box_x == 0 {
+        0
+    } else {
+        (f * 7) % max_box_x
+    };
+    let box_y = if max_box_y == 0 {
+        0
+    } else {
+        (height / 6 + (f * 3) % (height / 2).max(1)).min(max_box_y)
+    };
+    let border = 4usize.min(box_w / 2).min(box_h / 2);
     for row in box_y..(box_y + box_h) {
         let row_off = row * width;
-        let is_border_y = row < box_y + 4 || row >= box_y + box_h - 4;
+        let is_border_y = row < box_y + border || row >= box_y + box_h - border;
         for col in box_x..(box_x + box_w) {
-            let is_border_x = col < box_x + 4 || col >= box_x + box_w - 4;
+            let is_border_x = col < box_x + border || col >= box_x + box_w - border;
             y[row_off + col] = if is_border_x || is_border_y { 24 } else { 228 };
         }
     }
 
     // Moving high-contrast rectangle #2 moving in opposite horizontal direction.
-    let box2_w = (width / 7).max(24);
-    let box2_h = (height / 5).max(24);
-    let span2 = width.saturating_sub(box2_w).max(1);
-    let box2_x = span2 - ((f * 5) % span2);
-    let box2_y = (height / 2 + (f * 2) % (height / 4).max(1)).min(height.saturating_sub(box2_h));
+    let box2_w = (width / 7).max(24).min(width);
+    let box2_h = (height / 5).max(24).min(height);
+    let max_box2_x = width.saturating_sub(box2_w);
+    let max_box2_y = height.saturating_sub(box2_h);
+    let box2_x = if max_box2_x == 0 {
+        0
+    } else {
+        max_box2_x - ((f * 5) % max_box2_x)
+    };
+    let box2_y = if max_box2_y == 0 {
+        0
+    } else {
+        (height / 2 + (f * 2) % (height / 4).max(1)).min(max_box2_y)
+    };
     for row in box2_y..(box2_y + box2_h) {
         let row_off = row * width;
         for col in box2_x..(box2_x + box2_w) {
@@ -268,7 +364,9 @@ pub fn generate_animated_i420(width: usize, height: usize, frame_idx: u32) -> I4
 
     // Bottom frame counter progress bar.
     let bar_h = 20usize.min(height / 8);
-    let bar_y0 = height.saturating_sub(bar_h + 12);
+    let bar_y0 = height
+        .saturating_sub(bar_h.saturating_add(12))
+        .min(height.saturating_sub(bar_h));
     let filled_w = (((f % 300) + 1) * width) / 300;
     for row in bar_y0..(bar_y0 + bar_h) {
         let row_off = row * width;
@@ -313,6 +411,8 @@ pub struct FrameQualityMetrics {
 
 /// Computes exact Y-plane PSNR in dB (capped at `99.99` dB for lossless/exact match so JSON stays finite).
 pub fn compute_y_psnr(reference: &I420Frame, decoded: &I420Frame) -> Result<f64, VideoError> {
+    reference.validate()?;
+    decoded.validate()?;
     if reference.width != decoded.width || reference.height != decoded.height {
         return Err(VideoError::InvalidInput(format!(
             "PSNR dimension mismatch: ref {}x{} vs dec {}x{}",
@@ -320,9 +420,6 @@ pub fn compute_y_psnr(reference: &I420Frame, decoded: &I420Frame) -> Result<f64,
         )));
     }
     let count = reference.y.len();
-    if count == 0 || count != decoded.y.len() {
-        return Err(VideoError::InvalidInput("empty or mismatched Y plane".into()));
-    }
     let mut sum_sq = 0.0f64;
     for (&r, &d) in reference.y.iter().zip(decoded.y.iter()) {
         let diff = (r as f64) - (d as f64);
@@ -338,6 +435,8 @@ pub fn compute_y_psnr(reference: &I420Frame, decoded: &I420Frame) -> Result<f64,
 
 /// Computes Y-plane SSIM (Wang et al. 2004) over non-overlapping 8x8 blocks with `C1=(0.01*255)^2`, `C2=(0.03*255)^2`.
 pub fn compute_y_ssim(reference: &I420Frame, decoded: &I420Frame) -> Result<f64, VideoError> {
+    reference.validate()?;
+    decoded.validate()?;
     if reference.width != decoded.width || reference.height != decoded.height {
         return Err(VideoError::InvalidInput(format!(
             "SSIM dimension mismatch: ref {}x{} vs dec {}x{}",
@@ -404,13 +503,16 @@ enum InnerEncoder {
 
 /// Real `scrap` VP9 (`libvpx`) / AV1 (`libaom`) encoder producing raw elementary bitstreams
 /// directly mapped to `v2_transport::VideoFrameMeta` (zero RustDesk protobuf on the wire).
+///
+/// Per `protocol-spec/spec/04-inner-channels.md` §3.3, `ltr_slot` is always `0` (and
+/// `CAP_VIDEO_LTR` must remain `0`) until Phase 3 implements true encoder
+/// `mark_ltr` / `force_ref_ltr` reference pinning.
 pub struct V2VideoEncoder {
     codec: VideoCodec,
     inner: InnerEncoder,
     yuvfmt: EncodeYuvFormat,
     next_frame_id: u32,
-    last_anchor_frame_id: u32,
-    ltr_slot_toggle: u8,
+    prev_frame_id: Option<u32>,
 }
 
 impl V2VideoEncoder {
@@ -421,6 +523,14 @@ impl V2VideoEncoder {
         quality: f32,
         keyframe_interval: Option<usize>,
     ) -> Result<Self, VideoError> {
+        let w = width as usize;
+        let h = height as usize;
+        if w == 0 || h == 0 || (w & 1) != 0 || (h & 1) != 0 || w > MAX_FRAME_DIM || h > MAX_FRAME_DIM
+        {
+            return Err(VideoError::InvalidInput(format!(
+                "encoder dimensions must be positive, even, and <= {MAX_FRAME_DIM}, got {width}x{height}"
+            )));
+        }
         let (inner, yuvfmt) = match codec {
             VideoCodec::Vp9 => {
                 let enc = VpxEncoder::new(
@@ -457,8 +567,7 @@ impl V2VideoEncoder {
             inner,
             yuvfmt,
             next_frame_id: 1,
-            last_anchor_frame_id: 1,
-            ltr_slot_toggle: 1,
+            prev_frame_id: None,
         })
     }
 
@@ -470,6 +579,19 @@ impl V2VideoEncoder {
         &self.yuvfmt
     }
 
+    pub fn next_frame_id(&self) -> u32 {
+        self.next_frame_id
+    }
+
+    /// Ensures `next_frame_id` is at least `min_next` so `frame_id` stays strictly monotonic
+    /// across encoder replacements (e.g. mid-session codec switches).
+    pub fn advance_next_frame_id_at_least(&mut self, min_next: u32) {
+        let floor = min_next.max(1);
+        if floor > self.next_frame_id {
+            self.next_frame_id = floor;
+        }
+    }
+
     pub fn encode_i420(&mut self, frame: &I420Frame, pts_ms: i64) -> Result<EncodedV2Frame, VideoError> {
         let aligned = frame.pack_for_encoder(&self.yuvfmt)?;
         let (raw_data, is_key) = match &mut self.inner {
@@ -479,10 +601,21 @@ impl V2VideoEncoder {
                     .encode(pts_ms, &aligned, STRIDE_ALIGN)
                     .map_err(|e| VideoError::Encoder(e.to_string()))?
                 {
+                    if out.is_some() {
+                        return Err(VideoError::Encoder(
+                            "VP9 encoder unexpectedly emitted multiple packets for one input frame"
+                                .into(),
+                        ));
+                    }
                     out = Some((pkt.data.to_vec(), pkt.key));
                 }
                 if out.is_none() {
                     for pkt in enc.flush().map_err(|e| VideoError::Encoder(e.to_string()))? {
+                        if out.is_some() {
+                            return Err(VideoError::Encoder(
+                                "VP9 encoder flush unexpectedly emitted multiple packets".into(),
+                            ));
+                        }
                         out = Some((pkt.data.to_vec(), pkt.key));
                     }
                 }
@@ -494,6 +627,12 @@ impl V2VideoEncoder {
                     .encode(pts_ms, &aligned, STRIDE_ALIGN)
                     .map_err(|e| VideoError::Encoder(e.to_string()))?
                 {
+                    if out.is_some() {
+                        return Err(VideoError::Encoder(
+                            "AV1 encoder unexpectedly emitted multiple packets for one input frame"
+                                .into(),
+                        ));
+                    }
                     out = Some((pkt.data.to_vec(), pkt.key));
                 }
                 out.ok_or(VideoError::NoOutputFrame)?
@@ -503,21 +642,21 @@ impl V2VideoEncoder {
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
 
-        let (ref_frame_id, ltr_slot) = if is_key || frame_id == 1 {
-            let slot = self.ltr_slot_toggle;
-            self.ltr_slot_toggle = if slot == 1 { 2 } else { 1 };
-            self.last_anchor_frame_id = frame_id;
-            (frame_id, slot)
+        // True dual-slot LTR requires encoder mark_ltr/force_ref_ltr (Phase 3); emit ltr_slot = 0
+        // and truthful immediate-predecessor inter-frame dependency per spec §3.3.
+        let ref_frame_id = if is_key {
+            frame_id
         } else {
-            (self.last_anchor_frame_id, 0)
+            self.prev_frame_id.unwrap_or(frame_id)
         };
+        self.prev_frame_id = Some(frame_id);
 
         let meta = VideoFrameMeta {
             display_idx: 0,
             codec_id: self.codec.codec_id(),
             frame_id,
             ref_frame_id,
-            ltr_slot,
+            ltr_slot: 0,
             is_idr: is_key,
             is_ref: true,
             max_age_ms: VIDEO_REASSEMBLER_MAX_AGE_MS,
@@ -528,6 +667,44 @@ impl V2VideoEncoder {
             data: raw_data,
         })
     }
+}
+
+fn extract_vpx_i420(img: &scrap::vpxcodec::Image) -> Result<I420Frame, VideoError> {
+    if img.is_null() {
+        return Err(VideoError::Decoder("VP9 decoder yielded null image".into()));
+    }
+    let raw = img.inner();
+    let fmt_name = format!("{:?}", raw.fmt);
+    if fmt_name != "VPX_IMG_FMT_I420"
+        || raw.bit_depth != 8
+        || raw.x_chroma_shift != 1
+        || raw.y_chroma_shift != 1
+    {
+        return Err(VideoError::Decoder(format!(
+            "unsupported VP9 decoded pixel format: fmt={fmt_name}, bit_depth={}, shift=({}, {})",
+            raw.bit_depth, raw.x_chroma_shift, raw.y_chroma_shift
+        )));
+    }
+    I420Frame::from_google_image(img)
+}
+
+fn extract_aom_i420(img: &scrap::aom::Image) -> Result<I420Frame, VideoError> {
+    if img.is_null() {
+        return Err(VideoError::Decoder("AV1 decoder yielded null image".into()));
+    }
+    let raw = img.inner();
+    if raw.fmt != aom_img_fmt::AOM_IMG_FMT_I420
+        || raw.bit_depth != 8
+        || raw.monochrome != 0
+        || raw.x_chroma_shift != 1
+        || raw.y_chroma_shift != 1
+    {
+        return Err(VideoError::Decoder(format!(
+            "unsupported AV1 decoded pixel format: fmt={:?}, bit_depth={}, mono={}, shift=({}, {})",
+            raw.fmt, raw.bit_depth, raw.monochrome, raw.x_chroma_shift, raw.y_chroma_shift
+        )));
+    }
+    I420Frame::from_google_image(img)
 }
 
 enum InnerDecoder {
@@ -573,14 +750,24 @@ impl V2VideoDecoder {
                     .decode(data)
                     .map_err(|e| VideoError::Decoder(e.to_string()))?
                 {
-                    decoded = Some(I420Frame::from_google_image(&img)?);
+                    if decoded.is_some() {
+                        return Err(VideoError::Decoder(
+                            "VP9 decoder unexpectedly emitted multiple frames for one packet".into(),
+                        ));
+                    }
+                    decoded = Some(extract_vpx_i420(&img)?);
                 }
                 if decoded.is_none() {
                     for img in dec
                         .flush()
                         .map_err(|e| VideoError::Decoder(e.to_string()))?
                     {
-                        decoded = Some(I420Frame::from_google_image(&img)?);
+                        if decoded.is_some() {
+                            return Err(VideoError::Decoder(
+                                "VP9 decoder flush unexpectedly emitted multiple frames".into(),
+                            ));
+                        }
+                        decoded = Some(extract_vpx_i420(&img)?);
                     }
                 }
                 decoded.ok_or(VideoError::NoOutputFrame)
@@ -591,14 +778,24 @@ impl V2VideoDecoder {
                     .decode(data)
                     .map_err(|e| VideoError::Decoder(e.to_string()))?
                 {
-                    decoded = Some(I420Frame::from_google_image(&img)?);
+                    if decoded.is_some() {
+                        return Err(VideoError::Decoder(
+                            "AV1 decoder unexpectedly emitted multiple frames for one packet".into(),
+                        ));
+                    }
+                    decoded = Some(extract_aom_i420(&img)?);
                 }
                 if decoded.is_none() {
                     for img in dec
                         .flush()
                         .map_err(|e| VideoError::Decoder(e.to_string()))?
                     {
-                        decoded = Some(I420Frame::from_google_image(&img)?);
+                        if decoded.is_some() {
+                            return Err(VideoError::Decoder(
+                                "AV1 decoder flush unexpectedly emitted multiple frames".into(),
+                            ));
+                        }
+                        decoded = Some(extract_aom_i420(&img)?);
                     }
                 }
                 decoded.ok_or(VideoError::NoOutputFrame)
@@ -637,10 +834,18 @@ mod tests {
     fn vp9_encode_decode_720p_quality() {
         let mut enc = V2VideoEncoder::new(VideoCodec::Vp9, 1280, 720, 2.0, Some(60)).unwrap();
         let mut dec = V2VideoDecoder::new(VideoCodec::Vp9).unwrap();
+        let mut prev_id = None;
         for idx in 0..10u32 {
             let src = generate_animated_i420(1280, 720, idx);
             let encoded = enc.encode_i420(&src, (idx as i64) * 33).unwrap();
             assert_eq!(encoded.meta.codec_id, CODEC_ID_VP9);
+            assert_eq!(encoded.meta.ltr_slot, 0);
+            if encoded.meta.is_idr {
+                assert_eq!(encoded.meta.ref_frame_id, encoded.meta.frame_id);
+            } else {
+                assert_eq!(Some(encoded.meta.ref_frame_id), prev_id);
+            }
+            prev_id = Some(encoded.meta.frame_id);
             assert!(!encoded.data.is_empty());
             let decoded = dec.decode_raw(&encoded.data).unwrap();
             let psnr = compute_y_psnr(&src, &decoded).unwrap();
@@ -654,16 +859,67 @@ mod tests {
     fn av1_encode_decode_720p_quality() {
         let mut enc = V2VideoEncoder::new(VideoCodec::Av1, 1280, 720, 2.0, Some(60)).unwrap();
         let mut dec = V2VideoDecoder::new(VideoCodec::Av1).unwrap();
+        let mut prev_id = None;
         for idx in 0..5u32 {
             let src = generate_animated_i420(1280, 720, idx);
             let encoded = enc.encode_i420(&src, (idx as i64) * 33).unwrap();
             assert_eq!(encoded.meta.codec_id, CODEC_ID_AV1);
+            assert_eq!(encoded.meta.ltr_slot, 0);
+            if encoded.meta.is_idr {
+                assert_eq!(encoded.meta.ref_frame_id, encoded.meta.frame_id);
+            } else {
+                assert_eq!(Some(encoded.meta.ref_frame_id), prev_id);
+            }
+            prev_id = Some(encoded.meta.frame_id);
             assert!(!encoded.data.is_empty());
             let decoded = dec.decode_raw(&encoded.data).unwrap();
             let psnr = compute_y_psnr(&src, &decoded).unwrap();
             let ssim = compute_y_ssim(&src, &decoded).unwrap();
             assert!(psnr >= 32.0, "frame {idx} AV1 PSNR too low: {psnr:.2} dB");
             assert!(ssim >= 0.95, "frame {idx} AV1 SSIM too low: {ssim:.4}");
+        }
+    }
+
+    #[test]
+    fn i420_validation_guards_truncated_and_oversized_frames() {
+        let good = generate_animated_i420(16, 16, 0);
+        let mut bad_y = good.clone();
+        bad_y.y.truncate(10);
+        assert!(matches!(
+            compute_y_psnr(&bad_y, &good),
+            Err(VideoError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            compute_y_ssim(&bad_y, &good),
+            Err(VideoError::InvalidInput(_))
+        ));
+        let fmt = EncodeYuvFormat {
+            pixfmt: Pixfmt::I420,
+            w: 16,
+            h: 16,
+            stride: vec![16, 8, 8],
+            u: 256,
+            v: 320,
+        };
+        assert!(matches!(
+            bad_y.pack_for_encoder(&fmt),
+            Err(VideoError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            I420Frame::new(MAX_FRAME_DIM + 2, 16, vec![], vec![], vec![]),
+            Err(VideoError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            V2VideoEncoder::new(VideoCodec::Vp9, (MAX_FRAME_DIM + 2) as u32, 16, 2.0, Some(60)),
+            Err(VideoError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn generate_animated_i420_safe_for_small_dimensions() {
+        for &(w, h) in &[(0usize, 0usize), (2, 2), (8, 8), (16, 16), (32, 32)] {
+            let f = generate_animated_i420(w, h, 3);
+            assert!(f.validate().is_ok());
         }
     }
 }

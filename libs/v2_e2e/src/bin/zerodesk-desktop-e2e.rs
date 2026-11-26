@@ -28,7 +28,7 @@ use v2_identity::{
 use v2_transport::{
     PrologueInput, QuotaExhaustPolicy, TenantPolicyRules, TransportEvent, VerifiedTenantPolicy,
     VideoFrameMeta, CAP_ACCESS_LEG_SEQ_V11, CAP_CODEC_AV1, CAP_CODEC_VP9, CAP_SURVIVAL_MODE,
-    CAP_TRANSPORT_TCP443_DUAL, CAP_VIDEO_LTR, CIPHER_AESGCM, L3_MTU_DEFAULT, PATTERN_IK,
+    CAP_TRANSPORT_TCP443_DUAL, CIPHER_AESGCM, L3_MTU_DEFAULT, PATTERN_IK,
     TRANSPORT_MODE_RELAY_UDP, VER_MAJOR_MINOR,
 };
 
@@ -38,10 +38,11 @@ const MIN_PSNR_DB: f64 = 32.0;
 const MIN_SSIM: f64 = 0.95;
 const ENCODER_QUALITY: f32 = 2.0;
 const KEYFRAME_INTERVAL: usize = 60;
+// Per protocol-spec/spec/04-inner-channels.md §3.3, CAP_VIDEO_LTR must stay 0 until Phase 3
+// implements true encoder mark_ltr/force_ref_ltr reference pinning.
 const DEFAULT_CAP_BITS: u64 = CAP_CODEC_AV1
     | CAP_CODEC_VP9
     | CAP_TRANSPORT_TCP443_DUAL
-    | CAP_VIDEO_LTR
     | CAP_ACCESS_LEG_SEQ_V11
     | CAP_SURVIVAL_MODE;
 
