@@ -550,13 +550,15 @@ async fn run_p0_hid_ping_pong(
     count: usize,
 ) -> Result<Vec<u64>, ClientError> {
     const MAX_ATTEMPTS: usize = 3;
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(300);
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1000);
     let mut rtts_us = Vec::with_capacity(count);
     for i in 0..count {
-        let nonce_u64 = i as u64;
-        let nonce = nonce_u64.to_be_bytes();
         let mut rtt_us = None;
-        for _ in 0..MAX_ATTEMPTS {
+        for attempt in 0..MAX_ATTEMPTS {
+            // Strictly monotonic (probe_idx, attempt) nonce so late echoes from an earlier
+            // attempt are skipped (got < expected) instead of under-reporting RTT.
+            let nonce_u64 = ((i as u64) << 8) | (attempt as u64);
+            let nonce = nonce_u64.to_be_bytes();
             let sent = Instant::now();
             sess_a
                 .send_hid(&HidFrame {
@@ -598,6 +600,7 @@ async fn run_p0_hid_ping_pong(
 async fn cmd_probe(
     cfg_path: &Path,
     count: usize,
+    max_loss_pct: f64,
     ca_der_override: Option<&Path>,
 ) -> Result<ProbeReport, ClientError> {
     let cfg = ClusterConfig::from_file(cfg_path)?;
@@ -610,7 +613,7 @@ async fn cmd_probe(
         ((count.saturating_sub(received)) as f64) * 100.0 / (count as f64)
     };
     Ok(ProbeReport {
-        pass: count == 0 || (received > 0 && loss_pct <= 20.0),
+        pass: count == 0 || (received > 0 && loss_pct <= max_loss_pct),
         count,
         received,
         loss_pct,
@@ -722,7 +725,8 @@ async fn cmd_e2e(
         .sess_a
         .send_control(0x03, b"leg-nack-target-packet")
         .await?;
-    // Query LegCiphertextCache within the 250ms single-leg TTL before awaiting end-to-end delivery.
+    // LegCiphertextCache enforces the protocol-spec 250ms single-leg TTL (Leg-1 Edge NACK),
+    // so verify it immediately after send_control before awaiting the 3-leg end-to-end traversal.
     let rtx_pkts = pair.sess_a.link_mut().handle_local_leg_nack(last_seq_a, 1);
     let _ = pair.sess_b.recv_event(Duration::from_secs(2)).await?;
     let leg_nack_rtx_verified = if let Some(pkt) = rtx_pkts.first() {
@@ -1013,7 +1017,7 @@ async fn cmd_loopback_bridge(
 fn print_usage() {
     eprintln!(
         "Usage:\n  \
-         zerodesk-v2-cli probe --config <cluster.json> [--count 20] [--cp-ca-der <path>]\n  \
+         zerodesk-v2-cli probe --config <cluster.json> [--count 20] [--max-loss-pct 0.0] [--cp-ca-der <path>]\n  \
          zerodesk-v2-cli e2e --config <cluster.json> [--cp-ca-der <path>]\n  \
          zerodesk-v2-cli loopback-bridge --listen 127.0.0.1:<port> --config <cluster.json> [--target 127.0.0.1:<port>] [--cp-ca-der <path>]"
     );
@@ -1031,6 +1035,7 @@ async fn main() -> ExitCode {
     let mut config_path: Option<PathBuf> = None;
     let mut ca_der_path: Option<PathBuf> = None;
     let mut count: usize = 20;
+    let mut max_loss_pct: f64 = 0.0;
     let mut listen: Option<String> = None;
     let mut target: Option<String> = None;
 
@@ -1050,6 +1055,16 @@ async fn main() -> ExitCode {
                     Ok(v) => count = v,
                     Err(_) => {
                         eprintln!("invalid --count value");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--max-loss-pct" if i + 1 < args.len() => {
+                match args[i + 1].parse::<f64>() {
+                    Ok(v) if v.is_finite() && (0.0..=100.0).contains(&v) => max_loss_pct = v,
+                    _ => {
+                        eprintln!("invalid --max-loss-pct value (expected finite 0.0..=100.0)");
                         return ExitCode::from(2);
                     }
                 }
@@ -1082,7 +1097,7 @@ async fn main() -> ExitCode {
     };
 
     match subcmd {
-        "probe" => match cmd_probe(&cfg_path, count, ca_der_path.as_deref()).await {
+        "probe" => match cmd_probe(&cfg_path, count, max_loss_pct, ca_der_path.as_deref()).await {
             Ok(report) => {
                 let ok = report.pass;
                 println!(
