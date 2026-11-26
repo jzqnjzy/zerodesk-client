@@ -3,7 +3,7 @@ name = "v2_transport"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-description = "Clean-room ZeroDesk V2 (v1.2-FROZEN) channel-aware low-latency E2EE transport stack"
+description = "Clean-room ZeroDesk V2 (v1.2.3) channel-aware low-latency E2EE transport stack"
 
 [workspace]
 

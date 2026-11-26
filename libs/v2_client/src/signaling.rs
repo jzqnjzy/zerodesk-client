@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use crate::{control_plane::RelayTicketWire, error::ClientError};
 use std::time::{Duration, Instant};
 use tokio::{

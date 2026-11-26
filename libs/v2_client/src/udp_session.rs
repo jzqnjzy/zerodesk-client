@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use crate::{access_ctrl::AccessKeys, error::ClientError};
 use bytes::Bytes;
 use std::{

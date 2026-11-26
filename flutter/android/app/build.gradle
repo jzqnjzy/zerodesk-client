@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 import com.google.protobuf.gradle.*
 import groovy.json.JsonSlurper
 

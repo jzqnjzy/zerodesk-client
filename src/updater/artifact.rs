@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 use crate::{
     common::{display_version_from_release_id, release_id_from_update_url},
     hbbs_http::create_http_client_with_url_strict,

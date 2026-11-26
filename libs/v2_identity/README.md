@@ -1,6 +1,6 @@
 # `v2_identity` — ZeroDesk V2 Device Identity & Key Rotation
 
-Clean-room implementation of ZeroDesk V2 (`v1.2-FROZEN`) identity primitives:
+Clean-room implementation of ZeroDesk V2 (`v1.2.3`) identity primitives:
 
 - `DeviceKeyStore` trait for long-term P-256 identity keys, with an explicit `hardware_backed(&self) -> bool` attestation flag so software fallback stores (`SoftwareDeviceKeyStore`) never claim hardware-backed E2EE.
 - Deterministic Big-Endian TBS builders and ECDSA P-256 **low-S** verifiers for:

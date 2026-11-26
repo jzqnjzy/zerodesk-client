@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use serde::{Deserialize, Serialize};
 
 pub const DUAL_SEND_MIN_MS: u64 = 200;

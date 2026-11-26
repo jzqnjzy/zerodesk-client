@@ -1,10 +1,12 @@
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 [package]
 name = "rustdesk"
 version = "1.5.3"
-authors = ["rustdesk <info@rustdesk.com>"]
+authors = ["rustdesk <info@rustdesk.com>", "ZeroDesk Contributors"]
 edition = "2021"
 build= "build.rs"
-description = "RustDesk Remote Desktop"
+description = "ZeroDesk Remote Desktop Client (derived from RustDesk, GNU AGPL-3.0-only)"
+license = "AGPL-3.0-only"
 default-run = "rustdesk"
 rust-version = "1.75"
 

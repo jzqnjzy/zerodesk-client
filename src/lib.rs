@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 #[cfg(any(test, not(target_os = "linux")))]
 mod audio_resampler;
 mod keyboard;

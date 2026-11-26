@@ -1,0 +1,68 @@
+ZeroDesk Client
+Copyright (c) 2026 ZeroDesk Contributors
+
+This product is licensed under the GNU Affero General Public License v3.0
+(SPDX-License-Identifier: AGPL-3.0-only). See the LICENSE and LICENCE files
+in the root of this repository for the complete license text.
+
+================================================================================
+1. Upstream RustDesk Attribution
+================================================================================
+
+ZeroDesk Client is derived from RustDesk:
+  Project:   RustDesk (https://github.com/rustdesk/rustdesk)
+  Authors:   RustDesk Contributors (rustdesk <info@rustdesk.com>)
+  License:   GNU Affero General Public License v3.0 (AGPL-3.0)
+
+The original upstream license file (`LICENCE`) is preserved verbatim and
+unmodified. All upstream RustDesk source files modified by ZeroDesk Contributors
+carry prominent modification notices in compliance with AGPL-3.0 Section 5(a).
+ZeroDesk is an independent derivative project and is not affiliated with,
+sponsored by, or endorsed by RustDesk.
+
+================================================================================
+2. ZeroDesk Client Additions & Modifications
+================================================================================
+
+Copyright (c) 2026 ZeroDesk Contributors
+License: GNU Affero General Public License v3.0 (AGPL-3.0-only)
+
+All newly added ZeroDesk source files — including `libs/v2_identity/`,
+`libs/v2_transport/`, `libs/v2_client/`, `libs/v2_e2e/`, `src/v2_session/`,
+`libs/scrap/build_env.rs`, and `.github/workflows/zerodesk-v2-conformance.yml` —
+are licensed under GNU AGPL-3.0-only and carry explicit SPDX headers.
+
+================================================================================
+3. ZeroDesk V2 Protocol Specification Attribution
+================================================================================
+
+The ZeroDesk V2 client crates (`v2_identity`, `v2_transport`, `v2_client`,
+`v2_e2e`, and `src/v2_session`) are clean-room implementations of the
+ZeroDesk V2 Protocol Specification (`zerodesk-protocol-spec`, version v1.2.3):
+  License:   Apache License, Version 2.0 (Apache-2.0)
+
+Apache-2.0 is compatible one-way with GNU AGPL-3.0 (per the Free Software
+Foundation license compatibility guidelines). The combined ZeroDesk Client
+work is distributed under GNU AGPL-3.0-only.
+
+================================================================================
+4. Preservation of Upstream Sub-Crate and Third-Party Licenses
+================================================================================
+
+Upstream sub-crates bundled within this workspace retain their respective
+original copyright notices and licenses, including but not limited to:
+
+- `libs/scrap` — MIT License
+  Original work: https://github.com/quadrupleslap/scrap
+  Copyright (c) Ram <quadrupleslap@gmail.com> and RustDesk Contributors
+  (ZeroDesk modifications to files under `libs/scrap/` are marked with
+  AGPL-3.0-only modification/SPDX notices as part of this combined work.)
+
+- `libs/enigo` — MIT License
+  Original work: https://github.com/enigo-rs/enigo
+  Copyright (c) Dustin Bensing and contributors
+
+- Other workspace crates (`libs/base`, `libs/clipboard`, `libs/hbb_common`,
+  `libs/portable`, `libs/remote_printer`, `libs/virtual_display`) and third-party
+  Rust/C/C++/Dart dependencies retain their respective license files and notices
+  in their respective directories and package manifests.

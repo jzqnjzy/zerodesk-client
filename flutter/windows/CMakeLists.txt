@@ -1,3 +1,4 @@
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
 project(zerodesk LANGUAGES CXX)

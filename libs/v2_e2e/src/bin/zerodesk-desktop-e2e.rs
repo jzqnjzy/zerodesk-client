@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 #[path = "../phase3_cli.rs"]
 mod phase3_cli;
 #[path = "../wan_bench.rs"]

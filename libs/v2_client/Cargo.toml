@@ -3,7 +3,7 @@ name = "v2_client"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-description = "Clean-room ZeroDesk V2 (v1.2-FROZEN) client runtime: Control-Plane HTTPS/HTTP, Signaling, Noise_IK access tunnel, UDP 28B + LEG_NACK + RS(6,4) + E2EE L3/L4, Dual TLS-443 fallback, and V2ServiceStream/V2LoopbackBridge seams"
+description = "Clean-room ZeroDesk V2 (v1.2.3) client runtime: Control-Plane HTTPS/HTTP, Signaling, Noise_IK access tunnel, UDP 28B + LEG_NACK + RS(6,4) + E2EE L3/L4, Dual TLS-443 fallback, and V2ServiceStream/V2LoopbackBridge seams"
 
 [workspace]
 

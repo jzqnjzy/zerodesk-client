@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 use super::*;
 use crate::update_metadata::offline::{
     verify_offline_update_metadata_with_options, OfflineVerificationOptions,

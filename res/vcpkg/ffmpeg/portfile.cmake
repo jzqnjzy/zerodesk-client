@@ -1,3 +1,4 @@
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 # FFmpeg 7.1.1 includes the HEVC WPP slice-thread deadlock fix:
 # https://github.com/FFmpeg/FFmpeg/commit/79c47dfd25f101b6842bbec8c6ffef8d5077c3ae
 vcpkg_from_github(

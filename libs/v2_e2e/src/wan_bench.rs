@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use super::{
     bootstrap_live_pair, now_ms, parse_flag_value, percentile_ms, print_usage,
     BootstrappedSessions, ENCODER_QUALITY, HEIGHT, MIN_PSNR_DB, MIN_SSIM, WIDTH,

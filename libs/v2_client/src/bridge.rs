@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use crate::{error::ClientError, udp_session::UdpE2eeSession};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},

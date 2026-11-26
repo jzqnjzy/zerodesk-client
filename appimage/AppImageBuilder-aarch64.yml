@@ -1,3 +1,4 @@
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 # appimage-builder recipe see https://appimage-builder.readthedocs.io for details
 version: 1
 script:

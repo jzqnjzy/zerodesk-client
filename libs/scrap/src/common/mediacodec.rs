@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 use hbb_common::{anyhow::Error, bail, log, ResultType};
 use ndk::media::media_codec::{MediaCodec, MediaCodecDirection, MediaFormat};
 use std::ops::Deref;

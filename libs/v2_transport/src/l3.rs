@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use crate::{
     constants::{
         channel_priority_matches, AEAD_TAG_LEN, CIPHER_AESGCM, CIPHER_CHACHAPOLY, L3_HDR_LEN,

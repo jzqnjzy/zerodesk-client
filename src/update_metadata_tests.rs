@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 use super::*;
 use hbb_common::{
     base64::engine::general_purpose::STANDARD,

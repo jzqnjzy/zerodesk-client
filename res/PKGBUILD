@@ -1,3 +1,4 @@
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 pkgname=rustdesk
 pkgver=1.5.3
 pkgrel=0

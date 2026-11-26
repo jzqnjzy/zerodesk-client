@@ -1,6 +1,6 @@
 # `v2_client` — Clean-Room AGPL-3.0 ZeroDesk V2 Client Runtime
 
-Clean-room Rust client runtime for ZeroDesk V2 (`v1.2-FROZEN`), built strictly from `protocol-spec` (Apache-2.0) on top of `v2_identity` and `v2_transport` with zero C++/vcpkg/Flutter dependencies:
+Clean-room Rust client runtime for ZeroDesk V2 (`v1.2.3`), built strictly from `protocol-spec` (Apache-2.0) on top of `v2_identity` and `v2_transport` with zero C++/vcpkg/Flutter dependencies:
 
 - **Layer 1 — Control Plane, Signaling & Noise_IK Access Control**:
   - `control_plane.rs`: Pure-Rust `rustls` + `webpki-roots` + fail-closed custom CA DER (`--cp-ca-der`) with IP SAN verification and loopback-only `http://` guard. Implements P-256 low-S signed `POST /v2/devices/register`, `POST /v2/leases/renew` (initial issue + renewal), `POST /v2/metering/client-report`, `GET /v2/ca/pubkey`, and `GET /healthz`.

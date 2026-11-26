@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use crate::{
     constants::{
         ACTUATOR_MAX_TTL_MS, ARQ_MAX_RETRIES, ARQ_MAX_RTO_MS, ARQ_MIN_RTO_MS, HID_STALE_DROP_MS,

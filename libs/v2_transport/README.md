@@ -1,6 +1,6 @@
 # `v2_transport` — ZeroDesk V2 Channel-Aware Transport Stack
 
-Clean-room Rust implementation of the ZeroDesk V2 (`v1.2-FROZEN`) client transport stack designed to sit directly below `Connection` / `Remote::io_loop` (replacing V1 `hbb_common::Stream`):
+Clean-room Rust implementation of the ZeroDesk V2 (`v1.2.3`) client transport stack designed to sit directly below `Connection` / `Remote::io_loop` (replacing V1 `hbb_common::Stream`):
 
 - **L2 Access Framing (`access.rs`)**: 28B v1.1 UDP access header (+ 24B v1.0 interop), TCP-443/WSS stream framing (`34..=1232` strict length gate + 80ms HOL discard), HKDF-SHA256 `v2mac-v1` precomputed directional keys with `subtle` constant-time MAC verification, `{cur-1, cur, cur+1}` `access_epoch` state machine, modular `leg_seq` dedup window, 150ms/512KB `LegCiphertextCache` (`LEG_NACK` anti-amplification & 100% billing), and stateful `BwHintController`.
 - **Dual-Layer Noise Handshake (`handshake.rs`)**: `snow`-backed `Noise_IK_25519_{AESGCM,ChaChaPoly}_SHA256` & `Noise_XX_25519_*` wrappers, 204B deterministic anti-downgrade `prologue`, raw `Split()` directional key extraction, and 10,000-entry `ZeroRttGuard` LRU idempotency cache + piggybacked frame filter.

@@ -3,7 +3,7 @@ name = "v2_identity"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-description = "Clean-room ZeroDesk V2 (v1.2-FROZEN) device identity, P-256 low-S TBS certificates, and 12h X25519 static key rotation"
+description = "Clean-room ZeroDesk V2 (v1.2.3) device identity, P-256 low-S TBS certificates, and 12h X25519 static key rotation"
 
 [workspace]
 

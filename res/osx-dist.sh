@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 
 echo $MACOS_CODESIGN_IDENTITY
 cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
 use crate::{
     access_ctrl::AccessKeys,
     control_plane::{build_tls_client_config, tls_server_name_for_host},

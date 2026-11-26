@@ -1,3 +1,4 @@
+# Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 name: Build the flutter version of the RustDesk
 
 on:

@@ -1,3 +1,4 @@
+// Modified by ZeroDesk Contributors (2026) under GNU AGPL-3.0-only.
 use hbb_common::{
     anyhow::{anyhow, Context},
     base64::{engine::general_purpose::STANDARD, Engine as _},
