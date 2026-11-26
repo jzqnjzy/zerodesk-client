@@ -3,7 +3,10 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io::{self, Read, Write},
     net::SocketAddr,
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -22,6 +25,7 @@ pub const BRIDGE_CHANNEL_CAPACITY: usize = 256;
 pub const MAX_REORDER_WINDOW: usize = 256;
 pub const MAX_RETRANSMIT_ATTEMPTS: u32 = 16;
 pub const MAX_RETRANSMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+pub const PEER_EOF_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const TUNNEL_MSG_DATA: u8 = 0x10;
 const TUNNEL_MSG_EOF: u8 = 0x11;
@@ -101,7 +105,10 @@ type TunnelChannelPair = (
 );
 
 enum StreamSink {
-    Sync(std_mpsc::SyncSender<Vec<u8>>),
+    Sync {
+        tx: Option<std_mpsc::SyncSender<Vec<u8>>>,
+        overflowed: Arc<AtomicBool>,
+    },
     Async(mpsc::Sender<(u8, Vec<u8>)>),
 }
 
@@ -212,13 +219,29 @@ impl V2SessionMux {
                     recv_res = transport.recv_chunk(Duration::from_millis(20)) => {
                         match recv_res {
                             Ok(Some((chan_id, msg_type, data))) => {
-                                let guard = sinks_bg.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some(sink) = guard.get(&chan_id) {
+                                let mut guard = sinks_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(sink) = guard.get_mut(&chan_id) {
                                     match sink {
-                                        StreamSink::Sync(tx) => {
-                                            let _ = tx.try_send(data);
+                                        StreamSink::Sync { tx, overflowed } => {
+                                            if let Some(sender) = tx.as_ref() {
+                                                match sender.try_send(data) {
+                                                    Ok(()) => {}
+                                                    Err(std_mpsc::TrySendError::Full(_)) => {
+                                                        // V2ServiceStream has no transport-layer retransmit:
+                                                        // poison and disconnect the sink instead of silently dropping bytes.
+                                                        overflowed.store(true, Ordering::Release);
+                                                        *tx = None;
+                                                    }
+                                                    Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                                                        *tx = None;
+                                                    }
+                                                }
+                                            }
                                         }
                                         StreamSink::Async(tx) => {
+                                            // V2LoopbackBridge uses sequence-numbered ARQ retransmit;
+                                            // dropping on full queue triggers peer RTO without head-of-line
+                                            // blocking other multiplexed channels.
                                             let _ = tx.try_send((msg_type, data));
                                         }
                                     }
@@ -290,6 +313,7 @@ impl V2SessionMux {
         }
         self.policy.enforce_channel(chan_id, false)?;
         let (tx_in, rx_in) = std_mpsc::sync_channel(BRIDGE_CHANNEL_CAPACITY);
+        let inbound_overflowed = Arc::new(AtomicBool::new(false));
         {
             let mut guard = self.sinks.lock().unwrap_or_else(|e| e.into_inner());
             if guard.contains_key(&chan_id) {
@@ -297,7 +321,13 @@ impl V2SessionMux {
                     "channel {chan_id:#04x} already bound to a service stream"
                 )));
             }
-            guard.insert(chan_id, StreamSink::Sync(tx_in));
+            guard.insert(
+                chan_id,
+                StreamSink::Sync {
+                    tx: Some(tx_in),
+                    overflowed: Arc::clone(&inbound_overflowed),
+                },
+            );
         }
         Ok(V2ServiceStream {
             chan_id,
@@ -305,6 +335,7 @@ impl V2SessionMux {
             require_tcp_tunnel,
             tx_out: self.tx_out.clone(),
             rx_in,
+            inbound_overflowed,
             read_buf: VecDeque::new(),
             read_timeout,
             sinks: Arc::clone(&self.sinks),
@@ -356,6 +387,7 @@ pub struct V2ServiceStream {
     require_tcp_tunnel: bool,
     tx_out: mpsc::Sender<OutboundChunk>,
     rx_in: std_mpsc::Receiver<Vec<u8>>,
+    inbound_overflowed: Arc<AtomicBool>,
     read_buf: VecDeque<u8>,
     read_timeout: Option<Duration>,
     sinks: Arc<Mutex<HashMap<u8, StreamSink>>>,
@@ -427,6 +459,11 @@ impl Write for V2ServiceStream {
 
 impl Read for V2ServiceStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.inbound_overflowed.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "V2ServiceStream inbound queue overflowed (frames dropped)",
+            ));
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -437,11 +474,23 @@ impl Read for V2ServiceStream {
                         io::Error::new(io::ErrorKind::TimedOut, "V2ServiceStream read timed out")
                     }
                     std_mpsc::RecvTimeoutError::Disconnected => {
-                        io::Error::new(io::ErrorKind::UnexpectedEof, "V2ServiceStream closed")
+                        if self.inbound_overflowed.load(Ordering::Acquire) {
+                            io::Error::other(
+                                "V2ServiceStream inbound queue overflowed (frames dropped)",
+                            )
+                        } else {
+                            io::Error::new(io::ErrorKind::UnexpectedEof, "V2ServiceStream closed")
+                        }
                     }
                 })?,
                 None => self.rx_in.recv().map_err(|_| {
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "V2ServiceStream closed")
+                    if self.inbound_overflowed.load(Ordering::Acquire) {
+                        io::Error::other(
+                            "V2ServiceStream inbound queue overflowed (frames dropped)",
+                        )
+                    } else {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "V2ServiceStream closed")
+                    }
                 })?,
             };
             self.read_buf.extend(chunk);
@@ -525,6 +574,7 @@ impl V2LoopbackBridge {
             &mut self.rx_in,
             MAX_RETRANSMIT_ATTEMPTS,
             MAX_RETRANSMIT_TOTAL_TIMEOUT,
+            PEER_EOF_IDLE_TIMEOUT,
         )
         .await;
         let mut guard = self.sinks.lock().unwrap_or_else(|e| e.into_inner());
@@ -563,6 +613,7 @@ impl V2LoopbackBridge {
             &mut rx_in,
             MAX_RETRANSMIT_ATTEMPTS,
             MAX_RETRANSMIT_TOTAL_TIMEOUT,
+            PEER_EOF_IDLE_TIMEOUT,
         )
         .await;
         let mut guard = mux.sinks.lock().unwrap_or_else(|e| e.into_inner());
@@ -586,13 +637,14 @@ async fn pipe_tcp_over_v2(
     rx_in: &mut mpsc::Receiver<(u8, Vec<u8>)>,
     max_retransmit_attempts: u32,
     max_retransmit_total_timeout: Duration,
+    peer_eof_idle_timeout: Duration,
 ) -> Result<(u64, u64), ClientError> {
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
     let mut tx_bytes = 0u64;
     let mut rx_bytes = 0u64;
     let mut read_buf = [0u8; BRIDGE_MAX_CHUNK_BYTES];
     let mut local_eof = false;
-    let mut local_eof_at: Option<Instant> = None;
+    let mut last_peer_rx_at = Instant::now();
     let mut remote_eof = false;
 
     let mut next_tx_seq = 0u32;
@@ -632,15 +684,15 @@ async fn pipe_tcp_over_v2(
                             .map_err(|_| ClientError::Protocol("V2 mux closed during retransmit".into()))?;
                     }
                 }
-                if local_eof && unacked.is_empty() && !remote_eof {
-                    if let Some(eof_at) = local_eof_at {
-                        if now.duration_since(eof_at) >= max_retransmit_total_timeout {
-                            let _ = tcp_w.shutdown().await;
-                            return Err(ClientError::Timeout(
-                                "V2 tunnel timed out waiting for peer EOF".into(),
-                            ));
-                        }
-                    }
+                if local_eof
+                    && unacked.is_empty()
+                    && !remote_eof
+                    && last_peer_rx_at.elapsed() >= peer_eof_idle_timeout
+                {
+                    let _ = tcp_w.shutdown().await;
+                    return Err(ClientError::Timeout(
+                        "V2 tunnel timed out waiting for peer EOF".into(),
+                    ));
                 }
             }
             read_res = tcp_r.read(&mut read_buf), if can_read_local => {
@@ -650,7 +702,7 @@ async fn pipe_tcp_over_v2(
                 let now = Instant::now();
                 let (msg_type, framed) = if n == 0 {
                     local_eof = true;
-                    local_eof_at = Some(now);
+                    last_peer_rx_at = now;
                     (TUNNEL_MSG_EOF, seq.to_be_bytes().to_vec())
                 } else {
                     tx_bytes = tx_bytes.saturating_add(n as u64);
@@ -689,11 +741,18 @@ async fn pipe_tcp_over_v2(
                 let seq = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 match msg_type {
                     TUNNEL_MSG_ACK => {
-                        unacked.remove(&seq);
+                        if unacked.remove(&seq).is_some() && local_eof {
+                            last_peer_rx_at = Instant::now();
+                        }
                     }
                     TUNNEL_MSG_DATA | TUNNEL_MSG_EOF => {
+                        let has_data = payload.len() > 4;
+                        let prev_reorder_len = reorder.len();
                         let (should_ack, ready) =
                             reorder.insert_and_drain(seq, msg_type, payload[4..].to_vec());
+                        if has_data && (reorder.len() > prev_reorder_len || !ready.is_empty()) {
+                            last_peer_rx_at = Instant::now();
+                        }
                         if should_ack {
                             tx_out
                                 .send(OutboundChunk {
@@ -712,6 +771,7 @@ async fn pipe_tcp_over_v2(
                                 tcp_w.write_all(&data).await?;
                                 tcp_w.flush().await?;
                                 rx_bytes = rx_bytes.saturating_add(data.len() as u64);
+                                last_peer_rx_at = Instant::now();
                             }
                         }
                     }
@@ -908,6 +968,230 @@ mod tests {
             "bounded outbound channel must apply WouldBlock backpressure instead of OOM"
         );
         release.notify_waiters();
+        mux.shutdown().await;
+    }
+
+    struct FloodRecvTransport {
+        policy: VerifiedTenantPolicy,
+        chan_id: u8,
+        remaining: usize,
+        start_rx: watch::Receiver<bool>,
+        done_tx: watch::Sender<bool>,
+    }
+
+    impl V2DesktopTransport for FloodRecvTransport {
+        fn policy(&self) -> VerifiedTenantPolicy {
+            self.policy.clone()
+        }
+
+        async fn send_chunk(
+            &mut self,
+            _chan_id: u8,
+            _msg_type: u8,
+            _payload: Vec<u8>,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn recv_chunk(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u8, u8, Vec<u8>)>, ClientError> {
+            if !*self.start_rx.borrow() {
+                let _ = tokio::time::timeout(timeout, self.start_rx.changed()).await;
+                return Ok(None);
+            }
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                return Ok(Some((
+                    self.chan_id,
+                    TUNNEL_MSG_DATA,
+                    b"flood-chunk".to_vec(),
+                )));
+            }
+            let _ = self.done_tx.send(true);
+            tokio::time::sleep(timeout).await;
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn half_closed_bridge_stays_alive_while_peer_streams_data_past_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cli_res, srv_res) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut cli = cli_res.unwrap();
+        let (srv, _) = srv_res.unwrap();
+
+        let (tx_out, mut rx_out) = mpsc::channel::<OutboundChunk>(BRIDGE_CHANNEL_CAPACITY);
+        let (tx_in, mut rx_in) = mpsc::channel::<(u8, Vec<u8>)>(BRIDGE_CHANNEL_CAPACITY);
+        let idle_timeout = Duration::from_millis(200);
+
+        let pipe = tokio::spawn(async move {
+            pipe_tcp_over_v2(
+                srv,
+                DEFAULT_BRIDGE_CHANNEL,
+                tx_out,
+                &mut rx_in,
+                MAX_RETRANSMIT_ATTEMPTS,
+                MAX_RETRANSMIT_TOTAL_TIMEOUT,
+                idle_timeout,
+            )
+            .await
+        });
+
+        cli.write_all(b"req").await.unwrap();
+        cli.shutdown().await.unwrap();
+
+        let mut expected = Vec::new();
+        let peer = tokio::spawn(async move {
+            // ACK local DATA (seq 0) and local EOF (seq 1).
+            let mut saw_local_eof = false;
+            while !saw_local_eof {
+                let chunk = rx_out.recv().await.unwrap();
+                let seq = u32::from_be_bytes(chunk.payload[..4].try_into().unwrap());
+                if chunk.msg_type == TUNNEL_MSG_EOF {
+                    saw_local_eof = true;
+                }
+                tx_in
+                    .send((TUNNEL_MSG_ACK, seq.to_be_bytes().to_vec()))
+                    .await
+                    .unwrap();
+            }
+
+            // Stream 6 chunks spaced 80ms apart (~480ms > 200ms idle_timeout) after local EOF.
+            let mut sent = Vec::new();
+            for seq in 0u32..6u32 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let piece = format!("chunk-{seq}|");
+                sent.extend_from_slice(piece.as_bytes());
+                let mut framed = Vec::with_capacity(4 + piece.len());
+                framed.extend_from_slice(&seq.to_be_bytes());
+                framed.extend_from_slice(piece.as_bytes());
+                tx_in.send((TUNNEL_MSG_DATA, framed)).await.unwrap();
+            }
+            tx_in
+                .send((TUNNEL_MSG_EOF, 6u32.to_be_bytes().to_vec()))
+                .await
+                .unwrap();
+            // Drain ACKs including ACK for peer EOF so tx_out stays open until pipe finishes.
+            while let Some(chunk) = rx_out.recv().await {
+                if chunk.msg_type == TUNNEL_MSG_ACK
+                    && chunk.payload.len() >= 4
+                    && u32::from_be_bytes(chunk.payload[..4].try_into().unwrap()) == 6
+                {
+                    break;
+                }
+            }
+            sent
+        });
+
+        let mut received = Vec::new();
+        cli.read_to_end(&mut received).await.unwrap();
+        expected.extend_from_slice(&peer.await.unwrap());
+
+        let (tx_bytes, rx_bytes) = tokio::time::timeout(Duration::from_secs(3), pipe)
+            .await
+            .expect("pipe must complete once peer sends EOF")
+            .unwrap()
+            .expect("active inbound traffic must keep half-closed bridge alive past idle timeout");
+        assert_eq!(tx_bytes, 3);
+        assert_eq!(rx_bytes, expected.len() as u64);
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn half_closed_bridge_times_out_when_peer_stalls_without_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cli_res, srv_res) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut cli = cli_res.unwrap();
+        let (srv, _) = srv_res.unwrap();
+
+        let (tx_out, mut rx_out) = mpsc::channel::<OutboundChunk>(BRIDGE_CHANNEL_CAPACITY);
+        let (tx_in, mut rx_in) = mpsc::channel::<(u8, Vec<u8>)>(BRIDGE_CHANNEL_CAPACITY);
+        let idle_timeout = Duration::from_millis(200);
+
+        let pipe = tokio::spawn(async move {
+            pipe_tcp_over_v2(
+                srv,
+                DEFAULT_BRIDGE_CHANNEL,
+                tx_out,
+                &mut rx_in,
+                MAX_RETRANSMIT_ATTEMPTS,
+                MAX_RETRANSMIT_TOTAL_TIMEOUT,
+                idle_timeout,
+            )
+            .await
+        });
+
+        cli.write_all(b"req").await.unwrap();
+        cli.shutdown().await.unwrap();
+
+        let _peer = tokio::spawn(async move {
+            let mut saw_local_eof = false;
+            while !saw_local_eof {
+                let chunk = rx_out.recv().await.unwrap();
+                let seq = u32::from_be_bytes(chunk.payload[..4].try_into().unwrap());
+                if chunk.msg_type == TUNNEL_MSG_EOF {
+                    saw_local_eof = true;
+                }
+                tx_in
+                    .send((TUNNEL_MSG_ACK, seq.to_be_bytes().to_vec()))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&0u32.to_be_bytes());
+            framed.extend_from_slice(b"partial");
+            tx_in.send((TUNNEL_MSG_DATA, framed)).await.unwrap();
+            // Keep tx_in open and never send TUNNEL_MSG_EOF to simulate a stalled peer.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(tx_in);
+        });
+
+        let mut received = Vec::new();
+        cli.read_to_end(&mut received).await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(2), pipe)
+            .await
+            .expect("stalled peer must time out cleanly")
+            .unwrap();
+        assert!(matches!(res, Err(ClientError::Timeout(_))));
+        assert_eq!(received, b"partial");
+    }
+
+    #[tokio::test]
+    async fn service_stream_inbound_overflow_returns_error_instead_of_silent_drop() {
+        let policy = make_policy(true, true);
+        let (start_tx, start_rx) = watch::channel(false);
+        let (done_tx, mut done_rx) = watch::channel(false);
+        let mux = V2SessionMux::spawn_internal(FloodRecvTransport {
+            policy,
+            chan_id: CHAN_INPUT_HID,
+            remaining: BRIDGE_CHANNEL_CAPACITY + 4,
+            start_rx,
+            done_tx,
+        });
+        let mut stream = mux
+            .open_service_stream(CHAN_INPUT_HID, Some(Duration::from_millis(200)))
+            .unwrap();
+
+        start_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), done_rx.wait_for(|&done| done))
+            .await
+            .expect("flood transport should finish delivering chunks")
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let err = stream
+            .read(&mut buf)
+            .expect_err("inbound queue overflow must return an error instead of silently dropping");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.to_string().contains("overflow"),
+            "unexpected error message: {err}"
+        );
         mux.shutdown().await;
     }
 }
