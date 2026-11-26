@@ -78,3 +78,6 @@ pub mod privacy_mode;
 pub mod virtual_display_manager;
 
 mod kcp_stream;
+
+#[cfg(feature = "zerodesk-v2")]
+pub mod v2_session;

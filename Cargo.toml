@@ -46,6 +46,7 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
+zerodesk-v2 = ["dep:v2_identity", "dep:v2_transport", "dep:v2_client"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -89,6 +90,9 @@ totp-rs = { version = "5.4", default-features = false, features = ["gen_secret",
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys", branch = "rustdesk-patches" }
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip", "zstd"], default-features=false }
+v2_identity = { path = "libs/v2_identity", optional = true }
+v2_transport = { path = "libs/v2_transport", optional = true }
+v2_client = { path = "libs/v2_client", optional = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
@@ -217,8 +221,8 @@ jni = "0.21"
 android-wakelock = { git = "https://github.com/rustdesk-org/android-wakelock" }
 
 [workspace]
-members = ["libs/scrap", "libs/hbb_common", "libs/base", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer"]
-exclude = ["vdi/host"]
+members = ["libs/scrap", "libs/hbb_common", "libs/base", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer", "libs/v2_e2e"]
+exclude = ["vdi/host", "libs/v2_identity", "libs/v2_transport", "libs/v2_client"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo
 # This allows building and running on systems without libxdo installed (e.g., Wayland-only)

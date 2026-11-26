@@ -116,6 +116,23 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
     // Add the include path.
     let include = path.join("include");
     println!("cargo:include={}", include.to_str().unwrap());
+    if name == "aom" && Path::new("/opt/homebrew/Cellar/libvmaf").exists() {
+        let _ = link_homebrew_m1("libvmaf");
+    }
+    include
+}
+
+fn link_custom_libyuv(prefix: PathBuf) -> PathBuf {
+    println!("cargo:rustc-link-lib=static=yuv");
+    println!(
+        "cargo:rustc-link-search={}",
+        prefix.join("lib").to_str().unwrap()
+    );
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-lib=c++");
+    }
+    let include = prefix.join("include");
+    println!("cargo:include={}", include.to_str().unwrap());
     include
 }
 
@@ -125,6 +142,14 @@ fn link_homebrew_m1(name: &str) -> PathBuf {
 fn find_package(name: &str) -> Vec<PathBuf> {
     let no_pkg_config_var_name = format!("NO_PKG_CONFIG_{name}");
     println!("cargo:rerun-if-env-changed={no_pkg_config_var_name}");
+    if name == "libyuv" {
+        println!("cargo:rerun-if-env-changed=ZERODESK_LIBYUV_PREFIX");
+        if let Ok(prefix) = std::env::var("ZERODESK_LIBYUV_PREFIX") {
+            if !prefix.is_empty() {
+                return vec![link_custom_libyuv(PathBuf::from(prefix))];
+            }
+        }
+    }
     if cfg!(all(target_os = "linux", feature = "linux-pkg-config"))
         && std::env::var(no_pkg_config_var_name).as_deref() != Ok("1")
     {
@@ -132,6 +157,14 @@ fn find_package(name: &str) -> Vec<PathBuf> {
     } else if let Ok(vcpkg_root) = std::env::var("VCPKG_ROOT") {
         vec![link_vcpkg(vcpkg_root.into(), name)]
     } else {
+        if name == "libyuv" && !Path::new("/opt/homebrew/Cellar/libyuv").exists() {
+            if let Ok(home) = std::env::var("HOME") {
+                let candidate = PathBuf::from(home).join(".local").join("libyuv");
+                if candidate.join("lib").exists() && candidate.join("include").exists() {
+                    return vec![link_custom_libyuv(candidate)];
+                }
+            }
+        }
         // Try using homebrew
         vec![link_homebrew_m1(name)]
     }
