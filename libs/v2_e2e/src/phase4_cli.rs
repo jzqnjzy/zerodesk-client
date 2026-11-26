@@ -440,7 +440,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         .await
         .map_err(|e| e.to_string())?;
     let handshake_hash_hex = hex::encode(accepted.hs_hash);
-    let _ctrl_tunnel_b = accepted.ctrl_tunnel_b;
+    let host_lease_renewal = accepted.lease_renewal;
 
     let visual_marker: SharedVisualMarker = Arc::new(Mutex::new(None));
     let capture_stop = Arc::new(AtomicBool::new(false));
@@ -503,6 +503,10 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
     loop {
         if sig_stop.load(Ordering::Acquire) {
             close_reason = CloseReason::Signal;
+            break;
+        }
+        if host_lease_renewal.is_expired() {
+            close_reason = CloseReason::LeaseExpired;
             break;
         }
         if held_state.is_faulted() {
@@ -623,12 +627,13 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
     let frames_overwritten = capture.stats().frames_overwritten.load(Ordering::Acquire);
     let (e2ee_session, _enc) = host.into_inner();
 
-    // Strict ordered teardown: release_all -> stop capture -> 3x SESSION_CLOSE -> close data plane
+    // Strict ordered teardown: latch_closed + release_all -> stop capture (2s) -> 3x SESSION_CLOSE
+    // -> shutdown Host Edge B LeaseRenewalTask -> close data plane
     let teardown = ordered_session_teardown(
         Some(&mut executor),
         Some(capture),
         Some(e2ee_session),
-        None,
+        Some(host_lease_renewal),
         None,
         &close_reason,
     )
@@ -647,7 +652,11 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
     let final_keys = held_state.pressed_keys_snapshot();
     let wd_releases = held_state.watchdog_release_count();
     let total_releases = executor.release_all_count.saturating_add(wd_releases);
-    let pass = fatal_error.is_none()
+    let final_error = fatal_error
+        .or(teardown.release_all_error.clone())
+        .or(teardown.lease_renewal_error.clone());
+    let pass = final_error.is_none()
+        && teardown.release_all_ok
         && final_buttons == 0
         && final_keys.is_empty()
         && !held_state.is_faulted()
@@ -675,7 +684,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         close_reason: close_reason.label(),
         capture_thread_joined: teardown.capture_joined,
         watchdog_thread_joined: watchdog_joined,
-        error: fatal_error,
+        error: final_error,
     })
 }
 
@@ -1060,14 +1069,15 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
     };
 
     let _ = send_redundant_session_close_3x(controller.session_mut(), 0x0000).await;
-    let (lease_renewals_ok, lease_renewals_err) = lease_renewal.shutdown().await;
+    let lease_shut = lease_renewal.shutdown().await;
     if let Some(mut sig) = client.take_signaling() {
         let _ = sig.shutdown().await;
     }
 
     let decode_errors = controller.decode_errors;
     let decoder_flushed_frames = controller.decoder_flushed_frames;
-    let pass = run_res.is_ok()
+    let final_error = run_res.err().or(lease_shut.join_error);
+    let pass = final_error.is_none()
         && frame_id_monotonic
         && decode_errors == 0
         && (args.leave_stuck
@@ -1090,10 +1100,10 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
         hid_events_sent,
         visual_marker_before_hid,
         visual_marker_detected_frames,
-        lease_renewals_ok,
-        lease_renewals_err,
+        lease_renewals_ok: lease_shut.renewals_ok,
+        lease_renewals_err: lease_shut.renewals_err,
         leave_stuck: args.leave_stuck,
-        error: run_res.err(),
+        error: final_error,
     })
 }
 
@@ -1146,6 +1156,13 @@ pub async fn cmd_v2_ctl(args: &[String]) -> ExitCode {
                 .map(|c| codec = c),
             "--frames" => parse_flag_value(args, &mut i, "--frames")
                 .and_then(|v| v.parse::<usize>().map_err(|e| e.to_string()))
+                .and_then(|n| {
+                    if n == 0 {
+                        Err("--frames must be >= 1".to_string())
+                    } else {
+                        Ok(n)
+                    }
+                })
                 .map(|n| frames = n),
             "--leave-stuck" => {
                 leave_stuck = true;
@@ -1353,6 +1370,14 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String
     }
 }
 
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn contains_rendezvous_file(root: &Path) -> Result<Option<PathBuf>, String> {
     let entries = fs::read_dir(root)
         .map_err(|e| format!("scan dir '{}': {e}", root.display()))?;
@@ -1364,7 +1389,11 @@ fn contains_rendezvous_file(root: &Path) -> Result<Option<PathBuf>, String> {
                 return Ok(Some(p));
             }
         }
-        if p.is_dir() {
+        // Use `entry.file_type()` which does NOT follow symlinks, preventing symlink-loop DoS.
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file_type '{}': {e}", p.display()))?;
+        if ft.is_dir() {
             if let Some(found) = contains_rendezvous_file(&p)? {
                 return Ok(Some(found));
             }
@@ -1416,6 +1445,9 @@ async fn run_signaling_normal_scenario(
     let ready_file = work_dir.join(format!("{name}_host_ready.json"));
     let host_audit = work_dir.join(format!("{name}_host_audit.jsonl"));
     let ctrl_audit = work_dir.join(format!("{name}_ctrl_audit.jsonl"));
+    let _ = fs::remove_file(&ready_file);
+    let _ = fs::remove_file(&host_audit);
+    let _ = fs::remove_file(&ctrl_audit);
 
     let mut host_cmd = Command::new(exe);
     host_cmd
@@ -1446,7 +1478,7 @@ async fn run_signaling_normal_scenario(
         host_cmd.arg("--signaling-tls");
     }
 
-    let host_child = match ChildGroupGuard::spawn_in_group(&mut host_cmd) {
+    let mut host_child = match ChildGroupGuard::spawn_in_group(&mut host_cmd) {
         Ok(c) => c,
         Err(e) => {
             return ScenarioReport {
@@ -1466,6 +1498,7 @@ async fn run_signaling_normal_scenario(
     let ready_bytes = match wait_for_file(&ready_file, Duration::from_secs(15)).await {
         Ok(b) => b,
         Err(e) => {
+            host_child.sigkill_group();
             let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
             return ScenarioReport {
                 name: name.into(),
@@ -1483,6 +1516,7 @@ async fn run_signaling_normal_scenario(
     let ready: HostReadyFile = match serde_json::from_slice(&ready_bytes) {
         Ok(r) => r,
         Err(e) => {
+            host_child.sigkill_group();
             let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
             return ScenarioReport {
                 name: name.into(),
@@ -1528,6 +1562,7 @@ async fn run_signaling_normal_scenario(
     let ctl_child = match ChildGroupGuard::spawn_in_group(&mut ctl_cmd) {
         Ok(c) => c,
         Err(e) => {
+            host_child.sigkill_group();
             let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
             return ScenarioReport {
                 name: name.into(),
@@ -1637,6 +1672,10 @@ async fn run_signaling_sigkill_watchdog_scenario(
     let stuck_ready = work_dir.join(format!("{name}_stuck.ready"));
     let host_audit = work_dir.join(format!("{name}_host_audit.jsonl"));
     let ctrl_audit = work_dir.join(format!("{name}_ctrl_audit.jsonl"));
+    let _ = fs::remove_file(&ready_file);
+    let _ = fs::remove_file(&stuck_ready);
+    let _ = fs::remove_file(&host_audit);
+    let _ = fs::remove_file(&ctrl_audit);
 
     let mut host_cmd = Command::new(exe);
     host_cmd
@@ -1667,7 +1706,7 @@ async fn run_signaling_sigkill_watchdog_scenario(
         host_cmd.arg("--signaling-tls");
     }
 
-    let host_child = match ChildGroupGuard::spawn_in_group(&mut host_cmd) {
+    let mut host_child = match ChildGroupGuard::spawn_in_group(&mut host_cmd) {
         Ok(c) => c,
         Err(e) => {
             return ScenarioReport {
@@ -1687,6 +1726,7 @@ async fn run_signaling_sigkill_watchdog_scenario(
     let ready_bytes = match wait_for_file(&ready_file, Duration::from_secs(15)).await {
         Ok(b) => b,
         Err(e) => {
+            host_child.sigkill_group();
             let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
             return ScenarioReport {
                 name: name.into(),
@@ -1704,6 +1744,7 @@ async fn run_signaling_sigkill_watchdog_scenario(
     let ready: HostReadyFile = match serde_json::from_slice(&ready_bytes) {
         Ok(r) => r,
         Err(e) => {
+            host_child.sigkill_group();
             let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
             return ScenarioReport {
                 name: name.into(),
@@ -1752,6 +1793,7 @@ async fn run_signaling_sigkill_watchdog_scenario(
     let mut ctl_child = match ChildGroupGuard::spawn_in_group(&mut ctl_cmd) {
         Ok(c) => c,
         Err(e) => {
+            host_child.sigkill_group();
             let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
             return ScenarioReport {
                 name: name.into(),
@@ -1769,6 +1811,8 @@ async fn run_signaling_sigkill_watchdog_scenario(
 
     if let Err(e) = wait_for_file(&stuck_ready, Duration::from_secs(20)).await {
         ctl_child.sigkill_group();
+        let _ = ctl_child.wait_with_output(Duration::from_secs(2)).await;
+        host_child.sigkill_group();
         let _ = host_child.wait_with_output(Duration::from_secs(5)).await;
         return ScenarioReport {
             name: name.into(),
@@ -1875,6 +1919,13 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
                 .map(|c| codec = c),
             "--frames" => parse_flag_value(args, &mut i, "--frames")
                 .and_then(|v| v.parse::<usize>().map_err(|e| e.to_string()))
+                .and_then(|n| {
+                    if n == 0 {
+                        Err("--frames must be >= 1".to_string())
+                    } else {
+                        Ok(n)
+                    }
+                })
                 .map(|n| frames = n),
             other => Err(format!("unknown argument '{other}'")),
         };
@@ -1943,6 +1994,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         "zd-p4a-signaling-e2e-{}-{uniq}",
         std::process::id()
     ));
+    let _work_dir_guard = TempDirGuard(work_dir.clone());
     let host_id_dir = work_dir.join("host_identity");
     let ctrl_id_dir = work_dir.join("ctrl_identity");
     if let Err(e) = ensure_dir_0700(&work_dir)
@@ -1957,7 +2009,6 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("resolve current_exe: {e}");
-            let _ = fs::remove_dir_all(&work_dir);
             return ExitCode::FAILURE;
         }
     };
@@ -1966,7 +2017,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         &exe,
         "scenario_1_vp9",
         &config_path,
-        ca_der.as_deref(),
+        resolved_ca.as_deref(),
         signaling_tls,
         &host_id_dir,
         &ctrl_id_dir,
@@ -1982,7 +2033,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         &exe,
         "scenario_2_av1",
         &config_path,
-        ca_der.as_deref(),
+        resolved_ca.as_deref(),
         signaling_tls,
         &host_id_dir,
         &ctrl_id_dir,
@@ -1997,7 +2048,7 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
     let s3 = run_signaling_sigkill_watchdog_scenario(
         &exe,
         &config_path,
-        ca_der.as_deref(),
+        resolved_ca.as_deref(),
         signaling_tls,
         &host_id_dir,
         &ctrl_id_dir,
@@ -2007,9 +2058,15 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
     )
     .await;
 
-    // Strictly assert ZERO rendezvous files exist anywhere in work_dir or either identity_dir.
-    let rendezvous_found = contains_rendezvous_file(&work_dir).unwrap_or(None);
-    let zero_rendezvous_verified = rendezvous_found.is_none();
+    // Strictly assert fail-closed ZERO rendezvous files exist anywhere in work_dir.
+    let (zero_rendezvous_verified, rendezvous_err) = match contains_rendezvous_file(&work_dir) {
+        Ok(None) => (true, None),
+        Ok(Some(p)) => (
+            false,
+            Some(format!("unexpected rendezvous file found: {}", p.display())),
+        ),
+        Err(e) => (false, Some(format!("rendezvous scan failed: {e}"))),
+    };
 
     let pass = s1.pass && s2.pass && s3.pass && zero_rendezvous_verified;
     let report = SignalingE2eReport {
@@ -2018,10 +2075,9 @@ pub async fn cmd_signaling_e2e(args: &[String]) -> ExitCode {
         scenario_1_vp9: s1,
         scenario_2_av1: s2,
         scenario_3_sigkill_watchdog: s3,
-        error: rendezvous_found
-            .map(|p| format!("unexpected rendezvous file found: {}", p.display())),
+        error: rendezvous_err,
     };
-    let _ = fs::remove_dir_all(&work_dir);
+    drop(_work_dir_guard);
 
     if let Ok(json) = serde_json::to_string_pretty(&report) {
         println!("{json}");
@@ -2063,6 +2119,20 @@ mod tests {
 
         write_file_atomic_0600(&dir.join("rendezvous.json"), b"{}").unwrap();
         assert!(contains_rendezvous_file(&dir).unwrap().is_some());
+
+        // Symlink pointing back to parent dir MUST NOT cause infinite recursion (uses file_type())
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(dir.join("rendezvous.json"));
+            let loop_link = dir.join("self_loop");
+            std::os::unix::fs::symlink(&dir, &loop_link).unwrap();
+            assert!(contains_rendezvous_file(&dir).unwrap().is_none());
+        }
+
+        // Missing/unreadable directory MUST return Err (fail-closed)
+        let missing = dir.join("does_not_exist");
+        assert!(contains_rendezvous_file(&missing).is_err());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

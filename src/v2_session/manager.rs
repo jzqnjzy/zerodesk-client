@@ -38,7 +38,8 @@ pub const DEFAULT_V2_CAP_BITS: u64 = CAP_CODEC_AV1
     | CAP_ACCESS_LEG_SEQ_V11
     | CAP_SURVIVAL_MODE;
 pub const SEEN_SESSION_CACHE_CAP: usize = 4096;
-const UI_DISPATCH_CHANNEL_CAP: usize = 64;
+const UI_CONTROL_CHANNEL_CAP: usize = 256;
+const UI_FRAME_CHANNEL_CAP: usize = 4;
 const INCOMING_CALL_DECISION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -177,8 +178,7 @@ impl V2UiCallback for NoopUiCallback {
     fn on_security_event(&self, _event: SecurityEvent) {}
 }
 
-enum UiDispatchEvent {
-    Frame(Arc<I420Frame>),
+enum UiControlEvent {
     State(V2SessionState),
     Qoe(QoeSnapshot),
     Capabilities(VerifiedTenantPolicy),
@@ -191,49 +191,63 @@ enum UiDispatchEvent {
 
 /// Non-blocking async dispatcher that runs `V2UiCallback` on its own dedicated Tokio task,
 /// guaranteeing callbacks are never invoked while holding internal session locks.
+///
+/// Droppable high-FPS video frames use a small separate bounded channel so video backpressure
+/// can NEVER starve or drop reliable control/state/security events.
 #[derive(Clone)]
 pub struct UiCallbackDispatcher {
-    tx: mpsc::Sender<UiDispatchEvent>,
+    ctrl_tx: mpsc::Sender<UiControlEvent>,
+    frame_tx: mpsc::Sender<Arc<I420Frame>>,
 }
 
 impl UiCallbackDispatcher {
     pub fn spawn(callback: Arc<dyn V2UiCallback>) -> Self {
-        let (tx, mut rx) = mpsc::channel::<UiDispatchEvent>(UI_DISPATCH_CHANNEL_CAP);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<UiControlEvent>(UI_CONTROL_CHANNEL_CAP);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Arc<I420Frame>>(UI_FRAME_CHANNEL_CAP);
         tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    UiDispatchEvent::Frame(f) => callback.on_frame(f),
-                    UiDispatchEvent::State(s) => callback.on_state(s),
-                    UiDispatchEvent::Qoe(q) => callback.on_qoe(q),
-                    UiDispatchEvent::Capabilities(c) => callback.on_capabilities(c),
-                    UiDispatchEvent::IncomingCall { call, reply } => {
-                        callback.on_incoming_call(call, reply);
-                    }
-                    UiDispatchEvent::SecurityEvent(e) => callback.on_security_event(e),
+            let mut ctrl_open = true;
+            let mut frame_open = true;
+            while ctrl_open || frame_open {
+                tokio::select! {
+                    biased;
+                    ev = ctrl_rx.recv(), if ctrl_open => match ev {
+                        Some(UiControlEvent::State(s)) => callback.on_state(s),
+                        Some(UiControlEvent::Qoe(q)) => callback.on_qoe(q),
+                        Some(UiControlEvent::Capabilities(c)) => callback.on_capabilities(c),
+                        Some(UiControlEvent::IncomingCall { call, reply }) => {
+                            callback.on_incoming_call(call, reply);
+                        }
+                        Some(UiControlEvent::SecurityEvent(e)) => callback.on_security_event(e),
+                        None => ctrl_open = false,
+                    },
+                    frame = frame_rx.recv(), if frame_open => match frame {
+                        Some(f) => callback.on_frame(f),
+                        None => frame_open = false,
+                    },
                 }
             }
         });
-        Self { tx }
+        Self { ctrl_tx, frame_tx }
     }
 
     pub fn emit_frame(&self, frame: Arc<I420Frame>) {
-        let _ = self.tx.try_send(UiDispatchEvent::Frame(frame));
+        let _ = self.frame_tx.try_send(frame);
     }
 
     pub fn emit_state(&self, state: V2SessionState) {
-        let _ = self.tx.try_send(UiDispatchEvent::State(state));
+        let _ = self.ctrl_tx.try_send(UiControlEvent::State(state));
     }
 
     pub fn emit_qoe(&self, qoe: QoeSnapshot) {
-        let _ = self.tx.try_send(UiDispatchEvent::Qoe(qoe));
+        let _ = self.ctrl_tx.try_send(UiControlEvent::Qoe(qoe));
     }
 
     pub fn emit_capabilities(&self, caps: VerifiedTenantPolicy) {
-        let _ = self.tx.try_send(UiDispatchEvent::Capabilities(caps));
+        let _ = self.ctrl_tx.try_send(UiControlEvent::Capabilities(caps));
     }
 
     pub fn emit_security_event(&self, ev: SecurityEvent) {
-        let _ = self.tx.try_send(UiDispatchEvent::SecurityEvent(ev));
+        let _ = self.ctrl_tx.try_send(UiControlEvent::SecurityEvent(ev));
     }
 
     pub async fn ask_incoming_call(
@@ -242,26 +256,31 @@ impl UiCallbackDispatcher {
         timeout: Duration,
     ) -> CallDecision {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(UiDispatchEvent::IncomingCall {
-                call,
-                reply: reply_tx,
-            })
-            .await
-            .is_err()
-        {
-            return CallDecision::Reject {
-                error_code: 0x0401,
-                reason: "UI callback channel closed".into(),
-            };
-        }
-        match tokio::time::timeout(timeout, reply_rx).await {
-            Ok(Ok(decision)) => decision,
-            Ok(Err(_)) => CallDecision::Reject {
-                error_code: 0x0401,
-                reason: "UI dropped incoming call reply channel".into(),
-            },
+        let fut = async {
+            if self
+                .ctrl_tx
+                .send(UiControlEvent::IncomingCall {
+                    call,
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return CallDecision::Reject {
+                    error_code: 0x0401,
+                    reason: "UI callback channel closed".into(),
+                };
+            }
+            match reply_rx.await {
+                Ok(decision) => decision,
+                Err(_) => CallDecision::Reject {
+                    error_code: 0x0401,
+                    reason: "UI dropped incoming call reply channel".into(),
+                },
+            }
+        };
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(decision) => decision,
             Err(_) => CallDecision::Reject {
                 error_code: 0x0401,
                 reason: "incoming call approval timed out".into(),
@@ -312,7 +331,12 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
-/// Builds a `VerifiedTenantPolicy` anchored to mutually CA-verified `DeviceCert` fields.
+/// Builds a fail-closed `VerifiedTenantPolicy` anchored to mutually CA-verified `DeviceCert`.
+///
+/// Phase 4A enforces Video + HID baseline only (`allow_file_transfer`, `allow_clipboard`,
+/// `allow_file_clipboard`, `allow_tcp_tunnel`, `allow_terminal`, `allow_realtime_actuator` are
+/// all `false`) until Phase 4B fetches and hash-verifies the full tenant policy body from the
+/// Control Plane.
 pub fn build_verified_policy_from_cert(
     cert: &SignalingDeviceCert,
     bw_cap_kbps: u32,
@@ -321,11 +345,11 @@ pub fn build_verified_policy_from_cert(
         tenant_id: cert.tenant_id,
         policy_version: 1,
         policy_hash: cert.policy_hash,
-        allow_file_transfer: true,
-        allow_clipboard: true,
-        allow_file_clipboard: true,
-        allow_tcp_tunnel: true,
-        allow_terminal: true,
+        allow_file_transfer: false,
+        allow_clipboard: false,
+        allow_file_clipboard: false,
+        allow_tcp_tunnel: false,
+        allow_terminal: false,
         allow_realtime_actuator: false,
         bw_cap_kbps: bw_cap_kbps.max(256),
         exhaust_policy: QuotaExhaustPolicy::Throttle256Kbps,
@@ -343,13 +367,18 @@ fn verify_peer_cert_and_delegation(
     now_unix: u64,
     callbacks: &UiCallbackDispatcher,
 ) -> Result<(), (u16, String)> {
+    // 1. Verify CA signature & certificate validity FIRST before consulting any untrusted fields
+    //    (eliminates forged-cert tenant/device probing oracle).
+    if let Err(e) = peer_cert.verify(ca_spki_der, now_unix) {
+        let reason = format!("peer DeviceCert CA verification failed: {e}");
+        callbacks.emit_security_event(SecurityEvent::CertRejected {
+            reason: reason.clone(),
+        });
+        return Err((0x0201, reason));
+    }
     if let Some(expected_dev) = expected_peer_device_id {
         if peer_cert.device_id != expected_dev {
-            let reason = format!(
-                "peer DeviceCert device_id {} != expected {}",
-                hex::encode(peer_cert.device_id),
-                hex::encode(expected_dev)
-            );
+            let reason = "peer DeviceCert device_id mismatch".to_string();
             callbacks.emit_security_event(SecurityEvent::CertRejected {
                 reason: reason.clone(),
             });
@@ -361,29 +390,13 @@ fn verify_peer_cert_and_delegation(
             expected: local_cert.tenant_id,
             actual: peer_cert.tenant_id,
         });
-        return Err((
-            0x0401,
-            format!(
-                "cross-tenant session denied (local={}, peer={})",
-                hex::encode(local_cert.tenant_id),
-                hex::encode(peer_cert.tenant_id)
-            ),
-        ));
+        // Never leak local_cert.tenant_id in peer-visible error strings.
+        return Err((0x0401, "cross-tenant session denied".into()));
     }
     if peer_cert.policy_hash != local_cert.policy_hash {
         let reason = "peer DeviceCert policy_hash does not match local tenant policy_hash".into();
         callbacks.emit_security_event(SecurityEvent::CertRejected { reason });
-        return Err((
-            0x0401,
-            "peer DeviceCert policy_hash mismatch".into(),
-        ));
-    }
-    if let Err(e) = peer_cert.verify(ca_spki_der, now_unix) {
-        let reason = format!("peer DeviceCert CA verification failed: {e}");
-        callbacks.emit_security_event(SecurityEvent::CertRejected {
-            reason: reason.clone(),
-        });
-        return Err((0x0201, reason));
+        return Err((0x0401, "peer DeviceCert policy_hash mismatch".into()));
     }
     if peer_deleg.device_id != peer_cert.device_id {
         let reason = "peer DelegationStatement device_id != peer DeviceCert device_id".into();
@@ -416,7 +429,7 @@ pub struct AcceptedHostSession {
     pub peer_device_id: [u8; 16],
     pub tenant_id: [u8; 16],
     pub e2ee_session: UdpE2eeSession,
-    pub ctrl_tunnel_b: AccessControlTunnel,
+    pub lease_renewal: LeaseRenewalTask,
     pub hs_hash: [u8; 32],
     pub policy: VerifiedTenantPolicy,
     pub peer_route: PeerRouteCandidate,
@@ -425,10 +438,11 @@ pub struct AcceptedHostSession {
 }
 
 /// Persistent Host signaling daemon: stays online via `SignalingSession` + periodic `Heartbeat`,
-/// enforces anti-replay `session_id` dedup, mutual CA cert verification, same-tenant isolation,
-/// and mandatory `Noise_IK` responder handshake.
+/// enforces mutual CA cert verification, same-tenant isolation, anti-replay `session_id` dedup,
+/// mandatory `Noise_IK` responder handshake, and background Edge B lease renewal.
 pub struct DesktopHostDaemon {
     config: V2ClientConfig,
+    cp: ControlPlaneClient,
     identity: PersistentV2Identity,
     ca_spki_der: Vec<u8>,
     cap_bits: u64,
@@ -486,11 +500,14 @@ impl DesktopHostDaemon {
             Duration::from_secs(10),
         )
         .await?;
-        let hb_secs = u64::from(resp.heartbeat_interval_sec.clamp(5, 60));
+        let hb_dur = resp
+            .effective_heartbeat_interval()
+            .clamp(Duration::from_secs(5), Duration::from_secs(60));
         callbacks.emit_state(V2SessionState::Online);
 
         Ok(Self {
             config,
+            cp,
             identity,
             ca_spki_der,
             cap_bits: DEFAULT_V2_CAP_BITS,
@@ -498,7 +515,7 @@ impl DesktopHostDaemon {
             seen_sessions: SeenSessionCache::new(SEEN_SESSION_CACHE_CAP),
             delegation_cache: DelegationCache::new(),
             signaling: Some(sig),
-            heartbeat_interval: Duration::from_secs(hb_secs),
+            heartbeat_interval: hb_dur,
             backoff: SignalingReconnectBackoff::new(),
         })
     }
@@ -556,10 +573,32 @@ impl DesktopHostDaemon {
             Duration::from_secs(10),
         )
         .await?;
-        self.heartbeat_interval = Duration::from_secs(u64::from(resp.heartbeat_interval_sec.clamp(5, 60)));
+        self.heartbeat_interval = resp
+            .effective_heartbeat_interval()
+            .clamp(Duration::from_secs(5), Duration::from_secs(60));
         self.backoff.reset();
         self.signaling = Some(sig);
         self.callbacks.emit_state(V2SessionState::Online);
+        Ok(())
+    }
+
+    async fn send_signaling_heartbeat(&mut self) -> Result<(), ClientError> {
+        let hb = HeartbeatMsg {
+            device_id: self.identity.device_id(),
+            presence: PresenceState::Online,
+            client_unix: now_unix_secs(),
+            active_pop_id: self.config.edge_b.pop_id_bytes().ok(),
+            rtt_ms: 0,
+        };
+        if let Some(sig) = self.signaling.as_mut() {
+            if let Err(e) = sig.send_heartbeat(&hb).await {
+                self.callbacks.emit_security_event(SecurityEvent::SignalingDisconnected {
+                    reason: format!("heartbeat send failed: {e}"),
+                });
+                self.signaling = None;
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -586,7 +625,14 @@ impl DesktopHostDaemon {
 
             if self.signaling.is_none() {
                 let delay = self.backoff.next_delay();
-                tokio::time::sleep(delay).await;
+                let sleep_until = Instant::now().checked_add(delay).unwrap_or_else(Instant::now);
+                while Instant::now() < sleep_until {
+                    if stop_flag.load(Ordering::Acquire) {
+                        return Err(ManagerError::Stopped);
+                    }
+                    let rem = sleep_until.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(rem.min(Duration::from_millis(50))).await;
+                }
                 if stop_flag.load(Ordering::Acquire) {
                     return Err(ManagerError::Stopped);
                 }
@@ -600,21 +646,8 @@ impl DesktopHostDaemon {
             }
 
             if last_hb.elapsed() >= self.heartbeat_interval {
-                let hb = HeartbeatMsg {
-                    device_id: self.identity.device_id(),
-                    presence: PresenceState::Online,
-                    client_unix: now_unix_secs(),
-                    active_pop_id: self.config.edge_b.pop_id_bytes().ok(),
-                    rtt_ms: 0,
-                };
-                if let Some(sig) = self.signaling.as_mut() {
-                    if let Err(e) = sig.send_heartbeat(&hb).await {
-                        self.callbacks.emit_security_event(SecurityEvent::SignalingDisconnected {
-                            reason: format!("heartbeat send failed: {e}"),
-                        });
-                        self.signaling = None;
-                        continue;
-                    }
+                if self.send_signaling_heartbeat().await.is_err() {
+                    continue;
                 }
                 last_hb = Instant::now();
             }
@@ -675,17 +708,6 @@ impl DesktopHostDaemon {
         &mut self,
         offer: SignalingConnectOffer,
     ) -> Result<AcceptedHostSession, ManagerError> {
-        if !self.seen_sessions.mark_if_new(offer.session_id) {
-            self.callbacks.emit_security_event(SecurityEvent::ReplaySessionRejected {
-                session_id: offer.session_id,
-            });
-            self.send_reject(offer.session_id, 0x0401).await;
-            return Err(ManagerError::Rejected {
-                error_code: 0x0401,
-                reason: "duplicate session_id replay rejected".into(),
-            });
-        }
-
         let host_cert = self
             .identity
             .device_cert()
@@ -705,14 +727,23 @@ impl DesktopHostDaemon {
                 reason: "ConnectOffer missing controller_delegation".into(),
             });
         };
-        let Some(ticket_b) = offer.relay_ticket else {
+        let Some(offer_ticket_b) = offer.relay_ticket else {
             self.send_reject(offer.session_id, 0x0301).await;
             return Err(ManagerError::Rejected {
                 error_code: 0x0301,
                 reason: "ConnectOffer missing relay_ticket".into(),
             });
         };
+        if let Err(e) = offer_ticket_b.validate() {
+            self.send_reject(offer.session_id, 0x0301).await;
+            return Err(ManagerError::Rejected {
+                error_code: 0x0301,
+                reason: format!("invalid ConnectOffer relay_ticket: {e}"),
+            });
+        }
 
+        // Authenticate peer cert & delegation FIRST before touching the anti-replay cache
+        // so unauthenticated callers cannot pollute/evict valid seen session IDs.
         let now_unix = now_unix_secs();
         if let Err((code, reason)) = verify_peer_cert_and_delegation(
             &ctrl_cert,
@@ -728,6 +759,17 @@ impl DesktopHostDaemon {
             return Err(ManagerError::Rejected {
                 error_code: code,
                 reason,
+            });
+        }
+
+        if !self.seen_sessions.mark_if_new(offer.session_id) {
+            self.callbacks.emit_security_event(SecurityEvent::ReplaySessionRejected {
+                session_id: offer.session_id,
+            });
+            self.send_reject(offer.session_id, 0x0401).await;
+            return Err(ManagerError::Rejected {
+                error_code: 0x0401,
+                reason: "duplicate session_id replay rejected".into(),
             });
         }
 
@@ -750,6 +792,17 @@ impl DesktopHostDaemon {
                 reason: "ConnectOffer pop_b does not match local edge_b".into(),
             });
         }
+        let edge_a_cfg = match self.config.edge_for_pop(&peer_route.pop_a) {
+            Some(cfg) => cfg,
+            None => {
+                self.send_reject(offer.session_id, 0x0502).await;
+                return Err(ManagerError::Rejected {
+                    error_code: 0x0502,
+                    reason: "ConnectOffer pop_a is unknown in local edge config".into(),
+                });
+            }
+        };
+        let edge_a_hash = edge_a_cfg.edge_cert_hash()?;
 
         let negotiated_cap_bits = offer.controller_cap_bits & self.cap_bits;
         if (negotiated_cap_bits & (CAP_CODEC_VP9 | CAP_CODEC_AV1)) == 0 {
@@ -765,6 +818,8 @@ impl DesktopHostDaemon {
             (offer.proposed_l3_mtu as usize).clamp(512, L3_MTU_DEFAULT)
         };
 
+        // Keep signaling presence alive while awaiting user/UI incoming-call decision.
+        let _ = self.send_signaling_heartbeat().await;
         let incoming = IncomingCall {
             session_id: offer.session_id,
             controller_device_id: ctrl_cert.device_id,
@@ -773,11 +828,24 @@ impl DesktopHostDaemon {
             controller_cap_bits: offer.controller_cap_bits,
             peer_route: peer_route.clone(),
         };
-        match self
-            .callbacks
-            .ask_incoming_call(incoming, INCOMING_CALL_DECISION_TIMEOUT)
-            .await
-        {
+        let callbacks_clone = self.callbacks.clone();
+        let decision = {
+            let ask_fut = callbacks_clone
+                .ask_incoming_call(incoming, INCOMING_CALL_DECISION_TIMEOUT);
+            tokio::pin!(ask_fut);
+            let mut hb_tick = tokio::time::interval(self.heartbeat_interval);
+            hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            hb_tick.tick().await;
+            loop {
+                tokio::select! {
+                    dec = &mut ask_fut => break dec,
+                    _ = hb_tick.tick() => {
+                        let _ = self.send_signaling_heartbeat().await;
+                    }
+                }
+            }
+        };
+        match decision {
             CallDecision::Accept => {}
             CallDecision::Reject { error_code, reason } => {
                 self.send_reject(offer.session_id, error_code).await;
@@ -787,6 +855,24 @@ impl DesktopHostDaemon {
 
         self.callbacks.emit_state(V2SessionState::Handshaking);
         let (x25519_priv_host, host_deleg) = self.identity.ensure_delegation(now_unix_secs())?;
+
+        // Issue a Host-owned Edge B lease so Host can renew Edge B independently every <=15s
+        // over `ctrl_b` without ever colliding with Controller's Edge A session lease owner.
+        let host_lease_session_id = random_bytes::<16>();
+        let host_lease_b = self
+            .cp
+            .issue_lease(
+                self.identity.keystore(),
+                Some(&host_cert.tenant_id),
+                &host_lease_session_id,
+                &peer_route.cid_b,
+                &local_pop_b,
+                &host_cert.device_id,
+                &ctrl_cert.device_id,
+                1,
+            )
+            .await?;
+        let ticket_b = host_lease_b.to_relay_ticket()?;
 
         let edge_b_pub = self.config.edge_b.x25519_pub()?;
         let edge_b_hash = self.config.edge_b.edge_cert_hash()?;
@@ -808,8 +894,13 @@ impl DesktopHostDaemon {
             ));
         }
 
+        let effective_bw_cap_kbps = peer_route
+            .bw_cap_kbps
+            .min(host_lease_b.bw_cap_kbps.max(256))
+            .min(self.config.bw_cap_kbps)
+            .max(256);
         let mut udp_b =
-            UdpAccessLink::connect(&self.config.edge_b.udp_addr, &keys_b, peer_route.bw_cap_kbps)
+            UdpAccessLink::connect(&self.config.edge_b.udp_addr, &keys_b, effective_bw_cap_kbps)
                 .await?;
         let _ = udp_b.ping_with_retry(3, Duration::from_secs(1)).await?;
 
@@ -834,12 +925,6 @@ impl DesktopHostDaemon {
             ));
         }
 
-        let edge_a_hash = self
-            .config
-            .edge_for_pop(&peer_route.pop_a)
-            .map(|e| e.edge_cert_hash())
-            .transpose()?
-            .unwrap_or([0u8; 32]);
         let prologue_input = PrologueInput {
             ver_major_minor: VER_MAJOR_MINOR,
             handshake_pattern: PATTERN_IK,
@@ -854,7 +939,7 @@ impl DesktopHostDaemon {
             negotiated_cap_bits,
             session_id: offer.session_id,
         };
-        let policy = build_verified_policy_from_cert(&host_cert, peer_route.bw_cap_kbps);
+        let policy = build_verified_policy_from_cert(&host_cert, effective_bw_cap_kbps);
 
         let (e2ee_session, hs_out) = UdpE2eeSession::handshake_responder(
             udp_b,
@@ -877,6 +962,33 @@ impl DesktopHostDaemon {
             ));
         }
 
+        let pkcs8 = self
+            .identity
+            .keystore()
+            .to_pkcs8_der()
+            .map_err(IdentityStoreError::from)?;
+        let renew_ks: Arc<dyn DeviceKeyStore> = Arc::new(
+            SoftwareDeviceKeyStore::from_pkcs8_der(&pkcs8).map_err(IdentityStoreError::from)?,
+        );
+        let lease_renewal = LeaseRenewalTask::spawn(
+            LeaseRenewalConfig {
+                cp: self.cp.clone(),
+                keystore: renew_ks,
+                tenant_id: host_cert.tenant_id,
+                session_id: host_lease_session_id,
+                controller_device_id: host_cert.device_id,
+                controlled_device_id: ctrl_cert.device_id,
+                key_id: 1,
+                renew_interval: Duration::from_secs(self.config.lease_renew_interval_sec),
+            },
+            vec![LeaseRenewalLeg {
+                tunnel: ctrl_b,
+                route_cid: peer_route.cid_b,
+                pop_id: local_pop_b,
+                lease_seq: host_lease_b.lease_seq,
+            }],
+        )?;
+
         self.callbacks.emit_capabilities(policy.clone());
         self.callbacks.emit_state(V2SessionState::Streaming);
 
@@ -885,7 +997,7 @@ impl DesktopHostDaemon {
             peer_device_id: ctrl_cert.device_id,
             tenant_id: host_cert.tenant_id,
             e2ee_session,
-            ctrl_tunnel_b: ctrl_b,
+            lease_renewal,
             hs_hash: *hs_out.hs_hash,
             policy,
             peer_route,
@@ -923,6 +1035,7 @@ pub struct DesktopControllerClient {
     callbacks: UiCallbackDispatcher,
     delegation_cache: DelegationCache,
     signaling: Option<SignalingSession>,
+    heartbeat_interval: Duration,
 }
 
 impl DesktopControllerClient {
@@ -962,7 +1075,7 @@ impl DesktopControllerClient {
             ver_minor: u32::from(VER_MINOR),
             pop_sig: Vec::new(),
         };
-        let (sig, _resp) = SignalingSession::connect_and_register(
+        let (sig, resp) = SignalingSession::connect_and_register(
             &config.signaling_addr,
             &reg_req,
             identity.keystore(),
@@ -971,6 +1084,9 @@ impl DesktopControllerClient {
             Duration::from_secs(10),
         )
         .await?;
+        let heartbeat_interval = resp
+            .effective_heartbeat_interval()
+            .clamp(Duration::from_secs(5), Duration::from_secs(60));
         callbacks.emit_state(V2SessionState::Online);
 
         Ok(Self {
@@ -982,6 +1098,7 @@ impl DesktopControllerClient {
             callbacks,
             delegation_cache: DelegationCache::new(),
             signaling: Some(sig),
+            heartbeat_interval,
         })
     }
 
@@ -1043,23 +1160,25 @@ impl DesktopControllerClient {
                 1,
             )
             .await?;
-        let lease_b = self
+        // Issue the offer's Edge B ticket on an independent offer session_id so Controller's
+        // Edge A `session_id` remains locked to `pop_a`/`cid_a` (lease_seq=1) while Host issues
+        // and renews its own Edge B lease leg independently.
+        let offer_b_session_id = random_bytes::<16>();
+        let lease_b_offer = self
             .cp
-            .renew_lease(
+            .issue_lease(
                 self.identity.keystore(),
                 Some(&ctrl_cert.tenant_id),
-                &session_id,
+                &offer_b_session_id,
                 &cid_b,
                 &pop_b,
                 &ctrl_cert.device_id,
                 &target_device_id,
-                lease_a.lease_seq,
-                0,
                 1,
             )
             .await?;
         let ticket_a = lease_a.to_relay_ticket()?;
-        let ticket_b = lease_b.to_relay_ticket()?;
+        let ticket_b = lease_b_offer.to_relay_ticket()?;
 
         let edge_a_pub = self.config.edge_a.x25519_pub()?;
         let edge_a_hash = self.config.edge_a.edge_cert_hash()?;
@@ -1079,8 +1198,12 @@ impl DesktopControllerClient {
             ));
         }
 
+        let effective_bw_cap_kbps = lease_a
+            .bw_cap_kbps
+            .min(self.config.bw_cap_kbps)
+            .max(256);
         let mut udp_a =
-            UdpAccessLink::connect(&self.config.edge_a.udp_addr, &keys_a, lease_a.bw_cap_kbps)
+            UdpAccessLink::connect(&self.config.edge_a.udp_addr, &keys_a, effective_bw_cap_kbps)
                 .await?;
         let _ = udp_a.ping_with_retry(3, Duration::from_secs(1)).await?;
 
@@ -1089,7 +1212,7 @@ impl DesktopControllerClient {
             cid_a,
             pop_b,
             cid_b,
-            bw_cap_kbps: lease_b.bw_cap_kbps.max(256),
+            bw_cap_kbps: effective_bw_cap_kbps,
         };
         let connect_req = SignalingConnectReq {
             session_id,
@@ -1105,22 +1228,77 @@ impl DesktopControllerClient {
             ice_candidates: vec![peer_route.encode()?],
         };
 
-        let sig = self
-            .signaling
-            .as_mut()
-            .ok_or_else(|| ManagerError::Protocol("controller signaling session not connected".into()))?;
-        sig.send_connect_req(&connect_req).await?;
+        if let Some(sig) = self.signaling.as_mut() {
+            if let Err(e) = sig.send_connect_req(&connect_req).await {
+                self.signaling = None;
+                return Err(e.into());
+            }
+        } else {
+            return Err(ManagerError::Protocol(
+                "controller signaling session not connected".into(),
+            ));
+        }
 
-        let deadline = Instant::now() + connect_timeout;
+        let deadline = Instant::now().checked_add(connect_timeout).ok_or_else(|| {
+            ManagerError::Protocol("connect_timeout overflows monotonic clock".into())
+        })?;
+        let mut last_hb = Instant::now();
         let accept = loop {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("timed out awaiting ConnectAccept".into()).into());
             };
-            let (kind, payload) = sig.recv_frame(rem).await?;
+            if last_hb.elapsed() >= self.heartbeat_interval {
+                let hb = HeartbeatMsg {
+                    device_id: ctrl_cert.device_id,
+                    presence: PresenceState::Online,
+                    client_unix: now_unix_secs(),
+                    active_pop_id: Some(pop_a),
+                    rtt_ms: 0,
+                };
+                let Some(sig) = self.signaling.as_mut() else {
+                    return Err(ManagerError::Protocol(
+                        "controller signaling session disconnected while dialing".into(),
+                    ));
+                };
+                if let Err(e) = sig.send_heartbeat(&hb).await {
+                    self.signaling = None;
+                    return Err(e.into());
+                }
+                last_hb = Instant::now();
+            }
+            let until_hb = self
+                .heartbeat_interval
+                .saturating_sub(last_hb.elapsed())
+                .max(Duration::from_millis(1));
+            let slice = rem.min(until_hb);
+            let recv_res = {
+                let Some(sig) = self.signaling.as_mut() else {
+                    return Err(ManagerError::Protocol(
+                        "controller signaling session disconnected while dialing".into(),
+                    ));
+                };
+                sig.recv_frame(slice).await
+            };
+            let (kind, payload) = match recv_res {
+                Ok(frame) => frame,
+                Err(ClientError::Timeout(_)) => continue,
+                Err(e) => {
+                    self.signaling = None;
+                    return Err(e.into());
+                }
+            };
             if kind != SignalingMsgKind::ConnectAccept {
                 continue;
             }
-            let acc = SignalingConnectAccept::decode_pb(&payload)?;
+            let acc = match SignalingConnectAccept::decode_pb(&payload) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.callbacks.emit_security_event(SecurityEvent::CertRejected {
+                        reason: format!("malformed ConnectAccept ignored: {e}"),
+                    });
+                    continue;
+                }
+            };
             if acc.session_id != session_id {
                 continue;
             }
@@ -1135,6 +1313,12 @@ impl DesktopControllerClient {
                     accept.error_code
                 ),
             });
+        }
+        if accept.negotiated_cipher_suite != u32::from(CIPHER_AESGCM) {
+            return Err(ManagerError::Protocol(format!(
+                "unsupported negotiated_cipher_suite={} (expected {CIPHER_AESGCM})",
+                accept.negotiated_cipher_suite
+            )));
         }
         let host_cert = accept.controlled_cert.ok_or_else(|| {
             ManagerError::Protocol("ConnectAccept missing controlled_cert".into())
@@ -1189,7 +1373,7 @@ impl DesktopControllerClient {
             negotiated_cap_bits,
             session_id,
         };
-        let policy = build_verified_policy_from_cert(&host_cert, peer_route.bw_cap_kbps);
+        let policy = build_verified_policy_from_cert(&host_cert, effective_bw_cap_kbps);
 
         let (e2ee_session, hs_out) = UdpE2eeSession::handshake_initiator(
             udp_a,
@@ -1221,11 +1405,10 @@ impl DesktopControllerClient {
             LeaseRenewalConfig {
                 cp: self.cp.clone(),
                 keystore: renew_ks,
-                tenant_id: Some(ctrl_cert.tenant_id),
+                tenant_id: ctrl_cert.tenant_id,
                 session_id,
                 controller_device_id: ctrl_cert.device_id,
                 controlled_device_id: host_cert.device_id,
-                initial_lease_seq: lease_b.lease_seq,
                 key_id: 1,
                 renew_interval: Duration::from_secs(self.config.lease_renew_interval_sec),
             },
@@ -1233,6 +1416,7 @@ impl DesktopControllerClient {
                 tunnel: ctrl_a,
                 route_cid: cid_a,
                 pop_id: pop_a,
+                lease_seq: lease_a.lease_seq,
             }],
         )?;
 
@@ -1473,8 +1657,24 @@ mod tests {
         );
         assert_eq!(wrong_dev.unwrap_err().0, 0x0201);
 
-        // Cross-tenant MUST fail closed with 0x0401
-        let xt = verify_peer_cert_and_delegation(
+        // Forged CA signature with cross-tenant tenant_id MUST fail with 0x0201 FIRST (no tenant oracle!)
+        let mut forged_cross = cert_b_cross.clone();
+        forged_cross.ca_sig[0] ^= 0xFF;
+        let forged_err = verify_peer_cert_and_delegation(
+            &forged_cross,
+            &d2,
+            &cert_a,
+            Some([0xBB; 16]),
+            &ca_spki,
+            &mut cache,
+            now,
+            &disp,
+        )
+        .unwrap_err();
+        assert_eq!(forged_err.0, 0x0201);
+
+        // Cross-tenant MUST fail closed with 0x0401 and MUST NOT leak local tenant_id in reason
+        let (xt_code, xt_reason) = verify_peer_cert_and_delegation(
             &cert_b_cross,
             &d2,
             &cert_a,
@@ -1483,8 +1683,20 @@ mod tests {
             &mut cache,
             now,
             &disp,
-        );
-        assert_eq!(xt.unwrap_err().0, 0x0401);
+        )
+        .unwrap_err();
+        assert_eq!(xt_code, 0x0401);
+        assert!(!xt_reason.contains(&hex::encode(cert_a.tenant_id)));
+        assert!(!xt_reason.contains(&hex::encode(cert_b_cross.tenant_id)));
+
+        // Phase 4A baseline policy MUST be fail-closed for all non-Video/HID channels
+        let pol = build_verified_policy_from_cert(&cert_a, 10_000);
+        assert!(!pol.allow_file_transfer);
+        assert!(!pol.allow_clipboard);
+        assert!(!pol.allow_file_clipboard);
+        assert!(!pol.allow_tcp_tunnel);
+        assert!(!pol.allow_terminal);
+        assert!(!pol.allow_realtime_actuator);
 
         // Dispatcher delivers security events & call decision asynchronously
         let decision = disp
@@ -1513,6 +1725,59 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| matches!(e, SecurityEvent::TenantMismatch { .. })));
+    }
+
+    #[tokio::test]
+    async fn ui_callback_dispatcher_separates_droppable_frames_from_reliable_control_events() {
+        let cb = Arc::new(RecordingCallback::new(true));
+        let disp = UiCallbackDispatcher::spawn(Arc::clone(&cb) as Arc<dyn V2UiCallback>);
+        let frame = Arc::new(
+            crate::v2_session::video::I420Frame::new(
+                32,
+                32,
+                vec![16; 32 * 32],
+                vec![128; 16 * 16],
+                vec![128; 16 * 16],
+            )
+            .unwrap(),
+        );
+        // Flood video frame channel far beyond UI_FRAME_CHANNEL_CAP (4)
+        for _ in 0..200 {
+            disp.emit_frame(Arc::clone(&frame));
+        }
+        // Reliable control events MUST still be delivered without loss!
+        disp.emit_state(V2SessionState::Streaming);
+        disp.emit_security_event(SecurityEvent::WatchdogTriggered);
+        disp.emit_state(V2SessionState::Closed(CloseReason::WatchdogTimeout));
+
+        // Wait briefly for dispatcher task to drain
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let has_closed = cb
+                .states
+                .lock()
+                .unwrap()
+                .contains(&V2SessionState::Closed(CloseReason::WatchdogTimeout));
+            let has_wd = cb
+                .security_events
+                .lock()
+                .unwrap()
+                .contains(&SecurityEvent::WatchdogTriggered);
+            if has_closed && has_wd {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(cb
+            .states
+            .lock()
+            .unwrap()
+            .contains(&V2SessionState::Closed(CloseReason::WatchdogTimeout)));
+        assert!(cb
+            .security_events
+            .lock()
+            .unwrap()
+            .contains(&SecurityEvent::WatchdogTriggered));
     }
 
     #[tokio::test]

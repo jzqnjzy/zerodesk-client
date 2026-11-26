@@ -3,6 +3,7 @@
 
 use super::{
     capture::SharedVisualMarker,
+    config::sync_parent_dir,
     hid::{
         HidBatchOutcome, HidPayload, KeyEvent, MouseEvent, MouseKind, HID_MOVEREL_COALESCE_MAX,
         MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT, MOUSE_BUTTONS_VALID_MASK,
@@ -18,6 +19,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        mpsc::{self, RecvTimeoutError},
         Arc, Mutex, TryLockError,
     },
     thread::{self, JoinHandle},
@@ -44,6 +46,10 @@ const _: () = assert!(HID_RELEASE_ALL_BACKOFF_MS.len() == HID_RELEASE_ALL_MAX_RE
 /// Normative `spec/04` §6.2.4 watchdog bounds (`1s <= watchdog_timeout <= 10s`).
 pub const HID_WATCHDOG_MIN_MS: u64 = 1_000;
 pub const HID_WATCHDOG_MAX_MS: u64 = 10_000;
+/// Floor for `spawn_independent_release_watchdog` so deterministic tests can use short timeouts
+/// while production configs enforce `HID_WATCHDOG_MIN_MS` (`>= 1000ms`) in `V2ClientConfig::validate`.
+pub const HID_WATCHDOG_FLOOR_MS: u64 = 20;
+pub const WATCHDOG_JOIN_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 static AUDIT_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -712,7 +718,9 @@ pub struct AtomicHeldState {
     pressed_buttons: AtomicU8,
     pressed_keys: Mutex<BTreeSet<SafeHidKey>>,
     input_faulted: AtomicBool,
-    releasing_or_closed: AtomicBool,
+    releasing: AtomicBool,
+    closed: AtomicBool,
+    release_generation: AtomicU64,
     last_activity_mono_ms: AtomicU64,
     monotonic_origin: Instant,
     watchdog_release_count: AtomicU64,
@@ -730,7 +738,9 @@ impl AtomicHeldState {
             pressed_buttons: AtomicU8::new(0),
             pressed_keys: Mutex::new(BTreeSet::new()),
             input_faulted: AtomicBool::new(false),
-            releasing_or_closed: AtomicBool::new(false),
+            releasing: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            release_generation: AtomicU64::new(0),
             last_activity_mono_ms: AtomicU64::new(0),
             monotonic_origin: Instant::now(),
             watchdog_release_count: AtomicU64::new(0),
@@ -823,25 +833,47 @@ impl AtomicHeldState {
 
     pub fn latch_faulted(&self) {
         self.input_faulted.store(true, Ordering::Release);
-        self.releasing_or_closed.store(true, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
     }
 
     pub fn reset_fault(&self) {
         self.input_faulted.store(false, Ordering::Release);
-        self.releasing_or_closed.store(false, Ordering::Release);
+        self.releasing.store(false, Ordering::Release);
+        self.closed.store(false, Ordering::Release);
+    }
+
+    pub fn is_releasing(&self) -> bool {
+        self.releasing.load(Ordering::Acquire)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     pub fn is_releasing_or_closed(&self) -> bool {
-        self.releasing_or_closed.load(Ordering::Acquire)
+        self.releasing.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire)
     }
 
     pub fn is_faulted_or_releasing(&self) -> bool {
-        self.input_faulted.load(Ordering::Acquire)
-            || self.releasing_or_closed.load(Ordering::Acquire)
+        self.input_faulted.load(Ordering::Acquire) || self.is_releasing_or_closed()
     }
 
-    pub fn set_releasing_or_closed(&self, val: bool) {
-        self.releasing_or_closed.store(val, Ordering::Release);
+    pub fn set_releasing(&self, val: bool) {
+        self.releasing.store(val, Ordering::Release);
+    }
+
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub fn release_generation(&self) -> u64 {
+        self.release_generation.load(Ordering::Acquire)
+    }
+
+    pub fn bump_release_generation(&self) -> u64 {
+        self.release_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 
     pub fn touch_activity(&self) {
@@ -1105,6 +1137,14 @@ impl<S: HidInputSink> HidInputExecutor<S> {
         self.max_received_client_ts_ms
     }
 
+    /// Permanently latches this executor as closed BEFORE releasing held keys during teardown,
+    /// ensuring no concurrent/in-flight input can re-press a key or button after release.
+    pub fn latch_closed(&mut self) {
+        self.terminated = true;
+        self.pending_move_rel = None;
+        self.held_state.mark_closed();
+    }
+
     /// Explicit operator reset after hardware/driver recovery from an `input_faulted` latch.
     pub fn reset_input_fault(&mut self) {
         self.held_state.reset_fault();
@@ -1246,8 +1286,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
     }
 
     fn fail_sink(&mut self, err: InputSinkError) -> InputError {
-        self.terminated = true;
-        self.pending_move_rel = None;
+        self.latch_closed();
         let summary = self.release_all("sink_failed");
         if summary.input_faulted {
             InputError::InputFaulted
@@ -1338,7 +1377,8 @@ impl<S: HidInputSink> HidInputExecutor<S> {
         let mut total_released_buttons = 0u8;
         let mut total_released_keys: BTreeSet<SafeHidKey> = BTreeSet::new();
 
-        self.held_state.set_releasing_or_closed(true);
+        self.held_state.set_releasing(true);
+        self.held_state.bump_release_generation();
 
         let mut cur = self.release_all_single_pass(reason);
         total_released_buttons |= cur.released_buttons;
@@ -1370,12 +1410,13 @@ impl<S: HidInputSink> HidInputExecutor<S> {
             self.held_state.latch_faulted();
             self.terminated = true;
             eprintln!(
-                "[hid] FATAL: input_faulted latched after {retries_executed} retries (residual buttons={:#04x}, keys={:?}); emit 0x04 SESSION_CLOSE(0x0103)",
-                cur.failed_buttons, cur.failed_keys
+                "[hid] FATAL: input_faulted latched after {retries_executed} retries (residual buttons={:#04x}, key_count={}); emit 0x04 SESSION_CLOSE(0x0103)",
+                cur.failed_buttons,
+                cur.failed_keys.len()
             );
-        } else if !self.terminated {
-            self.held_state.set_releasing_or_closed(false);
         }
+        // Always clear `releasing` (NEVER clears `closed`!).
+        self.held_state.set_releasing(false);
 
         let released_keys: Vec<SafeHidKey> = initial_keys
             .iter()
@@ -1409,7 +1450,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
         if self.held_state.is_faulted() {
             return Err(InputError::InputFaulted);
         }
-        if self.terminated {
+        if self.terminated || self.held_state.is_releasing_or_closed() {
             return Err(InputError::SessionTerminated);
         }
         if events.len() > MAX_HID_BATCH_SIZE {
@@ -1438,7 +1479,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
         if self.held_state.is_faulted() {
             return Err(InputError::InputFaulted);
         }
-        if self.terminated {
+        if self.terminated || self.held_state.is_releasing_or_closed() {
             return Err(InputError::SessionTerminated);
         }
         if let Err(e) = self.sink.preflight_batch() {
@@ -1595,6 +1636,10 @@ impl<S: HidInputSink> HidInputExecutor<S> {
 
     fn apply_mouse_move_rel(&mut self, seq: u32, ev: MouseEvent) -> Result<bool, InputError> {
         let ts_ms = now_epoch_ms();
+        if ev.buttons & !MOUSE_BUTTONS_VALID_MASK != 0 {
+            self.record_invalid_button_drop(seq, ev.buttons);
+            return Ok(false);
+        }
         // Release-only directionality for non-Down events (spec/04 §6.1.1)
         self.release_cleared_buttons(seq, ev.buttons, ts_ms, false)?;
 
@@ -1652,6 +1697,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
         match ev.kind {
             MouseKind::MoveAbs => {
                 if !self.is_in_bounds(ev.x_or_dx, ev.y_or_dy) {
+                    self.release_cleared_buttons(seq, ev.buttons, ts_ms, false)?;
                     self.out_of_bounds_drops = self.out_of_bounds_drops.saturating_add(1);
                     self.push_audit(AuditRecord::Dropped {
                         seq,
@@ -1661,6 +1707,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
                     return Ok(false);
                 }
                 if is_late {
+                    self.release_cleared_buttons(seq, ev.buttons, ts_ms, false)?;
                     self.dropped_late = self.dropped_late.saturating_add(1);
                     out.dropped_stale_seqs.push(seq);
                     self.push_audit(AuditRecord::Dropped {
@@ -1671,6 +1718,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
                     return Ok(false);
                 }
                 if !self.rate_limiter.try_consume() {
+                    self.release_cleared_buttons(seq, ev.buttons, ts_ms, false)?;
                     self.rate_limited_drops = self.rate_limited_drops.saturating_add(1);
                     self.push_audit(AuditRecord::Dropped {
                         seq,
@@ -1748,14 +1796,25 @@ impl<S: HidInputSink> HidInputExecutor<S> {
                 for bit_idx in 0..5u8 {
                     let bit = 1u8 << bit_idx;
                     if ev.buttons & bit != 0 && (self.pressed_buttons & bit) == 0 {
-                        // Race closure with independent watchdog: record bit BEFORE sink call,
-                        // then re-check fault/releasing flag AFTER sink call.
+                        // Race closure with independent watchdog: capture release_generation and
+                        // verify not releasing/closed BEFORE pressing, record bit BEFORE sink call,
+                        // and re-check both generation and releasing/closed AFTER sink call.
+                        let gen_before = self.held_state.release_generation();
+                        if self.held_state.is_faulted_or_releasing() {
+                            return Err(if self.held_state.is_faulted() {
+                                InputError::InputFaulted
+                            } else {
+                                InputError::SessionTerminated
+                            });
+                        }
                         self.held_state.record_button_down(bit);
                         if let Err(e) = self.sink.mouse_down(bit) {
                             self.held_state.clear_button(bit);
                             return Err(self.fail_sink(e));
                         }
-                        if self.held_state.is_faulted_or_releasing() {
+                        if self.held_state.release_generation() != gen_before
+                            || self.held_state.is_faulted_or_releasing()
+                        {
                             let _ = self.sink.mouse_up(bit);
                             self.held_state.clear_button(bit);
                             return Err(if self.held_state.is_faulted() {
@@ -1796,9 +1855,17 @@ impl<S: HidInputSink> HidInputExecutor<S> {
                         if let Err(e) = self.sink.move_abs(ev.x_or_dx, ev.y_or_dy) {
                             return Err(self.fail_sink(e));
                         }
+                        self.cur_x = ev.x_or_dx;
+                        self.cur_y = ev.y_or_dy;
+                        self.update_visual_marker(self.cur_x, self.cur_y);
+                        self.executed_events = self.executed_events.saturating_add(1);
+                        self.push_audit(AuditRecord::MouseMoveAbs {
+                            seq,
+                            x: self.cur_x,
+                            y: self.cur_y,
+                            ts_ms,
+                        });
                     }
-                    self.cur_x = ev.x_or_dx;
-                    self.cur_y = ev.y_or_dy;
                     self.last_up_coords_applied = Some(true);
                     self.advance_high_water_mark(ev.client_ts_ms);
                 } else {
@@ -1813,6 +1880,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
             MouseKind::Wheel => {
                 // Wheel ignores x_or_dx / y_or_dy (no OOB check per spec/04 §6.1.1).
                 if is_late {
+                    self.release_cleared_buttons(seq, ev.buttons, ts_ms, false)?;
                     self.dropped_late = self.dropped_late.saturating_add(1);
                     out.dropped_stale_seqs.push(seq);
                     self.push_audit(AuditRecord::Dropped {
@@ -1823,6 +1891,7 @@ impl<S: HidInputSink> HidInputExecutor<S> {
                     return Ok(false);
                 }
                 if !self.rate_limiter.try_consume() {
+                    self.release_cleared_buttons(seq, ev.buttons, ts_ms, false)?;
                     self.rate_limited_drops = self.rate_limited_drops.saturating_add(1);
                     self.push_audit(AuditRecord::Dropped {
                         seq,
@@ -1900,14 +1969,25 @@ impl<S: HidInputSink> HidInputExecutor<S> {
                     });
                     return Ok(false);
                 }
-                // Race closure: record key in AtomicHeldState BEFORE calling sink.key_down,
-                // then re-check fault/releasing flag AFTER sink.key_down.
+                // Race closure: capture release_generation and check releasing/closed BEFORE
+                // calling sink.key_down, record key in AtomicHeldState BEFORE sink call, and
+                // re-check both generation and releasing/closed AFTER sink.key_down.
+                let gen_before = self.held_state.release_generation();
+                if self.held_state.is_faulted_or_releasing() {
+                    return Err(if self.held_state.is_faulted() {
+                        InputError::InputFaulted
+                    } else {
+                        InputError::SessionTerminated
+                    });
+                }
                 self.held_state.record_key_down(key);
                 if let Err(e) = self.sink.key_down(key) {
                     self.held_state.clear_key(key);
                     return Err(self.fail_sink(e));
                 }
-                if self.held_state.is_faulted_or_releasing() {
+                if self.held_state.release_generation() != gen_before
+                    || self.held_state.is_faulted_or_releasing()
+                {
                     let _ = self.sink.key_up(key);
                     self.held_state.clear_key(key);
                     return Err(if self.held_state.is_faulted() {
@@ -1986,21 +2066,16 @@ where
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
-        #[cfg(target_os = "macos")]
-        const O_NOFOLLOW_FLAG: i32 = 0x0100;
-        #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-        const O_NOFOLLOW_FLAG: i32 = 0o100000;
-        #[cfg(all(
-            target_os = "linux",
-            not(any(target_arch = "aarch64", target_arch = "arm"))
-        ))]
-        const O_NOFOLLOW_FLAG: i32 = 0o400000;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        opts.custom_flags(O_NOFOLLOW_FLAG);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
 
     let write_result = (|| -> std::io::Result<()> {
         let file = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         let mut writer = BufWriter::new(file);
         for rec in records {
             let line = serde_json::to_string(rec).map_err(std::io::Error::other)?;
@@ -2009,7 +2084,9 @@ where
         }
         let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
+        drop(file);
         fs::rename(&tmp_path, path)?;
+        sync_parent_dir(path)?;
         Ok(())
     })();
 
@@ -2027,31 +2104,54 @@ impl<S: HidInputSink> Drop for HidInputExecutor<S> {
     }
 }
 
+struct WatchdogDoneGuard(mpsc::SyncSender<()>);
+
+impl Drop for WatchdogDoneGuard {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
+}
+
 /// RAII handle for the independent HID release watchdog thread.
-/// Dropping this handle signals shutdown and joins the watchdog thread.
+/// Joining is always bounded so a deadlocked OS HID sink can never hang teardown.
 pub struct WatchdogHandle {
     stop: Arc<AtomicBool>,
     join_handle: Option<JoinHandle<()>>,
+    done_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl WatchdogHandle {
-    pub fn stop_and_join(&mut self) -> Result<(), InputError> {
+    pub fn stop_and_join_timeout(&mut self, timeout: Duration) -> Result<(), InputError> {
         self.stop.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            handle
-                .join()
-                .map_err(|_| InputError::SinkFailed("zd-v2-hid-watchdog thread panicked".into()))?;
+        let Some(handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+        if let Some(done_rx) = self.done_rx.take() {
+            match done_rx.recv_timeout(timeout) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    // Detach stalled watchdog thread rather than deadlocking teardown.
+                    drop(handle);
+                    return Err(InputError::SinkFailed(format!(
+                        "zd-v2-hid-watchdog did not exit within {timeout:?}"
+                    )));
+                }
+            }
         }
+        handle
+            .join()
+            .map_err(|_| InputError::SinkFailed("zd-v2-hid-watchdog thread panicked".into()))?;
         Ok(())
+    }
+
+    pub fn stop_and_join(&mut self) -> Result<(), InputError> {
+        self.stop_and_join_timeout(WATCHDOG_JOIN_TIMEOUT)
     }
 }
 
 impl Drop for WatchdogHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        let _ = self.stop_and_join_timeout(Duration::from_millis(200));
     }
 }
 
@@ -2061,14 +2161,24 @@ pub fn run_independent_release_all<S: HidInputSink, F: FnMut(Duration)>(
     held_state: &AtomicHeldState,
     release_sink: &mut S,
     reason: &str,
+    sleep_fn: F,
+) -> ReleaseAllSummary {
+    run_independent_release_all_with_stop(held_state, release_sink, reason, None, sleep_fn)
+}
+
+fn run_independent_release_all_with_stop<S: HidInputSink, F: FnMut(Duration)>(
+    held_state: &AtomicHeldState,
+    release_sink: &mut S,
+    reason: &str,
+    stop: Option<&AtomicBool>,
     mut sleep_fn: F,
 ) -> ReleaseAllSummary {
-    held_state.set_releasing_or_closed(true);
+    held_state.set_releasing(true);
+    held_state.bump_release_generation();
     let (initial_buttons, initial_keys) = held_state.snapshot();
     if initial_buttons == 0 && initial_keys.is_empty() {
-        if !held_state.is_faulted() {
-            held_state.set_releasing_or_closed(false);
-        }
+        // ONLY clear `releasing`, NEVER `closed`.
+        held_state.set_releasing(false);
         return ReleaseAllSummary {
             released_buttons: 0,
             released_keys: Vec::new(),
@@ -2109,6 +2219,9 @@ pub fn run_independent_release_all<S: HidInputSink, F: FnMut(Duration)>(
 
     if rem_buttons != 0 || !rem_keys.is_empty() {
         for &backoff_ms in &HID_RELEASE_ALL_BACKOFF_MS {
+            if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+                break;
+            }
             sleep_fn(Duration::from_millis(backoff_ms));
             retries_executed += 1;
             let (nb, nk) = run_pass(release_sink, rem_buttons, &rem_keys);
@@ -2125,11 +2238,12 @@ pub fn run_independent_release_all<S: HidInputSink, F: FnMut(Duration)>(
     if faulted {
         held_state.latch_faulted();
         eprintln!(
-            "[hid-watchdog] FATAL: independent release_all ({reason}) exhausted {retries_executed} retries; residual buttons={rem_buttons:#04x} keys={rem_keys:?}"
+            "[hid-watchdog] FATAL: independent release_all ({reason}) exhausted {retries_executed} retries; residual buttons={rem_buttons:#04x}, key_count={}",
+            rem_keys.len()
         );
-    } else {
-        held_state.set_releasing_or_closed(false);
     }
+    // Always clear ONLY `releasing`, NEVER `closed`!
+    held_state.set_releasing(false);
 
     let released_buttons = initial_buttons & !rem_buttons;
     let released_keys: Vec<SafeHidKey> = initial_keys
@@ -2153,6 +2267,10 @@ pub fn run_independent_release_all<S: HidInputSink, F: FnMut(Duration)>(
 /// Even if the executor thread is completely stalled inside an OS syscall, this watchdog still
 /// fires within `watchdog_timeout` and executes the bounded `[50, 100, 200, 400, 500]ms`
 /// isolated `release_all` loop.
+///
+/// `watchdog_timeout` is floored at `HID_WATCHDOG_FLOOR_MS` (20ms) for deterministic tests;
+/// production configurations enforce `HID_WATCHDOG_MIN_MS..=HID_WATCHDOG_MAX_MS` (`1000..=10000ms`)
+/// in `V2ClientConfig::validate()`.
 pub fn spawn_independent_release_watchdog<S: HidInputSink + 'static>(
     held_state: Arc<AtomicHeldState>,
     mut release_sink: S,
@@ -2160,41 +2278,55 @@ pub fn spawn_independent_release_watchdog<S: HidInputSink + 'static>(
     stop: Arc<AtomicBool>,
     audit_records: Option<Arc<Mutex<Vec<AuditRecord>>>>,
 ) -> std::io::Result<WatchdogHandle> {
+    let effective_timeout = watchdog_timeout.max(Duration::from_millis(HID_WATCHDOG_FLOOR_MS));
     let poll_interval =
-        (watchdog_timeout / 4).clamp(Duration::from_millis(5), Duration::from_millis(25));
+        (effective_timeout / 4).clamp(Duration::from_millis(5), Duration::from_millis(25));
     let thread_stop = Arc::clone(&stop);
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
 
     let join_handle = thread::Builder::new()
         .name("zd-v2-hid-indep-watchdog".to_string())
         .spawn(move || {
+            let _done_guard = WatchdogDoneGuard(done_tx);
             while !thread_stop.load(Ordering::Acquire) {
                 thread::sleep(poll_interval);
                 if thread_stop.load(Ordering::Acquire) {
                     break;
                 }
+                // Once `input_faulted` is latched, the session enters teardown which explicitly
+                // invokes a final `release_all` pass; avoid spin-retrying a permanently broken sink.
                 if !held_state.is_faulted()
                     && held_state.has_pressed_state()
-                    && held_state.elapsed_since_last_activity() >= watchdog_timeout
+                    && held_state.elapsed_since_last_activity() >= effective_timeout
                 {
-                    let summary = run_independent_release_all(
+                    let summary = run_independent_release_all_with_stop(
                         &held_state,
                         &mut release_sink,
                         "watchdog_timeout",
+                        Some(&thread_stop),
                         thread::sleep,
                     );
                     held_state.record_watchdog_release();
                     if let Some(audit) = &audit_records {
-                        let mut guard = audit
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        guard.push(AuditRecord::ReleaseAll {
-                            reason: "watchdog_timeout".into(),
-                            released_buttons: summary.released_buttons,
-                            released_keys: summary.released_keys,
-                            failed_buttons: summary.failed_buttons,
-                            failed_keys: summary.failed_keys,
-                            ts_ms: now_epoch_ms(),
-                        });
+                        let maybe_guard = match audit.try_lock() {
+                            Ok(g) => Some(g),
+                            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                            Err(TryLockError::WouldBlock) => None,
+                        };
+                        if let Some(mut guard) = maybe_guard {
+                            if guard.len() >= DEFAULT_AUDIT_LOG_CAP {
+                                let drain = guard.len() + 1 - DEFAULT_AUDIT_LOG_CAP;
+                                guard.drain(0..drain);
+                            }
+                            guard.push(AuditRecord::ReleaseAll {
+                                reason: "watchdog_timeout".into(),
+                                released_buttons: summary.released_buttons,
+                                released_keys: summary.released_keys,
+                                failed_buttons: summary.failed_buttons,
+                                failed_keys: summary.failed_keys,
+                                ts_ms: now_epoch_ms(),
+                            });
+                        }
                     }
                 }
             }
@@ -2203,6 +2335,7 @@ pub fn spawn_independent_release_watchdog<S: HidInputSink + 'static>(
     Ok(WatchdogHandle {
         stop,
         join_handle: Some(join_handle),
+        done_rx: Some(done_rx),
     })
 }
 
@@ -2213,13 +2346,16 @@ pub fn spawn_release_watchdog<S: HidInputSink + 'static>(
     watchdog_timeout: Duration,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<WatchdogHandle> {
+    let effective_timeout = watchdog_timeout.max(Duration::from_millis(HID_WATCHDOG_FLOOR_MS));
     let poll_interval =
-        (watchdog_timeout / 4).clamp(Duration::from_millis(5), Duration::from_millis(25));
+        (effective_timeout / 4).clamp(Duration::from_millis(5), Duration::from_millis(25));
     let thread_stop = Arc::clone(&stop);
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
 
     let join_handle = thread::Builder::new()
         .name("zd-v2-hid-watchdog".to_string())
         .spawn(move || {
+            let _done_guard = WatchdogDoneGuard(done_tx);
             while !thread_stop.load(Ordering::Acquire) {
                 thread::sleep(poll_interval);
                 if thread_stop.load(Ordering::Acquire) {
@@ -2231,7 +2367,7 @@ pub fn spawn_release_watchdog<S: HidInputSink + 'static>(
                     Err(TryLockError::Poisoned(e)) => (e.into_inner(), true),
                 };
                 if !guard.is_faulted() && guard.has_pressed_state() {
-                    if guard.elapsed_since_last_activity() >= watchdog_timeout {
+                    if guard.elapsed_since_last_activity() >= effective_timeout {
                         let _ = guard.release_all("watchdog_timeout");
                     } else if was_poisoned {
                         let _ = guard.release_all("watchdog_poison_recovery");
@@ -2243,6 +2379,7 @@ pub fn spawn_release_watchdog<S: HidInputSink + 'static>(
     Ok(WatchdogHandle {
         stop,
         join_handle: Some(join_handle),
+        done_rx: Some(done_rx),
     })
 }
 
@@ -3745,5 +3882,257 @@ mod tests {
                 ..
             } if reason == "watchdog_poison_recovery" && released_keys == &vec![SafeHidKey::KeyA]
         )));
+    }
+
+    #[test]
+    fn atomic_held_state_separates_closed_from_releasing_and_generation_catches_race() {
+        // 1. run_independent_release_all clears `releasing` but NEVER clears `closed`
+        let state = AtomicHeldState::new();
+        state.record_button_down(MOUSE_BUTTON_LEFT);
+        state.record_key_down(SafeHidKey::KeyA);
+        state.mark_closed();
+        assert!(state.is_closed());
+        assert!(state.is_releasing_or_closed());
+        let gen0 = state.release_generation();
+        let mut sink = DryRunSink::new();
+        let summary = run_independent_release_all(&state, &mut sink, "teardown", |_| {});
+        assert_eq!(summary.released_buttons, MOUSE_BUTTON_LEFT);
+        assert_eq!(summary.released_keys, vec![SafeHidKey::KeyA]);
+        assert!(!state.is_releasing());
+        assert!(state.is_closed());
+        assert!(state.is_releasing_or_closed());
+        assert!(state.release_generation() > gen0);
+
+        // 2. Stalled sink.key_down completing after concurrent release_generation bump issues
+        //    immediate compensating key_up and never leaves an untracked stuck key!
+        struct GenerationBumpingSink {
+            held_state: Arc<AtomicHeldState>,
+            ops: Vec<DryRunOp>,
+        }
+        impl HidInputSink for GenerationBumpingSink {
+            fn move_abs(&mut self, x: i32, y: i32) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::MoveAbs { x, y });
+                Ok(())
+            }
+            fn move_rel(&mut self, dx: i32, dy: i32) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::MoveRel { dx, dy });
+                Ok(())
+            }
+            fn mouse_down(&mut self, button_bit: u8) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::MouseDown { button_bit });
+                Ok(())
+            }
+            fn mouse_up(&mut self, button_bit: u8) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::MouseUp { button_bit });
+                Ok(())
+            }
+            fn wheel(&mut self, dx: i16, dy: i16) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::Wheel { dx, dy });
+                Ok(())
+            }
+            fn key_down(&mut self, key: SafeHidKey) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::KeyDown { key });
+                // Simulate watchdog completing a full release cycle while sink.key_down was stalled
+                self.held_state.bump_release_generation();
+                Ok(())
+            }
+            fn key_up(&mut self, key: SafeHidKey) -> Result<(), InputSinkError> {
+                self.ops.push(DryRunOp::KeyUp { key });
+                Ok(())
+            }
+            fn release_all_best_effort(
+                &mut self,
+                _pressed_buttons: u8,
+                _pressed_keys: &[SafeHidKey],
+            ) -> ReleaseAllResult {
+                ReleaseAllResult::default()
+            }
+        }
+
+        let dummy_state = Arc::new(AtomicHeldState::new());
+        let mut exec = HidInputExecutor::new(
+            GenerationBumpingSink {
+                held_state: dummy_state,
+                ops: Vec::new(),
+            },
+            640,
+            360,
+        )
+        .unwrap();
+        exec.sink.held_state = exec.held_state();
+
+        let res = exec.apply_v123_stream_batch(&[(
+            1,
+            HidPayload::Key(KeyEvent {
+                down: true,
+                modifiers: 0,
+                usb_hid_usage: SafeHidKey::KeyZ.usb_hid_usage(),
+                unicode_scalar: 0,
+                client_ts_ms: 1000,
+            }),
+        )]);
+        assert_eq!(res.unwrap_err(), InputError::SessionTerminated);
+        assert!(exec.sink().ops.contains(&DryRunOp::KeyUp {
+            key: SafeHidKey::KeyZ
+        }));
+        assert!(!exec.has_pressed_state());
+    }
+
+    #[test]
+    fn move_abs_and_wheel_drops_preserve_implicit_button_release_and_up_move_is_audited() {
+        let mut exec = HidInputExecutor::new(DryRunSink::new(), 640, 360).unwrap();
+        // Press LEFT at (100, 100)
+        exec.apply_v123_stream_batch(&[(
+            1,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::Down,
+                buttons: MOUSE_BUTTON_LEFT,
+                x_or_dx: 100,
+                y_or_dy: 100,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 1_000,
+            }),
+        )])
+        .unwrap();
+        assert_eq!(exec.pressed_buttons(), MOUSE_BUTTON_LEFT);
+
+        // OOB MoveAbs with buttons = 0 MUST still release LEFT even though MoveAbs is dropped!
+        exec.apply_v123_stream_batch(&[(
+            2,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::MoveAbs,
+                buttons: 0,
+                x_or_dx: 9999,
+                y_or_dy: 9999,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 1_010,
+            }),
+        )])
+        .unwrap();
+        assert_eq!(exec.pressed_buttons(), 0);
+
+        // Press RIGHT at (100, 100), then send late Wheel with buttons = 0 -> MUST release RIGHT!
+        exec.apply_v123_stream_batch(&[(
+            3,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::Down,
+                buttons: MOUSE_BUTTON_RIGHT,
+                x_or_dx: 100,
+                y_or_dy: 100,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 2_000,
+            }),
+        )])
+        .unwrap();
+        assert_eq!(exec.pressed_buttons(), MOUSE_BUTTON_RIGHT);
+        exec.apply_v123_stream_batch(&[(
+            4,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::Wheel,
+                buttons: 0,
+                x_or_dx: 0,
+                y_or_dy: 0,
+                wheel_dx: 0,
+                wheel_dy: 3,
+                client_ts_ms: 1_000, // >150ms stale
+            }),
+        )])
+        .unwrap();
+        assert_eq!(exec.pressed_buttons(), 0);
+
+        // MouseKind::Up at a new in-bounds coordinate MUST audit MouseMoveAbs + increment count
+        let before_count = exec.executed_events;
+        exec.apply_v123_stream_batch(&[(
+            5,
+            HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::Up,
+                buttons: 0,
+                x_or_dx: 222,
+                y_or_dy: 111,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: 2_010,
+            }),
+        )])
+        .unwrap();
+        assert_eq!(exec.cursor_position(), (222, 111));
+        assert!(exec.executed_events > before_count);
+        assert!(exec.audit_log().iter().any(|r| matches!(
+            r,
+            AuditRecord::MouseMoveAbs {
+                seq: 5,
+                x: 222,
+                y: 111,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn watchdog_stop_and_join_is_bounded_when_sink_stalls() {
+        struct StallingReleaseSink {
+            entered: Arc<AtomicBool>,
+        }
+        impl HidInputSink for StallingReleaseSink {
+            fn move_abs(&mut self, _x: i32, _y: i32) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn move_rel(&mut self, _dx: i32, _dy: i32) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn mouse_down(&mut self, _button_bit: u8) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn mouse_up(&mut self, _button_bit: u8) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn wheel(&mut self, _dx: i16, _dy: i16) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn key_down(&mut self, _key: SafeHidKey) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn key_up(&mut self, _key: SafeHidKey) -> Result<(), InputSinkError> {
+                Ok(())
+            }
+            fn release_all_best_effort(
+                &mut self,
+                _pressed_buttons: u8,
+                _pressed_keys: &[SafeHidKey],
+            ) -> ReleaseAllResult {
+                self.entered.store(true, Ordering::Release);
+                thread::sleep(Duration::from_secs(2));
+                ReleaseAllResult::default()
+            }
+        }
+
+        let state = Arc::new(AtomicHeldState::new());
+        state.record_key_down(SafeHidKey::KeyA);
+        let entered = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handle = spawn_independent_release_watchdog(
+            Arc::clone(&state),
+            StallingReleaseSink {
+                entered: Arc::clone(&entered),
+            },
+            Duration::from_millis(20),
+            stop,
+            None,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !entered.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(entered.load(Ordering::Acquire));
+
+        let t0 = Instant::now();
+        let res = handle.stop_and_join_timeout(Duration::from_millis(80));
+        assert!(res.is_err());
+        assert!(t0.elapsed() < Duration::from_millis(500));
     }
 }

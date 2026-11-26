@@ -2,14 +2,15 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 use super::config::{
-    ensure_dir_0700, verify_file_permissions_0600, write_file_atomic_0600, V2ConfigError,
-    DELEGATION_FILE_NAME, IDENTITY_FILE_NAME,
+    ensure_dir_0700, read_file_0600_to_string, write_file_atomic_0600, write_file_create_new_0600,
+    V2ConfigError, DELEGATION_FILE_NAME, IDENTITY_FILE_NAME,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt, fs,
+    fmt,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
 use v2_client::{
@@ -21,6 +22,88 @@ use v2_identity::{
 };
 
 const CERT_REFRESH_MARGIN_SECS: u64 = 300;
+const IDENTITY_LOCK_FILE_NAME: &str = ".lock";
+const PERSISTED_IDENTITY_VERSION: u32 = 1;
+
+/// Cross-process exclusive advisory lock (`flock(LOCK_EX)`) on `identity_dir/.lock` (0600,
+/// `O_NOFOLLOW`, `uid == geteuid()`). Never held across `.await`.
+struct IdentityDirLock {
+    #[cfg(unix)]
+    file: File,
+}
+
+impl IdentityDirLock {
+    fn acquire(identity_dir: &Path) -> Result<Self, IdentityStoreError> {
+        ensure_dir_0700(identity_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::{
+                fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+                io::AsRawFd,
+            };
+            let lock_path = identity_dir.join(IDENTITY_LOCK_FILE_NAME);
+            let mut opts = OpenOptions::new();
+            opts.read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW);
+            let file = opts.open(&lock_path).map_err(|e| {
+                IdentityStoreError::Storage(format!("open lock '{}': {e}", lock_path.display()))
+            })?;
+            let meta = file.metadata().map_err(|e| {
+                IdentityStoreError::Storage(format!("fstat lock '{}': {e}", lock_path.display()))
+            })?;
+            let expected_uid = unsafe { libc::geteuid() };
+            if !meta.is_file() || meta.uid() != expected_uid {
+                return Err(V2ConfigError::InsecurePermissions(format!(
+                    "lock file '{}' must be a regular file owned by uid {expected_uid}",
+                    lock_path.display()
+                ))
+                .into());
+            }
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    IdentityStoreError::Storage(format!(
+                        "fchmod 0600 lock '{}': {e}",
+                        lock_path.display()
+                    ))
+                })?;
+            loop {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if rc == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(IdentityStoreError::Storage(format!(
+                    "flock(LOCK_EX) '{}': {err}",
+                    lock_path.display()
+                )));
+            }
+            Ok(Self { file })
+        }
+        #[cfg(not(unix))]
+        {
+            // Phase 4A targets Unix (macOS/Linux); Windows cross-process LockFileEx enforcement
+            // is required before Windows production release.
+            let _ = (File::open, OpenOptions::new, IDENTITY_LOCK_FILE_NAME);
+            Ok(Self {})
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IdentityDirLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum IdentityStoreError {
@@ -63,7 +146,7 @@ impl From<ClientError> for IdentityStoreError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedIdentityFile {
     version: u32,
     device_id_hex: String,
@@ -72,6 +155,21 @@ struct PersistedIdentityFile {
     tenant_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_cert_pb_b64: Option<String>,
+}
+
+impl fmt::Debug for PersistedIdentityFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistedIdentityFile")
+            .field("version", &self.version)
+            .field("device_id_hex", &self.device_id_hex)
+            .field("p256_pkcs8_der_b64", &"<redacted>")
+            .field("tenant_id_hex", &self.tenant_id_hex)
+            .field(
+                "device_cert_pb_b64_present",
+                &self.device_cert_pb_b64.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Persistent ZeroDesk V2 device identity backed by atomic `0600` files in `identity_dir`:
@@ -87,70 +185,75 @@ pub struct PersistentV2Identity {
 }
 
 impl PersistentV2Identity {
-    /// Loads existing `identity_v2.json` + `delegation_v2.json` from `identity_dir` (refusing
-    /// overly permissive permissions on Unix), or creates and atomically persists a fresh identity.
+    fn load_locked(
+        identity_dir: &Path,
+        id_path: &Path,
+        deleg_path: &Path,
+    ) -> Result<Self, IdentityStoreError> {
+        let raw = read_file_0600_to_string(id_path)?;
+        let persisted: PersistedIdentityFile = serde_json::from_str(&raw).map_err(|e| {
+            IdentityStoreError::Storage(format!("parse '{}': {e}", id_path.display()))
+        })?;
+        if persisted.version != PERSISTED_IDENTITY_VERSION {
+            return Err(IdentityStoreError::Storage(format!(
+                "unsupported identity_v2.json version {} (expected {PERSISTED_IDENTITY_VERSION})",
+                persisted.version
+            )));
+        }
+        let device_id = decode_hex_array::<16>(&persisted.device_id_hex, "device_id_hex")?;
+        let pkcs8 = B64
+            .decode(&persisted.p256_pkcs8_der_b64)
+            .map_err(|e| IdentityStoreError::Storage(format!("decode p256_pkcs8_der: {e}")))?;
+        let keystore = SoftwareDeviceKeyStore::from_pkcs8_der(&pkcs8)?;
+        let tenant_id = match &persisted.tenant_id_hex {
+            Some(h) if !h.is_empty() => Some(decode_hex_array::<16>(h, "tenant_id_hex")?),
+            _ => None,
+        };
+        let device_cert = match &persisted.device_cert_pb_b64 {
+            Some(b64) if !b64.is_empty() => {
+                let pb = B64.decode(b64).map_err(|e| {
+                    IdentityStoreError::Storage(format!("decode device_cert_pb_b64: {e}"))
+                })?;
+                Some(SignalingDeviceCert::decode_pb(&pb)?)
+            }
+            _ => None,
+        };
+
+        let rotator = if deleg_path.exists() {
+            let deleg_raw = read_file_0600_to_string(deleg_path)?;
+            let state: RotatorPersistedState = serde_json::from_str(&deleg_raw).map_err(|e| {
+                IdentityStoreError::Storage(format!("parse '{}': {e}", deleg_path.display()))
+            })?;
+            if state.device_id != device_id {
+                return Err(IdentityStoreError::Storage(
+                    "delegation_v2.json device_id does not match identity_v2.json".into(),
+                ));
+            }
+            X25519StaticKeyRotator::from_persisted_state(state)
+        } else {
+            X25519StaticKeyRotator::new(device_id, false, 0)
+        };
+
+        Ok(Self {
+            identity_dir: identity_dir.to_path_buf(),
+            device_id,
+            tenant_id,
+            keystore,
+            device_cert,
+            rotator,
+        })
+    }
+
+    /// Loads existing `identity_v2.json` + `delegation_v2.json` from `identity_dir` under an
+    /// exclusive cross-process `flock` (refusing overly permissive permissions or mismatched UID
+    /// on Unix), or creates and atomically persists a fresh identity with `create_new`.
     pub fn load_or_create(identity_dir: &Path) -> Result<Self, IdentityStoreError> {
-        ensure_dir_0700(identity_dir)?;
+        let _lock = IdentityDirLock::acquire(identity_dir)?;
         let id_path = identity_dir.join(IDENTITY_FILE_NAME);
         let deleg_path = identity_dir.join(DELEGATION_FILE_NAME);
 
         if id_path.exists() {
-            verify_file_permissions_0600(&id_path)?;
-            let raw = fs::read_to_string(&id_path).map_err(|e| {
-                IdentityStoreError::Storage(format!("read '{}': {e}", id_path.display()))
-            })?;
-            let persisted: PersistedIdentityFile = serde_json::from_str(&raw).map_err(|e| {
-                IdentityStoreError::Storage(format!("parse '{}': {e}", id_path.display()))
-            })?;
-            let device_id = decode_hex_array::<16>(&persisted.device_id_hex, "device_id_hex")?;
-            let pkcs8 = B64
-                .decode(&persisted.p256_pkcs8_der_b64)
-                .map_err(|e| IdentityStoreError::Storage(format!("decode p256_pkcs8_der: {e}")))?;
-            let keystore = SoftwareDeviceKeyStore::from_pkcs8_der(&pkcs8)?;
-            let tenant_id = match &persisted.tenant_id_hex {
-                Some(h) if !h.is_empty() => Some(decode_hex_array::<16>(h, "tenant_id_hex")?),
-                _ => None,
-            };
-            let device_cert = match &persisted.device_cert_pb_b64 {
-                Some(b64) if !b64.is_empty() => {
-                    let pb = B64.decode(b64).map_err(|e| {
-                        IdentityStoreError::Storage(format!("decode device_cert_pb_b64: {e}"))
-                    })?;
-                    Some(SignalingDeviceCert::decode_pb(&pb)?)
-                }
-                _ => None,
-            };
-
-            let rotator = if deleg_path.exists() {
-                verify_file_permissions_0600(&deleg_path)?;
-                let deleg_raw = fs::read_to_string(&deleg_path).map_err(|e| {
-                    IdentityStoreError::Storage(format!("read '{}': {e}", deleg_path.display()))
-                })?;
-                let state: RotatorPersistedState =
-                    serde_json::from_str(&deleg_raw).map_err(|e| {
-                        IdentityStoreError::Storage(format!(
-                            "parse '{}': {e}",
-                            deleg_path.display()
-                        ))
-                    })?;
-                if state.device_id != device_id {
-                    return Err(IdentityStoreError::Storage(
-                        "delegation_v2.json device_id does not match identity_v2.json".into(),
-                    ));
-                }
-                X25519StaticKeyRotator::from_persisted_state(state)
-            } else {
-                X25519StaticKeyRotator::new(device_id, false, 0)
-            };
-
-            Ok(Self {
-                identity_dir: identity_dir.to_path_buf(),
-                device_id,
-                tenant_id,
-                keystore,
-                device_cert,
-                rotator,
-            })
+            Self::load_locked(identity_dir, &id_path, &deleg_path)
         } else {
             let mut device_id = [0u8; 16];
             OsRng.fill_bytes(&mut device_id);
@@ -164,8 +267,9 @@ impl PersistentV2Identity {
                 device_cert: None,
                 rotator,
             };
-            me.persist_identity()?;
-            me.persist_delegation()?;
+            let bytes = me.serialize_identity_bytes()?;
+            write_file_create_new_0600(&id_path, &bytes)?;
+            me.persist_delegation_locked()?;
             Ok(me)
         }
     }
@@ -194,26 +298,31 @@ impl PersistentV2Identity {
         Ok(self.keystore.public_key_spki_der()?)
     }
 
-    fn persist_identity(&self) -> Result<(), IdentityStoreError> {
+    fn serialize_identity_bytes(&self) -> Result<Vec<u8>, IdentityStoreError> {
         let pkcs8 = self.keystore.to_pkcs8_der()?;
         let cert_pb_b64 = self
             .device_cert
             .as_ref()
             .map(|c| B64.encode(c.encode_pb()));
         let file = PersistedIdentityFile {
-            version: 1,
+            version: PERSISTED_IDENTITY_VERSION,
             device_id_hex: hex::encode(self.device_id),
             p256_pkcs8_der_b64: B64.encode(pkcs8.as_slice()),
             tenant_id_hex: self.tenant_id.map(hex::encode),
             device_cert_pb_b64: cert_pb_b64,
         };
-        let bytes = serde_json::to_vec_pretty(&file)
-            .map_err(|e| IdentityStoreError::Storage(format!("serialize identity_v2.json: {e}")))?;
+        serde_json::to_vec_pretty(&file)
+            .map_err(|e| IdentityStoreError::Storage(format!("serialize identity_v2.json: {e}")))
+    }
+
+    fn persist_identity(&self) -> Result<(), IdentityStoreError> {
+        let _lock = IdentityDirLock::acquire(&self.identity_dir)?;
+        let bytes = self.serialize_identity_bytes()?;
         write_file_atomic_0600(&self.identity_dir.join(IDENTITY_FILE_NAME), &bytes)?;
         Ok(())
     }
 
-    fn persist_delegation(&self) -> Result<(), IdentityStoreError> {
+    fn persist_delegation_locked(&self) -> Result<(), IdentityStoreError> {
         let state = self.rotator.to_persisted_state();
         let bytes = serde_json::to_vec_pretty(&state)
             .map_err(|e| IdentityStoreError::Storage(format!("serialize delegation_v2.json: {e}")))?;
@@ -284,22 +393,45 @@ impl PersistentV2Identity {
     }
 
     /// Ensures a current 12-hour X25519 static key generation & signed `DelegationStatement`,
-    /// atomically persisting updated monotonic `delegation_seq` state (`0600`).
+    /// holding `identity_dir/.lock` while refreshing from disk and atomically persisting updated
+    /// monotonic `delegation_seq` state (`0600` + parent-dir fsync).
     pub fn ensure_delegation(
         &mut self,
         now_unix: u64,
     ) -> Result<([u8; 32], DelegationStatement), IdentityStoreError> {
-        let cert = self.device_cert.as_ref().ok_or_else(|| {
-            IdentityStoreError::EnrollmentRequired(
-                "cannot create X25519 delegation before DeviceCert registration".into(),
-            )
-        })?;
+        let cert_exp = self
+            .device_cert
+            .as_ref()
+            .ok_or_else(|| {
+                IdentityStoreError::EnrollmentRequired(
+                    "cannot create X25519 delegation before DeviceCert registration".into(),
+                )
+            })?
+            .exp_unix;
+        let _lock = IdentityDirLock::acquire(&self.identity_dir)?;
+        let deleg_path = self.identity_dir.join(DELEGATION_FILE_NAME);
+        if deleg_path.exists() {
+            let deleg_raw = read_file_0600_to_string(&deleg_path)?;
+            let disk_state: RotatorPersistedState =
+                serde_json::from_str(&deleg_raw).map_err(|e| {
+                    IdentityStoreError::Storage(format!("parse '{}': {e}", deleg_path.display()))
+                })?;
+            if disk_state.device_id != self.device_id {
+                return Err(IdentityStoreError::Storage(
+                    "delegation_v2.json device_id does not match identity_v2.json".into(),
+                ));
+            }
+            let local_state = self.rotator.to_persisted_state();
+            if disk_state.last_delegation_seq > local_state.last_delegation_seq {
+                self.rotator = X25519StaticKeyRotator::from_persisted_state(disk_state);
+            }
+        }
         let gen = self
             .rotator
-            .ensure_current(&self.keystore, now_unix, cert.exp_unix)?;
+            .ensure_current(&self.keystore, now_unix, cert_exp)?;
         let secret = *gen.secret_bytes();
         let deleg = gen.delegation.clone();
-        self.persist_delegation()?;
+        self.persist_delegation_locked()?;
         Ok((secret, deleg))
     }
 
@@ -372,6 +504,52 @@ mod tests {
             fs::set_permissions(&id_file, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(PersistentV2Identity::load_or_create(&dir).is_err());
             fs::set_permissions(&id_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_identity_debug_redacts_key_and_rejects_bad_version_and_concurrent_create() {
+        let f = PersistedIdentityFile {
+            version: 1,
+            device_id_hex: "00".repeat(16),
+            p256_pkcs8_der_b64: "SECRET_PKCS8_KEY_MATERIAL".into(),
+            tenant_id_hex: None,
+            device_cert_pb_b64: None,
+        };
+        let dbg = format!("{f:?}");
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("SECRET_PKCS8_KEY_MATERIAL"));
+
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zd-id-ver-{}-{uniq}", std::process::id()));
+        ensure_dir_0700(&dir).unwrap();
+
+        // Concurrent load_or_create under flock MUST converge on a single identical device_id
+        let d1 = dir.clone();
+        let d2 = dir.clone();
+        let t1 = std::thread::spawn(move || PersistentV2Identity::load_or_create(&d1).unwrap().device_id());
+        let t2 = std::thread::spawn(move || PersistentV2Identity::load_or_create(&d2).unwrap().device_id());
+        assert_eq!(t1.join().unwrap(), t2.join().unwrap());
+
+        // Unsupported version != 1 MUST be rejected
+        let id_path = dir.join(IDENTITY_FILE_NAME);
+        let raw = read_file_0600_to_string(&id_path).unwrap();
+        let mut parsed: PersistedIdentityFile = serde_json::from_str(&raw).unwrap();
+        parsed.version = 99;
+        write_file_atomic_0600(&id_path, &serde_json::to_vec(&parsed).unwrap()).unwrap();
+        assert!(PersistentV2Identity::load_or_create(&dir).is_err());
+
+        // Symlink read via read_file_0600_to_string MUST fail closed (O_NOFOLLOW)
+        #[cfg(unix)]
+        {
+            let link = dir.join("sym_id.json");
+            std::os::unix::fs::symlink(&id_path, &link).unwrap();
+            assert!(read_file_0600_to_string(&link).is_err());
         }
 
         let _ = fs::remove_dir_all(&dir);

@@ -19,10 +19,11 @@ pub use capture::{
     MIN_CAPTURE_DIM, ZERO_VARIANCE_WARN_THRESHOLD,
 };
 pub use config::{
-    ensure_dir_0700, verify_dir_permissions_0700, verify_file_permissions_0600,
-    write_file_atomic_0600, V2ClientConfig, V2ConfigError, DEFAULT_BW_CAP_KBPS, DEFAULT_FPS,
-    DEFAULT_KEEPALIVE_INTERVAL_MS, DEFAULT_LEASE_RENEW_INTERVAL_SEC, DEFAULT_WATCHDOG_TIMEOUT_MS,
-    DELEGATION_FILE_NAME, IDENTITY_FILE_NAME, MAX_LEASE_RENEW_INTERVAL_SEC,
+    ensure_dir_0700, read_file_0600_to_string, verify_dir_permissions_0700,
+    verify_file_permissions_0600, write_file_atomic_0600, V2ClientConfig, V2ConfigError,
+    DEFAULT_BW_CAP_KBPS, DEFAULT_FPS, DEFAULT_KEEPALIVE_INTERVAL_MS,
+    DEFAULT_LEASE_RENEW_INTERVAL_SEC, DEFAULT_WATCHDOG_TIMEOUT_MS, DELEGATION_FILE_NAME,
+    IDENTITY_FILE_NAME, MAX_LEASE_RENEW_INTERVAL_SEC,
 };
 pub use identity::{IdentityStoreError, PersistentV2Identity};
 pub use manager::{
@@ -33,9 +34,10 @@ pub use manager::{
 };
 pub use runtime::{
     ordered_session_teardown, send_redundant_session_close_3x, CloseReason, LeaseRenewalConfig,
-    LeaseRenewalLeg, LeaseRenewalTask, OrderedTeardownReport, QoeSnapshot,
-    LEASE_RENEW_MAX_CONSECUTIVE_FAILURES, LEASE_RENEW_SHUTDOWN_TIMEOUT,
-    SESSION_CLOSE_REDUNDANT_COUNT, SESSION_CLOSE_REDUNDANT_SPACING,
+    LeaseRenewalLeg, LeaseRenewalShutdown, LeaseRenewalTask, OrderedTeardownReport, QoeSnapshot,
+    CAPTURE_JOIN_TIMEOUT, LEASE_RENEW_CALL_TIMEOUT, LEASE_RENEW_MAX_CONSECUTIVE_FAILURES,
+    LEASE_RENEW_SHUTDOWN_TIMEOUT, MAX_LEASE_RENEW_INTERVAL, SESSION_CLOSE_REDUNDANT_COUNT,
+    SESSION_CLOSE_REDUNDANT_SPACING,
 };
 pub use hid::{
     coalesce_hid_batch, decode_hid_frame, decode_l4_hid_frame, encode_hid_frame,
@@ -56,8 +58,9 @@ pub use input::{
     HidInputExecutor, HidInputSink, InputError, InputSinkError, ReleaseAllResult,
     ReleaseAllSummary, SafeHidKey, WatchdogHandle, DEFAULT_AUDIT_LOG_CAP,
     DEFAULT_HID_RATE_LIMIT_PER_SEC, HID_RELEASE_ALL_BACKOFF_MS, HID_RELEASE_ALL_MAX_RETRIES,
-    HID_WATCHDOG_MAX_MS, HID_WATCHDOG_MIN_MS, MAX_HID_BATCH_SIZE, MOUSE_BUTTON_BACK,
-    MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT,
+    HID_WATCHDOG_FLOOR_MS, HID_WATCHDOG_MAX_MS, HID_WATCHDOG_MIN_MS, MAX_HID_BATCH_SIZE,
+    MOUSE_BUTTON_BACK, MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE,
+    MOUSE_BUTTON_RIGHT, WATCHDOG_JOIN_TIMEOUT,
 };
 pub use session::{
     parse_request_idr, parse_session_close, DecodedVideoDelivery, DesktopControllerSession,

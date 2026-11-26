@@ -7,13 +7,13 @@ use super::{
 };
 use std::{
     fmt,
-    fs::{self, DirBuilder, OpenOptions},
-    io::Write,
+    fs::{self, DirBuilder, File, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use v2_client::{resolve_signaling_tls, ClusterConfig, EdgeEndpointConfig};
+use v2_client::{is_loopback_host, resolve_signaling_tls, ClusterConfig, EdgeEndpointConfig};
 
 pub const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 3_000;
 pub const DEFAULT_KEEPALIVE_INTERVAL_MS: u64 = 500;
@@ -49,7 +49,7 @@ impl fmt::Display for V2ConfigError {
 impl std::error::Error for V2ConfigError {}
 
 /// Production ZeroDesk V2 client configuration shared by Host Daemon and Controller Client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct V2ClientConfig {
     pub control_plane_endpoint: String,
     pub signaling_addr: String,
@@ -70,6 +70,89 @@ pub struct V2ClientConfig {
     pub keepalive_interval_ms: u64,
     pub lease_renew_interval_sec: u64,
     pub bw_cap_kbps: u32,
+}
+
+impl fmt::Debug for V2ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V2ClientConfig")
+            .field("control_plane_endpoint", &self.control_plane_endpoint)
+            .field("signaling_addr", &self.signaling_addr)
+            .field("signaling_tls", &self.signaling_tls)
+            .field("edge_a", &self.edge_a)
+            .field("edge_b", &self.edge_b)
+            .field(
+                "enrollment_token",
+                &self.enrollment_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("ca_der_path", &self.ca_der_path)
+            .field("identity_dir", &self.identity_dir)
+            .field("home_region", &self.home_region)
+            .field("codec", &self.codec)
+            .field("fps", &self.fps)
+            .field("watchdog_timeout_ms", &self.watchdog_timeout_ms)
+            .field("keepalive_interval_ms", &self.keepalive_interval_ms)
+            .field("lease_renew_interval_sec", &self.lease_renew_interval_sec)
+            .field("bw_cap_kbps", &self.bw_cap_kbps)
+            .finish()
+    }
+}
+
+fn extract_url_host(url: &str) -> Result<String, V2ConfigError> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| {
+            V2ConfigError::InvalidValue(format!(
+                "control_plane_endpoint must start with http:// or https://, got '{url}'"
+            ))
+        })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(V2ConfigError::InvalidValue(format!(
+            "invalid control_plane_endpoint authority in '{url}'"
+        )));
+    }
+    if let Some(ipv6_rest) = authority.strip_prefix('[') {
+        let Some((host, after_bracket)) = ipv6_rest.split_once(']') else {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "unterminated IPv6 literal in control_plane_endpoint '{url}'"
+            )));
+        };
+        if host.is_empty() {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "empty IPv6 host in control_plane_endpoint '{url}'"
+            )));
+        }
+        if let Some(port_part) = after_bracket.strip_prefix(':') {
+            if port_part.parse::<u16>().is_err() {
+                return Err(V2ConfigError::InvalidValue(format!(
+                    "invalid port in control_plane_endpoint '{url}'"
+                )));
+            }
+        } else if !after_bracket.is_empty() {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "invalid authority suffix in control_plane_endpoint '{url}'"
+            )));
+        }
+        return Ok(host.to_string());
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((h, port_part)) => {
+            if h.contains(':') || port_part.parse::<u16>().is_err() {
+                return Err(V2ConfigError::InvalidValue(format!(
+                    "invalid host/port in control_plane_endpoint '{url}'"
+                )));
+            }
+            h
+        }
+        None => authority,
+    };
+    if host.is_empty() {
+        return Err(V2ConfigError::InvalidValue(format!(
+            "empty host in control_plane_endpoint '{url}'"
+        )));
+    }
+    Ok(host.to_string())
 }
 
 impl V2ClientConfig {
@@ -115,16 +198,13 @@ impl V2ClientConfig {
         }
     }
 
-    /// Fail-closed validation enforcing `spec/04` §6.2.4, `spec/06` §1.2.1, and strict Unix key
-    /// directory (`0700`) / key file (`0600`) permissions.
+    /// Fail-closed validation enforcing `spec/04` §6.2.4, `spec/06` §1.2.1, loopback-only plaintext
+    /// HTTP, and strict Unix key directory (`0700`) / key file (`0600`) ownership & permissions.
     pub fn validate(&self) -> Result<(), V2ConfigError> {
-        if self.control_plane_endpoint.is_empty()
-            || (!self.control_plane_endpoint.starts_with("http://")
-                && !self.control_plane_endpoint.starts_with("https://"))
-        {
+        let cp_host = extract_url_host(&self.control_plane_endpoint)?;
+        if self.control_plane_endpoint.starts_with("http://") && !is_loopback_host(&cp_host) {
             return Err(V2ConfigError::InvalidValue(format!(
-                "control_plane_endpoint must start with http:// or https://, got '{}'",
-                self.control_plane_endpoint
+                "plaintext http:// control_plane_endpoint is forbidden on non-loopback host '{cp_host}'; https:// is mandatory"
             )));
         }
         if self.signaling_addr.is_empty() {
@@ -134,14 +214,22 @@ impl V2ClientConfig {
         }
         resolve_signaling_tls(&self.signaling_addr, self.signaling_tls)
             .map_err(|e| V2ConfigError::InvalidValue(format!("signaling TLS policy invalid: {e}")))?;
-        self.edge_a
+        let pop_a = self
+            .edge_a
             .pop_id_bytes()
-            .and_then(|_| self.edge_a.x25519_pub())
+            .and_then(|p| self.edge_a.x25519_pub().map(|_| p))
             .map_err(|e| V2ConfigError::InvalidValue(format!("edge_a invalid: {e}")))?;
-        self.edge_b
+        let pop_b = self
+            .edge_b
             .pop_id_bytes()
-            .and_then(|_| self.edge_b.x25519_pub())
+            .and_then(|p| self.edge_b.x25519_pub().map(|_| p))
             .map_err(|e| V2ConfigError::InvalidValue(format!("edge_b invalid: {e}")))?;
+        if pop_a == pop_b {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "edge_a.pop_id and edge_b.pop_id must be distinct, both are '{}'",
+                self.edge_a.pop_id
+            )));
+        }
 
         if !(HID_WATCHDOG_MIN_MS..=HID_WATCHDOG_MAX_MS).contains(&self.watchdog_timeout_ms) {
             return Err(V2ConfigError::InvalidValue(format!(
@@ -229,7 +317,8 @@ pub fn ensure_dir_0700(dir: &Path) -> Result<(), V2ConfigError> {
     verify_dir_permissions_0700(dir)
 }
 
-/// Verifies on Unix that `dir` is a directory with strict `0700` permissions (no group/other bits).
+/// Verifies on Unix that `dir` is a regular directory (not a symlink) owned by `geteuid()`
+/// with strict `0700` permissions (no group/other bits).
 pub fn verify_dir_permissions_0700(dir: &Path) -> Result<(), V2ConfigError> {
     let meta = fs::symlink_metadata(dir)
         .map_err(|e| V2ConfigError::Io(format!("stat '{}': {e}", dir.display())))?;
@@ -241,7 +330,15 @@ pub fn verify_dir_permissions_0700(dir: &Path) -> Result<(), V2ConfigError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let expected_uid = unsafe { libc::geteuid() };
+        if meta.uid() != expected_uid {
+            return Err(V2ConfigError::InsecurePermissions(format!(
+                "directory '{}' is owned by uid {}, expected effective uid {expected_uid}",
+                dir.display(),
+                meta.uid()
+            )));
+        }
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o700 {
             return Err(V2ConfigError::InsecurePermissions(format!(
@@ -250,10 +347,18 @@ pub fn verify_dir_permissions_0700(dir: &Path) -> Result<(), V2ConfigError> {
             )));
         }
     }
+    #[cfg(not(unix))]
+    {
+        // Phase 4A targets Unix (macOS/Linux); Windows DACL enforcement (e.g., SetNamedSecurityInfoW
+        // restricting ownership & access to the current user SID) is required before Windows
+        // production release.
+        let _ = dir;
+    }
     Ok(())
 }
 
-/// Verifies on Unix that `path` is a regular file (not a symlink) with strict `0600` permissions.
+/// Verifies on Unix that `path` is a regular file (not a symlink) owned by `geteuid()` with
+/// strict `0600` permissions.
 pub fn verify_file_permissions_0600(path: &Path) -> Result<(), V2ConfigError> {
     let meta = fs::symlink_metadata(path)
         .map_err(|e| V2ConfigError::Io(format!("stat '{}': {e}", path.display())))?;
@@ -263,9 +368,27 @@ pub fn verify_file_permissions_0600(path: &Path) -> Result<(), V2ConfigError> {
             path.display()
         )));
     }
+    verify_file_meta_0600(&meta, path)
+}
+
+fn verify_file_meta_0600(meta: &fs::Metadata, path: &Path) -> Result<(), V2ConfigError> {
+    if !meta.is_file() {
+        return Err(V2ConfigError::InsecurePermissions(format!(
+            "'{}' must be a regular file",
+            path.display()
+        )));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let expected_uid = unsafe { libc::geteuid() };
+        if meta.uid() != expected_uid {
+            return Err(V2ConfigError::InsecurePermissions(format!(
+                "private key/state file '{}' is owned by uid {}, expected effective uid {expected_uid}",
+                path.display(),
+                meta.uid()
+            )));
+        }
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Err(V2ConfigError::InsecurePermissions(format!(
@@ -274,11 +397,104 @@ pub fn verify_file_permissions_0600(path: &Path) -> Result<(), V2ConfigError> {
             )));
         }
     }
+    #[cfg(not(unix))]
+    {
+        // Phase 4A targets Unix (macOS/Linux); Windows DACL enforcement is required before
+        // Windows production release.
+        let _ = path;
+    }
     Ok(())
 }
 
+/// Opens `path` with `O_NOFOLLOW` on Unix, verifies `f.metadata()` (regular file, `0600`,
+/// `uid == geteuid()`), and reads directly from the verified open file descriptor (zero TOCTOU).
+pub fn read_file_0600_to_string(path: &Path) -> Result<String, V2ConfigError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| V2ConfigError::Io(format!("open '{}': {e}", path.display())))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| V2ConfigError::Io(format!("fstat '{}': {e}", path.display())))?;
+    verify_file_meta_0600(&meta, path)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| V2ConfigError::Io(format!("read '{}': {e}", path.display())))?;
+    Ok(content)
+}
+
+/// Calls `fsync` on the parent directory of `path` after an atomic `rename` or `create_new` so
+/// directory entries (e.g., `delegation_seq` updates) survive power loss on Unix.
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let dir = File::open(parent)?;
+        dir.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        // Phase 4A targets Unix (macOS/Linux); Windows directory metadata durability uses
+        // filesystem-specific semantics outside POSIX dir fsync.
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Atomically creates a brand-new `0600` file (`O_CREAT | O_EXCL | O_NOFOLLOW` on Unix),
+/// sets permissions on the open handle, calls `sync_all()` on the file and parent directory,
+/// and fails with `io::ErrorKind::AlreadyExists` if the file already exists.
+pub(crate) fn write_file_create_new_0600(path: &Path, bytes: &[u8]) -> Result<(), V2ConfigError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_dir_0700(parent)?;
+        }
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| V2ConfigError::Io(format!("create_new '{}': {e}", path.display())))?;
+    let write_res = (|| -> Result<(), V2ConfigError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| V2ConfigError::Io(format!("fchmod 0600 '{}': {e}", path.display())))?;
+        }
+        f.write_all(bytes)
+            .map_err(|e| V2ConfigError::Io(format!("write '{}': {e}", path.display())))?;
+        f.sync_all()
+            .map_err(|e| V2ConfigError::Io(format!("sync '{}': {e}", path.display())))?;
+        drop(f);
+        sync_parent_dir(path)
+            .map_err(|e| V2ConfigError::Io(format!("fsync parent dir '{}': {e}", path.display())))?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    write_res
+}
+
 /// Atomically writes `bytes` to `path` via a unique temp file (`0600`, `O_CREAT | O_EXCL | O_NOFOLLOW`
-/// on Unix), `sync_all()`, and `rename()`.
+/// on Unix), `f.set_permissions(0600)`, `sync_all()`, `rename()`, and parent directory `sync_all()`.
 pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), V2ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -305,36 +521,26 @@ pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), V2ConfigE
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
-        #[cfg(target_os = "macos")]
-        const O_NOFOLLOW_FLAG: i32 = 0x0100;
-        #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-        const O_NOFOLLOW_FLAG: i32 = 0o100000;
-        #[cfg(all(
-            target_os = "linux",
-            not(any(target_arch = "aarch64", target_arch = "arm"))
-        ))]
-        const O_NOFOLLOW_FLAG: i32 = 0o400000;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        opts.custom_flags(O_NOFOLLOW_FLAG);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
 
     let write_res = (|| -> Result<(), V2ConfigError> {
         let mut f = opts.open(&tmp_path).map_err(|e| {
             V2ConfigError::Io(format!("create temp file '{}': {e}", tmp_path.display()))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| {
+                V2ConfigError::Io(format!("fchmod 0600 '{}': {e}", tmp_path.display()))
+            })?;
+        }
         f.write_all(bytes).map_err(|e| {
             V2ConfigError::Io(format!("write temp file '{}': {e}", tmp_path.display()))
         })?;
         f.sync_all().map_err(|e| {
             V2ConfigError::Io(format!("sync temp file '{}': {e}", tmp_path.display()))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).map_err(|e| {
-                V2ConfigError::Io(format!("chmod 0600 '{}': {e}", tmp_path.display()))
-            })?;
-        }
         drop(f);
         fs::rename(&tmp_path, path).map_err(|e| {
             V2ConfigError::Io(format!(
@@ -343,6 +549,8 @@ pub fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), V2ConfigE
                 path.display()
             ))
         })?;
+        sync_parent_dir(path)
+            .map_err(|e| V2ConfigError::Io(format!("fsync parent dir '{}': {e}", path.display())))?;
         Ok(())
     })();
 
@@ -408,6 +616,33 @@ mod tests {
         cfg.signaling_addr = "127.0.0.1:18090".into();
         cfg.signaling_tls = None;
         cfg.validate().unwrap();
+
+        // Non-loopback plaintext http:// control_plane_endpoint MUST fail closed
+        cfg.control_plane_endpoint = "http://cp.zerodesk.example:18080".into();
+        assert!(cfg.validate().is_err());
+        cfg.control_plane_endpoint = "http://203.0.113.10:18080".into();
+        assert!(cfg.validate().is_err());
+        cfg.control_plane_endpoint = "https://cp.zerodesk.example:443".into();
+        cfg.validate().unwrap();
+        cfg.control_plane_endpoint = "http://[::1]:18080".into();
+        cfg.validate().unwrap();
+        cfg.control_plane_endpoint = "http://localhost:18080".into();
+        cfg.validate().unwrap();
+        cfg.control_plane_endpoint = "http://127.0.0.1:18080".into();
+        cfg.validate().unwrap();
+
+        // Identical edge_a and edge_b pop_id MUST be rejected
+        let orig_b = cfg.edge_b.pop_id.clone();
+        cfg.edge_b.pop_id = cfg.edge_a.pop_id.clone();
+        assert!(cfg.validate().is_err());
+        cfg.edge_b.pop_id = orig_b;
+        cfg.validate().unwrap();
+
+        // V2ClientConfig Debug MUST redact enrollment_token
+        cfg.enrollment_token = Some("super-secret-enrollment-token".into());
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("super-secret-enrollment-token"));
 
         // Watchdog bounds [1000, 10000]
         cfg.watchdog_timeout_ms = 999;

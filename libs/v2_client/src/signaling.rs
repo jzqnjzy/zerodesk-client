@@ -28,6 +28,11 @@ use v2_identity::{DelegationStatement, DeviceCert, DeviceKeyStore, DEVCERT_DOMAI
 pub const MAX_SIGNALING_FRAME_BYTES: usize = 64 * 1024;
 pub const SIGNALING_BACKOFF_INITIAL_MS: u64 = 500;
 pub const SIGNALING_BACKOFF_MAX_MS: u64 = 30_000;
+pub const SIGNALING_HEARTBEAT_MIN_SEC: u32 = 1;
+pub const SIGNALING_HEARTBEAT_MAX_SEC: u32 = 300;
+pub const SIGNALING_HEARTBEAT_DEFAULT_SEC: u32 = 15;
+pub const SIGNALING_REDIRECT_MAX_RETRY_AFTER_MS: u32 = 60_000;
+const MAX_PROTOBUF_FIELD_NO: u64 = (1u64 << 29) - 1;
 pub const SIGNALING_POP_DOMAIN: &[u8; 13] = b"V2-SIG-POP-v1";
 pub const SIGNALING_POP_TBS_LEN: usize = 53;
 const _: () = assert!(SIGNALING_POP_DOMAIN.len() + 16 + 16 + 8 == SIGNALING_POP_TBS_LEN);
@@ -73,7 +78,12 @@ pub fn parse_signaling_host(addr: &str) -> Result<String, ClientError> {
             "signaling_addr '{addr}' must include :port"
         )));
     };
-    if host.is_empty() || port_part.parse::<u16>().is_err() {
+    if host.is_empty()
+        || host.contains(':')
+        || host.contains('[')
+        || host.contains(']')
+        || port_part.parse::<u16>().is_err()
+    {
         return Err(ClientError::Config(format!(
             "invalid host/port in signaling_addr '{addr}'"
         )));
@@ -322,9 +332,7 @@ impl SignalingDeviceCert {
         let mut ca_sig = Vec::new();
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 0) => version = decode_u32_varint(bytes, &mut pos, "DeviceCert.version")?,
                 (2, 2) => {
@@ -411,9 +419,7 @@ pub fn decode_delegation_pb(bytes: &[u8]) -> Result<DelegationStatement, ClientE
     let mut sig_der = Vec::new();
 
     while pos < bytes.len() {
-        let tag = decode_varint(bytes, &mut pos)?;
-        let field_no = (tag >> 3) as u32;
-        let wire_type = tag & 0x07;
+        let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
         match (field_no, wire_type) {
             (1, 2) => {
                 device_id =
@@ -480,9 +486,7 @@ impl RelayTicketWire {
         let mut has_mac = false;
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 0) => key_id = decode_u32_varint(bytes, &mut pos, "RelayTicket.key_id")?,
                 (2, 2) => body = read_pb_bytes(bytes, &mut pos)?.to_vec(),
@@ -544,9 +548,7 @@ impl MovedRedirect {
         let mut retry_after_ms = 0u32;
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     let b = read_pb_bytes(bytes, &mut pos)?;
@@ -568,12 +570,21 @@ impl MovedRedirect {
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
-        Ok(Self {
+        let redir = Self {
             target_home_region,
             target_pop_id,
             routing_cas_ver,
-            retry_after_ms,
-        })
+            retry_after_ms: retry_after_ms.min(SIGNALING_REDIRECT_MAX_RETRY_AFTER_MS),
+        };
+        redir.validate()?;
+        Ok(redir)
+    }
+
+    /// Returns the retry backoff clamped to `0..=60_000ms`.
+    pub fn clamped_retry_after(&self) -> Duration {
+        Duration::from_millis(u64::from(
+            self.retry_after_ms.min(SIGNALING_REDIRECT_MAX_RETRY_AFTER_MS),
+        ))
     }
 }
 
@@ -613,9 +624,7 @@ impl SignalingRegisterChallenge {
         let mut server_unix = 0u64;
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     server_nonce =
@@ -681,9 +690,7 @@ impl SignalingRegisterReq {
         let mut pop_sig = Vec::new();
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     let b = read_pb_bytes(bytes, &mut pos)?;
@@ -770,9 +777,7 @@ impl SignalingRegisterResp {
         let mut heartbeat_interval_sec = 0u32;
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 0) => {
                     error_code = decode_u32_varint(bytes, &mut pos, "RegisterResp.error_code")?;
@@ -793,10 +798,28 @@ impl SignalingRegisterResp {
             error_code,
             server_unix,
             redirect,
-            heartbeat_interval_sec,
+            heartbeat_interval_sec: if heartbeat_interval_sec == 0 {
+                0
+            } else {
+                heartbeat_interval_sec.clamp(
+                    SIGNALING_HEARTBEAT_MIN_SEC,
+                    SIGNALING_HEARTBEAT_MAX_SEC,
+                )
+            },
         };
         resp.validate()?;
         Ok(resp)
+    }
+
+    /// Returns a safe bounded heartbeat interval (`1..=300s`, defaulting to `15s` if `0`).
+    pub fn effective_heartbeat_interval(&self) -> Duration {
+        let secs = if self.heartbeat_interval_sec == 0 {
+            SIGNALING_HEARTBEAT_DEFAULT_SEC
+        } else {
+            self.heartbeat_interval_sec
+                .clamp(SIGNALING_HEARTBEAT_MIN_SEC, SIGNALING_HEARTBEAT_MAX_SEC)
+        };
+        Duration::from_secs(u64::from(secs))
     }
 }
 
@@ -872,9 +895,7 @@ impl SignalingStaticKeyHint {
         let mut hint_unix = 0u64;
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     device_id =
@@ -1149,6 +1170,17 @@ fn decode_u32_varint(bytes: &[u8], pos: &mut usize, field: &str) -> Result<u32, 
     u32::try_from(v).map_err(|_| ClientError::Protocol(format!("{field} overflows uint32: {v}")))
 }
 
+fn decode_pb_tag(bytes: &[u8], pos: &mut usize) -> Result<(u32, u64), ClientError> {
+    let tag = decode_varint(bytes, pos)?;
+    let field_raw = tag >> 3;
+    if field_raw == 0 || field_raw > MAX_PROTOBUF_FIELD_NO {
+        return Err(ClientError::Protocol(format!(
+            "invalid protobuf field number {field_raw} (must be in 1..={MAX_PROTOBUF_FIELD_NO})"
+        )));
+    }
+    Ok((field_raw as u32, tag & 0x07))
+}
+
 fn encode_pb_bytes(field_no: u32, data: &[u8], out: &mut Vec<u8>) {
     if data.is_empty() {
         return;
@@ -1245,9 +1277,7 @@ impl HeartbeatMsg {
         let mut active_pop_id = None;
         let mut rtt_ms = 0u32;
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     device_id = read_fixed_bytes::<16>(bytes, &mut pos, "Heartbeat.device_id")?;
@@ -1279,6 +1309,34 @@ impl HeartbeatMsg {
 }
 
 impl SignalingConnectReq {
+    pub fn validate(&self) -> Result<(), ClientError> {
+        if self.session_id == [0u8; 16] {
+            return Err(ClientError::Protocol(
+                "ConnectReq.session_id must not be zero".into(),
+            ));
+        }
+        if self.controller_device_id == [0u8; 16] {
+            return Err(ClientError::Protocol(
+                "ConnectReq.controller_device_id must not be zero".into(),
+            ));
+        }
+        if self.controlled_device_id == [0u8; 16] {
+            return Err(ClientError::Protocol(
+                "ConnectReq.controlled_device_id must not be zero".into(),
+            ));
+        }
+        if let Some(cert) = &self.controller_cert {
+            cert.validate()?;
+        }
+        if let Some(deleg) = &self.controller_delegation {
+            validate_delegation_wire(deleg)?;
+        }
+        if let Some(ticket) = &self.relay_ticket {
+            ticket.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn encode_pb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
         encode_pb_bytes(1, &self.session_id, &mut out);
@@ -1321,9 +1379,7 @@ impl SignalingConnectReq {
         let mut ice_candidates = Vec::new();
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     session_id = read_fixed_bytes::<16>(bytes, &mut pos, "ConnectReq.session_id")?;
@@ -1377,7 +1433,7 @@ impl SignalingConnectReq {
                 _ => skip_pb_field(wire_type, bytes, &mut pos)?,
             }
         }
-        Ok(Self {
+        let req = Self {
             session_id,
             controller_device_id,
             controlled_device_id,
@@ -1389,7 +1445,9 @@ impl SignalingConnectReq {
             requested_exhaust_policy,
             relay_ticket,
             ice_candidates,
-        })
+        };
+        req.validate()?;
+        Ok(req)
     }
 }
 
@@ -1446,9 +1504,7 @@ impl SignalingConnectOffer {
         let mut ice_candidates = Vec::new();
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     session_id =
@@ -1552,9 +1608,7 @@ impl SignalingConnectAccept {
         let mut redirect = None;
 
         while pos < bytes.len() {
-            let tag = decode_varint(bytes, &mut pos)?;
-            let field_no = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
+            let (field_no, wire_type) = decode_pb_tag(bytes, &mut pos)?;
             match (field_no, wire_type) {
                 (1, 2) => {
                     session_id =
@@ -2699,5 +2753,65 @@ mod tests {
 
         srv.await.unwrap();
         let _ = std::fs::remove_file(&ca_path);
+    }
+
+    #[test]
+    fn decode_tag_validate_clamping_and_unbracketed_ipv6_reject() {
+        // Invalid protobuf field numbers: 0 and > (1 << 29) - 1
+        let mut bad_zero_tag = Vec::new();
+        encode_varint(0u64, &mut bad_zero_tag); // field_no = 0, wire_type = 0
+        assert!(SignalingRegisterResp::decode_pb(&bad_zero_tag).is_err());
+
+        let mut bad_high_tag = Vec::new();
+        encode_varint((1u64 << 29) << 3, &mut bad_high_tag); // field_no = 536_870_912
+        encode_varint(1, &mut bad_high_tag);
+        assert!(SignalingRegisterResp::decode_pb(&bad_high_tag).is_err());
+
+        // MovedRedirect::decode_pb rejects empty region or zero pop_id and clamps retry_after_ms
+        assert!(MovedRedirect::decode_pb(&[]).is_err());
+        let big_redirect = MovedRedirect {
+            target_home_region: "us-east".into(),
+            target_pop_id: *b"edge-a01",
+            routing_cas_ver: 9,
+            retry_after_ms: u32::MAX,
+        };
+        let dec_redir = MovedRedirect::decode_pb(&big_redirect.encode_pb()).unwrap();
+        assert_eq!(
+            dec_redir.retry_after_ms,
+            SIGNALING_REDIRECT_MAX_RETRY_AFTER_MS
+        );
+        assert_eq!(dec_redir.clamped_retry_after(), Duration::from_secs(60));
+
+        // SignalingRegisterResp clamps extreme heartbeat_interval_sec to 1..=300s
+        let rogue_resp = SignalingRegisterResp {
+            error_code: 0,
+            server_unix: 1_700_000_000,
+            redirect: None,
+            heartbeat_interval_sec: 999_999,
+        };
+        let dec_resp = SignalingRegisterResp::decode_pb(&rogue_resp.encode_pb()).unwrap();
+        assert_eq!(dec_resp.heartbeat_interval_sec, SIGNALING_HEARTBEAT_MAX_SEC);
+        assert_eq!(
+            dec_resp.effective_heartbeat_interval(),
+            Duration::from_secs(u64::from(SIGNALING_HEARTBEAT_MAX_SEC))
+        );
+        let zero_hb_resp = SignalingRegisterResp {
+            error_code: 0,
+            server_unix: 1_700_000_000,
+            redirect: None,
+            heartbeat_interval_sec: 0,
+        };
+        assert_eq!(
+            zero_hb_resp.effective_heartbeat_interval(),
+            Duration::from_secs(u64::from(SIGNALING_HEARTBEAT_DEFAULT_SEC))
+        );
+
+        // SignalingConnectReq::decode_pb validates required non-zero IDs
+        assert!(SignalingConnectReq::decode_pb(&[]).is_err());
+
+        // Unbracketed IPv6 or extra ':' rejected fail-closed
+        assert!(parse_signaling_host("::1:18090").is_err());
+        assert!(parse_signaling_host("fe80::1:443").is_err());
+        assert_eq!(parse_signaling_host("[::1]:18090").unwrap(), "::1");
     }
 }

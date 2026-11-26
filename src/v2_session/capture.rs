@@ -687,11 +687,15 @@ impl CaptureStats {
     }
 }
 
-struct ThreadExitGuard(Arc<CaptureStats>);
+struct ThreadExitGuard {
+    stats: Arc<CaptureStats>,
+    done_tx: std::sync::mpsc::SyncSender<()>,
+}
 
 impl Drop for ThreadExitGuard {
     fn drop(&mut self) {
-        self.0.thread_exited.store(true, Ordering::Release);
+        self.stats.thread_exited.store(true, Ordering::Release);
+        let _ = self.done_tx.try_send(());
     }
 }
 
@@ -701,6 +705,7 @@ pub struct CapturePipelineHandle {
     stats: Arc<CaptureStats>,
     dimensions: (usize, usize),
     join_handle: Option<JoinHandle<()>>,
+    done_rx: Option<std::sync::mpsc::Receiver<()>>,
     last_sent_seq: u64,
     last_sent_at: Option<Instant>,
 }
@@ -783,24 +788,41 @@ impl CapturePipelineHandle {
         }
     }
 
-    /// Signals the capture thread to stop and joins it to guarantee full reclamation on shutdown.
-    pub fn stop_and_join(&mut self) -> Result<(), CaptureError> {
+    /// Signals the capture thread to stop and waits up to `timeout` for it to exit.
+    /// If the producer thread stalls past `timeout`, detaches it and returns `Err` instead of
+    /// deadlocking teardown.
+    pub fn stop_and_join_timeout(&mut self, timeout: Duration) -> Result<(), CaptureError> {
         self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            handle.join().map_err(|_| {
-                CaptureError::Backend("zd-v2-capture thread panicked during shutdown".into())
-            })?;
+        let Some(handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+        if let Some(done_rx) = self.done_rx.take() {
+            match done_rx.recv_timeout(timeout) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Detach stalled capture thread rather than deadlocking teardown.
+                    drop(handle);
+                    return Err(CaptureError::Backend(format!(
+                        "zd-v2-capture thread did not exit within {timeout:?}"
+                    )));
+                }
+            }
         }
+        handle.join().map_err(|_| {
+            CaptureError::Backend("zd-v2-capture thread panicked during shutdown".into())
+        })?;
         Ok(())
+    }
+
+    /// Signals the capture thread to stop and joins it (bounded to 2s) to guarantee reclamation.
+    pub fn stop_and_join(&mut self) -> Result<(), CaptureError> {
+        self.stop_and_join_timeout(Duration::from_secs(2))
     }
 }
 
 impl Drop for CapturePipelineHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        let _ = self.stop_and_join_timeout(Duration::from_millis(200));
     }
 }
 
@@ -812,6 +834,7 @@ pub fn spawn_capture_pipeline<S: ScreenCaptureSource + 'static>(
 ) -> Result<CapturePipelineHandle, CaptureError> {
     let dimensions = source.dimensions();
     let (tx, rx) = watch::channel::<Option<CapturedFrame>>(None);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let stats = Arc::new(CaptureStats::default());
     let thread_stats = Arc::clone(&stats);
     let thread_stop = Arc::clone(&stop_flag);
@@ -819,7 +842,10 @@ pub fn spawn_capture_pipeline<S: ScreenCaptureSource + 'static>(
     let join_handle = thread::Builder::new()
         .name("zd-v2-capture".to_string())
         .spawn(move || {
-            let _exit_guard = ThreadExitGuard(Arc::clone(&thread_stats));
+            let _exit_guard = ThreadExitGuard {
+                stats: Arc::clone(&thread_stats),
+                done_tx,
+            };
             let mut last_published_seq = 0u64;
             while !thread_stop.load(Ordering::Acquire) {
                 match source.next_frame() {
@@ -863,6 +889,7 @@ pub fn spawn_capture_pipeline<S: ScreenCaptureSource + 'static>(
         stats,
         dimensions,
         join_handle: Some(join_handle),
+        done_rx: Some(done_rx),
         last_sent_seq: 0,
         last_sent_at: None,
     })

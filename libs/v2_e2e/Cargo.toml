@@ -27,3 +27,6 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 v2_client = { path = "../v2_client" }
 v2_identity = { path = "../v2_identity" }
 v2_transport = { path = "../v2_transport" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
