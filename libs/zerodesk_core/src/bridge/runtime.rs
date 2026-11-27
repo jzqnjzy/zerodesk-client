@@ -417,6 +417,17 @@ impl V2BridgeRuntime {
     }
 
     pub fn with_options(options: V2BridgeRuntimeOptions) -> Result<Self, String> {
+        if let Some(report_path) = &options.watchdog_report_path {
+            if report_path.as_os_str().is_empty() {
+                return Err("InvalidArgument: watchdog_report_path must be non-empty".into());
+            }
+            if options.real_input_permit.is_some() {
+                return Err(
+                    "InvalidArgument: watchdog_report_path (dry-run watchdog) cannot be combined with real_input_permit"
+                        .into(),
+                );
+            }
+        }
         let mailbox = Arc::new(FrameMailbox::new());
         let events = Arc::new(BridgeEventHub::new(Arc::clone(&mailbox)));
         let controller = V2BridgeController::new();
@@ -1464,6 +1475,13 @@ impl BridgeActor {
                         parsed["error_code"].as_str().unwrap_or("IllegalStateTransition"),
                         parsed["error"].as_str().unwrap_or("set_audio_mute failed"),
                     )
+                }
+            }
+            "get_snapshot" | "snapshot" => {
+                self.sync_snapshot();
+                match serde_json::to_value(self.controller.snapshot()) {
+                    Ok(val) => RuntimeReplyEnvelope::ok(val),
+                    Err(e) => RuntimeReplyEnvelope::err("Internal", e.to_string()),
                 }
             }
             "start_host" => self.handle_start_host(env),
@@ -3889,11 +3907,12 @@ async fn run_active_host_session(
                     })
                     .await;
                 if using_real_input {
-                    // Fail closed: never allow unsupervised real OS HID injection when watchdog was requested.
-                    Box::new(DryRunHidSink::with_journal(adapters.dryrun_journal.clone()))
-                } else {
-                    base_hid_sink
+                    // Fail closed: terminate session immediately rather than running unsupervised
+                    // real OS input or silently degrading to DryRun.
+                    let _ = accepted.lease_renewal.shutdown().await;
+                    return format!("real_input hid watchdog failed closed: {e}");
                 }
+                base_hid_sink
             }
         }
     } else {
@@ -5402,5 +5421,36 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn get_snapshot_command_and_watchdog_report_validation() {
+        // Empty watchdog_report_path must fail closed.
+        let empty_res = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
+            watchdog_report_path: Some(PathBuf::new()),
+            ..V2BridgeRuntimeOptions::default()
+        });
+        assert!(empty_res.is_err());
+
+        // Real input + dry-run watchdog_report_path must be mutually exclusive.
+        #[cfg(feature = "real-input")]
+        {
+            let permit = Arc::new(RealInputPermit::from_explicit_opt_in(true).unwrap());
+            let conflict = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
+                real_input_permit: Some(permit),
+                watchdog_report_path: Some(PathBuf::from("/tmp/should-be-rejected.json")),
+                ..V2BridgeRuntimeOptions::default()
+            });
+            assert!(conflict.is_err());
+        }
+
+        // get_snapshot command must return structured BridgeSnapshot in data.
+        let rt = V2BridgeRuntime::new().unwrap();
+        let raw = rt.exec_json(r#"{"v":1,"cmd":"get_snapshot"}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["ok"].as_bool(), Some(true));
+        assert_eq!(parsed["data"]["v"].as_u64(), Some(1));
+        assert_eq!(parsed["data"]["state"].as_str(), Some("idle"));
+        rt.destroy();
     }
 }

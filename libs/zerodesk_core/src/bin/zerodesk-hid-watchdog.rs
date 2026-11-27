@@ -47,7 +47,10 @@ use zerodesk_core::os::{
     input::{emergency_release_real_os_keys, is_accessibility_trusted, RealInputPermit},
     watchdog_proto::{
         bitmap_collect_keys, WatchdogFrame, WatchdogMsgType, WatchdogReleaseReport,
-        ALL_MODIFIER_HID_USAGES, WATCHDOG_FRAME_LEN, WATCHDOG_REPORT_SCHEMA_VERSION,
+        ALL_MODIFIER_HID_USAGES, WATCHDOG_FRAME_LEN, WATCHDOG_READY_FLAG_AX_TRUSTED,
+        WATCHDOG_READY_FLAG_REAL_OS_INPUT, WATCHDOG_RELEASED_FLAG_EMERGENCY_FAILED,
+        WATCHDOG_RELEASED_FLAG_EMERGENCY_OK, WATCHDOG_RELEASED_FLAG_GRACEFUL,
+        WATCHDOG_REPORT_SCHEMA_VERSION,
     },
 };
 
@@ -138,11 +141,19 @@ fn parse_args(args: &[String]) -> Result<WatchdogArgs, String> {
         }
     }
 
+    let ack_fd = ack_fd.ok_or_else(|| "missing --ack-fd".to_string())?;
+    if cmd_fd == ack_fd {
+        return Err("--cmd-fd and --ack-fd must be distinct descriptors".into());
+    }
+    if real_os_input && dry_run_journal.is_some() {
+        return Err("--real-os-input cannot be combined with --dry-run-journal".into());
+    }
+
     Ok(WatchdogArgs {
         parent_pid: parent_pid.ok_or_else(|| "missing --parent-pid".to_string())?,
         nonce: nonce.ok_or_else(|| "missing --nonce-hex".to_string())?,
         cmd_fd,
-        ack_fd: ack_fd.ok_or_else(|| "missing --ack-fd".to_string())?,
+        ack_fd,
         lock_file: lock_file.ok_or_else(|| "missing --lock-file".to_string())?,
         dry_run_journal,
         real_os_input,
@@ -159,13 +170,10 @@ fn now_epoch_ms() -> u64 {
 #[cfg(unix)]
 mod unix_impl {
     use super::*;
-    use std::{
-        ffi::CString,
-        fs,
-        os::unix::ffi::OsStrExt,
-    };
+    use std::{ffi::CString, fs, os::unix::ffi::OsStrExt};
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_CLOSE_FD_CAP: i32 = 16_384;
 
     #[derive(Default)]
     struct TrackedState {
@@ -179,6 +187,35 @@ mod unix_impl {
         Continue,
         GracefulExit(u64),
         EmergencyRelease(&'static str),
+    }
+
+    fn validate_pipe_fd(fd: i32, name: &str) -> Result<(), String> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(format!(
+                "fstat({name}={fd}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+            return Err(format!("{name}={fd} is not a pipe/FIFO (S_ISFIFO required)"));
+        }
+        Ok(())
+    }
+
+    fn max_open_fd_bound() -> i32 {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0
+            && rl.rlim_cur != libc::RLIM_INFINITY
+            && rl.rlim_cur > 0
+        {
+            (rl.rlim_cur.min(MAX_CLOSE_FD_CAP as u64) as i32).max(256)
+        } else {
+            4096
+        }
     }
 
     fn set_nonblock(fd: i32) -> Result<(), String> {
@@ -218,14 +255,18 @@ mod unix_impl {
         }
     }
 
-    /// Startup hardening: ignore SIGPIPE, redirect stdio (except cmd_fd/ack_fd) to `/dev/null`,
-    /// detach session via `setsid()`, acquire exclusive non-blocking `flock` on lock file, and
-    /// close all unneeded fds >= 3.
+    /// Startup hardening: verify cmd_fd/ack_fd are distinct pipes, ignore SIGPIPE, redirect stdio
+    /// (except cmd_fd/ack_fd) to `/dev/null`, detach session via `setsid()`, acquire exclusive
+    /// non-blocking `flock` on lock file, and close all unneeded fds >= 3 up to `RLIMIT_NOFILE`
+    /// (clamped to 16384). Runs BEFORE any AX/XPC framework calls so closing fds never disrupts them.
     fn harden_process_and_lock(
         cmd_fd: i32,
         ack_fd: i32,
         lock_file: &Path,
     ) -> Result<i32, String> {
+        validate_pipe_fd(cmd_fd, "cmd_fd")?;
+        validate_pipe_fd(ack_fd, "ack_fd")?;
+
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
@@ -278,8 +319,8 @@ mod unix_impl {
             return Err("lock file already held by another watchdog instance".into());
         }
 
-        // Close all unneeded fds >= 3 up to getdtablesize().clamp(256, 4096).
-        let max_fd = unsafe { libc::getdtablesize() }.clamp(256, 4096);
+        // Close all unneeded fds >= 3 up to RLIMIT_NOFILE (clamped to 16384).
+        let max_fd = max_open_fd_bound();
         for fd in 3..max_fd {
             if fd != cmd_fd && fd != ack_fd && fd != lock_fd {
                 unsafe {
@@ -365,20 +406,35 @@ mod unix_impl {
         Ok(())
     }
 
+    /// Executes emergency release and returns `true` iff release completed with zero residuals
+    /// and zero errors.
     fn execute_emergency_release(
         trigger: &str,
         args: &WatchdogArgs,
         state: &TrackedState,
         real_permit: Option<&RealInputPermit>,
-    ) {
+    ) -> bool {
         let start = Instant::now();
         let released_keys = bitmap_collect_keys(&state.keys_bitmap);
         let released_modifiers = ALL_MODIFIER_HID_USAGES.to_vec();
 
-        if let Some(permit) = real_permit {
-            let _ = emergency_release_real_os_keys(permit, &released_keys, state.buttons);
-        }
+        let (release_ok, release_error) = if let Some(permit) = real_permit {
+            match emergency_release_real_os_keys(permit, &released_keys, state.buttons) {
+                Ok(rep) if rep.residual_keys == 0 && rep.residual_buttons == 0 => (true, None),
+                Ok(rep) => (
+                    false,
+                    Some(format!(
+                        "residual unreleased HID state: keys={} buttons={}",
+                        rep.residual_keys, rep.residual_buttons
+                    )),
+                ),
+                Err(e) => (false, Some(e.to_string())),
+            }
+        } else {
+            (true, None)
+        };
 
+        let mut overall_ok = release_ok;
         if let Some(report_path) = &args.dry_run_journal {
             let report = WatchdogReleaseReport {
                 schema_version: WATCHDOG_REPORT_SCHEMA_VERSION,
@@ -388,14 +444,24 @@ mod unix_impl {
                 released_keys,
                 released_buttons: state.buttons,
                 released_modifiers,
+                release_ok,
+                release_error,
                 release_elapsed_ms: start.elapsed().as_millis() as u64,
                 timestamp_epoch_ms: now_epoch_ms(),
             };
-            let _ = write_report_atomic_0600(report_path, &report);
+            if write_report_atomic_0600(report_path, &report).is_err() {
+                overall_ok = false;
+            }
         }
 
-        let ack = WatchdogFrame::released(state.last_seq, 1).encode();
+        let ack_flag = if overall_ok {
+            WATCHDOG_RELEASED_FLAG_EMERGENCY_OK
+        } else {
+            WATCHDOG_RELEASED_FLAG_EMERGENCY_FAILED
+        };
+        let ack = WatchdogFrame::released(state.last_seq, ack_flag).encode();
         write_all_best_effort(args.ack_fd, &ack);
+        overall_ok
     }
 
     fn drain_cmd_frames(
@@ -523,9 +589,10 @@ mod unix_impl {
         args: &WatchdogArgs,
         state: &mut TrackedState,
         real_permit: Option<&RealInputPermit>,
-    ) {
-        // Ignore SIGHUP/SIGTERM/SIGINT so kqueue EVFILT_SIGNAL intercepts them cleanly without
-        // killing the process before emergency release runs.
+        ready_flags: u8,
+    ) -> bool {
+        // Arm SIG_IGN + kqueue + EVFILT_READ + EVFILT_PROC + EVFILT_SIGNAL BEFORE sending Ready
+        // so the parent never injects keys until all crash-detection filters are live!
         unsafe {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
@@ -534,8 +601,7 @@ mod unix_impl {
 
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
-            execute_emergency_release("malformed_frame", args, state, real_permit);
-            return;
+            return false;
         }
 
         let make_ev = |ident: usize, filter: i16, flags: u16, fflags: u32| -> libc::kevent {
@@ -590,15 +656,14 @@ mod unix_impl {
             unsafe {
                 libc::close(kq);
             }
-            execute_emergency_release("malformed_frame", args, state, real_permit);
-            return;
+            return false;
         }
 
         let mut acc = [0u8; WATCHDOG_FRAME_LEN];
         let mut acc_len = 0usize;
 
-        // Register EVFILT_PROC NOTE_EXIT separately so ESRCH (parent already exited!) is
-        // detected immediately and cleanly.
+        // Register EVFILT_PROC NOTE_EXIT BEFORE sending Ready. If parent already died (ESRCH),
+        // exit cleanly without sending Ready (parent never received Ready, so no keys were injected).
         let proc_change = make_ev(
             args.parent_pid as usize,
             libc::EVFILT_PROC,
@@ -616,25 +681,17 @@ mod unix_impl {
             )
         };
         if proc_rc < 0 {
-            // Drain any buffered GracefulExit/StateSnapshot before concluding parent crashed.
-            match drain_cmd_frames(args.cmd_fd, &mut acc, &mut acc_len, state) {
-                DrainOutcome::GracefulExit(seq) => {
-                    let ack = WatchdogFrame::released(seq, 0).encode();
-                    write_all_best_effort(args.ack_fd, &ack);
-                }
-                DrainOutcome::EmergencyRelease(trigger) => {
-                    execute_emergency_release(trigger, args, state, real_permit);
-                }
-                DrainOutcome::Continue => {
-                    execute_emergency_release("parent_exit_kqueue", args, state, real_permit);
-                }
-            }
             unsafe {
                 libc::close(kq);
             }
-            return;
+            return false;
         }
 
+        // All kqueue filters are now armed: announce Ready (with capability flags) to supervisor!
+        let ready = WatchdogFrame::ready_with_flags(0, ready_flags).encode();
+        write_all_best_effort(args.ack_fd, &ready);
+
+        let mut exit_ok = true;
         let mut events = [make_ev(0, 0, 0, 0); 16];
         loop {
             let n = unsafe {
@@ -652,7 +709,7 @@ mod unix_impl {
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                execute_emergency_release("malformed_frame", args, state, real_permit);
+                exit_ok = execute_emergency_release("malformed_frame", args, state, real_permit);
                 break;
             }
 
@@ -679,24 +736,26 @@ mod unix_impl {
                 match drain_cmd_frames(args.cmd_fd, &mut acc, &mut acc_len, state) {
                     DrainOutcome::Continue => {}
                     DrainOutcome::GracefulExit(seq) => {
-                        let ack = WatchdogFrame::released(seq, 0).encode();
+                        let ack = WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL)
+                            .encode();
                         write_all_best_effort(args.ack_fd, &ack);
                         break;
                     }
                     DrainOutcome::EmergencyRelease(trigger) => {
-                        execute_emergency_release(trigger, args, state, real_permit);
+                        exit_ok = execute_emergency_release(trigger, args, state, real_permit);
                         break;
                     }
                 }
             }
 
             if saw_proc_exit {
-                execute_emergency_release("parent_exit_kqueue", args, state, real_permit);
+                exit_ok =
+                    execute_emergency_release("parent_exit_kqueue", args, state, real_permit);
                 break;
             }
 
             if saw_signal {
-                execute_emergency_release("signal", args, state, real_permit);
+                exit_ok = execute_emergency_release("signal", args, state, real_permit);
                 break;
             }
         }
@@ -704,6 +763,7 @@ mod unix_impl {
         unsafe {
             libc::close(kq);
         }
+        exit_ok
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -711,7 +771,8 @@ mod unix_impl {
         args: &WatchdogArgs,
         state: &mut TrackedState,
         real_permit: Option<&RealInputPermit>,
-    ) {
+        ready_flags: u8,
+    ) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SIG_FIRED: AtomicBool = AtomicBool::new(false);
         extern "C" fn on_sig(_sig: libc::c_int) {
@@ -723,6 +784,10 @@ mod unix_impl {
             libc::signal(libc::SIGINT, on_sig as *const () as libc::sighandler_t);
         }
 
+        let ready = WatchdogFrame::ready_with_flags(0, ready_flags).encode();
+        write_all_best_effort(args.ack_fd, &ready);
+
+        let mut exit_ok = true;
         let mut acc = [0u8; WATCHDOG_FRAME_LEN];
         let mut acc_len = 0usize;
         loop {
@@ -736,60 +801,80 @@ mod unix_impl {
                 match drain_cmd_frames(args.cmd_fd, &mut acc, &mut acc_len, state) {
                     DrainOutcome::Continue => {}
                     DrainOutcome::GracefulExit(seq) => {
-                        let ack = WatchdogFrame::released(seq, 0).encode();
+                        let ack = WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL)
+                            .encode();
                         write_all_best_effort(args.ack_fd, &ack);
                         break;
                     }
                     DrainOutcome::EmergencyRelease(trigger) => {
-                        execute_emergency_release(trigger, args, state, real_permit);
+                        exit_ok = execute_emergency_release(trigger, args, state, real_permit);
                         break;
                     }
                 }
             }
             if SIG_FIRED.load(Ordering::Acquire) {
-                execute_emergency_release("signal", args, state, real_permit);
+                exit_ok = execute_emergency_release("signal", args, state, real_permit);
                 break;
             }
             let alive = unsafe { libc::kill(args.parent_pid as libc::pid_t, 0) };
             if alive != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
                 match drain_cmd_frames(args.cmd_fd, &mut acc, &mut acc_len, state) {
                     DrainOutcome::GracefulExit(seq) => {
-                        let ack = WatchdogFrame::released(seq, 0).encode();
+                        let ack = WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL)
+                            .encode();
                         write_all_best_effort(args.ack_fd, &ack);
                     }
                     DrainOutcome::EmergencyRelease(trigger) => {
-                        execute_emergency_release(trigger, args, state, real_permit);
+                        exit_ok = execute_emergency_release(trigger, args, state, real_permit);
                     }
                     DrainOutcome::Continue => {
-                        execute_emergency_release("parent_exit_kqueue", args, state, real_permit);
+                        exit_ok = execute_emergency_release(
+                            "parent_exit_kqueue",
+                            args,
+                            state,
+                            real_permit,
+                        );
                     }
                 }
                 break;
             }
         }
+        exit_ok
     }
 
     pub fn run(args: WatchdogArgs) -> ExitCode {
-        let real_permit = if args.real_os_input {
-            match RealInputPermit::from_explicit_opt_in(true) {
-                Ok(p) => {
-                    if !is_accessibility_trusted() {
-                        return ExitCode::FAILURE;
-                    }
-                    Some(p)
-                }
-                Err(_) => return ExitCode::FAILURE,
-            }
-        } else {
-            None
-        };
-
+        // 1. Harden fds & acquire flock FIRST so closing fds >= 3 never closes AX/XPC fds!
         let Ok(lock_fd) = harden_process_and_lock(args.cmd_fd, args.ack_fd, &args.lock_file)
         else {
             return ExitCode::FAILURE;
         };
 
-        // Handshake: wait up to 5s for valid Hello matching (parent_pid, nonce).
+        // 2. Validate real-input permit & AX trust AFTER fd hardening.
+        let mut ready_flags = 0u8;
+        let real_permit = if args.real_os_input {
+            match RealInputPermit::from_explicit_opt_in(true) {
+                Ok(p) => {
+                    if !is_accessibility_trusted() {
+                        unsafe {
+                            libc::close(lock_fd);
+                        }
+                        return ExitCode::FAILURE;
+                    }
+                    ready_flags = WATCHDOG_READY_FLAG_REAL_OS_INPUT | WATCHDOG_READY_FLAG_AX_TRUSTED;
+                    Some(p)
+                }
+                Err(_) => {
+                    unsafe {
+                        libc::close(lock_fd);
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
+
+        // 3. Handshake: wait up to 5s for valid Hello matching (parent_pid, nonce).
         // If timeout or mismatch, exit cleanly WITHOUT releasing any keys!
         if wait_for_hello(args.cmd_fd, args.parent_pid, args.nonce).is_err() {
             unsafe {
@@ -798,16 +883,18 @@ mod unix_impl {
             return ExitCode::FAILURE;
         }
 
-        let ready = WatchdogFrame::ready(0).encode();
-        write_all_best_effort(args.ack_fd, &ready);
-
+        // 4. Arm kqueue/signals, send Ready (with capability flags), and enter event loop.
         let mut state = TrackedState::default();
-        run_event_loop(&args, &mut state, real_permit.as_ref());
+        let ok = run_event_loop(&args, &mut state, real_permit.as_ref(), ready_flags);
 
         unsafe {
             libc::close(lock_fd);
         }
-        ExitCode::SUCCESS
+        if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }
     }
 }
 

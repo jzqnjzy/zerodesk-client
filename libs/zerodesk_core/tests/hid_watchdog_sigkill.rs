@@ -358,6 +358,8 @@ fn test1_real_sigkill_releases_held_keys_and_modifiers_under_1s() {
     );
     assert_file_mode_0600(&report_path);
     assert_eq!(report.schema_version, WATCHDOG_REPORT_SCHEMA_VERSION);
+    assert!(report.release_ok);
+    assert!(report.release_error.is_none());
     assert!(
         report.trigger == "pipe_eof" || report.trigger == "parent_exit_kqueue",
         "unexpected trigger: {}",
@@ -515,6 +517,13 @@ fn test4_pipe_full_eagain_blocks_injection_releases_local_and_closes_after_5() {
             "0x05 must NEVER be injected on EAGAIN"
         );
         assert!(
+            !journal
+                .entries()
+                .iter()
+                .any(|e| e.kind == "key_down" && e.key_usage == Some(0x05)),
+            "journal event history must prove 0x05 key_down NEVER reached inner sink"
+        );
+        assert!(
             journal.is_all_released(),
             "local release_all_keys() must release prior held key 0x04"
         );
@@ -522,11 +531,19 @@ fn test4_pipe_full_eagain_blocks_injection_releases_local_and_closes_after_5() {
         assert_eq!(sup.phase(), HidGatePhase::Open);
     }
 
-    // 4. 5th consecutive EAGAIN permanently transitions HidGate to Closed!
+    // 4. 5th consecutive EAGAIN permanently transitions HidGate to Closed and closes cmd_write_fd!
     let fifth = sink.send_key(&key_ev(0x05, true, 0));
     assert_eq!(fifth, Err(OsError::Interlocked));
     assert_eq!(sup.consecutive_eagain_failures(), MAX_CONSECUTIVE_EAGAIN_FAILURES);
     assert_eq!(sup.phase(), HidGatePhase::Closed);
+    assert!(sup.cmd_write_fd().is_none(), "cmd_write_fd must be closed immediately on permanent EAGAIN");
+    assert!(
+        !journal
+            .entries()
+            .iter()
+            .any(|e| e.kind == "key_down" && e.key_usage == Some(0x05)),
+        "0x05 key_down must never appear in journal history"
+    );
     assert_eq!(
         degraded_events.lock().unwrap().len(),
         MAX_CONSECUTIVE_EAGAIN_FAILURES as usize
@@ -542,6 +559,13 @@ fn test4_pipe_full_eagain_blocks_injection_releases_local_and_closes_after_5() {
     journal.resume_for_new_session();
     assert_eq!(sink.send_key(&key_ev(0x06, true, 0)), Err(OsError::Interlocked));
     assert!(journal.pressed_keys().is_empty());
+    assert!(
+        !journal
+            .entries()
+            .iter()
+            .any(|e| e.kind == "key_down" && e.key_usage == Some(0x06)),
+        "0x06 key_down must never reach inner sink after permanent close"
+    );
 }
 
 #[test]
@@ -557,6 +581,17 @@ fn test5_external_watchdog_kill_epipe_triggers_local_release_and_fail_closed() {
         .unwrap(),
     );
     let wd_pid = sup.child_pid().unwrap() as i32;
+
+    // P1-3: verify FD_CLOEXEC is set on parent's cmd_write_fd!
+    let raw_w = sup.cmd_write_fd().unwrap();
+    let fd_flags = unsafe { libc::fcntl(raw_w, libc::F_GETFD) };
+    assert!(fd_flags >= 0, "fcntl(F_GETFD) on cmd_write_fd failed");
+    assert_ne!(
+        fd_flags & libc::FD_CLOEXEC,
+        0,
+        "cmd_write_fd MUST have FD_CLOEXEC set"
+    );
+
     let journal = DryRunHidJournal::new();
     let degraded_count = Arc::new(AtomicUsize::new(0));
     let deg_c = Arc::clone(&degraded_count);
@@ -577,7 +612,6 @@ fn test5_external_watchdog_kill_epipe_triggers_local_release_and_fail_closed() {
     }
 
     // Wait briefly for the kernel to close the dead watchdog's pipe read end (POLLERR on write fd).
-    let raw_w = sup.cmd_write_fd().unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let mut pfd = libc::pollfd {
@@ -592,11 +626,41 @@ fn test5_external_watchdog_kill_epipe_triggers_local_release_and_fail_closed() {
         thread::sleep(Duration::from_millis(5));
     }
 
+    // P1-2: on macOS, temporarily restore SIGPIPE to SIG_DFL across the broken-pipe write to
+    // genuinely prove F_SETNOSIGPIPE prevents SIGPIPE termination!
+    #[cfg(target_os = "macos")]
+    struct SigpipeRestoreGuard(libc::sighandler_t);
+    #[cfg(target_os = "macos")]
+    impl Drop for SigpipeRestoreGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::signal(libc::SIGPIPE, self.0);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let _sigpipe_guard = {
+        let prev = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        SigpipeRestoreGuard(prev)
+    };
+
     let err = sink.send_key(&key_ev(0x09, true, 0)).unwrap_err();
+    #[cfg(target_os = "macos")]
+    drop(_sigpipe_guard);
+
     assert_eq!(err, OsError::Interlocked);
     assert!(journal.is_all_released());
     assert!(!journal.pressed_keys().contains(&0x09));
+    // P1-1: verify journal event history proves 0x09 NEVER reached inner sink!
+    assert!(
+        !journal
+            .entries()
+            .iter()
+            .any(|e| e.kind == "key_down" && e.key_usage == Some(0x09)),
+        "0x09 key_down must NEVER appear in journal history on EPIPE"
+    );
     assert_eq!(sup.phase(), HidGatePhase::Closed);
+    assert!(sup.cmd_write_fd().is_none(), "cmd_write_fd must be closed immediately on EPIPE");
     assert!(degraded_count.load(Ordering::Acquire) >= 1);
 
     drop(sink);
@@ -682,4 +746,36 @@ fn test7_stress_100x_start_stop_zero_zombies_zero_leftovers() {
             "leftover/zombie watchdog pid {pid} detected"
         );
     }
+}
+
+#[test]
+fn test8_spawn_rejects_missing_symlink_and_world_writable_binary() {
+    let tmp = TempDirGuard::new("t8-fail-closed");
+
+    // 1. Non-existent binary path -> must fail closed.
+    let missing = tmp.path().join("does-not-exist-watchdog");
+    assert!(HidWatchdogSupervisor::spawn(HidWatchdogConfig {
+        binary_path: Some(missing),
+        ..HidWatchdogConfig::default()
+    })
+    .is_err());
+
+    // 2. Symlink pointing to the real watchdog binary -> must fail closed via lstat.
+    let symlink_path = tmp.path().join("watchdog-symlink");
+    std::os::unix::fs::symlink(WATCHDOG_BIN, &symlink_path).unwrap();
+    assert!(HidWatchdogSupervisor::spawn(HidWatchdogConfig {
+        binary_path: Some(symlink_path),
+        ..HidWatchdogConfig::default()
+    })
+    .is_err());
+
+    // 3. World-writable copy -> must fail closed.
+    let writable_path = tmp.path().join("watchdog-0777");
+    fs::copy(WATCHDOG_BIN, &writable_path).unwrap();
+    fs::set_permissions(&writable_path, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(HidWatchdogSupervisor::spawn(HidWatchdogConfig {
+        binary_path: Some(writable_path),
+        ..HidWatchdogConfig::default()
+    })
+    .is_err());
 }

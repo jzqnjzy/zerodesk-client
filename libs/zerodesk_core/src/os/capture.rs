@@ -286,6 +286,14 @@ pub fn create_os_screen_capture_with_policy(
                 if !legacy_capture_fallback {
                     return Err(sck_err);
                 }
+                eprintln!(
+                    "[zerodesk_core::os::capture] ScreenCaptureKit failed ({sck_err}); falling back to legacy CoreGraphics capture (explicit legacy_capture_fallback=true){}",
+                    if capture_audio {
+                        " (WARNING: system audio loopback unavailable in legacy capture)"
+                    } else {
+                        ""
+                    }
+                );
                 #[cfg(feature = "os-capture")]
                 {
                     Ok((Box::new(MacOsScreenCapture::new()?), None))

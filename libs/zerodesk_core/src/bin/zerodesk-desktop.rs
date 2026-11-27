@@ -151,7 +151,20 @@ fn has_flag(args: &[String], name: &str) -> bool {
 }
 
 fn build_runtime_from_flags(args: &[String]) -> Result<RuntimeDropGuard, String> {
-    let watchdog_report = flag_value(args, "--watchdog-report").map(std::path::PathBuf::from);
+    let watchdog_report = match flag_value(args, "--watchdog-report") {
+        Some(raw) if raw.trim().is_empty() => {
+            return Err("InvalidArgument: --watchdog-report must be a non-empty path".into());
+        }
+        Some(raw) => Some(std::path::PathBuf::from(raw)),
+        None => None,
+    };
+    let real_os_input = has_flag(args, "--real-os-input");
+    if real_os_input && watchdog_report.is_some() {
+        return Err(
+            "InvalidArgument: --watchdog-report (dry-run watchdog) cannot be combined with --real-os-input"
+                .into(),
+        );
+    }
     let enable_watchdog = has_flag(args, "--hid-watchdog") || watchdog_report.is_some();
     let mut opts = V2BridgeRuntimeOptions {
         use_os_capture: has_flag(args, "--os-capture"),
@@ -162,7 +175,7 @@ fn build_runtime_from_flags(args: &[String]) -> Result<RuntimeDropGuard, String>
         watchdog_report_path: watchdog_report,
         ..V2BridgeRuntimeOptions::default()
     };
-    if has_flag(args, "--real-os-input") {
+    if real_os_input {
         let permit = RealInputPermit::from_explicit_opt_in(true).map_err(|e| e.to_string())?;
         opts.real_input_permit = Some(Arc::new(permit));
     }

@@ -4,9 +4,9 @@
 //! macOS ScreenCaptureKit bridge adapter (Video + System Audio Loopback) implementing
 //! `OsScreenCapture` and `OsAudioCapture`.
 //!
-//! Pure-Rust audio ASBD parser (`ingest_sck_audio_buffers`) and video ingestion
-//! (`ingest_sck_bgra_frame` / `SckVideoSlot`) are compiled on all platforms and 100%
-//! unit-testable without OS permissions or display hardware.
+//! Pure-Rust audio ASBD parser (`ingest_sck_audio_buffers`), video ingestion
+//! (`ingest_sck_bgra_frame` / `SckVideoSlot`), and staleness checks are compiled on all
+//! platforms and 100% unit-testable without OS permissions or display hardware.
 
 use super::{
     audio::{
@@ -33,6 +33,9 @@ pub const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
 pub const K_AUDIO_FORMAT_FLAG_IS_BIG_ENDIAN: u32 = 1 << 1;
 pub const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
 pub const K_AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
+
+/// Maximum age a cached idle frame may be reused before declaring the SCK stream stalled.
+pub const SCK_STALE_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Stack chunk size for zero-allocation audio interleaving / ingestion on the RT callback path.
 const AUDIO_INGEST_STACK_CHUNK: usize = 512;
@@ -111,8 +114,9 @@ pub fn validate_sck_audio_asbd(asbd: &SckAudioAsbd) -> Result<(), OsError> {
 /// - **Planar / non-interleaved** (`kAudioFormatFlagIsNonInterleaved`, `buffers.len() == 2` of
 ///   `[L0, L1, ...]` and `[R0, R1, ...]`)
 ///
-/// Writes interleaved `f32` samples directly into the lock-free `SpscAudioProducer` using a
-/// small stack buffer (zero heap allocations on the real-time audio callback path).
+/// Writes interleaved `f32` chunks atomically into the lock-free `SpscAudioProducer` using a
+/// stack buffer (zero heap allocations; rejects a chunk atomically if ring free space < chunk
+/// length and increments `dropped_frames` so stereo pairs are never torn).
 pub fn ingest_sck_audio_buffers(
     asbd: &SckAudioAsbd,
     buffers: &[&[u8]],
@@ -168,7 +172,10 @@ pub fn ingest_sck_audio_buffers(
                 stack_buf[i * 2] = l;
                 stack_buf[i * 2 + 1] = r;
             }
-            total_pushed += producer.push_slice(&stack_buf[..(chunk_frames * 2)]);
+            let chunk_samples = chunk_frames * 2;
+            if producer.push_whole_frame(&stack_buf[..chunk_samples]) {
+                total_pushed += chunk_samples;
+            }
             frame_off += chunk_frames;
         }
     } else {
@@ -198,12 +205,31 @@ pub fn ingest_sck_audio_buffers(
                     bytes[byte_off + 3],
                 ]);
             }
-            total_pushed += producer.push_slice(&stack_buf[..chunk_samples]);
+            if producer.push_whole_frame(&stack_buf[..chunk_samples]) {
+                total_pushed += chunk_samples;
+            }
             sample_off += chunk_samples;
         }
     }
 
     Ok(total_pushed)
+}
+
+/// Checks whether a previously received SCK frame has aged past `max_age`, preventing
+/// infinite resending of a frozen frame when the SCK stream silently stalls.
+pub fn check_sck_frame_staleness(
+    last_received_at: Instant,
+    now: Instant,
+    max_age: Duration,
+) -> Result<(), OsError> {
+    if now.saturating_duration_since(last_received_at) > max_age {
+        Err(OsError::CaptureFailed(format!(
+            "ScreenCaptureKit stream stalled (no fresh frame for >{}ms)",
+            max_age.as_millis()
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Stored latest video frame produced by ScreenCaptureKit (single-slot overwrite).
@@ -212,6 +238,7 @@ pub struct SckLatestFrame {
     pub i420: I420Frame,
     pub scale_factor: f32,
     pub pts_us: i64,
+    pub received_at: Instant,
     pub seq: u64,
 }
 
@@ -305,9 +332,9 @@ impl SckVideoSlot {
     }
 }
 
-/// Validates even dimensions & `bytes_per_row` stride, converts BGRA -> I420 via `libyuv`
-/// (`convert_captured_stride_to_i420`), and publishes into the single-slot `SckVideoSlot`
-/// (dropping any unconsumed stale frame).
+/// Validates dimensions & `bytes_per_row` stride, cleanly crops odd display dimensions
+/// (e.g. 16" MacBook Pro `1728x1117` -> `1728x1116`) while preserving `bytes_per_row`,
+/// converts BGRA -> I420 via `libyuv`, and publishes into the single-slot `SckVideoSlot`.
 pub fn ingest_sck_bgra_frame(
     slot: &SckVideoSlot,
     bgra: &[u8],
@@ -317,25 +344,29 @@ pub fn ingest_sck_bgra_frame(
     scale_factor: f32,
     pts_us: i64,
 ) -> Result<u64, OsError> {
-    if width < 2 || height < 2 || (width & 1) != 0 || (height & 1) != 0 {
+    if width < 2 || height < 2 {
         return Err(OsError::InvalidData(format!(
-            "SCK video dimensions must be >= 2 and even, got {width}x{height}"
+            "SCK video dimensions must be >= 2x2, got {width}x{height}"
         )));
     }
-    let expected = checked_frame_byte_len(width, height, bytes_per_row)
+    let full_expected = checked_frame_byte_len(width, height, bytes_per_row)
         .map_err(|e| OsError::InvalidData(e.to_string()))?;
-    if bgra.len() < expected {
+    if bgra.len() < full_expected {
         return Err(OsError::InvalidData(format!(
-            "SCK BGRA buffer len {} < stride*height ({expected})",
+            "SCK BGRA buffer len {} < stride*height ({full_expected})",
             bgra.len()
         )));
     }
+    let even_w = width & !1;
+    let even_h = height & !1;
+    let cropped_expected = checked_frame_byte_len(even_w, even_h, bytes_per_row)
+        .map_err(|e| OsError::InvalidData(e.to_string()))?;
     let raw = RawCapturedFrame {
-        width,
-        height,
+        width: even_w,
+        height: even_h,
         stride: bytes_per_row,
         pixel_format: PixelFormat::Bgra8,
-        data: bgra[..expected].to_vec(),
+        data: bgra[..cropped_expected].to_vec(),
     };
     let i420 = convert_captured_stride_to_i420(&raw)?;
     let seq = slot.publish(SckLatestFrame {
@@ -347,6 +378,7 @@ pub fn ingest_sck_bgra_frame(
             1.0
         },
         pts_us,
+        received_at: Instant::now(),
         seq: 0,
     });
     Ok(seq)
@@ -467,12 +499,15 @@ mod macos_sck_impl {
         audio_producer: UnsafeCell<Option<SpscAudioProducer>>,
         stream_failed: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<String>>>,
+        video_ingest_errors: Arc<AtomicU64>,
+        audio_format_errors: Arc<AtomicU64>,
         dimensions: Arc<Mutex<(u32, u32)>>,
     }
 
-    // SAFETY: `video_slot`, `stream_failed`, `last_error`, `dimensions` are Send+Sync;
-    // `audio_producer` is touched strictly on the single serial `audio_queue` GCD queue,
-    // which is drained via `dispatch_sync` in `zd_sck_destroy` before `SckCallbackCtx` drops.
+    // SAFETY: `video_slot`, `stream_failed`, `last_error`, `video_ingest_errors`,
+    // `audio_format_errors`, and `dimensions` are Send+Sync; `audio_producer` is touched
+    // strictly on the single serial `audio_queue` GCD queue, which is drained via
+    // `dispatch_sync` in `zd_sck_destroy` before `SckCallbackCtx` drops.
     unsafe impl Sync for SckCallbackCtx {}
     unsafe impl Send for SckCallbackCtx {}
 
@@ -489,11 +524,19 @@ mod macos_sck_impl {
             return;
         }
         let ctx = unsafe { &*(user_ctx as *const SckCallbackCtx) };
-        let Ok(byte_len) = checked_frame_byte_len(width, height, bytes_per_row) else {
-            return;
+        let byte_len = match checked_frame_byte_len(width, height, bytes_per_row) {
+            Ok(n) => n,
+            Err(e) => {
+                ctx.video_ingest_errors.fetch_add(1, Ordering::Relaxed);
+                let mut err_slot = ctx.last_error.lock().unwrap_or_else(|e| e.into_inner());
+                if err_slot.is_none() {
+                    *err_slot = Some(format!("SCK video frame bounds error: {e}"));
+                }
+                return;
+            }
         };
         let slice = unsafe { std::slice::from_raw_parts(bgra_base, byte_len) };
-        if ingest_sck_bgra_frame(
+        match ingest_sck_bgra_frame(
             &ctx.video_slot,
             slice,
             width,
@@ -501,11 +544,18 @@ mod macos_sck_impl {
             bytes_per_row,
             scale_factor,
             pts_us,
-        )
-        .is_ok()
-        {
-            let mut dims = ctx.dimensions.lock().unwrap_or_else(|e| e.into_inner());
-            *dims = (width, height);
+        ) {
+            Ok(_) => {
+                let mut dims = ctx.dimensions.lock().unwrap_or_else(|e| e.into_inner());
+                *dims = (width & !1, height & !1);
+            }
+            Err(e) => {
+                ctx.video_ingest_errors.fetch_add(1, Ordering::Relaxed);
+                let mut err_slot = ctx.last_error.lock().unwrap_or_else(|e| e.into_inner());
+                if err_slot.is_none() {
+                    *err_slot = Some(format!("SCK video ingest failed: {e}"));
+                }
+            }
         }
     }
 
@@ -544,7 +594,15 @@ mod macos_sck_impl {
             format_flags,
             bits_per_channel,
         };
-        let _ = ingest_sck_audio_buffers(&asbd, &slices[..(num_buffers as usize)], producer);
+        if let Err(e) =
+            ingest_sck_audio_buffers(&asbd, &slices[..(num_buffers as usize)], producer)
+        {
+            ctx.audio_format_errors.fetch_add(1, Ordering::Relaxed);
+            let mut err_slot = ctx.last_error.lock().unwrap_or_else(|e| e.into_inner());
+            if err_slot.is_none() {
+                *err_slot = Some(format!("SCK audio format error: {e}"));
+            }
+        }
     }
 
     extern "C" fn on_sck_error(
@@ -574,11 +632,13 @@ mod macos_sck_impl {
         video_slot: Arc<SckVideoSlot>,
         stream_failed: Arc<AtomicBool>,
         last_error: Arc<Mutex<Option<String>>>,
+        video_ingest_errors: Arc<AtomicU64>,
+        audio_format_errors: Arc<AtomicU64>,
         dimensions: Arc<Mutex<(u32, u32)>>,
     }
 
-    // SAFETY: `ZdSckHandle` uses internal atomics & dedicated serial GCD queues (`stop_queue`,
-    // `video_queue`, `audio_queue`), and `zd_sck_destroy` drains all queues before freeing `ctx_ptr`.
+    // SAFETY: `ZdSckHandle` uses internal atomics, `os_unfair_lock`, and dedicated serial GCD
+    // queues, and `zd_sck_destroy` detaches the delegate & drains all queues before freeing `ctx_ptr`.
     unsafe impl Send for SckStreamInner {}
     unsafe impl Sync for SckStreamInner {}
 
@@ -586,13 +646,19 @@ mod macos_sck_impl {
         fn drop(&mut self) {
             self.video_slot.close();
             if !self.handle.is_null() {
+                let stop_rc = unsafe { zd_sck_stop(self.handle, ZD_SCK_DEFAULT_STOP_TIMEOUT_MS) };
+                if stop_rc != ZD_SCK_OK {
+                    let mut err_slot = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+                    if err_slot.is_none() {
+                        *err_slot = Some(format!("zd_sck_stop returned code {stop_rc}"));
+                    }
+                }
                 unsafe {
-                    let _ = zd_sck_stop(self.handle, ZD_SCK_DEFAULT_STOP_TIMEOUT_MS);
                     zd_sck_destroy(self.handle);
                 }
                 self.handle = std::ptr::null_mut();
             }
-            // Safe to free callback context ONLY AFTER `zd_sck_destroy` drained both GCD queues.
+            // Safe to free callback context ONLY AFTER `zd_sck_destroy` detached & drained queues.
             if !self.ctx_ptr.is_null() {
                 unsafe {
                     drop(Box::from_raw(self.ctx_ptr));
@@ -604,7 +670,23 @@ mod macos_sck_impl {
 
     pub struct MacOsSckScreenCapture {
         inner: Arc<SckStreamInner>,
-        last_raw: Option<RawCapturedFrame>,
+        last_raw: Option<(RawCapturedFrame, Instant)>,
+    }
+
+    impl MacOsSckScreenCapture {
+        #[allow(dead_code)]
+        pub fn video_ingest_errors(&self) -> u64 {
+            self.inner.video_ingest_errors.load(Ordering::Relaxed)
+        }
+
+        #[allow(dead_code)]
+        pub fn last_error(&self) -> Option<String> {
+            self.inner
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
     }
 
     impl OsScreenCapture for MacOsSckScreenCapture {
@@ -627,13 +709,18 @@ mod macos_sck_impl {
                     .unwrap_or_else(|| "ScreenCaptureKit stream stopped".into());
                 return Err(OsError::CaptureFailed(msg));
             }
-            if let Some(latest) = self.inner.video_slot.take_latest_wait(Duration::from_millis(250))
+            if let Some(latest) = self
+                .inner
+                .video_slot
+                .take_latest_wait(Duration::from_millis(250))
             {
-                self.last_raw = Some(latest.raw.clone());
+                self.last_raw = Some((latest.raw.clone(), latest.received_at));
                 return Ok(latest.raw);
             }
-            // ScreenCaptureKit delivers frames on display damage; reuse last frame when idle.
-            if let Some(prev) = &self.last_raw {
+            // ScreenCaptureKit delivers frames on display damage; reuse last frame ONLY within
+            // bounded staleness window so a frozen/stalled stream fails closed.
+            if let Some((prev, received_at)) = &self.last_raw {
+                check_sck_frame_staleness(*received_at, Instant::now(), SCK_STALE_FRAME_TIMEOUT)?;
                 return Ok(prev.clone());
             }
             Err(OsError::CaptureFailed(
@@ -645,6 +732,13 @@ mod macos_sck_impl {
     pub struct MacOsSckAudioCapture {
         inner: Arc<SckStreamInner>,
         consumer: SpscAudioConsumer,
+    }
+
+    impl MacOsSckAudioCapture {
+        #[allow(dead_code)]
+        pub fn audio_format_errors(&self) -> u64 {
+            self.inner.audio_format_errors.load(Ordering::Relaxed)
+        }
     }
 
     impl OsAudioCapture for MacOsSckAudioCapture {
@@ -674,6 +768,7 @@ mod macos_sck_impl {
 
         fn has_stream_error(&self) -> bool {
             self.inner.stream_failed.load(Ordering::Acquire)
+                || self.inner.audio_format_errors.load(Ordering::Relaxed) > 0
         }
     }
 
@@ -691,9 +786,13 @@ mod macos_sck_impl {
         let video_slot = Arc::new(SckVideoSlot::new());
         let stream_failed = Arc::new(AtomicBool::new(false));
         let last_error = Arc::new(Mutex::new(None));
+        let video_ingest_errors = Arc::new(AtomicU64::new(0));
+        let audio_format_errors = Arc::new(AtomicU64::new(0));
+        let req_w = cfg.width & !1;
+        let req_h = cfg.height & !1;
         let dimensions = Arc::new(Mutex::new((
-            if cfg.width >= 2 { cfg.width & !1 } else { 1280 },
-            if cfg.height >= 2 { cfg.height & !1 } else { 720 },
+            if req_w >= 2 { req_w } else { 1280 },
+            if req_h >= 2 { req_h } else { 720 },
         )));
 
         let ctx = Box::new(SckCallbackCtx {
@@ -701,13 +800,15 @@ mod macos_sck_impl {
             audio_producer: UnsafeCell::new(audio_prod),
             stream_failed: Arc::clone(&stream_failed),
             last_error: Arc::clone(&last_error),
+            video_ingest_errors: Arc::clone(&video_ingest_errors),
+            audio_format_errors: Arc::clone(&audio_format_errors),
             dimensions: Arc::clone(&dimensions),
         });
         let ctx_ptr = Box::into_raw(ctx);
 
         let c_cfg = ZdSckConfig {
-            width: cfg.width,
-            height: cfg.height,
+            width: req_w,
+            height: req_h,
             fps: cfg.fps,
             display_index: cfg.display_index,
             capture_audio: u8::from(cfg.capture_audio),
@@ -741,6 +842,8 @@ mod macos_sck_impl {
             video_slot,
             stream_failed,
             last_error,
+            video_ingest_errors,
+            audio_format_errors,
             dimensions: Arc::clone(&dimensions),
         });
 
@@ -763,7 +866,7 @@ mod macos_sck_impl {
             && actual_w >= 2
             && actual_h >= 2
         {
-            *dimensions.lock().unwrap_or_else(|e| e.into_inner()) = (actual_w, actual_h);
+            *dimensions.lock().unwrap_or_else(|e| e.into_inner()) = (actual_w & !1, actual_h & !1);
         }
 
         let video_cap: Box<dyn OsScreenCapture> = Box::new(MacOsSckScreenCapture {
@@ -811,14 +914,12 @@ mod tests {
 
     #[test]
     fn unauthorized_preflight_returns_permission_denied_without_prompt() {
-        // Pure deterministic permission gate check:
         assert_eq!(
             enforce_sck_permission_preflight(false),
             Err(OsError::PermissionDenied(OsPermission::ScreenRecording))
         );
         assert_eq!(enforce_sck_permission_preflight(true), Ok(()));
 
-        // Live non-interactive preflight on macOS MUST return promptly without popping any dialog.
         #[cfg(all(target_os = "macos", feature = "os-sck"))]
         {
             let granted = preflight_sck_permission().expect("preflight must not fail on macOS");
@@ -892,7 +993,6 @@ mod tests {
         let (mut prod, _cons) = create_spsc_audio_ring();
         let valid_bytes = f32_slice_to_le_bytes(&[0.1, -0.1, 0.2, -0.2]);
 
-        // 44.1 kHz -> rejected
         let bad_rate = SckAudioAsbd {
             sample_rate: 44_100.0,
             channels: 2,
@@ -904,7 +1004,6 @@ mod tests {
             Err(OsError::UnsupportedAudioFormat(_))
         ));
 
-        // 1ch mono -> rejected
         let mono = SckAudioAsbd {
             sample_rate: 48_000.0,
             channels: 1,
@@ -916,7 +1015,6 @@ mod tests {
             Err(OsError::UnsupportedAudioFormat(_))
         ));
 
-        // 6ch surround -> rejected
         let surround = SckAudioAsbd {
             sample_rate: 48_000.0,
             channels: 6,
@@ -928,7 +1026,6 @@ mod tests {
             Err(OsError::UnsupportedAudioFormat(_))
         ));
 
-        // 16-bit integer -> rejected
         let pcm16 = SckAudioAsbd {
             sample_rate: 48_000.0,
             channels: 2,
@@ -940,7 +1037,6 @@ mod tests {
             Err(OsError::UnsupportedAudioFormat(_))
         ));
 
-        // Big-endian float32 -> rejected
         let big_endian = SckAudioAsbd {
             sample_rate: 48_000.0,
             channels: 2,
@@ -952,7 +1048,6 @@ mod tests {
             Err(OsError::UnsupportedAudioFormat(_))
         ));
 
-        // Mismatched planar buffer lengths -> rejected
         let planar_ok = SckAudioAsbd {
             sample_rate: 48_000.0,
             channels: 2,
@@ -967,15 +1062,15 @@ mod tests {
     }
 
     #[test]
-    fn bgra_padded_stride_converts_to_i420_and_overwrites_latest_slot() {
+    fn bgra_padded_stride_odd_crop_and_staleness_detection() {
         let slot = SckVideoSlot::new();
         let w = 64u32;
         let h = 32u32;
         let stride = 320u32; // 64 bytes extra row padding beyond 64*4=256
 
-        let make_frame = |b: u8, g: u8, r: u8| -> Vec<u8> {
-            let mut buf = vec![0xAAu8; (stride as usize) * (h as usize)];
-            for row in 0..(h as usize) {
+        let make_frame = |b: u8, g: u8, r: u8, height: u32| -> Vec<u8> {
+            let mut buf = vec![0xAAu8; (stride as usize) * (height as usize)];
+            for row in 0..(height as usize) {
                 for col in 0..(w as usize) {
                     let off = row * (stride as usize) + col * 4;
                     buf[off] = b;
@@ -987,26 +1082,43 @@ mod tests {
             buf
         };
 
-        // Odd dimensions rejected fail-closed.
+        // Too-small (<2) dimensions rejected fail-closed.
         let dummy = vec![0u8; 64 * 64 * 4];
-        assert!(ingest_sck_bgra_frame(&slot, &dummy, 63, 32, 256, 2.0, 100).is_err());
+        assert!(ingest_sck_bgra_frame(&slot, &dummy, 1, 32, 256, 2.0, 100).is_err());
+
+        // Odd height/width (like 16" MBP 1728x1117) crops cleanly to even while preserving stride!
+        let odd_frame = make_frame(80, 160, 200, 33);
+        let seq_odd = ingest_sck_bgra_frame(&slot, &odd_frame, 63, 33, stride, 2.0, 500).unwrap();
+        assert_eq!(seq_odd, 1);
+        let cropped = slot.take_latest().expect("odd frame cropped cleanly");
+        assert_eq!(cropped.i420.width, 62);
+        assert_eq!(cropped.i420.height, 32);
+        assert_eq!(cropped.raw.stride, stride);
 
         // Publish 2 frames back-to-back without consuming -> 1st is overwritten (dropped_stale = 1).
-        let dark = make_frame(10, 10, 10);
-        let bright = make_frame(230, 230, 230);
+        let dark = make_frame(10, 10, 10, h);
+        let bright = make_frame(230, 230, 230, h);
         let seq1 = ingest_sck_bgra_frame(&slot, &dark, w, h, stride, 2.0, 1000).unwrap();
         let seq2 = ingest_sck_bgra_frame(&slot, &bright, w, h, stride, 2.0, 2000).unwrap();
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
+        assert_eq!(seq1, 2);
+        assert_eq!(seq2, 3);
         assert_eq!(slot.dropped_stale_frames(), 1);
 
         let latest = slot.take_latest().expect("latest frame present");
-        assert_eq!(latest.seq, 2);
+        assert_eq!(latest.seq, 3);
         assert_eq!(latest.pts_us, 2000);
         assert_eq!(latest.scale_factor, 2.0);
         assert_eq!(latest.i420.width, 64);
         assert_eq!(latest.i420.height, 32);
         assert!(latest.i420.y.iter().all(|&y| y > 180));
         assert!(slot.take_latest().is_none());
+
+        // Stale frame detection fails closed once frame age exceeds SCK_STALE_FRAME_TIMEOUT.
+        let t0 = Instant::now();
+        assert!(check_sck_frame_staleness(t0, t0 + Duration::from_secs(2), SCK_STALE_FRAME_TIMEOUT).is_ok());
+        assert!(matches!(
+            check_sck_frame_staleness(t0, t0 + Duration::from_secs(4), SCK_STALE_FRAME_TIMEOUT),
+            Err(OsError::CaptureFailed(_))
+        ));
     }
 }

@@ -15,8 +15,9 @@
 use super::{
     watchdog_proto::{
         bitmap_clear_key, bitmap_set_key, WatchdogFrame, WatchdogMsgType, WATCHDOG_FRAME_LEN,
+        WATCHDOG_READY_FLAG_AX_TRUSTED, WATCHDOG_READY_FLAG_REAL_OS_INPUT,
     },
-    EmergencyKeyReleaser, OsError, OsHidSink, ReleaseReport,
+    EmergencyKeyReleaser, OsError, OsHidSink, OsPermission, ReleaseReport,
 };
 use crate::session::hid::{KeyEvent, MouseEvent, MouseKind};
 use std::{
@@ -148,7 +149,25 @@ mod unix_impl {
             {
                 // Darwin <sys/fcntl.h>: #define F_SETNOSIGPIPE 73 (absent in older libc 0.2.x).
                 const F_SETNOSIGPIPE: libc::c_int = 73;
-                let _ = libc::fcntl(fd, F_SETNOSIGPIPE, 1);
+                if libc::fcntl(fd, F_SETNOSIGPIPE, 1) < 0 {
+                    return Err(OsError::CaptureFailed(format!(
+                        "fcntl(F_SETNOSIGPIPE) failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Non-macOS Unix has no per-fd F_SETNOSIGPIPE; verify SIGPIPE is SIG_IGN (fail closed).
+                let mut act: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut act) != 0
+                    || act.sa_sigaction != libc::SIG_IGN
+                {
+                    return Err(OsError::CaptureFailed(
+                        "SIGPIPE must be SIG_IGN on non-macOS Unix before supervising HID watchdog"
+                            .into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -275,7 +294,7 @@ mod unix_impl {
         }
     }
 
-    fn wait_for_ready_frame(ack_fd: i32, timeout: Duration) -> Result<(), OsError> {
+    fn wait_for_ready_frame(ack_fd: i32, timeout: Duration) -> Result<u8, OsError> {
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; WATCHDOG_FRAME_LEN];
         let mut filled = 0usize;
@@ -335,7 +354,7 @@ mod unix_impl {
                 frame.msg_type
             )));
         }
-        Ok(())
+        Ok(frame.flags)
     }
 
     fn reap_child_bounded(pid: i32, timeout: Duration) {
@@ -441,7 +460,10 @@ mod unix_impl {
                 cmd.arg("--real-os-input");
             }
 
-            // Clear FD_CLOEXEC ONLY on the two child pipe endpoints in pre_exec.
+            // In pre_exec (async-signal-safe only):
+            // 1. Clear FD_CLOEXEC ONLY on cmd_read and ack_write.
+            // 2. Call setsid() (ignore EPERM) so child is detached even before exec().
+            // 3. Close all inherited fds 3..rlim_cur.min(16384) except cmd_read and ack_write.
             unsafe {
                 cmd.pre_exec(move || {
                     for fd in [cmd_read, ack_write] {
@@ -451,6 +473,24 @@ mod unix_impl {
                         }
                         if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                             return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    let _ = libc::setsid();
+                    let mut rl = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    let max_fd = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0
+                        && rl.rlim_cur != libc::RLIM_INFINITY
+                        && rl.rlim_cur > 0
+                    {
+                        (rl.rlim_cur.min(16_384) as i32).max(256)
+                    } else {
+                        4096
+                    };
+                    for fd in 3..max_fd {
+                        if fd != cmd_read && fd != ack_write {
+                            let _ = libc::close(fd);
                         }
                     }
                     Ok(())
@@ -513,9 +553,19 @@ mod unix_impl {
                 }
             }
 
-            if let Err(e) = wait_for_ready_frame(ack_read, cfg.handshake_timeout) {
-                sup.force_kill_and_cleanup();
-                return Err(e);
+            let ready_flags = match wait_for_ready_frame(ack_read, cfg.handshake_timeout) {
+                Ok(f) => f,
+                Err(e) => {
+                    sup.force_kill_and_cleanup();
+                    return Err(e);
+                }
+            };
+            if cfg.real_os_input {
+                let required = WATCHDOG_READY_FLAG_REAL_OS_INPUT | WATCHDOG_READY_FLAG_AX_TRUSTED;
+                if (ready_flags & required) != required {
+                    sup.force_kill_and_cleanup();
+                    return Err(OsError::PermissionDenied(OsPermission::Accessibility));
+                }
             }
 
             Ok(sup)
@@ -608,6 +658,36 @@ mod unix_impl {
             }
         }
 
+        /// Non-blocking reap + resource cleanup invoked after detecting a broken pipe (`EPIPE`)
+        /// so a dead watchdog never lingers as a zombie while the supervisor is still alive.
+        fn try_reap_dead_child_nonblock(&self) {
+            if let Some(fd) = self
+                .ack_read_fd
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                close_fd(fd);
+            }
+            let mut pid_guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pid) = *pid_guard {
+                let mut status: libc::c_int = 0;
+                let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if r == pid
+                    || (r < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                {
+                    *pid_guard = None;
+                    if self.owns_child {
+                        ACTIVE_WATCHDOG_CHILDREN.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    if let Some(lock_path) = &self.lock_file_path {
+                        let _ = fs::remove_file(lock_path);
+                    }
+                }
+            }
+        }
+
         /// Golden ordering for `KeyDown`:
         /// Acquire `HidGate` -> check `Open` -> build snapshot -> write 56B `O_NONBLOCK` ->
         /// commit & return `Ok(())` ONLY on full write.
@@ -625,6 +705,7 @@ mod unix_impl {
             }
             let degraded_reason: Option<String>;
             let err_to_return: OsError;
+            let mut is_broken = false;
             {
                 let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 if g.phase != HidGatePhase::Open {
@@ -652,10 +733,16 @@ mod unix_impl {
                     PipeWriteResult::WouldBlock => {
                         g.consecutive_eagain_failures =
                             g.consecutive_eagain_failures.saturating_add(1);
+                        g.keys_bitmap = [0u8; 32];
+                        g.buttons = 0;
+                        g.mods = 0;
                         let count = g.consecutive_eagain_failures;
                         let closed_now = count >= MAX_CONSECUTIVE_EAGAIN_FAILURES;
                         if closed_now {
                             g.phase = HidGatePhase::Closed;
+                            if let Some(wfd) = g.cmd_write_fd.take() {
+                                close_fd(wfd);
+                            }
                         }
                         degraded_reason = Some(format!(
                             "HID watchdog pipe full (EAGAIN {count}/{MAX_CONSECUTIVE_EAGAIN_FAILURES}{})",
@@ -669,6 +756,13 @@ mod unix_impl {
                     }
                     PipeWriteResult::Broken(msg) => {
                         g.phase = HidGatePhase::Closed;
+                        g.keys_bitmap = [0u8; 32];
+                        g.buttons = 0;
+                        g.mods = 0;
+                        if let Some(wfd) = g.cmd_write_fd.take() {
+                            close_fd(wfd);
+                        }
+                        is_broken = true;
                         degraded_reason = Some(msg);
                         err_to_return = OsError::Interlocked;
                     }
@@ -676,6 +770,9 @@ mod unix_impl {
             }
             // Drop HidGate lock BEFORE calling local_releaser or degraded callback.
             let _ = local_releaser.release_all_keys();
+            if is_broken {
+                self.try_reap_dead_child_nonblock();
+            }
             if let (Some(cb), Some(reason)) = (on_degraded, degraded_reason) {
                 cb(reason);
             }
@@ -723,12 +820,19 @@ mod unix_impl {
                     }
                     PipeWriteResult::Broken(msg) => {
                         g.phase = HidGatePhase::Closed;
+                        g.keys_bitmap = [0u8; 32];
+                        g.buttons = 0;
+                        g.mods = 0;
+                        if let Some(wfd) = g.cmd_write_fd.take() {
+                            close_fd(wfd);
+                        }
                         Some(msg)
                     }
                 }
             };
             if let Some(reason) = broken_reason {
                 let _ = local_releaser.release_all_keys();
+                self.try_reap_dead_child_nonblock();
                 if let Some(cb) = on_degraded {
                     cb(reason);
                 }
@@ -745,6 +849,7 @@ mod unix_impl {
             let masked = buttons_mask & 0x1F;
             let degraded_reason: Option<String>;
             let err_to_return: OsError;
+            let mut is_broken = false;
             {
                 let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 if g.phase != HidGatePhase::Open {
@@ -773,10 +878,16 @@ mod unix_impl {
                     PipeWriteResult::WouldBlock => {
                         g.consecutive_eagain_failures =
                             g.consecutive_eagain_failures.saturating_add(1);
+                        g.keys_bitmap = [0u8; 32];
+                        g.buttons = 0;
+                        g.mods = 0;
                         let count = g.consecutive_eagain_failures;
                         let closed_now = count >= MAX_CONSECUTIVE_EAGAIN_FAILURES;
                         if closed_now {
                             g.phase = HidGatePhase::Closed;
+                            if let Some(wfd) = g.cmd_write_fd.take() {
+                                close_fd(wfd);
+                            }
                         }
                         degraded_reason = Some(format!(
                             "HID watchdog pipe full on MouseDown (EAGAIN {count}/{MAX_CONSECUTIVE_EAGAIN_FAILURES}{})",
@@ -790,12 +901,22 @@ mod unix_impl {
                     }
                     PipeWriteResult::Broken(msg) => {
                         g.phase = HidGatePhase::Closed;
+                        g.keys_bitmap = [0u8; 32];
+                        g.buttons = 0;
+                        g.mods = 0;
+                        if let Some(wfd) = g.cmd_write_fd.take() {
+                            close_fd(wfd);
+                        }
+                        is_broken = true;
                         degraded_reason = Some(msg);
                         err_to_return = OsError::Interlocked;
                     }
                 }
             }
             let _ = local_releaser.release_all_keys();
+            if is_broken {
+                self.try_reap_dead_child_nonblock();
+            }
             if let (Some(cb), Some(reason)) = (on_degraded, degraded_reason) {
                 cb(reason);
             }
@@ -836,12 +957,19 @@ mod unix_impl {
                     PipeWriteResult::WouldBlock => None,
                     PipeWriteResult::Broken(msg) => {
                         g.phase = HidGatePhase::Closed;
+                        g.keys_bitmap = [0u8; 32];
+                        g.buttons = 0;
+                        g.mods = 0;
+                        if let Some(wfd) = g.cmd_write_fd.take() {
+                            close_fd(wfd);
+                        }
                         Some(msg)
                     }
                 }
             };
             if let Some(reason) = broken_reason {
                 let _ = local_releaser.release_all_keys();
+                self.try_reap_dead_child_nonblock();
                 if let Some(cb) = on_degraded {
                     cb(reason);
                 }
@@ -1012,9 +1140,10 @@ struct SupervisedEmergencyKeyReleaser {
 
 impl EmergencyKeyReleaser for SupervisedEmergencyKeyReleaser {
     fn release_all_keys(&self) -> ReleaseReport {
-        let report = self.inner.release_all_keys();
+        // Quiesce & close HidGate FIRST so any concurrent send_key/send_mouse post-injection
+        // check sees !is_open() immediately, then release local keys.
         self.supervisor.shutdown(None);
-        report
+        self.inner.release_all_keys()
     }
 }
 
@@ -1069,7 +1198,14 @@ impl OsHidSink for WatchdogSupervisedHidSink {
                 self.local_releaser.as_ref(),
                 self.on_degraded.as_ref(),
             )?;
-            self.inner.send_key(ev)
+            let res = self.inner.send_key(ev);
+            // Post-injection re-check: close microsecond race if concurrent shutdown/release
+            // transitioned HidGate out of Open while `inner.send_key` was executing.
+            if !self.supervisor.is_open() {
+                let _ = self.local_releaser.release_all_keys();
+                return Err(OsError::Interlocked);
+            }
+            res
         } else {
             // Golden ordering: inject KeyUp FIRST, then update watchdog snapshot.
             let res = self.inner.send_key(ev);
@@ -1093,7 +1229,12 @@ impl OsHidSink for WatchdogSupervisedHidSink {
                     self.local_releaser.as_ref(),
                     self.on_degraded.as_ref(),
                 )?;
-                self.inner.send_mouse(ev)
+                let res = self.inner.send_mouse(ev);
+                if !self.supervisor.is_open() {
+                    let _ = self.local_releaser.release_all_keys();
+                    return Err(OsError::Interlocked);
+                }
+                res
             }
             MouseKind::Up => {
                 let res = self.inner.send_mouse(ev);
@@ -1167,5 +1308,114 @@ mod tests {
         assert!(verify_watchdog_binary(&sock).is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_injection_gate_recheck_releases_key_on_concurrent_shutdown_race() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct RacingState {
+            held: Mutex<Vec<u16>>,
+            release_calls: AtomicUsize,
+        }
+
+        struct RacingReleaser {
+            state: Arc<RacingState>,
+        }
+
+        impl EmergencyKeyReleaser for RacingReleaser {
+            fn release_all_keys(&self) -> ReleaseReport {
+                self.state.release_calls.fetch_add(1, Ordering::AcqRel);
+                let mut held = self.state.held.lock().unwrap();
+                let count = held.len();
+                held.clear();
+                ReleaseReport {
+                    released_keys: count,
+                    released_buttons: 0,
+                    residual_keys: 0,
+                    residual_buttons: 0,
+                }
+            }
+        }
+
+        struct RacingHidSink {
+            state: Arc<RacingState>,
+            supervised_releaser: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>>,
+        }
+
+        impl OsHidSink for RacingHidSink {
+            fn send_key(&mut self, ev: &KeyEvent) -> Result<(), OsError> {
+                // Simulate concurrent emergency_releaser().release_all_keys() from another thread
+                // running right BEFORE this KeyDown lands in the inner sink!
+                if let Some(rel) = self.supervised_releaser.lock().unwrap().clone() {
+                    let h = std::thread::spawn(move || {
+                        let _ = rel.release_all_keys();
+                    });
+                    h.join().unwrap();
+                }
+                if ev.down {
+                    self.state.held.lock().unwrap().push(ev.usb_hid_usage as u16);
+                }
+                Ok(())
+            }
+
+            fn send_mouse(&mut self, _ev: &MouseEvent) -> Result<(), OsError> {
+                Ok(())
+            }
+
+            fn emergency_releaser(&self) -> Arc<dyn EmergencyKeyReleaser> {
+                Arc::new(RacingReleaser {
+                    state: Arc::clone(&self.state),
+                })
+            }
+        }
+
+        let mut fds = [-1i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        struct ReadGuard(i32);
+        impl Drop for ReadGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+        let _r = ReadGuard(read_fd);
+
+        let sup = Arc::new(HidWatchdogSupervisor::from_raw_pipe_fd(write_fd).unwrap());
+        let state = Arc::new(RacingState {
+            held: Mutex::new(Vec::new()),
+            release_calls: AtomicUsize::new(0),
+        });
+        let rel_slot: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>> =
+            Arc::new(Mutex::new(None));
+        let mut sink = WatchdogSupervisedHidSink::new(
+            Box::new(RacingHidSink {
+                state: Arc::clone(&state),
+                supervised_releaser: Arc::clone(&rel_slot),
+            }),
+            Arc::clone(&sup),
+            None,
+        );
+        *rel_slot.lock().unwrap() = Some(sink.emergency_releaser());
+
+        let res = sink.send_key(&KeyEvent {
+            down: true,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 0,
+            client_ts_ms: 1,
+        });
+        assert_eq!(res, Err(OsError::Interlocked));
+        assert!(
+            state.held.lock().unwrap().is_empty(),
+            "post-injection re-check MUST release key pressed during concurrent shutdown race"
+        );
+        assert!(
+            state.release_calls.load(Ordering::Acquire) >= 2,
+            "both concurrent emergency release and post-injection re-check release must have run"
+        );
     }
 }

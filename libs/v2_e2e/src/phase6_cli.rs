@@ -2,12 +2,16 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 //! `phase6-e2e` — Live-cluster verification of:
-//! 1. Real child `zerodesk-desktop` Host supervised by independent `zerodesk-hid-watchdog`
+//! 1. Real child `zerodesk-desktop` Host in strictly dry-run HID mode (NO `--real-os-input`,
+//!    zero physical desktop injection) + synthetic capture (`host_capture_mode = "synthetic_dryrun"`),
+//!    supervised by the independent `zerodesk-hid-watchdog` subprocess.
 //! 2. Live Controller (`V2BridgeRuntime`) video + HID KeyDown delivery (regular + modifier keys)
+//!    confirmed deterministically via cross-process clipboard delivery barrier before SIGKILL.
 //! 3. Real `SIGKILL` (`kill -9`) of the Host process and independent watchdog release report
-//!    within <= 1000ms (`0600` JSON, all held keys + all 8 modifiers released, zero leftovers)
-//! 4. Non-interactive `os-sck` ScreenCaptureKit permission preflight (clean `PermissionDenied`
-//!    without hanging or popping dialogs)
+//!    within <= 1000ms (`0600` JSON, exact held key set + all 8 modifiers released, `release_ok`,
+//!    zero zombie/leftover watchdog processes).
+//! 4. Bounded (<= 10s) non-interactive `os-sck` ScreenCaptureKit permission preflight (clean
+//!    `PermissionDenied` without hanging or popping dialogs).
 
 use crate::phase4_cli::{parse_flag_value, TempDirGuard};
 use rand_core::{OsRng, RngCore};
@@ -37,6 +41,8 @@ use v2_e2e::{
     BridgePersistedConfig, TransportMode, V2BridgeRuntime, V2BridgeRuntimeOptions, MOD_META,
 };
 
+const SCK_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     OsRng.fill_bytes(&mut b);
@@ -46,13 +52,18 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 #[derive(Debug, Default, Serialize)]
 struct Phase6E2eReport {
     pass: bool,
+    host_capture_mode: String,
+    host_hid_mode: String,
     host_child_spawned: bool,
+    host_snapshot_verified: bool,
     live_video_frame_verified: bool,
     hid_keys_delivered: Vec<u16>,
+    hid_delivery_barrier_confirmed: bool,
     sigkill_sent_to_host_pid: Option<u32>,
     watchdog_pid: Option<u32>,
     watchdog_trigger: Option<String>,
     watchdog_report_mode_0600: bool,
+    watchdog_release_ok: bool,
     watchdog_released_keys: Vec<u16>,
     watchdog_released_modifiers: Vec<u16>,
     watchdog_release_elapsed_ms: Option<u64>,
@@ -66,6 +77,7 @@ struct Phase6E2eReport {
 
 struct ChildHostGuard {
     child: Option<Child>,
+    killed_host_pid: Option<u32>,
     watchdog_pid: Option<u32>,
 }
 
@@ -73,38 +85,51 @@ impl ChildHostGuard {
     fn new(child: Child) -> Self {
         Self {
             child: Some(child),
+            killed_host_pid: None,
             watchdog_pid: None,
         }
     }
 
     #[cfg(unix)]
     fn sigkill_and_reap(&mut self) -> Result<u32, String> {
-        let mut child = self
+        let child = self
             .child
-            .take()
+            .as_mut()
             .ok_or_else(|| "host child already exited".to_string())?;
         let pid = child.id();
         let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         if rc != 0 {
-            return Err(format!(
-                "kill({pid}, SIGKILL) failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                // Keep `self.child` intact so `Drop` can still clean it up.
+                return Err(format!("kill({pid}, SIGKILL) failed: {err}"));
+            }
         }
-        let _ = child.wait();
+        // Reap with explicit EINTR retry loop.
+        let mut status: libc::c_int = 0;
+        loop {
+            let w = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            if w == pid as libc::pid_t {
+                break;
+            }
+            if w < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+        }
+        // Take child handle after reaping so Drop does not double-wait/kill.
+        let mut owned = self.child.take().unwrap();
+        let _ = owned.try_wait();
+        self.killed_host_pid = Some(pid);
         Ok(pid)
     }
 
     #[cfg(not(unix))]
     fn sigkill_and_reap(&mut self) -> Result<u32, String> {
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| "host child already exited".to_string())?;
-        let pid = child.id();
-        let _ = child.kill();
-        let _ = child.wait();
-        Ok(pid)
+        Err("real SIGKILL verification requires a Unix host".into())
     }
 }
 
@@ -116,8 +141,11 @@ impl Drop for ChildHostGuard {
         }
         #[cfg(unix)]
         if let Some(wd_pid) = self.watchdog_pid {
-            unsafe {
-                let _ = libc::kill(wd_pid as libc::pid_t, libc::SIGKILL);
+            let self_pid = std::process::id();
+            if wd_pid > 1 && wd_pid != self_pid && Some(wd_pid) != self.killed_host_pid {
+                unsafe {
+                    let _ = libc::kill(wd_pid as libc::pid_t, libc::SIGKILL);
+                }
             }
         }
     }
@@ -136,7 +164,6 @@ fn resolve_host_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
             candidates.push(dir.join("zerodesk-desktop"));
         }
     }
-    // Standard workspace build directories when zerodesk_core is built as a standalone workspace.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if let Some(libs_dir) = manifest_dir.parent() {
         let core_target = libs_dir.join("zerodesk_core").join("target");
@@ -286,10 +313,26 @@ fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
 
 #[cfg(not(unix))]
 fn wait_pid_gone(_pid: u32, _timeout: Duration) -> bool {
-    true
+    false
 }
 
-fn verify_sck_preflight_non_interactive() -> (String, bool) {
+#[cfg(unix)]
+fn check_file_mode_0600(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)
+        .map_err(|e| format!("stat watchdog report: {e}"))?
+        .permissions()
+        .mode()
+        & 0o777;
+    Ok(mode == 0o600)
+}
+
+#[cfg(not(unix))]
+fn check_file_mode_0600(_path: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+fn verify_sck_preflight_non_interactive_inner() -> (String, bool) {
     // Always verify pure permission gate fails closed when ungranted.
     if enforce_sck_permission_preflight(false)
         != Err(OsError::PermissionDenied(OsPermission::ScreenRecording))
@@ -308,6 +351,28 @@ fn verify_sck_preflight_non_interactive() -> (String, bool) {
         Ok(true) => ("granted_non_interactive".into(), true),
         Err(OsError::UnsupportedPlatform(_)) => ("unsupported_platform".into(), true),
         Err(other) => (format!("preflight_err:{other}"), false),
+    }
+}
+
+/// Runs the non-interactive SCK preflight on a dedicated thread bounded by 10s so an unexpected
+/// OS TCC stall can never hang the E2E suite.
+fn verify_sck_preflight_non_interactive() -> (String, bool) {
+    let (tx, rx) = mpsc::channel();
+    if thread::Builder::new()
+        .name("zd-p6-sck-preflight".into())
+        .spawn(move || {
+            let res = std::panic::catch_unwind(verify_sck_preflight_non_interactive_inner);
+            let _ = tx.send(res);
+        })
+        .is_err()
+    {
+        return ("spawn_failed".into(), false);
+    }
+    match rx.recv_timeout(SCK_PREFLIGHT_TIMEOUT) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => ("preflight_panicked".into(), false),
+        Err(mpsc::RecvTimeoutError::Timeout) => ("preflight_timeout_10s".into(), false),
+        Err(mpsc::RecvTimeoutError::Disconnected) => ("preflight_disconnected".into(), false),
     }
 }
 
@@ -408,7 +473,11 @@ pub async fn cmd_phase6_e2e(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut report = Phase6E2eReport::default();
+    let mut report = Phase6E2eReport {
+        host_capture_mode: "synthetic_dryrun".into(),
+        host_hid_mode: "dryrun_zero_os_injection".into(),
+        ..Phase6E2eReport::default()
+    };
     let res = run_phase6_suite(
         &cluster,
         &cp,
@@ -428,8 +497,12 @@ pub async fn cmd_phase6_e2e(args: &[String]) -> ExitCode {
         report.error = Some(e);
     } else {
         report.pass = report.host_child_spawned
+            && report.host_snapshot_verified
             && report.live_video_frame_verified
+            && report.hid_delivery_barrier_confirmed
             && report.watchdog_report_mode_0600
+            && report.watchdog_release_ok
+            && report.watchdog_release_elapsed_ms.is_some_and(|ms| ms <= 1000)
             && report.observed_sigkill_to_report_ms.is_some_and(|ms| ms <= 1000)
             && report.watchdog_zero_leftovers_verified
             && report.sck_preflight_verified;
@@ -458,7 +531,7 @@ async fn run_phase6_suite(
     work_dir: &Path,
     report: &mut Phase6E2eReport,
 ) -> Result<(), String> {
-    // Step 5 pre-check (non-interactive SCK preflight; zero dialogs, zero hangs).
+    // Non-interactive SCK preflight (bounded <= 10s, zero dialogs, zero hangs).
     let (sck_status, sck_ok) = verify_sck_preflight_non_interactive();
     report.sck_preflight_status = sck_status;
     report.sck_preflight_verified = sck_ok;
@@ -535,7 +608,6 @@ async fn run_phase6_suite(
     let ctrl_cfg_path = work_dir.join("ctrl_cfg.json");
     let wd_report_path = work_dir.join("hid-watchdog-release.json");
 
-    // Save Controller config and bootstrap Controller runtime.
     let ctrl_rt = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
         download_dir: Some(work_dir.join("ctrl_downloads")),
         ..V2BridgeRuntimeOptions::default()
@@ -567,14 +639,18 @@ async fn run_phase6_suite(
         return Err(format!("controller load_config failed: {load_ctrl_resp}"));
     }
 
-    // 1. Spawn real child `zerodesk-desktop bridge-stdio --hid-watchdog --watchdog-report <path>`.
+    // 1. Spawn real child `zerodesk-desktop bridge-stdio` in strictly DRY-RUN HID mode
+    //    (NEVER `--real-os-input`, zero physical desktop injection!) with `--hid-watchdog` and
+    //    `--watchdog-report <path>`.
+    let host_args = [
+        "bridge-stdio".to_string(),
+        "--hid-watchdog".to_string(),
+        "--watchdog-report".to_string(),
+        wd_report_path.display().to_string(),
+    ];
+    debug_assert!(!host_args.iter().any(|a| a == "--real-os-input"));
     let mut child = Command::new(&host_bin)
-        .args([
-            "bridge-stdio",
-            "--hid-watchdog",
-            "--watchdog-report",
-            &wd_report_path.display().to_string(),
-        ])
+        .args(&host_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -623,24 +699,44 @@ async fn run_phase6_suite(
     }
 
     send_host_cmd(&mut host_stdin, &serde_json::json!({"v": 1, "cmd": "start_host"}))?;
-    let _host_ready = wait_for_host_msg(&host_msg_rx, Duration::from_secs(15), |m| {
+    let _start_ack = wait_for_host_msg(&host_msg_rx, Duration::from_secs(5), |m| {
+        m["stream"] == "reply"
+    })
+    .ok_or_else(|| "host child did not reply to start_host".to_string())?;
+
+    let host_ready = wait_for_host_msg(&host_msg_rx, Duration::from_secs(15), |m| {
         m["stream"] == "event"
             && m["body"]["kind"] == "CommandResult"
             && m["body"]["payload"]["cmd"] == "start_host"
-            && m["body"]["payload"]["ok"].as_bool() == Some(true)
     })
-    .ok_or_else(|| "host child did not complete start_host".to_string())?;
+    .ok_or_else(|| "host child did not emit start_host CommandResult".to_string())?;
+    if host_ready["body"]["payload"]["ok"].as_bool() != Some(true) {
+        return Err(format!("host child start_host failed: {host_ready}"));
+    }
+    let event_device_id = host_ready["body"]["payload"]["device_id_hex"]
+        .as_str()
+        .ok_or_else(|| format!("start_host CommandResult missing device_id_hex: {host_ready}"))?
+        .to_string();
 
-    // Query host device_id via get_snapshot.
+    // Also verify `get_snapshot` JSON command returns `body.data.local_device_id_hex` matching!
     send_host_cmd(&mut host_stdin, &serde_json::json!({"v": 1, "cmd": "get_snapshot"}))?;
     let snap_reply = wait_for_host_msg(&host_msg_rx, Duration::from_secs(5), |m| {
-        m["stream"] == "reply" && m["body"]["snapshot"]["local_device_id_hex"].is_string()
+        m["stream"] == "reply"
     })
-    .ok_or_else(|| "host child did not return snapshot with local_device_id_hex".to_string())?;
-    let host_device_id = snap_reply["body"]["snapshot"]["local_device_id_hex"]
+    .ok_or_else(|| "host child did not reply to get_snapshot".to_string())?;
+    if snap_reply["body"]["ok"].as_bool() != Some(true) {
+        return Err(format!("host child get_snapshot failed: {snap_reply}"));
+    }
+    let snap_device_id = snap_reply["body"]["data"]["local_device_id_hex"]
         .as_str()
-        .ok_or_else(|| "missing host local_device_id_hex".to_string())?
-        .to_string();
+        .ok_or_else(|| format!("get_snapshot missing data.local_device_id_hex: {snap_reply}"))?;
+    if snap_device_id != event_device_id {
+        return Err(format!(
+            "snapshot device_id_hex ({snap_device_id}) != start_host event device_id_hex ({event_device_id})"
+        ));
+    }
+    report.host_snapshot_verified = true;
+    let host_device_id = event_device_id;
 
     // 2. Dial from Controller and accept IncomingCall on Host child.
     let dial_cmd = serde_json::json!({
@@ -707,9 +803,30 @@ async fn run_phase6_suite(
     }
     report.hid_keys_delivered = held_keys.iter().map(|(u, _)| *u).collect();
 
-    // Give UDP/TLS transport + Host HID loop brief settle time so all 3 KeyDown snapshots reach
-    // the independent `zerodesk-hid-watchdog` pipe before we SIGKILL the Host!
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    // Deterministic delivery barrier: send a clipboard sync over the same active E2EE session and
+    // wait for the Host child to emit `ClipboardReceived` (plus 2 live video frames), proving the
+    // Host event loop has processed all preceding packets without relying on a blind fixed sleep.
+    let barrier_cmd = serde_json::json!({
+        "v": 1,
+        "cmd": "send_clipboard",
+        "text": "P6_HID_DELIVERY_BARRIER",
+    });
+    let barrier_resp: serde_json::Value =
+        serde_json::from_str(&ctrl_rt.exec_json(&barrier_cmd.to_string()))
+            .map_err(|e| e.to_string())?;
+    if barrier_resp["ok"].as_bool() != Some(true) {
+        return Err(format!("send_clipboard barrier failed: {barrier_resp}"));
+    }
+    let _host_barrier = wait_for_host_msg(&host_msg_rx, Duration::from_secs(5), |m| {
+        m["stream"] == "event" && m["body"]["kind"] == "ClipboardReceived"
+    })
+    .ok_or_else(|| "host child never emitted ClipboardReceived delivery barrier".to_string())?;
+    for _ in 0..2 {
+        let _ = wait_for_ctrl_event(&ctrl_rt, Duration::from_secs(3), |ev| {
+            ev["kind"] == "VideoFrameReady"
+        });
+    }
+    report.hid_delivery_barrier_confirmed = true;
 
     // 3. Send real SIGKILL (`kill -9`) to the live Host process!
     let kill_start = Instant::now();
@@ -722,32 +839,38 @@ async fn run_phase6_suite(
     let total_observed_ms = kill_start.elapsed().as_millis() as u64;
     host_guard.watchdog_pid = Some(wd_report.watchdog_pid);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&wd_report_path)
-            .map_err(|e| format!("stat watchdog report: {e}"))?
-            .permissions()
-            .mode()
-            & 0o777;
-        report.watchdog_report_mode_0600 = mode == 0o600;
-    }
-    #[cfg(not(unix))]
-    {
-        report.watchdog_report_mode_0600 = true;
-    }
-
+    report.watchdog_report_mode_0600 = check_file_mode_0600(&wd_report_path)?;
     report.watchdog_pid = Some(wd_report.watchdog_pid);
     report.watchdog_trigger = Some(wd_report.trigger.clone());
+    report.watchdog_release_ok = wd_report.release_ok;
     report.watchdog_released_keys = wd_report.released_keys.clone();
     report.watchdog_released_modifiers = wd_report.released_modifiers.clone();
     report.watchdog_release_elapsed_ms = Some(wd_report.release_elapsed_ms);
-    report.observed_sigkill_to_report_ms = Some(total_observed_ms.max(observed_elapsed.as_millis() as u64));
+    report.observed_sigkill_to_report_ms =
+        Some(total_observed_ms.max(observed_elapsed.as_millis() as u64));
 
     if wd_report.schema_version != WATCHDOG_REPORT_SCHEMA_VERSION {
         return Err(format!(
             "unexpected watchdog report schema_version={}",
             wd_report.schema_version
+        ));
+    }
+    if wd_report.trigger != "pipe_eof" && wd_report.trigger != "parent_exit_kqueue" {
+        return Err(format!(
+            "unexpected watchdog trigger '{}'; expected pipe_eof or parent_exit_kqueue",
+            wd_report.trigger
+        ));
+    }
+    if !wd_report.release_ok {
+        return Err(format!(
+            "watchdog report indicated release_ok=false: {:?}",
+            wd_report.release_error
+        ));
+    }
+    if wd_report.release_elapsed_ms > 1000 {
+        return Err(format!(
+            "watchdog release_elapsed_ms={} exceeded 1000ms budget",
+            wd_report.release_elapsed_ms
         ));
     }
     if wd_report.parent_pid != killed_pid {
@@ -756,13 +879,18 @@ async fn run_phase6_suite(
             wd_report.parent_pid
         ));
     }
-    for &(usage, _) in &held_keys {
-        if !wd_report.released_keys.contains(&usage) {
-            return Err(format!(
-                "watchdog report missing held key {usage:#x}: {:?}",
-                wd_report.released_keys
-            ));
-        }
+
+    // Strict exact set equality on released keys (sorted & deduplicated).
+    let mut got_keys = wd_report.released_keys.clone();
+    got_keys.sort_unstable();
+    got_keys.dedup();
+    let mut want_keys: Vec<u16> = held_keys.iter().map(|(u, _)| *u).collect();
+    want_keys.sort_unstable();
+    want_keys.dedup();
+    if got_keys != want_keys {
+        return Err(format!(
+            "watchdog released_keys mismatch: got={got_keys:?} want={want_keys:?}"
+        ));
     }
     if wd_report.released_modifiers != ALL_MODIFIER_HID_USAGES.to_vec() {
         return Err(format!(
@@ -793,5 +921,54 @@ mod tests {
         let (status, ok) = verify_sck_preflight_non_interactive();
         assert!(ok, "sck preflight failed: {status}");
         assert!(!status.is_empty());
+    }
+
+    #[test]
+    fn bridge_stdio_get_snapshot_protocol_roundtrip() {
+        // Verify the exact JSON wire protocol phase6-e2e speaks to `zerodesk-desktop bridge-stdio`
+        // when the sibling binary is built, and always verify V2BridgeRuntime's `get_snapshot` reply.
+        let rt = V2BridgeRuntime::new().unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_str(&rt.exec_json(r#"{"v":1,"cmd":"get_snapshot"}"#)).unwrap();
+        assert_eq!(reply["ok"].as_bool(), Some(true));
+        assert_eq!(reply["data"]["v"].as_u64(), Some(1));
+        assert_eq!(reply["data"]["state"].as_str(), Some("idle"));
+        rt.destroy();
+
+        if let Ok(host_bin) = resolve_host_binary(None) {
+            let mut child = Command::new(&host_bin)
+                .arg("bridge-stdio")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn zerodesk-desktop bridge-stdio");
+            let mut stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut guard = ChildHostGuard::new(child);
+
+            send_host_cmd(&mut stdin, &serde_json::json!({"v": 1, "cmd": "get_snapshot"})).unwrap();
+            drop(stdin);
+
+            let reader = BufReader::new(stdout);
+            let mut saw_snapshot = false;
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if val["stream"] == "reply"
+                        && val["body"]["ok"].as_bool() == Some(true)
+                        && val["body"]["data"]["state"].as_str() == Some("idle")
+                    {
+                        saw_snapshot = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                saw_snapshot,
+                "zerodesk-desktop bridge-stdio did not return valid get_snapshot reply"
+            );
+            let _ = guard.child.take().map(|mut c| c.wait());
+        }
     }
 }

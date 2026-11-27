@@ -22,8 +22,8 @@ extern "C" {
 typedef struct ZdSckHandle ZdSckHandle;
 
 typedef struct ZdSckConfig {
-    uint32_t width;              /* 0 = derive from display (capped <= 1920, even) */
-    uint32_t height;             /* 0 = derive from display (capped <= 1080, even) */
+    uint32_t width;              /* 0 = derive from display (capped <= 1920, rounded even) */
+    uint32_t height;             /* 0 = derive from display (capped <= 1080, rounded even) */
     uint32_t fps;                /* target fps (clamped 1..=120; 0 -> 30) */
     uint32_t display_index;      /* 0 = primary shareable display */
     uint8_t  capture_audio;      /* non-zero to capture system audio (48kHz/2ch) */
@@ -76,8 +76,18 @@ ZdSckHandle* zd_sck_create(
     void* user_ctx
 );
 
+/* Starts capture. Threading contract:
+ * - MUST NOT be invoked on the main thread (waits up to 3s on SCK async completion). */
 int32_t zd_sck_start(ZdSckHandle* h);
+
+/* Stops capture with bounded timeout (default 2000ms when timeout_ms == 0).
+ * Threading contract:
+ * - MUST NOT be invoked synchronously from inside a video/audio callback; returns
+ *   ZD_SCK_ERR_INVALID_ARG if called re-entrantly on a callback queue. */
 int32_t zd_sck_stop(ZdSckHandle* h, uint32_t timeout_ms);
+
+/* Stops (if needed), detaches delegate under lock, drains queues, and frees handle.
+ * MUST NOT be invoked from inside a video/audio callback. */
 void zd_sck_destroy(ZdSckHandle* h);
 
 int32_t zd_sck_get_dimensions(

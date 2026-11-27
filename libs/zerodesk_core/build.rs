@@ -51,6 +51,7 @@ fn compile_macos_sck() {
             .file("native/macos_sck.m")
             .include("native")
             .flag("-fobjc-arc")
+            .flag("-fobjc-arc-exceptions")
             .flag("-mmacosx-version-min=13.0")
             .flag("-Wall")
             .flag("-Wextra")

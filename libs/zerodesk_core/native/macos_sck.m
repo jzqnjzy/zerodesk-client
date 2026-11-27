@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
+#include <os/lock.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,11 +19,81 @@
 #define ZD_SCK_DEFAULT_STOP_TIMEOUT_MS 2000u
 #define ZD_SCK_START_TIMEOUT_NS (3LL * NSEC_PER_SEC)
 
+enum ZdSckState {
+    ZD_SCK_STATE_IDLE = 0,
+    ZD_SCK_STATE_STARTING = 1,
+    ZD_SCK_STATE_RUNNING = 2,
+    ZD_SCK_STATE_STOPPING = 3,
+    ZD_SCK_STATE_STOP_TIMED_OUT = 4,
+};
+
+static const void* kZdCallbackQueueKey = &kZdCallbackQueueKey;
 static const void* kZdVideoQueueKey = &kZdVideoQueueKey;
 static const void* kZdAudioQueueKey = &kZdAudioQueueKey;
+static const void* kZdStopQueueKey = &kZdStopQueueKey;
 
-@interface ZdSckDelegate : NSObject <SCStreamDelegate, SCStreamOutput>
-@property (nonatomic, assign) ZdSckHandle* handle;
+/* Heap-allocated completion box so late ScreenCaptureKit callbacks after a timeout
+ * never write into an unwound caller stack frame. */
+@interface ZdSckAsyncBox : NSObject {
+    os_unfair_lock _lock;
+    BOOL _completed;
+}
+@property (nonatomic, strong, readonly) dispatch_semaphore_t sem;
+@property (nonatomic, strong) id result;
+@property (nonatomic, strong) NSError* error;
+- (void)completeWithResult:(id)res error:(NSError*)err;
+- (BOOL)waitUntil:(dispatch_time_t)deadline outResult:(id*)outRes outError:(NSError**)outErr;
+@end
+
+@implementation ZdSckAsyncBox
+
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        _lock = OS_UNFAIR_LOCK_INIT;
+        _completed = NO;
+        _sem = dispatch_semaphore_create(0);
+    }
+    return self;
+}
+
+- (void)completeWithResult:(id)res error:(NSError*)err {
+    os_unfair_lock_lock(&_lock);
+    if (!_completed) {
+        _result = res;
+        _error = err;
+        _completed = YES;
+    }
+    os_unfair_lock_unlock(&_lock);
+    dispatch_semaphore_signal(_sem);
+}
+
+- (BOOL)waitUntil:(dispatch_time_t)deadline outResult:(id*)outRes outError:(NSError**)outErr {
+    long rc = dispatch_semaphore_wait(_sem, deadline);
+    if (rc != 0) {
+        return NO;
+    }
+    os_unfair_lock_lock(&_lock);
+    if (outRes != NULL) {
+        *outRes = _result;
+    }
+    if (outErr != NULL) {
+        *outErr = _error;
+    }
+    os_unfair_lock_unlock(&_lock);
+    return YES;
+}
+
+@end
+
+@interface ZdSckDelegate : NSObject <SCStreamDelegate, SCStreamOutput> {
+    os_unfair_lock _delegateLock;
+    ZdSckHandle* _handle;
+    uint64_t _sessionId;
+}
+- (instancetype)initWithHandle:(ZdSckHandle*)handle;
+- (void)armForSession:(uint64_t)sessionId;
+- (void)detach;
 @end
 
 struct ZdSckHandle {
@@ -36,11 +107,12 @@ struct ZdSckHandle {
     dispatch_queue_t audio_queue;
     dispatch_queue_t stop_queue;
 
+    os_unfair_lock stream_lock;
     SCStream* stream;
     ZdSckDelegate* delegate;
 
-    _Atomic uint8_t running;
-    _Atomic uint8_t stopping;
+    _Atomic uint32_t state;
+    _Atomic uint64_t session_id;
     _Atomic uint32_t active_width;
     _Atomic uint32_t active_height;
 };
@@ -68,17 +140,54 @@ static uint32_t zd_clamp_even(uint32_t val, uint32_t min_v, uint32_t max_v) {
 
 @implementation ZdSckDelegate
 
+- (instancetype)initWithHandle:(ZdSckHandle*)handle {
+    self = [super init];
+    if (self != nil) {
+        _delegateLock = OS_UNFAIR_LOCK_INIT;
+        _handle = handle;
+        _sessionId = 0;
+    }
+    return self;
+}
+
+- (void)armForSession:(uint64_t)sessionId {
+    os_unfair_lock_lock(&_delegateLock);
+    _sessionId = sessionId;
+    os_unfair_lock_unlock(&_delegateLock);
+}
+
+- (void)detach {
+    os_unfair_lock_lock(&_delegateLock);
+    _handle = NULL;
+    _sessionId = 0;
+    os_unfair_lock_unlock(&_delegateLock);
+}
+
 - (void)stream:(SCStream*)stream
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                    ofType:(SCStreamOutputType)type {
     (void)stream;
     @autoreleasepool {
         @try {
-            ZdSckHandle* h = self.handle;
-            if (h == NULL || sampleBuffer == NULL) {
+            if (sampleBuffer == NULL) {
                 return;
             }
-            if (atomic_load_explicit(&h->stopping, memory_order_acquire) != 0) {
+            /* Snapshot handle + session_id under delegateLock. Because this callback runs
+             * strictly on h->video_queue or h->audio_queue, and zd_sck_destroy detaches
+             * _handle under _delegateLock BEFORE dispatch_sync draining both queues, `h`
+             * is guaranteed alive for the full duration of this callback once non-NULL. */
+            os_unfair_lock_lock(&_delegateLock);
+            ZdSckHandle* h = _handle;
+            uint64_t expected_sid = _sessionId;
+            os_unfair_lock_unlock(&_delegateLock);
+
+            if (h == NULL || expected_sid == 0) {
+                return;
+            }
+            if (atomic_load_explicit(&h->state, memory_order_acquire) != ZD_SCK_STATE_RUNNING) {
+                return;
+            }
+            if (atomic_load_explicit(&h->session_id, memory_order_acquire) != expected_sid) {
                 return;
             }
             if (!CMSampleBufferIsValid(sampleBuffer) || !CMSampleBufferDataIsReady(sampleBuffer)) {
@@ -123,25 +232,28 @@ static uint32_t zd_clamp_even(uint32_t val, uint32_t min_v, uint32_t max_v) {
                 if (lock_rc != kCVReturnSuccess) {
                     return;
                 }
-                const uint8_t* base = (const uint8_t*)CVPixelBufferGetBaseAddress(pb);
-                size_t width = CVPixelBufferGetWidth(pb);
-                size_t height = CVPixelBufferGetHeight(pb);
-                size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-                if (base != NULL && width > 0 && height > 0 && bpr >= width * 4
-                    && width <= UINT32_MAX && height <= UINT32_MAX && bpr <= UINT32_MAX) {
-                    atomic_store_explicit(&h->active_width, (uint32_t)width, memory_order_release);
-                    atomic_store_explicit(&h->active_height, (uint32_t)height, memory_order_release);
-                    h->video_cb(
-                        h->user_ctx,
-                        base,
-                        (uint32_t)width,
-                        (uint32_t)height,
-                        (uint32_t)bpr,
-                        scale,
-                        pts_us
-                    );
+                @try {
+                    const uint8_t* base = (const uint8_t*)CVPixelBufferGetBaseAddress(pb);
+                    size_t width = CVPixelBufferGetWidth(pb);
+                    size_t height = CVPixelBufferGetHeight(pb);
+                    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+                    if (base != NULL && width > 0 && height > 0 && bpr >= width * 4
+                        && width <= UINT32_MAX && height <= UINT32_MAX && bpr <= UINT32_MAX) {
+                        atomic_store_explicit(&h->active_width, (uint32_t)width, memory_order_release);
+                        atomic_store_explicit(&h->active_height, (uint32_t)height, memory_order_release);
+                        h->video_cb(
+                            h->user_ctx,
+                            base,
+                            (uint32_t)width,
+                            (uint32_t)height,
+                            (uint32_t)bpr,
+                            scale,
+                            pts_us
+                        );
+                    }
+                } @finally {
+                    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
                 }
-                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
             } else if (type == SCStreamOutputTypeAudio) {
                 if (h->audio_cb == NULL) {
                     return;
@@ -160,7 +272,7 @@ static uint32_t zd_clamp_even(uint32_t val, uint32_t min_v, uint32_t max_v) {
                 _Alignas(16) uint8_t abl_storage[sizeof(AudioBufferList)
                     + (ZD_SCK_MAX_AUDIO_BUFFERS - 1) * sizeof(AudioBuffer)];
                 AudioBufferList* abl = (AudioBufferList*)abl_storage;
-                CMBlockBufferRef block_buf = NULL;
+                CMBlockBufferRef raw_block_buf = NULL;
                 size_t needed_size = 0;
 
                 OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
@@ -171,8 +283,13 @@ static uint32_t zd_clamp_even(uint32_t val, uint32_t min_v, uint32_t max_v) {
                     NULL,
                     NULL,
                     kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-                    &block_buf
+                    &raw_block_buf
                 );
+                /* Transfer CoreFoundation +1 ownership directly into ARC via CFBridgingRelease:
+                 * zero manual CFRelease (eliminates double-release risk) and zero leaks even on
+                 * exception unwind with -fobjc-arc-exceptions. */
+                id owned_block_buf = (raw_block_buf != NULL) ? CFBridgingRelease(raw_block_buf) : nil;
+                raw_block_buf = NULL;
                 if (st == noErr && abl->mNumberBuffers > 0
                     && abl->mNumberBuffers <= ZD_SCK_MAX_AUDIO_BUFFERS) {
                     ZdSckAudioBuffer bufs[ZD_SCK_MAX_AUDIO_BUFFERS];
@@ -193,17 +310,18 @@ static uint32_t zd_clamp_even(uint32_t val, uint32_t min_v, uint32_t max_v) {
                         pts_us
                     );
                 }
-                if (block_buf != NULL) {
-                    CFRelease(block_buf);
-                }
+                owned_block_buf = nil;
+                (void)owned_block_buf;
             }
         } @catch (NSException* ex) {
-            ZdSckHandle* h = self.handle;
+            os_unfair_lock_lock(&_delegateLock);
+            ZdSckHandle* h = _handle;
             if (h != NULL && h->err_cb != NULL
-                && atomic_load_explicit(&h->stopping, memory_order_acquire) == 0) {
+                && atomic_load_explicit(&h->state, memory_order_acquire) == ZD_SCK_STATE_RUNNING) {
                 const char* msg = ex.reason ? ex.reason.UTF8String : "NSException in SCK callback";
                 h->err_cb(h->user_ctx, ZD_SCK_ERR_INTERNAL, msg);
             }
+            os_unfair_lock_unlock(&_delegateLock);
         }
     }
 }
@@ -212,23 +330,37 @@ static uint32_t zd_clamp_even(uint32_t val, uint32_t min_v, uint32_t max_v) {
     (void)stream;
     @autoreleasepool {
         @try {
-            ZdSckHandle* h = self.handle;
-            if (h == NULL) {
-                return;
+            /* Hold _delegateLock across the short non-blocking err_cb so zd_sck_destroy's
+             * [delegate detach] strictly synchronizes with any Apple-internal callback thread
+             * and prevents UAF on `h`. */
+            os_unfair_lock_lock(&_delegateLock);
+            ZdSckHandle* h = _handle;
+            uint64_t expected_sid = _sessionId;
+            if (h != NULL && expected_sid != 0
+                && atomic_load_explicit(&h->session_id, memory_order_acquire) == expected_sid) {
+                uint32_t prev = ZD_SCK_STATE_RUNNING;
+                (void)atomic_compare_exchange_strong_explicit(
+                    &h->state,
+                    &prev,
+                    ZD_SCK_STATE_IDLE,
+                    memory_order_acq_rel,
+                    memory_order_acquire
+                );
+                if (prev == ZD_SCK_STATE_RUNNING && h->err_cb != NULL) {
+                    NSString* formatted = error
+                        ? [NSString stringWithFormat:@"SCStream error domain=%@ code=%ld: %@",
+                              error.domain ?: @"unknown",
+                              (long)error.code,
+                              error.localizedDescription ?: @"(no description)"]
+                        : @"SCStream stopped with unknown error";
+                    /* Always report ZD_SCK_ERR_INTERNAL (never alias raw NSError.code into ZD_SCK_ERR_*). */
+                    h->err_cb(h->user_ctx, ZD_SCK_ERR_INTERNAL, formatted.UTF8String);
+                }
             }
-            atomic_store_explicit(&h->running, 0, memory_order_release);
-            if (atomic_load_explicit(&h->stopping, memory_order_acquire) != 0) {
-                return;
-            }
-            if (h->err_cb != NULL) {
-                int32_t code = error ? (int32_t)error.code : ZD_SCK_ERR_INTERNAL;
-                const char* msg = error && error.localizedDescription
-                    ? error.localizedDescription.UTF8String
-                    : "SCStream stopped with error";
-                h->err_cb(h->user_ctx, code, msg);
-            }
+            os_unfair_lock_unlock(&_delegateLock);
         } @catch (NSException* ex) {
             (void)ex;
+            os_unfair_lock_unlock(&_delegateLock);
         }
     }
 }
@@ -261,16 +393,20 @@ ZdSckHandle* zd_sck_create(
         h->err_cb = err_cb;
         h->user_ctx = user_ctx;
 
+        h->stream_lock = OS_UNFAIR_LOCK_INIT;
         h->video_queue = dispatch_queue_create("com.zerodesk.sck.video", DISPATCH_QUEUE_SERIAL);
         h->audio_queue = dispatch_queue_create("com.zerodesk.sck.audio", DISPATCH_QUEUE_SERIAL);
         h->stop_queue = dispatch_queue_create("com.zerodesk.sck.stop", DISPATCH_QUEUE_SERIAL);
+
+        dispatch_queue_set_specific(h->video_queue, kZdCallbackQueueKey, (void*)kZdCallbackQueueKey, NULL);
+        dispatch_queue_set_specific(h->audio_queue, kZdCallbackQueueKey, (void*)kZdCallbackQueueKey, NULL);
         dispatch_queue_set_specific(h->video_queue, kZdVideoQueueKey, (void*)kZdVideoQueueKey, NULL);
         dispatch_queue_set_specific(h->audio_queue, kZdAudioQueueKey, (void*)kZdAudioQueueKey, NULL);
+        dispatch_queue_set_specific(h->stop_queue, kZdStopQueueKey, (void*)kZdStopQueueKey, NULL);
 
-        h->delegate = [[ZdSckDelegate alloc] init];
-        h->delegate.handle = h;
-        atomic_init(&h->running, 0);
-        atomic_init(&h->stopping, 0);
+        h->delegate = [[ZdSckDelegate alloc] initWithHandle:h];
+        atomic_init(&h->state, ZD_SCK_STATE_IDLE);
+        atomic_init(&h->session_id, 0);
         atomic_init(&h->active_width, 0);
         atomic_init(&h->active_height, 0);
         return h;
@@ -281,37 +417,49 @@ int32_t zd_sck_start(ZdSckHandle* h) {
     if (h == NULL) {
         return ZD_SCK_ERR_INVALID_ARG;
     }
-    if (atomic_load_explicit(&h->running, memory_order_acquire) != 0) {
-        return ZD_SCK_ERR_ALREADY_RUNNING;
+    /* CAS Idle -> Starting; refuse restart while Running, Starting, Stopping, or StopTimedOut. */
+    uint32_t expected = ZD_SCK_STATE_IDLE;
+    if (!atomic_compare_exchange_strong_explicit(
+            &h->state,
+            &expected,
+            ZD_SCK_STATE_STARTING,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        if (expected == ZD_SCK_STATE_RUNNING || expected == ZD_SCK_STATE_STARTING) {
+            return ZD_SCK_ERR_ALREADY_RUNNING;
+        }
+        return ZD_SCK_ERR_INTERNAL;
     }
+
     /* Mandatory non-interactive preflight BEFORE touching SCShareableContent. */
     if (!CGPreflightScreenCaptureAccess()) {
+        atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
         return ZD_SCK_ERR_PERMISSION;
     }
 
     @autoreleasepool {
-        __block SCShareableContent* captured_content = nil;
-        __block NSError* content_err = nil;
-        dispatch_semaphore_t content_sem = dispatch_semaphore_create(0);
-
+        ZdSckAsyncBox* content_box = [[ZdSckAsyncBox alloc] init];
         [SCShareableContent getShareableContentExcludingDesktopWindows:NO
                                                    onScreenWindowsOnly:YES
                                                      completionHandler:^(SCShareableContent* content, NSError* error) {
-            captured_content = content;
-            content_err = error;
-            dispatch_semaphore_signal(content_sem);
+            [content_box completeWithResult:content error:error];
         }];
 
-        long wait_rc = dispatch_semaphore_wait(
-            content_sem,
-            dispatch_time(DISPATCH_TIME_NOW, ZD_SCK_START_TIMEOUT_NS)
-        );
-        if (wait_rc != 0 || content_err != nil || captured_content == nil) {
+        id raw_content = nil;
+        NSError* content_err = nil;
+        BOOL got_content = [content_box
+            waitUntil:dispatch_time(DISPATCH_TIME_NOW, ZD_SCK_START_TIMEOUT_NS)
+            outResult:&raw_content
+             outError:&content_err];
+        SCShareableContent* captured_content = (SCShareableContent*)raw_content;
+        if (!got_content || content_err != nil || captured_content == nil) {
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
             return ZD_SCK_ERR_START_FAILED;
         }
 
         NSArray<SCDisplay*>* displays = captured_content.displays;
         if (displays == nil || displays.count == 0) {
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
             return ZD_SCK_ERR_NO_DISPLAY;
         }
         NSUInteger idx = (h->cfg.display_index < displays.count) ? h->cfg.display_index : 0;
@@ -344,6 +492,7 @@ int32_t zd_sck_start(ZdSckHandle* h) {
                                               configuration:sc_cfg
                                                    delegate:h->delegate];
         if (stream == nil) {
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
             return ZD_SCK_ERR_START_FAILED;
         }
 
@@ -352,6 +501,7 @@ int32_t zd_sck_start(ZdSckHandle* h) {
                                 type:SCStreamOutputTypeScreen
                   sampleHandlerQueue:h->video_queue
                                error:&add_err]) {
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
             return ZD_SCK_ERR_START_FAILED;
         }
         if (h->cfg.capture_audio != 0) {
@@ -362,32 +512,56 @@ int32_t zd_sck_start(ZdSckHandle* h) {
                                    error:&audio_err]) {
                 NSError* rem_err = nil;
                 [stream removeStreamOutput:h->delegate type:SCStreamOutputTypeScreen error:&rem_err];
+                atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
                 return ZD_SCK_ERR_START_FAILED;
             }
         }
 
-        atomic_store_explicit(&h->stopping, 0, memory_order_release);
+        uint64_t sid = atomic_fetch_add_explicit(&h->session_id, 1, memory_order_acq_rel) + 1;
+        [h->delegate armForSession:sid];
         atomic_store_explicit(&h->active_width, target_w, memory_order_release);
         atomic_store_explicit(&h->active_height, target_h, memory_order_release);
-        h->stream = stream;
 
-        __block NSError* start_err = nil;
-        dispatch_semaphore_t start_sem = dispatch_semaphore_create(0);
+        os_unfair_lock_lock(&h->stream_lock);
+        h->stream = stream;
+        os_unfair_lock_unlock(&h->stream_lock);
+
+        ZdSckAsyncBox* start_box = [[ZdSckAsyncBox alloc] init];
         [stream startCaptureWithCompletionHandler:^(NSError* error) {
-            start_err = error;
-            dispatch_semaphore_signal(start_sem);
+            [start_box completeWithResult:nil error:error];
         }];
 
-        long start_wait = dispatch_semaphore_wait(
-            start_sem,
-            dispatch_time(DISPATCH_TIME_NOW, ZD_SCK_START_TIMEOUT_NS)
-        );
-        if (start_wait != 0 || start_err != nil) {
+        NSError* start_err = nil;
+        BOOL got_start = [start_box
+            waitUntil:dispatch_time(DISPATCH_TIME_NOW, ZD_SCK_START_TIMEOUT_NS)
+            outResult:NULL
+             outError:&start_err];
+        if (!got_start || start_err != nil) {
+            /* Clean up orphan SCStream explicitly so a late start never leaks a live capture. */
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_STOPPING, memory_order_release);
+            (void)atomic_fetch_add_explicit(&h->session_id, 1, memory_order_acq_rel);
+            [h->delegate armForSession:0];
+
+            NSError* rem_err = nil;
+            [stream removeStreamOutput:h->delegate type:SCStreamOutputTypeScreen error:&rem_err];
+            if (h->cfg.capture_audio != 0) {
+                [stream removeStreamOutput:h->delegate type:SCStreamOutputTypeAudio error:&rem_err];
+            }
+
+            os_unfair_lock_lock(&h->stream_lock);
             h->stream = nil;
+            os_unfair_lock_unlock(&h->stream_lock);
+
+            dispatch_async(h->stop_queue, ^{
+                [stream stopCaptureWithCompletionHandler:^(NSError* stop_err) {
+                    (void)stop_err;
+                }];
+            });
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
             return ZD_SCK_ERR_START_FAILED;
         }
 
-        atomic_store_explicit(&h->running, 1, memory_order_release);
+        atomic_store_explicit(&h->state, ZD_SCK_STATE_RUNNING, memory_order_release);
         return ZD_SCK_OK;
     }
 }
@@ -396,33 +570,59 @@ int32_t zd_sck_stop(ZdSckHandle* h, uint32_t timeout_ms) {
     if (h == NULL) {
         return ZD_SCK_ERR_INVALID_ARG;
     }
+    /* Re-entrancy guard: never stop synchronously from inside a video/audio callback. */
+    if (dispatch_get_specific(kZdCallbackQueueKey) != NULL) {
+        return ZD_SCK_ERR_INVALID_ARG;
+    }
+
     @autoreleasepool {
-        atomic_store_explicit(&h->stopping, 1, memory_order_release);
-        uint8_t was_running = atomic_exchange_explicit(&h->running, 0, memory_order_acq_rel);
-        SCStream* stream = h->stream;
-        if (was_running == 0 && stream == nil) {
+        uint32_t cur = atomic_load_explicit(&h->state, memory_order_acquire);
+        while (cur == ZD_SCK_STATE_RUNNING || cur == ZD_SCK_STATE_STARTING) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &h->state,
+                    &cur,
+                    ZD_SCK_STATE_STOPPING,
+                    memory_order_acq_rel,
+                    memory_order_acquire)) {
+                break;
+            }
+        }
+        if (cur == ZD_SCK_STATE_IDLE) {
             return ZD_SCK_OK;
         }
+        if (cur == ZD_SCK_STATE_STOPPING) {
+            return ZD_SCK_OK;
+        }
+        if (cur == ZD_SCK_STATE_STOP_TIMED_OUT) {
+            return ZD_SCK_ERR_STOP_TIMEOUT;
+        }
+
+        /* Bump session_id immediately so any queued stale callbacks drop without invoking Rust. */
+        (void)atomic_fetch_add_explicit(&h->session_id, 1, memory_order_acq_rel);
+        [h->delegate armForSession:0];
+
+        os_unfair_lock_lock(&h->stream_lock);
+        SCStream* stream = h->stream;
+        h->stream = nil;
+        os_unfair_lock_unlock(&h->stream_lock);
 
         uint32_t effective_ms = (timeout_ms == 0) ? ZD_SCK_DEFAULT_STOP_TIMEOUT_MS : timeout_ms;
-        __block int32_t result = ZD_SCK_OK;
+        int32_t result = ZD_SCK_OK;
 
         if (stream != nil) {
-            dispatch_semaphore_t stop_sem = dispatch_semaphore_create(0);
-            /* Always dispatch stopCaptureWithCompletionHandler onto the dedicated serial stop_queue
-             * so stopping from any thread/callback context can never deadlock. */
+            ZdSckAsyncBox* stop_box = [[ZdSckAsyncBox alloc] init];
+            /* Capture only ObjC objects in the async block (never raw `h` pointer). */
             dispatch_async(h->stop_queue, ^{
                 [stream stopCaptureWithCompletionHandler:^(NSError* error) {
-                    (void)error;
-                    dispatch_semaphore_signal(stop_sem);
+                    [stop_box completeWithResult:nil error:error];
                 }];
             });
 
-            long wait_rc = dispatch_semaphore_wait(
-                stop_sem,
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)effective_ms * NSEC_PER_MSEC)
-            );
-            if (wait_rc != 0) {
+            BOOL stopped = [stop_box
+                waitUntil:dispatch_time(DISPATCH_TIME_NOW, (int64_t)effective_ms * NSEC_PER_MSEC)
+                outResult:NULL
+                 outError:NULL];
+            if (!stopped) {
                 result = ZD_SCK_ERR_STOP_TIMEOUT;
             }
 
@@ -431,10 +631,9 @@ int32_t zd_sck_stop(ZdSckHandle* h, uint32_t timeout_ms) {
             if (h->cfg.capture_audio != 0) {
                 [stream removeStreamOutput:h->delegate type:SCStreamOutputTypeAudio error:&rem_err];
             }
-            h->stream = nil;
         }
 
-        /* Drain any in-flight output callbacks before returning (skip sync if invoked on same queue). */
+        /* Drain in-flight video/audio callbacks on our serial queues. */
         if (dispatch_get_specific(kZdVideoQueueKey) != kZdVideoQueueKey) {
             dispatch_sync(h->video_queue, ^{});
         }
@@ -442,6 +641,11 @@ int32_t zd_sck_stop(ZdSckHandle* h, uint32_t timeout_ms) {
             dispatch_sync(h->audio_queue, ^{});
         }
 
+        if (result == ZD_SCK_ERR_STOP_TIMEOUT) {
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_STOP_TIMED_OUT, memory_order_release);
+        } else {
+            atomic_store_explicit(&h->state, ZD_SCK_STATE_IDLE, memory_order_release);
+        }
         return result;
     }
 }
@@ -450,13 +654,30 @@ void zd_sck_destroy(ZdSckHandle* h) {
     if (h == NULL) {
         return;
     }
-    (void)zd_sck_stop(h, ZD_SCK_DEFAULT_STOP_TIMEOUT_MS);
+    if (dispatch_get_specific(kZdCallbackQueueKey) == NULL) {
+        (void)zd_sck_stop(h, ZD_SCK_DEFAULT_STOP_TIMEOUT_MS);
+    }
     @autoreleasepool {
+        /* Detach delegate under _delegateLock BEFORE draining queues and freeing `h`,
+         * guaranteeing zero UAF even if Apple delivers didStopWithError on a private thread. */
         if (h->delegate != nil) {
-            h->delegate.handle = NULL;
-            h->delegate = nil;
+            [h->delegate detach];
         }
+        if (h->stop_queue != nil && dispatch_get_specific(kZdStopQueueKey) != kZdStopQueueKey) {
+            dispatch_sync(h->stop_queue, ^{});
+        }
+        if (h->video_queue != nil && dispatch_get_specific(kZdVideoQueueKey) != kZdVideoQueueKey) {
+            dispatch_sync(h->video_queue, ^{});
+        }
+        if (h->audio_queue != nil && dispatch_get_specific(kZdAudioQueueKey) != kZdAudioQueueKey) {
+            dispatch_sync(h->audio_queue, ^{});
+        }
+
+        os_unfair_lock_lock(&h->stream_lock);
         h->stream = nil;
+        os_unfair_lock_unlock(&h->stream_lock);
+
+        h->delegate = nil;
         h->video_queue = nil;
         h->audio_queue = nil;
         h->stop_queue = nil;

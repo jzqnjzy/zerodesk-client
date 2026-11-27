@@ -13,6 +13,15 @@ pub const WATCHDOG_PROTO_VERSION: u8 = 1;
 pub const WATCHDOG_FRAME_LEN: usize = 56;
 pub const WATCHDOG_REPORT_SCHEMA_VERSION: u32 = 1;
 
+/// Capability bits carried in `WatchdogMsgType::Ready` frame `flags`.
+pub const WATCHDOG_READY_FLAG_REAL_OS_INPUT: u8 = 0x01;
+pub const WATCHDOG_READY_FLAG_AX_TRUSTED: u8 = 0x02;
+
+/// Outcome flags carried in `WatchdogMsgType::Released` frame `flags`.
+pub const WATCHDOG_RELEASED_FLAG_GRACEFUL: u8 = 0x00;
+pub const WATCHDOG_RELEASED_FLAG_EMERGENCY_OK: u8 = 0x01;
+pub const WATCHDOG_RELEASED_FLAG_EMERGENCY_FAILED: u8 = 0x02;
+
 /// All 8 USB HID modifier usages (Left/Right Ctrl, Shift, Alt, Meta), released
 /// unconditionally during emergency release as defense-in-depth.
 pub const ALL_MODIFIER_HID_USAGES: [u16; 8] = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7];
@@ -148,9 +157,13 @@ impl WatchdogFrame {
     }
 
     pub fn ready(seq: u64) -> Self {
+        Self::ready_with_flags(seq, 0)
+    }
+
+    pub fn ready_with_flags(seq: u64, flags: u8) -> Self {
         Self {
             msg_type: WatchdogMsgType::Ready,
-            flags: 0,
+            flags,
             seq,
             payload: [0u8; 32],
             buttons: 0,
@@ -309,6 +322,10 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Versioned (`schema_version = 1`) atomic release report written by `zerodesk-hid-watchdog`
 /// in dry-run mode on emergency release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +337,10 @@ pub struct WatchdogReleaseReport {
     pub released_keys: Vec<u16>,
     pub released_buttons: u8,
     pub released_modifiers: Vec<u16>,
+    #[serde(default = "default_true")]
+    pub release_ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_error: Option<String>,
     pub release_elapsed_ms: u64,
     pub timestamp_epoch_ms: u64,
 }
