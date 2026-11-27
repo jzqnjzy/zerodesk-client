@@ -987,7 +987,7 @@ pub fn measure_audio_quality(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::policy::{
+    use crate::session::policy::{
         EffectiveTenantPolicy, TenantPolicyBody, POLICY_FLAG_ALLOW_AUDIO,
     };
     use serde_json::Value;

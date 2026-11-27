@@ -311,6 +311,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "arboard"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeb9553e62312c8756a5979254fc6d7da8bbeb5986a1e17037fab932f7037917"
+dependencies = [
+ "clipboard-win",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "parking_lot",
+ "percent-encoding",
+ "windows-sys 0.61.2",
+ "x11rb 0.13.1",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1746,6 +1763,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f01585027057ff5f0a5bf276174ae4c1594a2c5bde93d5f46a016d76270f5a9"
 dependencies = [
  "bindgen 0.69.4",
+]
+
+[[package]]
+name = "cpal"
+version = "0.15.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "873dab07c8f743075e57f524c583985fbaf745602acbe916a01539364369a779"
+dependencies = [
+ "alsa",
+ "core-foundation-sys 0.8.7",
+ "coreaudio-rs",
+ "dasp_sample",
+ "jni",
+ "js-sys",
+ "libc",
+ "mach2",
+ "ndk 0.8.0",
+ "ndk-context",
+ "oboe",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -5402,6 +5442,7 @@ dependencies = [
  "bitflags 2.9.1",
  "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation 0.3.2",
 ]
 
@@ -5459,7 +5500,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.9.1",
+ "dispatch2",
+ "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -5522,6 +5566,17 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.9.1",
  "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-surface"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
+dependencies = [
+ "bitflags 2.9.1",
  "objc2 0.6.4",
  "objc2-core-foundation",
 ]
@@ -7110,7 +7165,7 @@ version = "1.5.3"
 dependencies = [
  "android-wakelock",
  "android_logger",
- "arboard",
+ "arboard 3.4.0",
  "async-process",
  "async-trait",
  "base",
@@ -7125,7 +7180,7 @@ dependencies = [
  "cocoa 0.24.1",
  "core-foundation 0.9.4",
  "core-graphics 0.22.3",
- "cpal",
+ "cpal 0.15.3 (git+https://github.com/rustdesk-org/cpal?branch=osx-screencapturekit)",
  "crossbeam-queue",
  "ctrlc",
  "dasp",
@@ -7222,6 +7277,7 @@ dependencies = [
  "x11rb 0.12.0",
  "xkbcommon-dl",
  "xxhash-rust",
+ "zerodesk_core",
  "zstd",
 ]
 
@@ -9257,6 +9313,7 @@ dependencies = [
  "v2_client",
  "v2_identity",
  "v2_transport",
+ "zerodesk_core",
 ]
 
 [[package]]
@@ -11011,6 +11068,33 @@ dependencies = [
  "proc-macro2 1.0.93",
  "quote 1.0.36",
  "syn 2.0.98",
+]
+
+[[package]]
+name = "zerodesk_core"
+version = "0.1.0"
+dependencies = [
+ "arboard 3.7.0",
+ "base64 0.22.1",
+ "bytes",
+ "core-foundation 0.9.4",
+ "core-graphics 0.23.2",
+ "cpal 0.15.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "enigo",
+ "hex",
+ "libc",
+ "rand_core 0.6.4",
+ "scrap",
+ "serde 1.0.228",
+ "serde_json 1.0.118",
+ "sha2",
+ "thiserror 1.0.61",
+ "tokio",
+ "tokio-util",
+ "v2_client",
+ "v2_identity",
+ "v2_transport",
+ "zeroize",
 ]
 
 [[package]]

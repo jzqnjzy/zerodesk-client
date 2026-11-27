@@ -48,7 +48,7 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
-zerodesk-v2 = ["dep:v2_identity", "dep:v2_transport", "dep:v2_client", "dep:tokio"]
+zerodesk-v2 = ["dep:v2_identity", "dep:v2_transport", "dep:v2_client", "dep:zerodesk_core", "dep:tokio"]
 os-input = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -97,6 +97,7 @@ tokio = { version = "1.44", features = ["rt-multi-thread", "sync", "time"], opti
 v2_identity = { path = "libs/v2_identity", optional = true }
 v2_transport = { path = "libs/v2_transport", optional = true }
 v2_client = { path = "libs/v2_client", optional = true }
+zerodesk_core = { path = "libs/zerodesk_core", optional = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
@@ -229,7 +230,7 @@ android-wakelock = { git = "https://github.com/rustdesk-org/android-wakelock" }
 
 [workspace]
 members = ["libs/scrap", "libs/hbb_common", "libs/base", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer", "libs/v2_e2e"]
-exclude = ["vdi/host", "libs/v2_identity", "libs/v2_transport", "libs/v2_client"]
+exclude = ["vdi/host", "libs/v2_identity", "libs/v2_transport", "libs/v2_client", "libs/zerodesk_core"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo
 # This allows building and running on systems without libxdo installed (e.g., Wayland-only)

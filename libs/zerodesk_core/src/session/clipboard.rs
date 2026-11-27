@@ -781,7 +781,7 @@ impl ClipboardReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::policy::{
+    use crate::session::policy::{
         TenantPolicyBody, POLICY_FLAG_ALLOW_CLIPBOARD, POLICY_FLAG_ALLOW_FILE_CLIPBOARD,
     };
     use serde_json::Value;

@@ -1493,7 +1493,7 @@ impl FileTransferReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::policy::{TenantPolicyBody, POLICY_FLAG_ALLOW_FILE_TRANSFER};
+    use crate::session::policy::{TenantPolicyBody, POLICY_FLAG_ALLOW_FILE_TRANSFER};
     use serde_json::Value;
     use v2_transport::encode_l4_frame;
 

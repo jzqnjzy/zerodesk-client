@@ -11,7 +11,7 @@ path = "src/bin/zerodesk-desktop-e2e.rs"
 
 [features]
 default = []
-os-input = ["dep:enigo"]
+os-input = ["dep:enigo", "zerodesk_core/os-input"]
 
 [dependencies]
 base64 = "0.22.1"
@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 v2_client = { path = "../v2_client", features = ["test-utils"] }
 v2_identity = { path = "../v2_identity" }
 v2_transport = { path = "../v2_transport" }
+zerodesk_core = { path = "../zerodesk_core" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

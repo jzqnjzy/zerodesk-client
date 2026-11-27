@@ -322,12 +322,11 @@ impl ScreenCaptureSource for SyntheticAnimatedSource {
 mod macos_tcc {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
-        // CoreGraphics `boolean_t` is C `unsigned int` (`u32`).
-        fn CGPreflightScreenCaptureAccess() -> u32;
+        fn CGPreflightScreenCaptureAccess() -> bool;
     }
 
     pub fn preflight_screen_capture() -> bool {
-        unsafe { CGPreflightScreenCaptureAccess() != 0 }
+        unsafe { CGPreflightScreenCaptureAccess() }
     }
 }
 
@@ -898,7 +897,7 @@ pub fn spawn_capture_pipeline<S: ScreenCaptureSource + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::video::{V2VideoDecoder, V2VideoEncoder, VideoCodec};
+    use crate::session::video::{V2VideoDecoder, V2VideoEncoder, VideoCodec};
 
     struct ZeroVarianceMockSource {
         seq: u64,

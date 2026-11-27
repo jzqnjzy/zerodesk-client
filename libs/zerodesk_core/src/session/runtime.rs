@@ -519,7 +519,7 @@ pub async fn ordered_session_teardown<S: HidInputSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::{
+    use crate::session::{
         hid::{HidPayload, KeyEvent},
         input::{DryRunSink, InputError, InputSinkError, ReleaseAllResult, SafeHidKey},
     };

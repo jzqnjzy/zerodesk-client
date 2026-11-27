@@ -630,17 +630,19 @@ impl DesktopControllerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::{
+    use crate::session::{
         hid::{KeyEvent, MouseEvent, MouseKind},
         video::generate_animated_i420,
     };
     use bytes::Bytes;
     use tokio::{net::UdpSocket, task::JoinHandle};
-    use v2_client::{AccessKeys, UdpAccessLink};
+    use v2_client::{now_unix_secs, AccessKeys, UdpAccessLink};
+    use v2_identity::{DeviceKeyStore, SoftwareDeviceKeyStore, X25519StaticKeyRotator};
     use v2_transport::{
-        seal_udp_v11, AccessEpochState, AccessFlags, AccessHeaderV11, HidFrame,
-        VerifiedTenantPolicy, DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT, TRANSPORT_DATAGRAM,
-        UDP_MAX_LEN,
+        seal_udp_v11, AccessEpochState, AccessFlags, AccessHeaderV11, HidFrame, PrologueInput,
+        VerifiedTenantPolicy, CIPHER_AESGCM, DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT,
+        L3_MTU_DEFAULT, PATTERN_IK, TRANSPORT_DATAGRAM, TRANSPORT_MODE_RELAY_UDP, UDP_MAX_LEN,
+        VER_MAJOR_MINOR,
     };
 
     struct LoopbackPair {
@@ -740,12 +742,64 @@ mod tests {
         });
 
         let policy = VerifiedTenantPolicy::free_tier([0x11; 16]);
-        let key_c2h = [0x55; 32];
-        let key_h2c = [0x66; 32];
-        let ctrl_sess =
-            UdpE2eeSession::from_keys(link_ctrl, key_c2h, key_h2c, policy.clone(), [0x01; 16]);
-        let host_sess =
-            UdpE2eeSession::from_keys(link_host, key_h2c, key_c2h, policy, [0x02; 16]);
+        let now = now_unix_secs();
+        let ctrl_id = [0x01; 16];
+        let host_id = [0x02; 16];
+        let ctrl_ks = SoftwareDeviceKeyStore::generate();
+        let host_ks = SoftwareDeviceKeyStore::generate();
+        let mut ctrl_x = X25519StaticKeyRotator::new(ctrl_id, false, 0);
+        let mut host_x = X25519StaticKeyRotator::new(host_id, false, 0);
+        let ctrl_gen = ctrl_x.ensure_current(&ctrl_ks, now, now + 7200).unwrap();
+        let host_gen = host_x.ensure_current(&host_ks, now, now + 7200).unwrap();
+        let ctrl_spki = ctrl_ks.public_key_spki_der().unwrap();
+        let host_spki = host_ks.public_key_spki_der().unwrap();
+        let prologue = PrologueInput {
+            ver_major_minor: VER_MAJOR_MINOR,
+            handshake_pattern: PATTERN_IK,
+            cipher_suite: CIPHER_AESGCM,
+            transport_mode: TRANSPORT_MODE_RELAY_UDP,
+            device_id_ctrl: ctrl_id,
+            device_id_host: host_id,
+            ctrl_devcert_tbs_sha256: [0u8; 32],
+            host_devcert_tbs_sha256: [0u8; 32],
+            policy_hash: [0u8; 32],
+            edge_cert_tbs_sha256_or_zero: [0u8; 32],
+            negotiated_cap_bits: 0,
+            session_id: [0xEE; 16],
+        };
+        let (ctrl_res, host_res) = tokio::join!(
+            UdpE2eeSession::handshake_initiator(
+                link_ctrl,
+                &prologue,
+                ctrl_gen.secret_bytes(),
+                &host_gen.public_key,
+                &host_gen.delegation,
+                &host_id,
+                &host_spki,
+                now + 7200,
+                now,
+                policy.clone(),
+                ctrl_id,
+                L3_MTU_DEFAULT,
+                Duration::from_secs(5),
+            ),
+            UdpE2eeSession::handshake_responder(
+                link_host,
+                &prologue,
+                host_gen.secret_bytes(),
+                &ctrl_gen.delegation,
+                &ctrl_id,
+                &ctrl_spki,
+                now + 7200,
+                now,
+                policy,
+                host_id,
+                L3_MTU_DEFAULT,
+                Duration::from_secs(5),
+            ),
+        );
+        let (ctrl_sess, _) = ctrl_res.unwrap();
+        let (host_sess, _) = host_res.unwrap();
 
         let enc = V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(30)).unwrap();
         let dec = V2VideoDecoder::new(VideoCodec::Vp9).unwrap();

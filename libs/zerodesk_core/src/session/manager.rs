@@ -2160,7 +2160,7 @@ mod tests {
         let cb = Arc::new(RecordingCallback::new(true));
         let disp = UiCallbackDispatcher::spawn(Arc::clone(&cb) as Arc<dyn V2UiCallback>);
         let frame = Arc::new(
-            crate::v2_session::video::I420Frame::new(
+            crate::session::video::I420Frame::new(
                 32,
                 32,
                 vec![16; 32 * 32],
@@ -2210,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn signaling_drop_mid_session_has_zero_effect_on_active_media_and_hid() {
-        use crate::v2_session::{
+        use crate::session::{
             hid::{HidPayload, MouseEvent, MouseKind},
             session::{DesktopControllerSession, DesktopHostSession},
             video::{generate_animated_i420, V2VideoDecoder, V2VideoEncoder, VideoCodec},
@@ -2402,12 +2402,68 @@ mod tests {
         });
 
         let policy = build_verified_policy_from_cert(&cert, 50_000);
+        let now = now_unix_secs();
+        let ctrl_id = [1u8; 16];
+        let host_id = [2u8; 16];
+        let ctrl_ks = SoftwareDeviceKeyStore::generate();
+        let host_ks = SoftwareDeviceKeyStore::generate();
+        let mut ctrl_x = v2_identity::X25519StaticKeyRotator::new(ctrl_id, false, 0);
+        let mut host_x = v2_identity::X25519StaticKeyRotator::new(host_id, false, 0);
+        let ctrl_gen = ctrl_x.ensure_current(&ctrl_ks, now, now + 7200).unwrap();
+        let host_gen = host_x.ensure_current(&host_ks, now, now + 7200).unwrap();
+        let ctrl_spki = ctrl_ks.public_key_spki_der().unwrap();
+        let host_spki = host_ks.public_key_spki_der().unwrap();
+        let prologue = PrologueInput {
+            ver_major_minor: VER_MAJOR_MINOR,
+            handshake_pattern: PATTERN_IK,
+            cipher_suite: CIPHER_AESGCM,
+            transport_mode: TRANSPORT_MODE_RELAY_UDP,
+            device_id_ctrl: ctrl_id,
+            device_id_host: host_id,
+            ctrl_devcert_tbs_sha256: [0u8; 32],
+            host_devcert_tbs_sha256: [0u8; 32],
+            policy_hash: cert.policy_hash,
+            edge_cert_tbs_sha256_or_zero: [0u8; 32],
+            negotiated_cap_bits: 0,
+            session_id: [0xDD; 16],
+        };
+        let (ctrl_hs, host_hs) = tokio::join!(
+            UdpE2eeSession::handshake_initiator(
+                link_ctrl,
+                &prologue,
+                ctrl_gen.secret_bytes(),
+                &host_gen.public_key,
+                &host_gen.delegation,
+                &host_id,
+                &host_spki,
+                now + 7200,
+                now,
+                policy.clone(),
+                ctrl_id,
+                L3_MTU_DEFAULT,
+                Duration::from_secs(5),
+            ),
+            UdpE2eeSession::handshake_responder(
+                link_host,
+                &prologue,
+                host_gen.secret_bytes(),
+                &ctrl_gen.delegation,
+                &ctrl_id,
+                &ctrl_spki,
+                now + 7200,
+                now,
+                policy,
+                host_id,
+                L3_MTU_DEFAULT,
+                Duration::from_secs(5),
+            ),
+        );
         let mut ctrl = DesktopControllerSession::new(
-            UdpE2eeSession::from_keys(link_ctrl, [0x55; 32], [0x66; 32], policy.clone(), [1; 16]),
+            ctrl_hs.unwrap().0,
             V2VideoDecoder::new(VideoCodec::Vp9).unwrap(),
         );
         let mut host = DesktopHostSession::new(
-            UdpE2eeSession::from_keys(link_host, [0x66; 32], [0x55; 32], policy, [2; 16]),
+            host_hs.unwrap().0,
             V2VideoEncoder::new(VideoCodec::Vp9, 64, 64, 2.0, Some(30)).unwrap(),
         );
 

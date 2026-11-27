@@ -2386,7 +2386,7 @@ pub fn spawn_release_watchdog<S: HidInputSink + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::hid::decode_l4_hid_frame;
+    use crate::session::hid::decode_l4_hid_frame;
     use std::sync::atomic::AtomicUsize;
 
     struct FaultInjectingSink {

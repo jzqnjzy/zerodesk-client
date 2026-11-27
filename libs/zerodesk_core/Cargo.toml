@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 ZeroDesk Contributors
+
+[package]
+name = "zerodesk_core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "ZeroDesk V2 desktop core library: session engine, FrameMailbox, async V2BridgeRuntime, OS adapters, and stable C-ABI"
+
+[workspace]
+resolver = "2"
+
+[lib]
+name = "zerodesk_core"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "zerodesk-desktop"
+path = "src/bin/zerodesk-desktop.rs"
+
+[features]
+default = ["os-capture", "os-audio", "os-clipboard"]
+os-capture = ["dep:core-graphics", "dep:core-foundation"]
+os-audio = ["dep:cpal"]
+os-clipboard = ["dep:arboard"]
+real-input = []
+os-input = ["dep:enigo"]
+
+[dependencies]
+arboard = { version = "3.6", default-features = false, optional = true }
+base64 = "0.22.1"
+bytes = "1.9"
+cpal = { version = "0.15", optional = true }
+enigo = { path = "../enigo", optional = true }
+hex = "0.4"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+scrap = { path = "../scrap" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+v2_client = { path = "../v2_client" }
+v2_identity = { path = "../v2_identity" }
+v2_transport = { path = "../v2_transport" }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.9", optional = true }
+core-graphics = { version = "0.23", optional = true }
+
+[dev-dependencies]
+cc = "1.0"

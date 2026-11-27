@@ -7,6 +7,8 @@ mod phase3_cli;
 mod phase4_cli;
 #[path = "../phase4b_cli.rs"]
 mod phase4b_cli;
+#[path = "../phase5_cli.rs"]
+mod phase5_cli;
 #[path = "../wan_bench.rs"]
 mod wan_bench;
 
@@ -1418,6 +1420,7 @@ async fn main() -> ExitCode {
         "v2-ctl" => phase4_cli::cmd_v2_ctl(&args).await,
         "signaling-e2e" => phase4_cli::cmd_signaling_e2e(&args).await,
         "phase4b-e2e" => phase4b_cli::cmd_phase4b_e2e(&args).await,
+        "phase5-e2e" => phase5_cli::cmd_phase5_e2e(&args).await,
         other => {
             eprintln!("unknown subcommand '{other}'");
             print_usage();

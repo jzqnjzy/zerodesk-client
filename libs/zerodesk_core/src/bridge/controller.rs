@@ -7,7 +7,7 @@
 //! state machine, a pollable bounded event queue (zero re-entrant callbacks while holding locks),
 //! CA-verified caller display info, secret-redacted snapshots, and atomic `0600` config save/load.
 
-use super::{
+use crate::session::{
     clipboard::{check_clipboard_policy_for_sync, CLIP_HARD_MAX_BYTES},
     config::{
         read_file_0600_to_string, write_file_atomic_0600, TransportMode, V2ConfigError,
@@ -1392,7 +1392,7 @@ impl V2BridgeController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_session::policy::{TenantPolicyBody, POLICY_FLAGS_VALID_MASK};
+    use crate::session::policy::{TenantPolicyBody, POLICY_FLAGS_VALID_MASK};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_cert(dev_id: [u8; 16], tid: [u8; 16]) -> SignalingDeviceCert {
@@ -1644,7 +1644,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("zd-br-p1-{}-{uniq}", std::process::id()));
-        crate::v2_session::config::ensure_dir_0700(&dir).unwrap();
+        crate::session::config::ensure_dir_0700(&dir).unwrap();
         let cfg_path = dir.join("cfg.json");
 
         // Invalid config (empty endpoint) rejected by save_config BEFORE writing to disk
