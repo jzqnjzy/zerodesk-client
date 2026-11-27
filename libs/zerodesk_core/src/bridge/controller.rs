@@ -233,8 +233,8 @@ pub struct BridgeSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_transport_mode: Option<ActiveTransportMode>,
     pub audio_muted: bool,
-    #[serde(default)]
-    pub real_input_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_input_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_device_id_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -487,7 +487,7 @@ impl BridgeInner {
             transport_mode: self.transport_mode,
             active_transport_mode: self.active_transport_mode,
             audio_muted: self.audio_muted,
-            real_input_enabled: false,
+            real_input_enabled: None,
             local_device_id_hex: self.local_device_id_hex.clone(),
             local_tenant_id_hex: self.local_tenant_id_hex.clone(),
             active_session_id_hex: self.active_session_id_hex.clone(),

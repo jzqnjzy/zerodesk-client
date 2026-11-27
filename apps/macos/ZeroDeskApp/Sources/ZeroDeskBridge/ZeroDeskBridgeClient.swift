@@ -37,17 +37,35 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         var result: Result<T, Error>?
     }
 
-    private let condition = NSCondition()
-    private var workQueue: [WorkBox] = []
-    private var eventHandler: EventHandler?
-    private var closing = false
-    private var exited = false
+    private final class BridgeState: @unchecked Sendable {
+        static let onEventQueueKey = DispatchSpecificKey<UInt8>()
 
-    private let eventDeliveryQueue = DispatchQueue(
-        label: "io.zerodesk.desktop.events",
-        qos: .userInitiated
-    )
-    private var workerThread: Thread?
+        let condition = NSCondition()
+        var workQueue: [WorkBox] = []
+        var eventHandler: EventHandler?
+        var handlerEpoch: UInt64 = 0
+        var closing = false
+        var exited = false
+        var workerThread: Thread?
+        let eventDeliveryQueue: DispatchQueue
+
+        init() {
+            let queue = DispatchQueue(
+                label: "io.zerodesk.desktop.events",
+                qos: .userInitiated
+            )
+            queue.setSpecific(key: Self.onEventQueueKey, value: 1)
+            self.eventDeliveryQueue = queue
+        }
+
+        func isEpochActive(_ epoch: UInt64) -> Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return !closing && handlerEpoch == epoch
+        }
+    }
+
+    private let state = BridgeState()
 
     public static func abiVersion() -> UInt32 {
         zerodesk_v2_abi_version()
@@ -75,8 +93,9 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
             var error: ZeroDeskBridgeError?
         }
         let initBox = InitResultBox()
+        let bridgeState = self.state
 
-        let thread = Thread { [weak self] in
+        let thread = Thread {
             var handle: UInt64 = 0
             let rc = zerodesk_v2_create(&handle)
             if rc != ZERODESK_OK || handle == 0 {
@@ -85,19 +104,23 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
                 return
             }
             initSem.signal()
-            self?.runBridgeLoop(handle: handle)
+            Self.runBridgeLoop(state: bridgeState, handle: handle)
         }
         thread.name = "zerodesk-swift-bridge"
-        self.workerThread = thread
+        thread.stackSize = 2 * 1024 * 1024
+        bridgeState.condition.lock()
+        bridgeState.workerThread = thread
+        bridgeState.condition.unlock()
         thread.start()
 
         initSem.wait()
         if let err = initBox.error {
-            condition.lock()
-            closing = true
-            exited = true
-            condition.broadcast()
-            condition.unlock()
+            bridgeState.condition.lock()
+            bridgeState.closing = true
+            bridgeState.exited = true
+            bridgeState.workerThread = nil
+            bridgeState.condition.broadcast()
+            bridgeState.condition.unlock()
             throw err
         }
     }
@@ -108,24 +131,29 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
 
     /// Registers or clears the asynchronous bridge event callback.
     public func setEventHandler(_ handler: EventHandler?) {
-        condition.lock()
-        eventHandler = handler
-        condition.signal()
-        condition.unlock()
+        state.condition.lock()
+        state.handlerEpoch &+= 1
+        state.eventHandler = handler
+        state.condition.signal()
+        state.condition.unlock()
     }
 
     /// Idempotently destroys the underlying Rust runtime handle and joins the dedicated bridge
     /// thread so zero callbacks or FFI calls can execute after `close()` returns.
     public func close() {
-        condition.lock()
-        closing = true
-        eventHandler = nil
-        condition.broadcast()
-        while !exited {
-            condition.wait()
+        state.condition.lock()
+        state.closing = true
+        state.handlerEpoch &+= 1
+        state.eventHandler = nil
+        state.condition.broadcast()
+        while !state.exited {
+            state.condition.wait()
         }
-        condition.unlock()
-        workerThread = nil
+        state.workerThread = nil
+        state.condition.unlock()
+        if DispatchQueue.getSpecific(key: BridgeState.onEventQueueKey) == nil {
+            state.eventDeliveryQueue.sync {}
+        }
     }
 
     /// Executes a raw JSON command against `V2BridgeRuntime::exec_json`.
@@ -264,7 +292,11 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
             }
             return Self.copyOwnedBuffer(outBuf)
         }
-        return try JSONDecoder().decode(BridgeCommandReply.self, from: data)
+        do {
+            return try JSONDecoder().decode(BridgeCommandReply.self, from: data)
+        } catch {
+            throw ZeroDeskBridgeError.protocolError("decode send_clipboard_png reply failed: \(error)")
+        }
     }
 
     public func sendFile(at path: String) throws -> BridgeCommandReply {
@@ -280,7 +312,11 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
             }
             return Self.copyOwnedBuffer(outBuf)
         }
-        return try JSONDecoder().decode(BridgeCommandReply.self, from: data)
+        do {
+            return try JSONDecoder().decode(BridgeCommandReply.self, from: data)
+        } catch {
+            throw ZeroDeskBridgeError.protocolError("decode send_file reply failed: \(error)")
+        }
     }
 
     /// Two-phase frame fetch (`frame_info` -> allocate -> `take_latest_frame`, up to 3 retries on
@@ -327,23 +363,35 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
                 }
                 guard copiedInfo.byte_len <= cap,
                       copiedInfo.width > 0,
-                      copiedInfo.height > 0,
-                      copiedInfo.stride >= copiedInfo.width * 4 else {
-                    throw ZeroDeskBridgeError.protocolError("frame byte_len/stride invariant violation")
+                      copiedInfo.height > 0 else {
+                    throw ZeroDeskBridgeError.protocolError("frame metadata invariant violation")
+                }
+
+                let width = Int(copiedInfo.width)
+                let height = Int(copiedInfo.height)
+                let stride = Int(copiedInfo.stride)
+                let (rowBytes, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+                guard !rowOverflow, stride >= rowBytes else {
+                    throw ZeroDeskBridgeError.protocolError("frame stride invariant violation")
+                }
+                let (prefixBytes, prefixOverflow) = (height - 1).multipliedReportingOverflow(by: stride)
+                let (requiredBytes, totalOverflow) = prefixBytes.addingReportingOverflow(rowBytes)
+                guard !prefixOverflow, !totalOverflow, copiedInfo.byte_len >= requiredBytes else {
+                    throw ZeroDeskBridgeError.protocolError("frame byte_len smaller than required image bytes")
                 }
 
                 let slice = copiedInfo.byte_len == cap ? pixelData : pixelData.prefix(copiedInfo.byte_len)
                 let cgImage = try Self.makeCGImage(
                     data: slice,
-                    width: Int(copiedInfo.width),
-                    height: Int(copiedInfo.height),
-                    stride: Int(copiedInfo.stride),
+                    width: width,
+                    height: height,
+                    stride: stride,
                     pixelFormat: copiedInfo.pixel_format
                 )
                 return CapturedFrameImage(
                     seq: copiedInfo.seq,
-                    width: Int(copiedInfo.width),
-                    height: Int(copiedInfo.height),
+                    width: width,
+                    height: height,
                     ptsMs: copiedInfo.pts_ms,
                     droppedUiFrames: copiedInfo.dropped_ui_frames,
                     image: cgImage
@@ -359,14 +407,14 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
             box.result = Result { try op(handle) }
         }
 
-        condition.lock()
-        if closing || exited {
-            condition.unlock()
+        state.condition.lock()
+        if state.closing || state.exited {
+            state.condition.unlock()
             throw ZeroDeskBridgeError.closed
         }
-        workQueue.append(work)
-        condition.signal()
-        condition.unlock()
+        state.workQueue.append(work)
+        state.condition.signal()
+        state.condition.unlock()
 
         work.sem.wait()
         guard let res = box.result else {
@@ -375,18 +423,18 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         return try res.get()
     }
 
-    private func runBridgeLoop(handle: UInt64) {
+    private static func runBridgeLoop(state: BridgeState, handle: UInt64) {
         defer {
             let rc = zerodesk_v2_destroy(handle)
             if rc != ZERODESK_OK {
                 Self.logger.error("zerodesk_v2_destroy returned code \(rc, privacy: .public)")
             }
-            condition.lock()
-            let residual = workQueue
-            workQueue.removeAll()
-            exited = true
-            condition.broadcast()
-            condition.unlock()
+            state.condition.lock()
+            let residual = state.workQueue
+            state.workQueue.removeAll()
+            state.exited = true
+            state.condition.broadcast()
+            state.condition.unlock()
             for item in residual {
                 item.sem.signal()
             }
@@ -395,23 +443,25 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         while true {
             var pending: [WorkBox] = []
             var activeHandler: EventHandler?
+            var activeEpoch: UInt64 = 0
             var shouldStop = false
 
-            condition.lock()
-            if !workQueue.isEmpty {
-                pending = workQueue
-                workQueue.removeAll(keepingCapacity: true)
-            } else if closing {
+            state.condition.lock()
+            if !state.workQueue.isEmpty {
+                pending = state.workQueue
+                state.workQueue.removeAll(keepingCapacity: true)
+            } else if state.closing {
                 shouldStop = true
-            } else if let handler = eventHandler {
+            } else if let handler = state.eventHandler {
                 activeHandler = handler
+                activeEpoch = state.handlerEpoch
             } else {
                 // Idle with no event listener: sleep cleanly with zero CPU usage.
-                condition.wait()
-                condition.unlock()
+                state.condition.wait()
+                state.condition.unlock()
                 continue
             }
-            condition.unlock()
+            state.condition.unlock()
 
             for item in pending {
                 item.run(handle)
@@ -432,8 +482,12 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
                         Self.logger.debug(
                             "bridge event kind=\(envelope.kind, privacy: .public) seq=\(envelope.seq, privacy: .public)"
                         )
-                        eventDeliveryQueue.async {
-                            handler(envelope)
+                        let deliveryEpoch = activeEpoch
+                        if state.isEpochActive(deliveryEpoch) {
+                            state.eventDeliveryQueue.async {
+                                guard state.isEpochActive(deliveryEpoch) else { return }
+                                handler(envelope)
+                            }
                         }
                     }
                 } else {
@@ -463,16 +517,30 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         let v = (obj["v"] as? NSNumber)?.uint32Value ?? 1
         let seq = (obj["seq"] as? NSNumber)?.uint64Value ?? 0
         var flatPayload: [String: String] = [:]
+        var boolPayload: [String: Bool] = [:]
         if let payload = obj["payload"] as? [String: Any] {
             for (k, val) in payload {
                 if let s = val as? String {
                     flatPayload[k] = s
                 } else if let n = val as? NSNumber {
-                    flatPayload[k] = n.stringValue
+                    if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                        let b = n.boolValue
+                        boolPayload[k] = b
+                        flatPayload[k] = b ? "true" : "false"
+                    } else {
+                        flatPayload[k] = n.stringValue
+                    }
                 }
             }
         }
-        return BridgeEventEnvelope(v: v, seq: seq, kind: kind, rawJSON: raw, payloadJSON: flatPayload)
+        return BridgeEventEnvelope(
+            v: v,
+            seq: seq,
+            kind: kind,
+            rawJSON: raw,
+            payloadJSON: flatPayload,
+            payloadBools: boolPayload
+        )
     }
 
     private static func makeCGImage(

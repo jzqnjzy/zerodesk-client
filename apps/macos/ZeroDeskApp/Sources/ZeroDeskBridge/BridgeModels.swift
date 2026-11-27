@@ -230,13 +230,22 @@ public struct BridgeEventEnvelope: Sendable {
     public let kind: String
     public let rawJSON: String
     public let payloadJSON: [String: String]
+    public let payloadBools: [String: Bool]
 
-    public init(v: UInt32, seq: UInt64, kind: String, rawJSON: String, payloadJSON: [String: String]) {
+    public init(
+        v: UInt32,
+        seq: UInt64,
+        kind: String,
+        rawJSON: String,
+        payloadJSON: [String: String],
+        payloadBools: [String: Bool] = [:]
+    ) {
         self.v = v
         self.seq = seq
         self.kind = kind
         self.rawJSON = rawJSON
         self.payloadJSON = payloadJSON
+        self.payloadBools = payloadBools
     }
 }
 

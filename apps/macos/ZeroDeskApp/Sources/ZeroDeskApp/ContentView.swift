@@ -275,12 +275,13 @@ private struct IncomingCallSheetView: View {
             HStack {
                 Spacer()
                 Button("Reject", role: .cancel, action: onReject)
+                    .keyboardShortcut(.cancelAction)
                 Button("Approve", action: onAccept)
-                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
         .frame(width: 420)
+        .interactiveDismissDisabled(true)
     }
 }
 
@@ -317,5 +318,8 @@ private struct SettingsSheetView: View {
         }
         .padding(20)
         .frame(width: 460)
+        .onDisappear {
+            vm.enrollmentTokenDraft = ""
+        }
     }
 }

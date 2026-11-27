@@ -12,12 +12,16 @@ ENV_PREFIX=(
   PATH="/usr/bin:$PATH"
   RUSTC_WRAPPER=""
   TMPDIR=/tmp
-  ZERODESK_LIBYUV_PREFIX="${ZERODESK_LIBYUV_PREFIX:-/Users/taole/.local/libyuv}"
   MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 )
+if [ -n "${ZERODESK_LIBYUV_PREFIX:-}" ]; then
+  ENV_PREFIX+=(ZERODESK_LIBYUV_PREFIX="$ZERODESK_LIBYUV_PREFIX")
+fi
 
 TMP_SPDX_LIST="$(mktemp "${TMPDIR:-/tmp}/zd-spdx-list.XXXXXX")"
-trap 'rm -f "$TMP_SPDX_LIST"' EXIT
+TMP_CARGO_LIST="$(mktemp "${TMPDIR:-/tmp}/zd-cargo-list.XXXXXX")"
+TMP_CLEANROOM_LIST="$(mktemp "${TMPDIR:-/tmp}/zd-cleanroom-list.XXXXXX")"
+trap 'rm -f "$TMP_SPDX_LIST" "$TMP_CARGO_LIST" "$TMP_CLEANROOM_LIST"' EXIT
 
 for req_path in \
   Cargo.toml \
@@ -101,9 +105,15 @@ if bad:
 ' "${ENV_PREFIX[@]}" cargo metadata --locked --no-deps --manifest-path libs/zerodesk_core/Cargo.toml --format-version 1
 echo "  OK: zero test-utils leakage across default, --no-default-features, and --all-features (host + --target all); default features safe."
 
-echo "[2/5] Checking clean-room isolation (zero cloud-backend references across all Cargo.toml & ZeroDesk code)..."
-TMP_CARGO_LIST="$(mktemp "${TMPDIR:-/tmp}/zd-cargo-list.XXXXXX")"
-trap 'rm -f "$TMP_SPDX_LIST" "$TMP_CARGO_LIST"' EXIT
+echo "[2/5] Checking clean-room isolation, zero tracked Vendor/dist, and zero hardcoded user paths..."
+# Hard gate: git MUST NOT track any file under Vendor/ or dist/.
+TRACKED_VENDOR_DIST="$(git ls-files | grep -E '(^|/)(Vendor|dist)/' || true)"
+if [ -n "$TRACKED_VENDOR_DIST" ]; then
+  echo "FAIL: git tracks forbidden Vendor/ or dist/ artifacts:" >&2
+  echo "$TRACKED_VENDOR_DIST" >&2
+  exit 1
+fi
+
 find . -maxdepth 4 -name "Cargo.toml" -not -path "*/target/*" -not -path "./.git/*" >"$TMP_CARGO_LIST" \
   || { echo "FAIL: find Cargo.toml failed" >&2; exit 1; }
 
@@ -116,8 +126,8 @@ if [ "${#CARGO_TOMLS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-CLEANROOM_PATHS=(
-  "${CARGO_TOMLS[@]}"
+# Build exact clean-room file list excluding ONLY exact generated dirs under ZeroDeskApp.
+CLEANROOM_DIRS=(
   libs/zerodesk_core
   libs/v2_e2e/src
   libs/v2_client/src
@@ -126,19 +136,58 @@ CLEANROOM_PATHS=(
   src/v2_session
 )
 if [ -d apps/macos ]; then
-  CLEANROOM_PATHS+=(apps/macos)
+  CLEANROOM_DIRS+=(apps/macos)
 fi
 
-rc=0
-grep -rn --exclude-dir=target --exclude-dir=.build --exclude-dir=Vendor --exclude-dir=dist "cloud-backend" "${CLEANROOM_PATHS[@]}" || rc=$?
-if [ "$rc" -eq 0 ]; then
-  echo "FAIL: forbidden cloud-backend reference detected!" >&2
-  exit 1
-elif [ "$rc" -ne 1 ]; then
-  echo "FAIL: grep error ($rc) during clean-room isolation check (fail-closed)!" >&2
-  exit 1
+: >"$TMP_CLEANROOM_LIST"
+for ct in "${CARGO_TOMLS[@]}"; do
+  printf '%s\n' "$ct" >>"$TMP_CLEANROOM_LIST"
+done
+find "${CLEANROOM_DIRS[@]}" \
+  -not -path "*/target/*" \
+  -not -path "apps/macos/ZeroDeskApp/.build/*" \
+  -not -path "apps/macos/ZeroDeskApp/Vendor/*" \
+  -not -path "apps/macos/ZeroDeskApp/dist/*" \
+  -type f >>"$TMP_CLEANROOM_LIST" \
+  || { echo "FAIL: find clean-room files failed" >&2; exit 1; }
+
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  rc=0
+  grep -n "cloud-backend" "$f" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "FAIL: forbidden cloud-backend reference detected in $f!" >&2
+    exit 1
+  elif [ "$rc" -ne 1 ]; then
+    echo "FAIL: grep error ($rc) checking $f (fail-closed)!" >&2
+    exit 1
+  fi
+done <"$TMP_CLEANROOM_LIST"
+
+# Hard gate: zero hardcoded local macOS home paths in scripts/ or apps/.
+FORBIDDEN_USER_PATH="/Us""ers/"
+USER_CHECK_ROOTS=(scripts)
+if [ -d apps ]; then
+  USER_CHECK_ROOTS+=(apps)
 fi
-echo "  OK: zero cloud-backend references across ${#CARGO_TOMLS[@]} Cargo.toml files and all ZeroDesk code."
+USER_CHECK_FILES="$(find "${USER_CHECK_ROOTS[@]}" \
+  -not -path "apps/macos/ZeroDeskApp/.build/*" \
+  -not -path "apps/macos/ZeroDeskApp/Vendor/*" \
+  -not -path "apps/macos/ZeroDeskApp/dist/*" \
+  -type f)" || { echo "FAIL: find scripts/apps failed" >&2; exit 1; }
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  rc=0
+  grep -n "$FORBIDDEN_USER_PATH" "$f" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "FAIL: hardcoded local user path ($FORBIDDEN_USER_PATH) detected in $f!" >&2
+    exit 1
+  elif [ "$rc" -ne 1 ]; then
+    echo "FAIL: grep error ($rc) checking $f for hardcoded user paths!" >&2
+    exit 1
+  fi
+done <<<"$USER_CHECK_FILES"
+echo "  OK: zero cloud-backend refs, zero tracked Vendor/dist, zero hardcoded user paths."
 
 echo "[3/5] Checking SPDX AGPL-3.0-only headers on all ZeroDesk source/header/script files..."
 SPDX_ROOTS=(
@@ -156,7 +205,12 @@ fi
 : >"$TMP_SPDX_LIST"
 for root in "${SPDX_ROOTS[@]}"; do
   root_tmp="$(mktemp "${TMPDIR:-/tmp}/zd-spdx-root.XXXXXX")"
-  if ! find "$root" -not -path "*/target/*" -not -path "*/.build/*" -not -path "*/Vendor/*" -not -path "*/dist/*" -type f \
+  if ! find "$root" \
+    -not -path "*/target/*" \
+    -not -path "apps/macos/ZeroDeskApp/.build/*" \
+    -not -path "apps/macos/ZeroDeskApp/Vendor/*" \
+    -not -path "apps/macos/ZeroDeskApp/dist/*" \
+    -type f \
     \( -name "*.rs" -o -name "*.h" -o -name "*.c" -o -name "*.m" -o -name "*.mm" \
        -o -name "*.cpp" -o -name "*.hpp" -o -name "*.swift" -o -name "*.metal" -o -name "*.sh" \) \
     >"$root_tmp"; then
@@ -183,7 +237,7 @@ fi
 scripts_cnt="$(wc -l <"$scripts_tmp" | tr -d ' ')"
 if [ "$scripts_cnt" -lt 1 ]; then
   rm -f "$scripts_tmp"
-  echo "FAIL: scripts/check-*.sh matched 0 files" >&2
+  echo "FAIL: scripts/*.sh matched 0 files" >&2
   exit 1
 fi
 cat "$scripts_tmp" >>"$TMP_SPDX_LIST"

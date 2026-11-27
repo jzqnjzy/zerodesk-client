@@ -41,8 +41,21 @@ final class ZeroDeskBridgeTests: XCTestCase {
         XCTAssertEqual(secret.byteCount, 0)
         XCTAssertTrue(secret.snapshotBytesForTesting().isEmpty)
 
-        let sanitized = sanitizeLogMessage("https://example.test/enroll?enrollment_token=\(canary)")
-        XCTAssertFalse(sanitized.contains(canary))
+        let sanitizedUrl = sanitizeLogMessage("https://example.test/enroll?enrollment_token=\(canary)")
+        XCTAssertFalse(sanitizedUrl.contains(canary))
+
+        let samples = [
+            "{\"enrollment_token\":\"\(canary)\"}",
+            "{\"client_secret\": \"\(canary)\", \"api_key\": \"\(canary)\"}",
+            "Authorization: Bearer \(canary)",
+            "authorization: basic \(canary)",
+            "https://user:\(canary)@host.example/path",
+            "https://example.test/api?foo=1&access_token=\(canary)&bar=2",
+        ]
+        for sample in samples {
+            let clean = sanitizeLogMessage(sample)
+            XCTAssertFalse(clean.contains(canary), "sanitizer leaked canary for sample: \(sample) -> \(clean)")
+        }
     }
 
     func testConfig0600SaveLoadAndSnapshot() throws {
@@ -157,6 +170,102 @@ final class ZeroDeskBridgeTests: XCTestCase {
             let c = try ZeroDeskBridgeClient()
             _ = try c.snapshot()
             c.close()
+        }
+    }
+
+    func testCreateAndImmediateDropNoDeadlock() throws {
+        for _ in 0..<200 {
+            _ = try ZeroDeskBridgeClient()
+        }
+    }
+
+    func testZeroCallbacksAfterCloseAndConcurrentTSan() throws {
+        final class CallbackTracker: @unchecked Sendable {
+            private let lock = NSLock()
+            private var closed = false
+            private var beforeClose = 0
+            private var afterClose = 0
+
+            func record() {
+                lock.lock()
+                if closed {
+                    afterClose += 1
+                } else {
+                    beforeClose += 1
+                }
+                lock.unlock()
+            }
+
+            func markClosed() {
+                lock.lock()
+                closed = true
+                lock.unlock()
+            }
+
+            func counts() -> (before: Int, after: Int) {
+                lock.lock()
+                defer { lock.unlock() }
+                return (beforeClose, afterClose)
+            }
+        }
+
+        let tmpDir = try makeTempDir("zero_cb_close")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        for round in 0..<3 {
+            let tracker = CallbackTracker()
+            let client = try ZeroDeskBridgeClient()
+            client.setEventHandler { _ in
+                tracker.record()
+            }
+
+            let cfgPath = tmpDir.appendingPathComponent("cfg_\(round).json").path
+            let idDir = tmpDir.appendingPathComponent("id_\(round)", isDirectory: true).path
+            let input = BridgeConfigInput(
+                controlPlaneEndpoint: "https://127.0.0.1:8443",
+                signalingAddr: "127.0.0.1:8444",
+                identityDir: idDir,
+                homeRegion: "local",
+                codec: "vp9",
+                fps: 30,
+                transportMode: "auto"
+            )
+            XCTAssertTrue(try client.saveConfig0600(at: cfgPath, config: input).ok)
+            XCTAssertTrue(try client.loadConfig(at: cfgPath).ok)
+            XCTAssertTrue(try client.execCommand(["cmd": "set_transport_mode", "mode": "tls443"]).ok)
+            XCTAssertTrue(try client.execCommand(["cmd": "set_transport_mode", "mode": "auto"]).ok)
+
+            // Wait briefly until at least one real Rust event callback is observed before closing.
+            let deadline = Date().addingTimeInterval(2.0)
+            while tracker.counts().before == 0 && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            XCTAssertGreaterThan(tracker.counts().before, 0, "expected real Rust events before close (round \(round))")
+
+            let group = DispatchGroup()
+            let queue = DispatchQueue(label: "zd.test.tsan.events.\(round)", attributes: .concurrent)
+            for worker in 0..<4 {
+                group.enter()
+                queue.async {
+                    defer { group.leave() }
+                    for i in 0..<20 {
+                        let mode = ((worker + i) % 2 == 0) ? "tls443" : "auto"
+                        _ = try? client.execCommand(["cmd": "set_transport_mode", "mode": mode])
+                        _ = try? client.snapshot()
+                    }
+                }
+            }
+
+            // Close concurrently while event producers & snapshot callers are in flight.
+            Thread.sleep(forTimeInterval: 0.01)
+            client.close()
+            tracker.markClosed()
+            group.wait()
+
+            // Verify zero callbacks execute after close() returned.
+            Thread.sleep(forTimeInterval: 0.2)
+            let finalCounts = tracker.counts()
+            XCTAssertEqual(finalCounts.after, 0, "observed \(finalCounts.after) callbacks after close() returned")
         }
     }
 }

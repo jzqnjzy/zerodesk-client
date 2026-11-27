@@ -431,7 +431,9 @@ impl V2BridgeRuntime {
         let mailbox = Arc::new(FrameMailbox::new());
         let events = Arc::new(BridgeEventHub::new(Arc::clone(&mailbox)));
         let controller = V2BridgeController::new();
-        let snapshot_cache = Arc::new(RwLock::new(controller.snapshot()));
+        let mut initial_snap = controller.snapshot();
+        initial_snap.real_input_enabled = Some(options.real_input_permit.is_some());
+        let snapshot_cache = Arc::new(RwLock::new(initial_snap));
         let shutdown_token = CancellationToken::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
         let spawned_tasks_total = Arc::new(AtomicU64::new(0));
@@ -1047,7 +1049,7 @@ impl BridgeActor {
 
     fn sync_snapshot(&self) {
         let mut snap = self.controller.snapshot();
-        snap.real_input_enabled = self.options.real_input_permit.is_some();
+        snap.real_input_enabled = Some(self.options.real_input_permit.is_some());
         *self
             .snapshot_cache
             .write()
@@ -1273,6 +1275,9 @@ impl BridgeActor {
                                 serde_json::json!({
                                     "incoming_id": incoming_id,
                                     "session_id_hex": sid_hex,
+                                    "caller_device_id_hex": caller.device_id_hex,
+                                    "caller_tenant_id_hex": caller.tenant_id_hex,
+                                    "verified_by_ca": caller.verified_by_ca,
                                     "verified_caller": caller,
                                     "session_gen": gen,
                                 }),
@@ -2479,6 +2484,9 @@ impl BridgeActor {
                     serde_json::json!({
                         "incoming_id": incoming_id,
                         "session_id_hex": sid_hex,
+                        "caller_device_id_hex": caller.device_id_hex,
+                        "caller_tenant_id_hex": caller.tenant_id_hex,
+                        "verified_by_ca": caller.verified_by_ca,
                         "verified_caller": caller,
                         "session_gen": ev_gen,
                     }),

@@ -53,8 +53,19 @@ public final class RedactedSecret: @unchecked Sendable, CustomStringConvertible,
     /// Exposes a temporary UTF-8 string copy only inside `body` for explicit serialization.
     public func withExposedUTF8String<T>(_ body: (String) throws -> T) rethrows -> T {
         lock.lock()
-        let copy = Array(storage)
+        var copy = Array(storage)
         lock.unlock()
+        defer {
+            let count = copy.count
+            if count > 0 {
+                copy.withUnsafeMutableBufferPointer { buf in
+                    if let base = buf.baseAddress {
+                        _ = memset_s(base, count, 0, count)
+                    }
+                }
+            }
+            copy.removeAll(keepingCapacity: false)
+        }
         let str = String(decoding: copy, as: UTF8.self)
         return try body(str)
     }
@@ -67,18 +78,35 @@ public final class RedactedSecret: @unchecked Sendable, CustomStringConvertible,
     }
 }
 
-/// Redacts URL query strings and bearer/enrollment token fragments before logging.
+private enum SanitizerRegex {
+    static let rules: [(regex: NSRegularExpression, template: String)] = {
+        let patterns: [(String, String)] = [
+            (#"(?i)\bbearer\s+[^\s,;"]+"#, "Bearer <redacted>"),
+            (#"(?i)\bbasic\s+[^\s,;"]+"#, "Basic <redacted>"),
+            (#"(?i)([?&][\w-]*token)=[^&\s]+"#, "$1=<redacted>"),
+            (#"(?i)("(?:[^"]*(?:token|secret|key)[^"]*)"\s*:\s*)"[^"]*""#, #"$1"<redacted>""#),
+            (#"://[^/\s@]+@"#, "://<redacted>@"),
+        ]
+        return patterns.compactMap { pattern, template in
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+                return nil
+            }
+            return (regex, template)
+        }
+    }()
+}
+
+/// Redacts auth headers, URL credentials, query tokens, and JSON secret fields before logging.
 public func sanitizeLogMessage(_ raw: String) -> String {
     var out = raw
-    if let qRange = out.range(of: "?") {
-        let prefix = String(out[..<qRange.lowerBound])
-        out = prefix + "?<redacted>"
-    }
-    for marker in ["enrollment_token", "Bearer ", "token="] {
-        if let idx = out.range(of: marker) {
-            let head = String(out[..<idx.upperBound])
-            out = head + "<redacted>"
-        }
+    for rule in SanitizerRegex.rules {
+        let range = NSRange(out.startIndex..<out.endIndex, in: out)
+        out = rule.regex.stringByReplacingMatches(
+            in: out,
+            options: [],
+            range: range,
+            withTemplate: rule.template
+        )
     }
     return out
 }

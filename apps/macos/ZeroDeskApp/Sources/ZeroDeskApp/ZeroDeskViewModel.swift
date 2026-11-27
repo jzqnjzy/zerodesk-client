@@ -39,12 +39,22 @@ public final class ZeroDeskViewModel: ObservableObject {
     private let configDirPath: String
     private let configFilePath: String
     private let identityDirPath: String
+    private var isFrameFetchScheduled = false
+    private var hasPendingFrame = false
 
     public init() {
-        let appSupport = FileManager.default.urls(
+        guard let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
-        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        ).first else {
+            self.configDirPath = ""
+            self.configFilePath = ""
+            self.identityDirPath = ""
+            self.client = nil
+            refreshSelftest()
+            setStatus("Failed to locate Application Support directory")
+            return
+        }
         let baseDir = appSupport.appendingPathComponent("ZeroDesk", isDirectory: true)
         self.configDirPath = baseDir.path
         self.configFilePath = baseDir.appendingPathComponent("bridge_config.json").path
@@ -63,11 +73,11 @@ public final class ZeroDeskViewModel: ObservableObject {
             if FileManager.default.fileExists(atPath: configFilePath) {
                 if let reply = try? bridge.loadConfig(at: configFilePath), reply.ok {
                     refreshSnapshot()
-                    statusMessage = "Loaded saved configuration"
+                    setStatus("Loaded saved configuration")
                 }
             }
         } catch {
-            statusMessage = "Bridge init error: \(error)"
+            setStatus("Bridge init error: \(error)")
         }
     }
 
@@ -84,7 +94,7 @@ public final class ZeroDeskViewModel: ObservableObject {
         do {
             let snap = try client.snapshot()
             snapshot = snap
-            if let cfg = snap.config {
+            if let cfg = snap.config, !isSettingsPresented {
                 controlPlaneEndpoint = cfg.controlPlaneEndpoint
                 signalingAddr = cfg.signalingAddr
                 transportMode = cfg.transportMode
@@ -113,19 +123,19 @@ public final class ZeroDeskViewModel: ObservableObject {
         do {
             let saveReply = try client.saveConfig0600(at: configFilePath, config: input)
             if !saveReply.ok {
-                statusMessage = "Save config failed: \(saveReply.error ?? "unknown")"
+                setStatus("Save config failed: \(saveReply.error ?? "unknown")")
                 return
             }
             let loadReply = try client.loadConfig(at: configFilePath)
             if loadReply.ok {
-                statusMessage = "Configuration saved (0600) and loaded"
+                setStatus("Configuration saved (0600) and loaded")
                 isSettingsPresented = false
                 refreshSnapshot()
             } else {
-                statusMessage = "Load config failed: \(loadReply.error ?? "unknown")"
+                setStatus("Load config failed: \(loadReply.error ?? "unknown")")
             }
         } catch {
-            statusMessage = "Save config error: \(error)"
+            setStatus("Save config error: \(error)")
         }
     }
 
@@ -140,7 +150,7 @@ public final class ZeroDeskViewModel: ObservableObject {
     public func dial() {
         let trimmed = targetDeviceId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            statusMessage = "Enter a 32-hex target Device ID"
+            setStatus("Enter a 32-hex target Device ID")
             return
         }
         runSimpleCommand(["cmd": "dial", "target_device_id_hex": trimmed], label: "Dial")
@@ -179,10 +189,10 @@ public final class ZeroDeskViewModel: ObservableObject {
         guard !path.isEmpty, let client else { return }
         do {
             let reply = try client.sendFile(at: path)
-            statusMessage = reply.ok ? "File transfer queued" : "Send file failed: \(reply.error ?? "error")"
+            setStatus(reply.ok ? "File transfer queued" : "Send file failed: \(reply.error ?? "error")")
             appendLog(statusMessage)
         } catch {
-            statusMessage = "Send file error: \(error)"
+            setStatus("Send file error: \(error)")
             appendLog(statusMessage)
         }
     }
@@ -198,46 +208,73 @@ public final class ZeroDeskViewModel: ObservableObject {
 
     private func runSimpleCommand(_ cmd: [String: Any], label: String) {
         guard let client else {
-            statusMessage = "\(label): bridge unavailable"
+            setStatus("\(label): bridge unavailable")
             return
         }
         do {
             let reply = try client.execCommand(cmd)
             if reply.ok {
-                statusMessage = "\(label): accepted"
+                setStatus("\(label): accepted")
             } else {
-                statusMessage = "\(label) failed: \(reply.error ?? reply.errorCode ?? "unknown")"
+                setStatus("\(label) failed: \(reply.error ?? reply.errorCode ?? "unknown")")
             }
             appendLog(statusMessage)
             refreshSnapshot()
         } catch {
-            statusMessage = "\(label) error: \(error)"
+            setStatus("\(label) error: \(error)")
             appendLog(statusMessage)
         }
     }
 
     private func handleBridgeEvent(_ ev: BridgeEventEnvelope) {
         if ev.kind == "VideoFrameReady" {
-            if let client, let captured = try? client.fetchLatestFrameCGImage() {
-                latestFrame = captured.image
-                frameCounter = captured.seq
-            }
+            scheduleFrameFetch()
             return
         }
 
         appendLog("[\(ev.seq)] \(ev.kind)")
         if ev.kind == "IncomingCall", let incomingId = ev.payloadJSON["incoming_id"] {
+            let verifiedByCa = ev.payloadBools["verified_by_ca"] ?? false
             incomingCall = IncomingCallPrompt(
                 id: incomingId,
                 callerDeviceId: ev.payloadJSON["caller_device_id_hex"] ?? "unknown",
                 callerTenantId: ev.payloadJSON["caller_tenant_id_hex"] ?? "unknown",
-                verifiedByCa: true
+                verifiedByCa: verifiedByCa
             )
         } else if ev.kind == "SessionEnded" {
             latestFrame = nil
             incomingCall = nil
         }
         refreshSnapshot()
+    }
+
+    private func scheduleFrameFetch() {
+        if isFrameFetchScheduled {
+            hasPendingFrame = true
+            return
+        }
+        guard let client else { return }
+        isFrameFetchScheduled = true
+        hasPendingFrame = false
+        Task { @MainActor [weak self] in
+            let captured = await Task.detached(priority: .userInitiated) {
+                try? client.fetchLatestFrameCGImage()
+            }.value
+            guard let self else { return }
+            self.isFrameFetchScheduled = false
+            if let captured {
+                self.latestFrame = captured.image
+                self.frameCounter = captured.seq
+            }
+            if self.hasPendingFrame {
+                self.hasPendingFrame = false
+                self.scheduleFrameFetch()
+            }
+        }
+    }
+
+    private func setStatus(_ raw: String) {
+        statusMessage = sanitizeLogMessage(raw)
     }
 
     private func appendLog(_ line: String) {

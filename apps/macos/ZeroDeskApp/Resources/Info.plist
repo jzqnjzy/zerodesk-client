@@ -24,6 +24,8 @@
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>ZeroDesk captures system audio via ScreenCaptureKit to stream desktop audio during approved remote sessions.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>ZeroDesk uses audio capture to stream remote desktop audio during active sessions.</string>
     <key>NSScreenCaptureUsageDescription</key>

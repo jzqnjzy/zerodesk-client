@@ -7,6 +7,10 @@ import SwiftUI
 final class ZeroDeskAppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (@MainActor () -> Void)?
 
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if let onTerminate {
             MainActor.assumeIsolated {

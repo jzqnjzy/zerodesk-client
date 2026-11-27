@@ -453,14 +453,16 @@ static void zd_sck_revert_starting_to_idle(ZdSckHandle* h) {
 
 static void zd_sck_cleanup_orphan_stream(ZdSckHandle* h, SCStream* stream, uint64_t my_gen) {
     uint64_t expected_gen = my_gen;
-    (void)atomic_compare_exchange_strong_explicit(
-        &h->session_id,
-        &expected_gen,
-        my_gen + 1,
-        memory_order_acq_rel,
-        memory_order_acquire
-    );
-    [h->delegate armForSession:0];
+    /* Only disarm the shared delegate when our generation CAS succeeds so a preempted
+     * orphan cleanup can NEVER disarm a newer running session. */
+    if (atomic_compare_exchange_strong_explicit(
+            &h->session_id,
+            &expected_gen,
+            my_gen + 1,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        [h->delegate armForSession:0];
+    }
 
     NSError* rem_err = nil;
     [stream removeStreamOutput:h->delegate type:SCStreamOutputTypeScreen error:&rem_err];

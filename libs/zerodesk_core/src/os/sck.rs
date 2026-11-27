@@ -34,8 +34,13 @@ pub const K_AUDIO_FORMAT_FLAG_IS_BIG_ENDIAN: u32 = 1 << 1;
 pub const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
 pub const K_AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
 
-/// Maximum age a cached idle frame may be reused before declaring the SCK stream stalled.
+/// Diagnostic staleness threshold helper constant.
 pub const SCK_STALE_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Generous silent-idle liveness ceiling: when a static desktop produces zero display damage
+/// for longer than this interval, re-verify TCC screen-recording permission so revoked
+/// permission fails closed instead of silently streaming a frozen frame forever.
+pub const SCK_MAX_SILENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Stack chunk size for zero-allocation audio interleaving / ingestion on the RT callback path.
 const AUDIO_INGEST_STACK_CHUNK: usize = 512;
@@ -239,6 +244,32 @@ pub fn resolve_idle_capture_frame(
     Err(OsError::CaptureFailed(
         "ScreenCaptureKit produced no initial frame within timeout".into(),
     ))
+}
+
+/// Pure liveness/health check invoked on prolonged silent-idle periods (`> max_silent_idle`):
+/// fails closed if `stream_failed` is set OR if Screen Recording permission was revoked
+/// while the display was silent.
+pub fn check_stream_health(
+    stream_failed: bool,
+    last_error: Option<&str>,
+    last_received_at: Instant,
+    now: Instant,
+    max_silent_idle: Duration,
+    permission_still_granted: impl FnOnce() -> bool,
+) -> Result<(), OsError> {
+    if stream_failed {
+        return Err(OsError::CaptureFailed(
+            last_error
+                .unwrap_or("ScreenCaptureKit stream stopped")
+                .to_string(),
+        ));
+    }
+    if now.saturating_duration_since(last_received_at) > max_silent_idle
+        && !permission_still_granted()
+    {
+        return Err(OsError::PermissionDenied(OsPermission::ScreenRecording));
+    }
+    Ok(())
 }
 
 /// Explicit diagnostic helper checking whether a previously received frame has aged past
@@ -744,8 +775,9 @@ mod macos_sck_impl {
                 return Ok(latest.raw);
             }
             // ScreenCaptureKit only emits frames on display damage: smoothly reuse `last_raw` on
-            // a static screen as long as `stream_failed` is false; fail closed immediately if
-            // `stream_failed` became true!
+            // a static screen as long as `stream_failed` is false; if silent beyond
+            // `SCK_MAX_SILENT_IDLE_TIMEOUT`, re-verify TCC screen-recording permission so revoked
+            // access fails closed instead of streaming a frozen frame indefinitely.
             let failed = self.inner.stream_failed.load(Ordering::Acquire);
             let err_msg = if failed {
                 self.inner
@@ -756,6 +788,16 @@ mod macos_sck_impl {
             } else {
                 None
             };
+            if let Some((_, received_at)) = &self.last_raw {
+                check_stream_health(
+                    failed,
+                    err_msg.as_deref(),
+                    *received_at,
+                    Instant::now(),
+                    SCK_MAX_SILENT_IDLE_TIMEOUT,
+                    preflight,
+                )?;
+            }
             resolve_idle_capture_frame(
                 failed,
                 err_msg.as_deref(),
@@ -875,12 +917,16 @@ mod macos_sck_impl {
             handle,
             ctx_ptr,
             video_slot,
-            stream_failed,
-            last_error,
+            stream_failed: Arc::clone(&stream_failed),
+            last_error: Arc::clone(&last_error),
             video_ingest_errors,
             audio_format_errors,
             dimensions: Arc::clone(&dimensions),
         });
+
+        // Explicitly reset failure state before starting so a restarted stream never carries stale errors.
+        stream_failed.store(false, Ordering::Release);
+        *last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         let start_rc = unsafe { zd_sck_start(inner.handle) };
         if start_rc != ZD_SCK_OK {
@@ -1164,8 +1210,51 @@ mod tests {
             resolve_idle_capture_frame(false, None, None),
             Err(OsError::CaptureFailed(_))
         ));
-        // Explicit diagnostic staleness helper remains available.
+        // 4. Prolonged silent-idle health check: static screen with valid permission succeeds
+        //    even after >120s, while revoked permission fails closed with PermissionDenied!
         let t0 = Instant::now();
+        assert!(check_stream_health(
+            false,
+            None,
+            t0,
+            t0 + SCK_MAX_SILENT_IDLE_TIMEOUT + Duration::from_secs(10),
+            SCK_MAX_SILENT_IDLE_TIMEOUT,
+            || true
+        )
+        .is_ok());
+        assert_eq!(
+            check_stream_health(
+                false,
+                None,
+                t0,
+                t0 + SCK_MAX_SILENT_IDLE_TIMEOUT + Duration::from_secs(10),
+                SCK_MAX_SILENT_IDLE_TIMEOUT,
+                || false
+            ),
+            Err(OsError::PermissionDenied(OsPermission::ScreenRecording))
+        );
+        // 5. Simulated restart resets `stream_failed` from true -> false cleanly.
+        let failed_flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(check_stream_health(
+            failed_flag.load(Ordering::Acquire),
+            Some("prior stream error"),
+            t0,
+            t0 + Duration::from_secs(1),
+            SCK_MAX_SILENT_IDLE_TIMEOUT,
+            || true
+        )
+        .is_err());
+        failed_flag.store(false, Ordering::Release);
+        assert!(check_stream_health(
+            failed_flag.load(Ordering::Acquire),
+            None,
+            t0,
+            t0 + Duration::from_secs(1),
+            SCK_MAX_SILENT_IDLE_TIMEOUT,
+            || true
+        )
+        .is_ok());
+        // Explicit diagnostic staleness helper remains available.
         assert!(check_sck_frame_staleness(t0, t0 + Duration::from_secs(2), SCK_STALE_FRAME_TIMEOUT).is_ok());
         assert!(matches!(
             check_sck_frame_staleness(t0, t0 + Duration::from_secs(4), SCK_STALE_FRAME_TIMEOUT),
