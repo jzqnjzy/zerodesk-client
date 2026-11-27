@@ -45,6 +45,7 @@ pub enum FrameError {
     ExceedsMaxPixels { pixels: usize, max: usize },
     BufferTooSmall { required: usize, provided: usize },
     NoFrame,
+    StaleGeneration,
     ConversionFailed(String),
 }
 
@@ -63,6 +64,7 @@ impl fmt::Display for FrameError {
                 )
             }
             Self::NoFrame => write!(f, "no decoded frame available in mailbox"),
+            Self::StaleGeneration => write!(f, "frame dropped due to stale session generation"),
             Self::ConversionFailed(msg) => write!(f, "I420 pixel conversion failed: {msg}"),
         }
     }
@@ -150,17 +152,22 @@ pub struct FrameInfo {
     pub dropped_ui_frames: u64,
 }
 
+struct MailboxSlot {
+    frame: Option<Arc<DecodedFrame>>,
+    session_gen: u64,
+}
+
 /// Latest-frame `Arc<DecodedFrame>` mailbox with zero-tear `FramePool` recycling,
 /// checked dimension arithmetic, idempotent `dropped_ui_frames` tracking, and lock-free memcpy.
 pub struct FrameMailbox {
-    slot: Mutex<Option<Arc<DecodedFrame>>>,
+    slot: Mutex<MailboxSlot>,
     pool: FramePool,
     next_seq: AtomicU64,
     latest_seq: AtomicU64,
-    session_gen: AtomicU64,
     frames_written: AtomicU64,
     frames_taken: AtomicU64,
     invalid_frames_dropped: AtomicU64,
+    stale_gen_frames_dropped: AtomicU64,
 }
 
 impl Default for FrameMailbox {
@@ -172,14 +179,17 @@ impl Default for FrameMailbox {
 impl FrameMailbox {
     pub fn new() -> Self {
         Self {
-            slot: Mutex::new(None),
+            slot: Mutex::new(MailboxSlot {
+                frame: None,
+                session_gen: 0,
+            }),
             pool: FramePool::default(),
             next_seq: AtomicU64::new(1),
             latest_seq: AtomicU64::new(0),
-            session_gen: AtomicU64::new(0),
             frames_written: AtomicU64::new(0),
             frames_taken: AtomicU64::new(0),
             invalid_frames_dropped: AtomicU64::new(0),
+            stale_gen_frames_dropped: AtomicU64::new(0),
         }
     }
 
@@ -192,11 +202,17 @@ impl FrameMailbox {
     }
 
     pub fn session_gen(&self) -> u64 {
-        self.session_gen.load(Ordering::Acquire)
+        self.slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_gen
     }
 
     pub fn set_session_gen(&self, gen: u64) {
-        self.session_gen.store(gen, Ordering::Release);
+        self.slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_gen = gen;
     }
 
     pub fn frames_written(&self) -> u64 {
@@ -211,6 +227,10 @@ impl FrameMailbox {
         self.invalid_frames_dropped.load(Ordering::Relaxed)
     }
 
+    pub fn stale_gen_frames_dropped(&self) -> u64 {
+        self.stale_gen_frames_dropped.load(Ordering::Relaxed)
+    }
+
     /// Number of frames written by the decoder that were never taken by the UI.
     /// Repeated reads of the same `seq` are idempotent.
     pub fn dropped_ui_frames(&self) -> u64 {
@@ -219,10 +239,10 @@ impl FrameMailbox {
             .saturating_sub(self.frames_taken.load(Ordering::Acquire))
     }
 
-    /// Publishes an already-formatted BGRA8/RGBA8 frame into the mailbox slot.
-    /// Rejects invalid/overflowing dimensions fail-closed and increments `invalid_frames_dropped`.
-    pub fn publish_raw(
+    #[allow(clippy::too_many_arguments)]
+    fn publish_raw_inner(
         &self,
+        expected_gen: Option<u64>,
         width: u32,
         height: u32,
         stride: u32,
@@ -245,28 +265,59 @@ impl FrameMailbox {
             )));
         }
 
-        // Assign `seq` and update `latest_seq` strictly under `slot` lock so concurrent
-        // publishers can never reorder or regress `latest_seq`.
-        let (seq, prev) = {
+        // Assign `seq`, check `expected_gen`, and update `latest_seq` atomically under `slot` lock
+        // so concurrent publishers or `reset_for_session` can never reorder or cross-stamp frames.
+        let (seq, prev, dropped_buf) = {
             let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-            let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-            let sgen = self.session_gen.load(Ordering::Acquire);
-            let new_frame = Arc::new(DecodedFrame {
-                seq,
-                session_gen: sgen,
-                width,
-                height,
-                stride,
-                pixel_format,
-                pts_ms,
-                data,
-                taken: AtomicBool::new(false),
-            });
-            let prev = g.replace(new_frame);
-            self.frames_written.fetch_add(1, Ordering::AcqRel);
-            self.latest_seq.store(seq, Ordering::Release);
-            (seq, prev)
+            if let Some(eg) = expected_gen {
+                if eg != g.session_gen {
+                    self.stale_gen_frames_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    (0, None, Some(data))
+                } else {
+                    let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+                    let new_frame = Arc::new(DecodedFrame {
+                        seq,
+                        session_gen: g.session_gen,
+                        width,
+                        height,
+                        stride,
+                        pixel_format,
+                        pts_ms,
+                        data,
+                        taken: AtomicBool::new(false),
+                    });
+                    let prev = g.frame.replace(new_frame);
+                    self.frames_written.fetch_add(1, Ordering::AcqRel);
+                    self.latest_seq.store(seq, Ordering::Release);
+                    (seq, prev, None)
+                }
+            } else {
+                let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+                let new_frame = Arc::new(DecodedFrame {
+                    seq,
+                    session_gen: g.session_gen,
+                    width,
+                    height,
+                    stride,
+                    pixel_format,
+                    pts_ms,
+                    data,
+                    taken: AtomicBool::new(false),
+                });
+                let prev = g.frame.replace(new_frame);
+                self.frames_written.fetch_add(1, Ordering::AcqRel);
+                self.latest_seq.store(seq, Ordering::Release);
+                (seq, prev, None)
+            }
         };
+        if let Some(mut stale_data) = dropped_buf {
+            for b in stale_data.iter_mut() {
+                unsafe { std::ptr::write_volatile(b, 0) };
+            }
+            self.pool.release(stale_data);
+            return Err(FrameError::StaleGeneration);
+        }
         if let Some(old_arc) = prev {
             // Recycle ONLY outside the mailbox mutex and ONLY when Arc::try_unwrap succeeds.
             self.pool.recycle_arc(old_arc, |owned| owned.data);
@@ -275,14 +326,58 @@ impl FrameMailbox {
         Ok(seq)
     }
 
-    /// Converts a decoded `I420Frame` into BGRA8 or RGBA8 using `libyuv` and a pooled buffer,
-    /// then publishes it into the mailbox.
-    pub fn publish_i420(
+    /// Publishes an already-formatted BGRA8/RGBA8 frame into the mailbox slot.
+    /// Rejects invalid/overflowing dimensions fail-closed and increments `invalid_frames_dropped`.
+    pub fn publish_raw(
         &self,
+        width: u32,
+        height: u32,
+        stride: u32,
+        pixel_format: PixelFormat,
+        pts_ms: u64,
+        data: Vec<u8>,
+    ) -> Result<u64, FrameError> {
+        self.publish_raw_inner(None, width, height, stride, pixel_format, pts_ms, data)
+    }
+
+    /// Generation-checked variant of `publish_raw`: drops the frame and returns
+    /// `Err(FrameError::StaleGeneration)` if `expected_gen != current session_gen`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_raw_for_session(
+        &self,
+        expected_gen: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        pixel_format: PixelFormat,
+        pts_ms: u64,
+        data: Vec<u8>,
+    ) -> Result<u64, FrameError> {
+        self.publish_raw_inner(
+            Some(expected_gen),
+            width,
+            height,
+            stride,
+            pixel_format,
+            pts_ms,
+            data,
+        )
+    }
+
+    fn publish_i420_inner(
+        &self,
+        expected_gen: Option<u64>,
         frame: &I420Frame,
         pixel_format: PixelFormat,
         pts_ms: u64,
     ) -> Result<u64, FrameError> {
+        if let Some(eg) = expected_gen {
+            if self.session_gen() != eg {
+                self.stale_gen_frames_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(FrameError::StaleGeneration);
+            }
+        }
         let width = u32::try_from(frame.width).map_err(|_| {
             self.invalid_frames_dropped.fetch_add(1, Ordering::Relaxed);
             FrameError::Overflow
@@ -355,13 +450,44 @@ impl FrameMailbox {
             )));
         }
 
-        self.publish_raw(width, height, stride, pixel_format, pts_ms, dst)
+        self.publish_raw_inner(
+            expected_gen,
+            width,
+            height,
+            stride,
+            pixel_format,
+            pts_ms,
+            dst,
+        )
+    }
+
+    /// Converts a decoded `I420Frame` into BGRA8 or RGBA8 using `libyuv` and a pooled buffer,
+    /// then publishes it into the mailbox.
+    pub fn publish_i420(
+        &self,
+        frame: &I420Frame,
+        pixel_format: PixelFormat,
+        pts_ms: u64,
+    ) -> Result<u64, FrameError> {
+        self.publish_i420_inner(None, frame, pixel_format, pts_ms)
+    }
+
+    /// Generation-checked variant of `publish_i420`: drops stale-gen frames before or under
+    /// the mailbox slot lock so prior-session frames can never be stamped with a new `session_gen`.
+    pub fn publish_i420_for_session(
+        &self,
+        expected_gen: u64,
+        frame: &I420Frame,
+        pixel_format: PixelFormat,
+        pts_ms: u64,
+    ) -> Result<u64, FrameError> {
+        self.publish_i420_inner(Some(expected_gen), frame, pixel_format, pts_ms)
     }
 
     /// Clones the latest `Arc<DecodedFrame>` under a short lock without copying pixels.
     pub fn latest_arc(&self) -> Option<Arc<DecodedFrame>> {
         let g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-        g.as_ref().map(Arc::clone)
+        g.frame.as_ref().map(Arc::clone)
     }
 
     /// Phase 1: queries metadata for the current latest frame without copying pixels.
@@ -436,12 +562,7 @@ impl FrameMailbox {
             .map_err(|(e, _)| e)
     }
 
-    /// Clears the mailbox slot and zeroizes all buffered pixel memory in both slot and pool.
-    pub fn clear(&self) {
-        let prev = {
-            let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-            g.take()
-        };
+    fn zeroize_frame_arc(prev: Option<Arc<DecodedFrame>>) {
         if let Some(old_arc) = prev {
             if let Ok(mut owned) = Arc::try_unwrap(old_arc) {
                 for b in owned.data.iter_mut() {
@@ -449,13 +570,28 @@ impl FrameMailbox {
                 }
             }
         }
+    }
+
+    /// Clears the mailbox slot and zeroizes all buffered pixel memory in both slot and pool.
+    pub fn clear(&self) {
+        let prev = {
+            let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            g.frame.take()
+        };
+        Self::zeroize_frame_arc(prev);
         self.pool.clear_zeroize();
     }
 
-    /// Clears and zeroizes any prior session's frames and stamps the new `session_gen`.
+    /// Atomically updates `session_gen` and clears any prior session's frame in a single
+    /// critical section (never resetting monotonic `next_seq`), then zeroizes freed pixels.
     pub fn reset_for_session(&self, gen: u64) {
-        self.clear();
-        self.set_session_gen(gen);
+        let prev = {
+            let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            g.session_gen = gen;
+            g.frame.take()
+        };
+        Self::zeroize_frame_arc(prev);
+        self.pool.clear_zeroize();
     }
 }
 
@@ -616,5 +752,42 @@ mod tests {
         let taken = mb.take_latest_into(&mut buf).unwrap();
         assert_eq!(taken.dropped_ui_frames, 0);
         assert!(buf.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn mailbox_reset_for_session_drops_stale_gen_publishes_and_keeps_seq_monotonic() {
+        let mb = FrameMailbox::new();
+        mb.reset_for_session(1);
+        let seq1 = mb
+            .publish_raw_for_session(1, 4, 4, 16, PixelFormat::Bgra8, 10, vec![0x11; 64])
+            .unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(mb.frame_info().unwrap().session_gen, 1);
+
+        // Atomically advance to session_gen 2 -> clears slot, keeps next_seq monotonic.
+        mb.reset_for_session(2);
+        assert_eq!(mb.frame_info(), Err(FrameError::NoFrame));
+
+        // Stale gen=1 raw and I420 publishes MUST be rejected and counted.
+        assert_eq!(
+            mb.publish_raw_for_session(1, 4, 4, 16, PixelFormat::Bgra8, 20, vec![0x22; 64]),
+            Err(FrameError::StaleGeneration)
+        );
+        let i420 = generate_animated_i420(32, 32, 1);
+        assert_eq!(
+            mb.publish_i420_for_session(1, &i420, PixelFormat::Bgra8, 25),
+            Err(FrameError::StaleGeneration)
+        );
+        assert_eq!(mb.stale_gen_frames_dropped(), 2);
+        assert_eq!(mb.frame_info(), Err(FrameError::NoFrame));
+
+        // Current gen=2 publish succeeds with strictly greater seq > seq1!
+        let seq2 = mb
+            .publish_i420_for_session(2, &i420, PixelFormat::Bgra8, 30)
+            .unwrap();
+        assert!(seq2 > seq1);
+        let info2 = mb.frame_info().unwrap();
+        assert_eq!(info2.seq, seq2);
+        assert_eq!(info2.session_gen, 2);
     }
 }

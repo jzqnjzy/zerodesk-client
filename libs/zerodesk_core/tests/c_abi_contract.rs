@@ -14,8 +14,8 @@ use zerodesk_core::{
     ffi_abi::{
         register_runtime, zerodesk_v2_abi_version, zerodesk_v2_buffer_free, zerodesk_v2_destroy,
         zerodesk_v2_frame_info, zerodesk_v2_poll_event_json, zerodesk_v2_take_latest_frame,
-        ZeroDeskFrameInfo, ZeroDeskOwnedBuffer, ZERODESK_ERR_INVALID_HANDLE, ZERODESK_OK,
-        ZERODESK_V2_ABI_VERSION,
+        ZeroDeskFrameInfo, ZeroDeskOwnedBuffer, ZERODESK_ERR_BUFFER_TOO_SMALL,
+        ZERODESK_ERR_INVALID_HANDLE, ZERODESK_OK, ZERODESK_V2_ABI_VERSION,
     },
     frame::PixelFormat,
 };
@@ -145,6 +145,7 @@ fn compiled_c_side_populated_frame_two_phase_and_canary_check() {
         "-std=c11",
         "-Wall",
         "-Wextra",
+        "-Wmissing-prototypes",
         "-Werror",
         "-DZERODESK_NO_MAIN",
         "-shared",
@@ -210,6 +211,76 @@ fn compiled_c_side_populated_frame_two_phase_and_canary_check() {
         libc::dlclose(lib);
         let _ = std::fs::remove_file(&dylib_path);
         assert_eq!(rc, 0, "C-side seeded frame contract verification failed");
+    }
+
+    assert_eq!(zerodesk_v2_destroy(handle), ZERODESK_OK);
+    assert_eq!(zerodesk_v2_destroy(handle), ZERODESK_ERR_INVALID_HANDLE);
+}
+
+#[test]
+fn cross_platform_ffi_populated_frame_two_phase_canary_and_video_frame_ready() {
+    assert_eq!(zerodesk_v2_abi_version(), ZERODESK_V2_ABI_VERSION);
+
+    let rt = Arc::new(V2BridgeRuntime::new().unwrap());
+    // Publish two frames so dropped_ui_frames == 1 when taking latest.
+    rt.mailbox()
+        .publish_raw(4, 4, 16, PixelFormat::Bgra8, 100, vec![0x11; 64])
+        .unwrap();
+    let pixels: Vec<u8> = (0..64u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    rt.mailbox()
+        .publish_raw(4, 4, 16, PixelFormat::Bgra8, 777, pixels.clone())
+        .unwrap();
+    let handle = register_runtime(rt);
+
+    unsafe {
+        // 1. frame_info query
+        let mut info = ZeroDeskFrameInfo::default();
+        assert_eq!(zerodesk_v2_frame_info(handle, &mut info), ZERODESK_OK);
+        assert_eq!(info.seq, 2);
+        assert_eq!(info.width, 4);
+        assert_eq!(info.height, 4);
+        assert_eq!(info.stride, 16);
+        assert_eq!(info.pixel_format, PixelFormat::Bgra8.as_u32());
+        assert_eq!(info.byte_len, 64);
+        assert_eq!(info.pts_ms, 777);
+
+        // 2. out_cap == 0 size query -> ZERODESK_ERR_BUFFER_TOO_SMALL + required byte_len
+        let mut q_info = ZeroDeskFrameInfo::default();
+        assert_eq!(
+            zerodesk_v2_take_latest_frame(handle, std::ptr::null_mut(), 0, &mut q_info),
+            ZERODESK_ERR_BUFFER_TOO_SMALL
+        );
+        assert_eq!(q_info.byte_len, 64);
+
+        // 3. Small canary buffer -> ZERODESK_ERR_BUFFER_TOO_SMALL + ZERO bytes overwritten
+        let mut canary = [0xAAu8; 16];
+        let mut s_info = ZeroDeskFrameInfo::default();
+        assert_eq!(
+            zerodesk_v2_take_latest_frame(handle, canary.as_mut_ptr(), canary.len(), &mut s_info),
+            ZERODESK_ERR_BUFFER_TOO_SMALL
+        );
+        assert!(canary.iter().all(|&b| b == 0xAA));
+        assert_eq!(s_info.byte_len, 64);
+
+        // 4. Full exact copy -> ZERODESK_OK + exact pixels + pts_ms + dropped_ui_frames == 1
+        let mut full = vec![0u8; 64];
+        let mut f_info = ZeroDeskFrameInfo::default();
+        assert_eq!(
+            zerodesk_v2_take_latest_frame(handle, full.as_mut_ptr(), full.len(), &mut f_info),
+            ZERODESK_OK
+        );
+        assert_eq!(full, pixels);
+        assert_eq!(f_info.pts_ms, 777);
+        assert_eq!(f_info.dropped_ui_frames, 1);
+
+        // 5. On-demand VideoFrameReady synthesis via poll_event_json
+        let mut ev = ZeroDeskOwnedBuffer::empty();
+        assert_eq!(zerodesk_v2_poll_event_json(handle, &mut ev), ZERODESK_OK);
+        let ev_str = std::str::from_utf8(std::slice::from_raw_parts(ev.ptr, ev.len)).unwrap();
+        assert!(ev_str.contains("\"kind\":\"VideoFrameReady\""));
+        zerodesk_v2_buffer_free(ev);
     }
 
     assert_eq!(zerodesk_v2_destroy(handle), ZERODESK_OK);

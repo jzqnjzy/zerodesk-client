@@ -93,8 +93,11 @@ impl BridgeEventHub {
 
     /// Notifies blocked pollers that `FrameMailbox` has a newer frame available for on-demand
     /// `VideoFrameReady` synthesis (without pushing anything onto any queue!).
+    /// Acquires and drops `self.queues` before notifying to guarantee zero lost-wakeup window.
     pub fn notify_frame_published(&self) {
-        let _g = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _g = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        }
         self.cvar.notify_all();
     }
 
@@ -128,9 +131,13 @@ impl BridgeEventHub {
         if let Some(ev) = g.critical.pop_front() {
             return Ok(ev);
         }
-        // 2. Check atomic `latest_seq` under lock, then drop lock before reading `mailbox.frame_info()`.
-        let latest_seq = self.mailbox.latest_seq();
-        if latest_seq > g.last_notified_frame_seq {
+        // 2. Check atomic `latest_seq` under lock, drop lock before reading `mailbox.frame_info()`,
+        //    and retry up to 3 times if `latest_seq` changed while unlocked so no wakeup is missed.
+        for _ in 0..3 {
+            let latest_seq = self.mailbox.latest_seq();
+            if latest_seq <= g.last_notified_frame_seq {
+                break;
+            }
             drop(g);
             let frame_res = self.mailbox.frame_info();
             g = self.queues.lock().unwrap_or_else(|e| e.into_inner());
@@ -171,12 +178,21 @@ impl BridgeEventHub {
                     });
                 }
                 Err(_) => {
+                    if self.mailbox.latest_seq() != latest_seq {
+                        continue;
+                    }
                     // Mailbox was cleared concurrently; advance cursor past cleared seq so we do not spin.
                     if latest_seq > g.last_notified_frame_seq {
                         g.last_notified_frame_seq = latest_seq;
                     }
+                    break;
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    if self.mailbox.latest_seq() != latest_seq {
+                        continue;
+                    }
+                    break;
+                }
             }
         }
         // 3. Droppable overwrite telemetry slot last.

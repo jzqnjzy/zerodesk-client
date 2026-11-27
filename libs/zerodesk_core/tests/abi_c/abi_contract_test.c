@@ -70,6 +70,22 @@ static int buf_contains(ZeroDeskOwnedBuffer buf, const char *needle) {
 /* C-side verification of populated FrameMailbox two-phase copy, 0-cap size query,
  * canary buffer zero-overwrite on ZERODESK_ERR_BUFFER_TOO_SMALL, exact pixel copy,
  * and on-demand VideoFrameReady synthesis. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("default")))
+#endif
+int zerodesk_c_verify_seeded_frame(
+    uint64_t handle,
+    uint32_t expected_w,
+    uint32_t expected_h,
+    uint32_t expected_stride,
+    uint32_t expected_fmt,
+    const uint8_t *expected_pixels,
+    size_t expected_len,
+    fn_frame_info_t fn_info,
+    fn_take_latest_frame_t fn_take,
+    fn_poll_event_json_t fn_poll,
+    fn_buffer_free_t fn_free);
+
 int zerodesk_c_verify_seeded_frame(
     uint64_t handle,
     uint32_t expected_w,

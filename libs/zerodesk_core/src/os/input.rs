@@ -469,54 +469,68 @@ mod macos_real_input {
                 }
             }
             let (pw, ph) = Self::display_point_bounds();
+            let max_x = (pw.max(1.0) - 1.0).max(0.0);
+            let max_y = (ph.max(1.0) - 1.0).max(0.0);
             let buttons = ev.buttons & 0x07;
             match ev.kind {
                 MouseKind::MoveAbs => {
-                    let x = ((ev.x_or_dx.max(0) as f64) / 65535.0).clamp(0.0, 1.0) * (pw - 1.0);
-                    let y = ((ev.y_or_dy.max(0) as f64) / 65535.0).clamp(0.0, 1.0) * (ph - 1.0);
-                    self.cursor_pt = CGPoint { x, y };
-                    if !post_mouse_event(
-                        K_CG_EVENT_MOUSE_MOVED,
-                        self.cursor_pt,
-                        K_CG_MOUSE_BUTTON_LEFT,
-                    ) {
+                    let x = ((ev.x_or_dx.max(0) as f64) / 65535.0).clamp(0.0, 1.0) * max_x;
+                    let y = ((ev.y_or_dy.max(0) as f64) / 65535.0).clamp(0.0, 1.0) * max_y;
+                    let next_pt = CGPoint { x, y };
+                    if !post_mouse_event(K_CG_EVENT_MOUSE_MOVED, next_pt, K_CG_MOUSE_BUTTON_LEFT) {
                         return Err(OsError::CaptureFailed("CGEventCreateMouseEvent failed".into()));
                     }
+                    self.cursor_pt = next_pt;
                 }
                 MouseKind::MoveRel => {
-                    self.cursor_pt.x =
-                        (self.cursor_pt.x + ev.x_or_dx as f64).clamp(0.0, pw - 1.0);
-                    self.cursor_pt.y =
-                        (self.cursor_pt.y + ev.y_or_dy as f64).clamp(0.0, ph - 1.0);
-                    if !post_mouse_event(
-                        K_CG_EVENT_MOUSE_MOVED,
-                        self.cursor_pt,
-                        K_CG_MOUSE_BUTTON_LEFT,
-                    ) {
+                    let next_pt = CGPoint {
+                        x: (self.cursor_pt.x + ev.x_or_dx as f64).clamp(0.0, max_x),
+                        y: (self.cursor_pt.y + ev.y_or_dy as f64).clamp(0.0, max_y),
+                    };
+                    if !post_mouse_event(K_CG_EVENT_MOUSE_MOVED, next_pt, K_CG_MOUSE_BUTTON_LEFT) {
                         return Err(OsError::CaptureFailed("CGEventCreateMouseEvent failed".into()));
                     }
+                    self.cursor_pt = next_pt;
                 }
                 MouseKind::Down => {
-                    for (mask, down_ev, btn) in [
-                        (1u8 << 0, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_MOUSE_BUTTON_LEFT),
+                    for (mask, down_ev, up_ev, btn) in [
+                        (
+                            1u8 << 0,
+                            K_CG_EVENT_LEFT_MOUSE_DOWN,
+                            K_CG_EVENT_LEFT_MOUSE_UP,
+                            K_CG_MOUSE_BUTTON_LEFT,
+                        ),
                         (
                             1u8 << 1,
                             K_CG_EVENT_RIGHT_MOUSE_DOWN,
+                            K_CG_EVENT_RIGHT_MOUSE_UP,
                             K_CG_MOUSE_BUTTON_RIGHT,
                         ),
                         (
                             1u8 << 2,
                             K_CG_EVENT_OTHER_MOUSE_DOWN,
+                            K_CG_EVENT_OTHER_MOUSE_UP,
                             K_CG_MOUSE_BUTTON_CENTER,
                         ),
                     ] {
                         if (buttons & mask) != 0 {
+                            {
+                                let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                                if g.interlocked {
+                                    return Err(OsError::Interlocked);
+                                }
+                            }
                             if !post_mouse_event(down_ev, self.cursor_pt, btn) {
                                 return Err(OsError::CaptureFailed(
                                     "CGEventCreateMouseEvent(down) failed".into(),
                                 ));
                             }
                             let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                            if g.interlocked {
+                                drop(g);
+                                let _ = post_mouse_event(up_ev, self.cursor_pt, btn);
+                                return Err(OsError::Interlocked);
+                            }
                             g.buttons |= mask;
                         }
                     }
@@ -532,6 +546,12 @@ mod macos_real_input {
                         ),
                     ] {
                         if (buttons & mask) != 0 {
+                            {
+                                let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                                if g.interlocked {
+                                    return Err(OsError::Interlocked);
+                                }
+                            }
                             if !post_mouse_event(up_ev, self.cursor_pt, btn) {
                                 return Err(OsError::CaptureFailed(
                                     "CGEventCreateMouseEvent(up) failed".into(),
@@ -543,6 +563,12 @@ mod macos_real_input {
                     }
                 }
                 MouseKind::Wheel => {
+                    {
+                        let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.interlocked {
+                            return Err(OsError::Interlocked);
+                        }
+                    }
                     let wy = (ev.wheel_dy as i32).clamp(-WHEEL_CLAMP, WHEEL_CLAMP);
                     let wx = (ev.wheel_dx as i32).clamp(-WHEEL_CLAMP, WHEEL_CLAMP);
                     unsafe {

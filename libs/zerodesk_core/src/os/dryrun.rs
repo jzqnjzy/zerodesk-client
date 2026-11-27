@@ -115,6 +115,8 @@ struct DryRunJournalState {
     interlocked: bool,
 }
 
+pub const MAX_PRESSED_KEYS: usize = 256;
+
 impl DryRunJournalState {
     fn push_entry(&mut self, entry: DryRunHidJournalEntry) {
         if self.entries.len() >= MAX_JOURNAL_ENTRIES {
@@ -201,6 +203,11 @@ impl DryRunHidJournal {
             return Err(OsError::Interlocked);
         }
         if ev.down {
+            if !g.keys.contains(&usage) && g.keys.len() >= MAX_PRESSED_KEYS {
+                return Err(OsError::InvalidData(
+                    "pressed key set limit exceeded".into(),
+                ));
+            }
             g.keys.insert(usage);
         } else {
             g.keys.remove(&usage);
@@ -485,5 +492,36 @@ mod tests {
             }),
             Err(OsError::Interlocked)
         );
+    }
+
+    #[test]
+    fn dryrun_journal_caps_distinct_pressed_keys_at_256() {
+        let mut sink = DryRunHidSink::new();
+        for usage in 1..=(MAX_PRESSED_KEYS as u32) {
+            sink.send_key(&KeyEvent {
+                down: true,
+                modifiers: 0,
+                usb_hid_usage: usage,
+                unicode_scalar: 0,
+                client_ts_ms: u64::from(usage),
+            })
+            .unwrap();
+        }
+        assert_eq!(sink.journal().pressed_keys().len(), MAX_PRESSED_KEYS);
+        let before_entries = sink.journal().entries().len();
+
+        // 257th distinct pressed key MUST fail closed without mutating entries or keys.
+        let err = sink
+            .send_key(&KeyEvent {
+                down: true,
+                modifiers: 0,
+                usb_hid_usage: (MAX_PRESSED_KEYS as u32) + 1,
+                unicode_scalar: 0,
+                client_ts_ms: 9999,
+            })
+            .unwrap_err();
+        assert!(matches!(err, OsError::InvalidData(_)));
+        assert_eq!(sink.journal().pressed_keys().len(), MAX_PRESSED_KEYS);
+        assert_eq!(sink.journal().entries().len(), before_entries);
     }
 }

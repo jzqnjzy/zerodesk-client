@@ -8,10 +8,20 @@ use std::{
     collections::VecDeque,
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
+
+/// Atomically updates the live `allow_clipboard` flag and bumps `policy_gen` whenever the
+/// policy transitions so `ClipboardPoller` always forces a baseline resync even if policy
+/// toggles `true -> false -> true` between two polling ticks.
+pub fn set_clipboard_policy_allowed(flag: &AtomicBool, policy_gen: &AtomicU64, allowed: bool) {
+    let prev = flag.swap(allowed, Ordering::AcqRel);
+    if prev != allowed {
+        policy_gen.fetch_add(1, Ordering::AcqRel);
+    }
+}
 
 /// Validates raw PNG clipboard bytes WITHOUT decoding pixels:
 /// checks 8-byte PNG signature, IHDR width/height caps, and `CLIP_HARD_MAX_BYTES`.
@@ -74,16 +84,17 @@ impl fmt::Debug for OutboundClipboardItem {
 }
 
 /// Controlled read-only consumer handle for queued outbound clipboard changes.
-/// Enforces the live `allow_clipboard` flag on every dequeue and never exposes raw mutex internals.
+/// Binds the live `allow_clipboard` policy flag at construction so consumers cannot bypass policy.
 #[derive(Clone)]
 pub struct ClipboardOutboundHandle {
     queue: Arc<Mutex<VecDeque<OutboundClipboardItem>>>,
+    allow_clipboard: Arc<AtomicBool>,
 }
 
 impl ClipboardOutboundHandle {
-    pub fn pop_front(&self, allow_clipboard: &AtomicBool) -> Option<OutboundClipboardItem> {
+    pub fn pop_front(&self) -> Option<OutboundClipboardItem> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if !allow_clipboard.load(Ordering::Acquire) {
+        if !self.allow_clipboard.load(Ordering::Acquire) {
             q.clear();
             return None;
         }
@@ -101,11 +112,13 @@ impl ClipboardOutboundHandle {
 
 /// Single-threaded clipboard poller owning the sole `OsClipboardBackend` instance.
 /// Uses SHA-256 primary dedup + optional OS `change_count` pre-filter + one-shot anti-echo
-/// (`A -> B -> A`) + initial/policy-reenable baseline resync (never leaks pre-existing clipboard
-/// contents when connecting or re-enabling policy!).
+/// (`A -> B -> A`) + initial/policy-reenable baseline resync tracked via monotonic `policy_gen`
+/// (never leaks pre-existing clipboard contents even across fast `true -> false -> true` toggles!).
 pub struct ClipboardPoller {
     backend: Box<dyn OsClipboardBackend>,
     allow_clipboard: Arc<AtomicBool>,
+    policy_gen: Arc<AtomicU64>,
+    last_seen_policy_gen: u64,
     last_change_count: Option<i64>,
     last_seen_sha256: Option<[u8; 32]>,
     needs_resync: bool,
@@ -116,9 +129,20 @@ pub struct ClipboardPoller {
 
 impl ClipboardPoller {
     pub fn new(backend: Box<dyn OsClipboardBackend>, allow_clipboard: Arc<AtomicBool>) -> Self {
+        Self::with_policy_gen(backend, allow_clipboard, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn with_policy_gen(
+        backend: Box<dyn OsClipboardBackend>,
+        allow_clipboard: Arc<AtomicBool>,
+        policy_gen: Arc<AtomicU64>,
+    ) -> Self {
+        let init_gen = policy_gen.load(Ordering::Acquire);
         Self {
             backend,
             allow_clipboard,
+            policy_gen,
+            last_seen_policy_gen: init_gen,
             last_change_count: None,
             last_seen_sha256: None,
             needs_resync: true,
@@ -128,15 +152,32 @@ impl ClipboardPoller {
         }
     }
 
+    /// Updates the clipboard policy flag and bumps `policy_gen` on any transition.
+    pub fn set_policy_allowed(&self, allowed: bool) {
+        set_clipboard_policy_allowed(&self.allow_clipboard, &self.policy_gen, allowed);
+    }
+
     pub fn outbound_handle(&self) -> ClipboardOutboundHandle {
         ClipboardOutboundHandle {
             queue: Arc::clone(&self.outbound_queue),
+            allow_clipboard: Arc::clone(&self.allow_clipboard),
+        }
+    }
+
+    fn sync_policy_gen(&mut self) {
+        let cur_gen = self.policy_gen.load(Ordering::Acquire);
+        if cur_gen != self.last_seen_policy_gen {
+            self.last_seen_policy_gen = cur_gen;
+            self.needs_resync = true;
+            self.anti_echo.clear();
+            self.clear_outbound_queue();
         }
     }
 
     /// Applies remote clipboard text locally and arms one-shot anti-echo suppression ONLY on success.
     /// Returns `Ok(true)` if applied, `Ok(false)` if blocked by policy.
     pub fn apply_remote_text(&mut self, text: &str) -> Result<bool, OsError> {
+        self.sync_policy_gen();
         if text.is_empty() || text.len() > CLIP_HARD_MAX_BYTES as usize {
             return Err(OsError::InvalidData(format!(
                 "remote clipboard text len {} outside 1..={CLIP_HARD_MAX_BYTES}",
@@ -160,6 +201,7 @@ impl ClipboardPoller {
     /// Runs a single poll tick on the owning thread without duplicating into `outbound_queue`.
     /// Returns `Ok(Some(item))` if a new user-initiated clipboard change should be sent to the peer.
     pub fn poll_once(&mut self) -> Result<Option<OutboundClipboardItem>, OsError> {
+        self.sync_policy_gen();
         if !self.allow_clipboard.load(Ordering::Acquire) {
             self.needs_resync = true;
             self.anti_echo.clear();
@@ -363,7 +405,7 @@ mod tests {
         // 2. Local user copies "B" -> transmitted via poll_into_queue!
         mem.set_local_text("B");
         assert!(poller.poll_into_queue().unwrap());
-        let item_b = handle.pop_front(&allow).expect("B should dequeue");
+        let item_b = handle.pop_front().expect("B should dequeue");
         assert_eq!(item_b.text, "B");
         let dbg_str = format!("{item_b:?}");
         assert!(!dbg_str.contains("\"B\""));
@@ -375,18 +417,50 @@ mod tests {
         assert_eq!(handle.len(), 1);
 
         // 4. Policy disables clipboard -> poll immediately purges outbound queue & sets needs_resync
-        allow.store(false, Ordering::Release);
+        poller.set_policy_allowed(false);
         mem.set_local_text("SECRET_WHILE_DISABLED");
         assert!(poller.poll_once().unwrap().is_none());
         assert!(handle.is_empty());
 
         // 5. Policy re-enabled -> first poll resyncs baseline WITHOUT leaking SECRET_WHILE_DISABLED!
-        allow.store(true, Ordering::Release);
+        poller.set_policy_allowed(true);
         assert!(poller.poll_once().unwrap().is_none());
         // Next user copy AFTER re-enable transmits normally
         mem.set_local_text("AFTER_REENABLE");
         let after = poller.poll_once().unwrap().expect("after reenable sends");
         assert_eq!(after.text, "AFTER_REENABLE");
+    }
+
+    #[test]
+    fn clipboard_poller_resyncs_across_fast_false_true_toggle_without_intermediate_poll() {
+        let mem = MemoryClipboardBackend::new();
+        let allow = Arc::new(AtomicBool::new(true));
+        let pgen = Arc::new(AtomicU64::new(0));
+        let mut poller =
+            ClipboardPoller::with_policy_gen(Box::new(mem.clone()), Arc::clone(&allow), Arc::clone(&pgen));
+        let handle = poller.outbound_handle();
+
+        // Initial baseline resync.
+        assert!(poller.poll_once().unwrap().is_none());
+
+        // Queue one item while allowed, then toggle false -> copy secret -> toggle true WITHOUT
+        // calling poll_once while disabled!
+        mem.set_local_text("BEFORE_TOGGLE");
+        assert!(poller.poll_into_queue().unwrap());
+        assert_eq!(handle.len(), 1);
+
+        set_clipboard_policy_allowed(&allow, &pgen, false);
+        mem.set_local_text("COPIED_DURING_DISABLED_WINDOW");
+        set_clipboard_policy_allowed(&allow, &pgen, true);
+
+        // First poll MUST observe policy_gen bump, purge stale queue, and resync baseline without emitting!
+        assert!(poller.poll_once().unwrap().is_none());
+        assert!(handle.is_empty());
+
+        // Subsequent copy after resync transmits normally.
+        mem.set_local_text("FRESH_AFTER_RESYNC");
+        let item = poller.poll_once().unwrap().expect("fresh copy sends");
+        assert_eq!(item.text, "FRESH_AFTER_RESYNC");
     }
 
     #[test]

@@ -38,11 +38,11 @@ use crate::{
         },
         config::{TransportMode, V2ClientConfig},
         file_transfer::{
-            check_file_policy, decode_file_l4, validate_safe_filename, FileAbort, FileChunk,
-            FileComplete, FileMessage, FileOffer, FileRecvAction, FileTransferReceiver,
-            FILE_COMPLETE_ACK_OK, FILE_ERR_POLICY_DENIED, FILE_MSG_ABORT, FILE_MSG_ACCEPT,
-            FILE_MSG_ACK, FILE_MSG_CHUNK, FILE_MSG_COMPLETE, FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER,
-            FILE_RECOMMENDED_CHUNK_SIZE,
+            check_file_policy, decode_file_l4, validate_safe_filename, FileAbort, FileAccept,
+            FileAck, FileChunk, FileComplete, FileMessage, FileOffer, FileRecvAction,
+            FileTransferReceiver, FILE_COMPLETE_ACK_OK, FILE_ERR_POLICY_DENIED, FILE_MSG_ABORT,
+            FILE_MSG_ACCEPT, FILE_MSG_ACK, FILE_MSG_CHUNK, FILE_MSG_COMPLETE,
+            FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER, FILE_RECOMMENDED_CHUNK_SIZE,
         },
         hid::{decode_hid_frame, encode_hid_frame, HidPayload, KeyEvent, MouseEvent, MouseKind},
         identity::PersistentV2Identity,
@@ -2325,10 +2325,26 @@ impl BridgeActor {
                 local_cert,
                 policy,
             } => {
-                self.effective_policy = Some(policy.clone());
-                let _ = self
+                if let Err(err) = self
                     .controller
-                    .on_bootstrap_complete(&local_cert, policy.clone(), true);
+                    .on_bootstrap_complete(&local_cert, policy.clone(), true)
+                {
+                    self.drain_controller_events_to_hub();
+                    self.sync_snapshot();
+                    self.events.push_critical(
+                        "CommandResult",
+                        serde_json::json!({
+                            "cmd_id": cmd_id,
+                            "cmd": "start_host",
+                            "ok": false,
+                            "session_gen": ev_gen,
+                            "error_code": "IllegalStateTransition",
+                            "error": err,
+                        }),
+                    );
+                    return;
+                }
+                self.effective_policy = Some(policy.clone());
                 self.drain_controller_events_to_hub();
                 self.sync_snapshot();
                 self.emit_policy_event(&policy);
@@ -2466,12 +2482,22 @@ impl BridgeActor {
                 action_tx,
             } => {
                 // Check BOTH controller state transitions fail-closed!
-                let boot_res = self.controller.on_bootstrap_complete(
-                    &local_cert,
-                    policy.clone(),
-                    self.role == ActiveRole::Host,
-                );
-                let stream_res = boot_res.and_then(|()| {
+                // When Host is already past bootstrap (Listening/Incoming), update policy in-place
+                // via `on_policy_updated` instead of calling `on_bootstrap_complete` a second time.
+                let prep_res = if self.role == ActiveRole::Host
+                    && matches!(
+                        self.controller.state(),
+                        BridgeState::Listening | BridgeState::Incoming
+                    ) {
+                    self.controller.on_policy_updated(policy.clone())
+                } else {
+                    self.controller.on_bootstrap_complete(
+                        &local_cert,
+                        policy.clone(),
+                        self.role == ActiveRole::Host,
+                    )
+                };
+                let stream_res = prep_res.and_then(|()| {
                     self.controller
                         .on_streaming_started(session_id, &peer_cert, active_mode)
                 });
@@ -2568,12 +2594,35 @@ impl BridgeActor {
                     }
                     return;
                 }
-                self.effective_policy = Some(policy.clone());
                 if self.controller.state() != BridgeState::Idle {
-                    let _ = self.controller.on_policy_updated(policy.clone());
+                    if let Err(err) = self.controller.on_policy_updated(policy.clone()) {
+                        self.events.push_critical(
+                            "SecurityEvent",
+                            serde_json::json!({
+                                "session_gen": ev_gen,
+                                "detail": security_event_to_json(&SecurityEvent::PolicyDegraded {
+                                    reason: err.clone(),
+                                }),
+                            }),
+                        );
+                        if let Some(cid) = cmd_id {
+                            self.events.push_critical(
+                                "CommandResult",
+                                serde_json::json!({
+                                    "cmd_id": cid,
+                                    "cmd": "refresh_policy",
+                                    "ok": false,
+                                    "error_code": "PolicyApplyFailed",
+                                    "error": err,
+                                }),
+                            );
+                        }
+                        return;
+                    }
                     self.drain_controller_events_to_hub();
                     self.sync_snapshot();
                 }
+                self.effective_policy = Some(policy.clone());
                 if is_degraded || policy.degraded {
                     self.events.push_critical(
                         "PolicyDegraded",
@@ -2891,6 +2940,29 @@ fn compute_file_sha256_streaming(mut file: File) -> Result<(File, u64, [u8; 32])
     Ok((file, total, sha256))
 }
 
+trait FileL4Sender {
+    fn send_file_l4<'a>(
+        &'a mut self,
+        msg_type: u8,
+        body: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+impl FileL4Sender for UdpE2eeSession {
+    fn send_file_l4<'a>(
+        &'a mut self,
+        msg_type: u8,
+        body: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.send_l4_raw(CHAN_FILE_TRANSFER, msg_type, 0, false, body)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
 struct OutboundTransferState {
     transfer_id: u64,
     cmd_id: u64,
@@ -2898,8 +2970,11 @@ struct OutboundTransferState {
     file: File,
     total_bytes: u64,
     sha256: [u8; 32],
+    accepted: bool,
+    window_end_offset: u64,
     offset: u64,
     complete_sent_at: Option<Instant>,
+    last_activity_at: Instant,
     last_progress_at: Instant,
     last_progress_pct: u8,
 }
@@ -2921,10 +2996,45 @@ impl OutboundFileManager {
         !self.active.is_empty()
     }
 
+    /// Processes an inbound `FILE_MSG_ACCEPT` from the peer. Returns `true` if it matched an
+    /// active outbound transfer (consumed), or `false` if unknown.
+    fn handle_accept(&mut self, acc: &FileAccept) -> bool {
+        let Some(st) = self.active.get_mut(&acc.transfer_id) else {
+            self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
+            return false;
+        };
+        if st.accepted || acc.resume_offset != 0 {
+            return true;
+        }
+        let clamped_win = acc.initial_window_end_offset.min(st.total_bytes);
+        st.accepted = true;
+        st.window_end_offset = clamped_win;
+        st.last_activity_at = Instant::now();
+        true
+    }
+
+    /// Processes an inbound `FILE_MSG_ACK` from the peer, advancing the send credit window.
+    /// Returns `true` if it matched an active outbound transfer (consumed), or `false` if unknown.
+    fn handle_ack(&mut self, ack: &FileAck) -> bool {
+        let Some(st) = self.active.get_mut(&ack.transfer_id) else {
+            self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
+            return false;
+        };
+        if !st.accepted {
+            return true;
+        }
+        let new_win = ack.window_end_offset.min(st.total_bytes);
+        if new_win > st.window_end_offset {
+            st.window_end_offset = new_win;
+        }
+        st.last_activity_at = Instant::now();
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
-    async fn start_transfer(
+    async fn start_transfer<S: FileL4Sender>(
         &mut self,
-        sess: &mut UdpE2eeSession,
+        sess: &mut S,
         transfer_id: u64,
         cmd_id: u64,
         path: PathBuf,
@@ -2933,14 +3043,29 @@ impl OutboundFileManager {
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
     ) {
+        let policy_c = policy.clone();
         let open_res = tokio::task::spawn_blocking(move || {
             let file = open_regular_file_nofollow(&path)?;
+            let meta = file
+                .metadata()
+                .map_err(|e| ("IoError".to_string(), format!("fstat file failed: {e}")))?;
+            if !meta.is_file() {
+                return Err((
+                    "InvalidArgument".to_string(),
+                    "send_file path must be a regular file".to_string(),
+                ));
+            }
+            // Check file policy BEFORE running the 64 KiB streaming SHA-256 loop!
+            if let Err(e) = check_file_policy(&policy_c, meta.len()) {
+                return Err(("PolicyDenied".to_string(), e.to_string()));
+            }
             compute_file_sha256_streaming(file)
         })
         .await;
         let (file, total, sha256) = match open_res {
             Ok(Ok(tuple)) => tuple,
             Ok(Err((code, msg))) => {
+                // Policy or I/O failure BEFORE FILE_MSG_OFFER: never send a spurious FILE_MSG_ABORT.
                 emit_file_cmd_result(gen, cmd_id, actor_tx, Err((code, msg))).await;
                 return;
             }
@@ -2956,14 +3081,8 @@ impl OutboundFileManager {
             }
         };
 
+        // Re-verify against latest policy in case file size changed slightly or policy updated.
         if let Err(e) = check_file_policy(policy, total) {
-            let abort = FileAbort {
-                transfer_id,
-                error_code: FILE_ERR_POLICY_DENIED,
-            };
-            let _ = sess
-                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
-                .await;
             emit_file_cmd_result(gen, cmd_id, actor_tx, Err(("PolicyDenied".into(), e.to_string())))
                 .await;
             return;
@@ -2989,20 +3108,12 @@ impl OutboundFileManager {
                 return;
             }
         };
-        if let Err(e) = sess
-            .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_OFFER, 0, false, &offer_wire)
-            .await
-        {
-            emit_file_cmd_result(
-                gen,
-                cmd_id,
-                actor_tx,
-                Err(("TransportError".into(), e.to_string())),
-            )
-            .await;
+        if let Err(e) = sess.send_file_l4(FILE_MSG_OFFER, &offer_wire).await {
+            emit_file_cmd_result(gen, cmd_id, actor_tx, Err(("TransportError".into(), e))).await;
             return;
         }
 
+        let now = Instant::now();
         self.active.insert(
             transfer_id,
             OutboundTransferState {
@@ -3012,29 +3123,74 @@ impl OutboundFileManager {
                 file,
                 total_bytes: total,
                 sha256,
+                accepted: false,
+                window_end_offset: 0,
                 offset: 0,
                 complete_sent_at: None,
-                last_progress_at: Instant::now(),
+                last_activity_at: now,
+                last_progress_at: now,
                 last_progress_pct: 0,
             },
         );
     }
 
-    /// Pumps at most one chunk across active outbound transfers and enforces `CompleteAck` timeout.
-    async fn pump_one_step(
+    /// Pumps at most one chunk across active outbound transfers, re-checks live file policy,
+    /// and enforces bounded stall / `CompleteAck` timeouts.
+    async fn pump_one_step<S: FileL4Sender>(
         &mut self,
-        sess: &mut UdpE2eeSession,
+        sess: &mut S,
+        policy: &EffectiveTenantPolicy,
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
     ) {
-        // 1. Check CompleteAck timeouts first.
+        // 0. Re-check live policy on every step: if file transfer was disabled mid-flight, abort all.
+        if !policy.allow_file_transfer() {
+            let revoked: Vec<OutboundTransferState> =
+                self.active.drain().map(|(_, st)| st).collect();
+            for st in revoked {
+                let abort = FileAbort {
+                    transfer_id: st.transfer_id,
+                    error_code: FILE_ERR_POLICY_DENIED,
+                };
+                let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::FileAborted {
+                            transfer_id: st.transfer_id,
+                            error_code: FILE_ERR_POLICY_DENIED,
+                            reason: "file transfer disabled by policy update".into(),
+                        },
+                    })
+                    .await;
+                emit_file_cmd_result(
+                    gen,
+                    st.cmd_id,
+                    actor_tx,
+                    Err((
+                        "PolicyDenied".into(),
+                        "file transfer disabled by tenant policy update".into(),
+                    )),
+                )
+                .await;
+            }
+            return;
+        }
+
+        // 1. Check CompleteAck / Accept / window stall timeouts.
         let timed_out_ids: Vec<u64> = self
             .active
             .iter()
             .filter_map(|(&tid, st)| {
-                st.complete_sent_at
-                    .filter(|t| t.elapsed() >= FILE_COMPLETE_ACK_TIMEOUT)
-                    .map(|_| tid)
+                let complete_to = st
+                    .complete_sent_at
+                    .is_some_and(|t| t.elapsed() >= FILE_COMPLETE_ACK_TIMEOUT);
+                let stall_to = st.last_activity_at.elapsed() >= FILE_COMPLETE_ACK_TIMEOUT;
+                if complete_to || stall_to {
+                    Some(tid)
+                } else {
+                    None
+                }
             })
             .collect();
         for tid in timed_out_ids {
@@ -3043,16 +3199,14 @@ impl OutboundFileManager {
                     transfer_id: tid,
                     error_code: FILE_ERR_LOCAL_ABORT,
                 };
-                let _ = sess
-                    .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
-                    .await;
+                let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
                 let _ = actor_tx
                     .send(ActorMessage::InternalEvent {
                         session_gen: gen,
                         event: ActorEvent::FileAborted {
                             transfer_id: tid,
                             error_code: FILE_ERR_LOCAL_ABORT,
-                            reason: "complete_ack timeout".into(),
+                            reason: "file transfer peer timeout".into(),
                         },
                     })
                     .await;
@@ -3060,17 +3214,21 @@ impl OutboundFileManager {
                     gen,
                     st.cmd_id,
                     actor_tx,
-                    Err(("Timeout".into(), "peer did not acknowledge file completion".into())),
+                    Err(("Timeout".into(), "peer did not acknowledge file transfer".into())),
                 )
                 .await;
             }
         }
 
-        // 2. Pick the first active transfer still sending chunks or needing FILE_MSG_COMPLETE.
+        // 2. Pick the first accepted transfer that has window credit or is ready for FILE_MSG_COMPLETE.
         let next_tid = self
             .active
             .iter()
-            .find(|(_, st)| st.complete_sent_at.is_none())
+            .find(|(_, st)| {
+                st.accepted
+                    && st.complete_sent_at.is_none()
+                    && (st.offset == st.total_bytes || st.offset < st.window_end_offset)
+            })
             .map(|(&tid, _)| tid);
         let Some(tid) = next_tid else {
             return;
@@ -3081,27 +3239,24 @@ impl OutboundFileManager {
 
         if st.offset < st.total_bytes {
             let remaining = (st.total_bytes - st.offset) as usize;
-            let to_read = remaining.min(FILE_RECOMMENDED_CHUNK_SIZE as usize);
+            let win_avail = st.window_end_offset.saturating_sub(st.offset) as usize;
+            let to_read = remaining
+                .min(win_avail)
+                .min(FILE_RECOMMENDED_CHUNK_SIZE as usize);
+            if to_read == 0 {
+                return;
+            }
             let mut chunk_buf = vec![0u8; to_read];
             let read_res = st.file.read(&mut chunk_buf);
             match read_res {
                 Ok(0) => {
-                    // Unexpected EOF -> abort cleanly.
                     let st = self.active.remove(&tid);
                     if let Some(st) = st {
                         let abort = FileAbort {
                             transfer_id: tid,
                             error_code: FILE_ERR_LOCAL_ABORT,
                         };
-                        let _ = sess
-                            .send_l4_raw(
-                                CHAN_FILE_TRANSFER,
-                                FILE_MSG_ABORT,
-                                0,
-                                false,
-                                &abort.encode(),
-                            )
-                            .await;
+                        let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
                         emit_file_cmd_result(
                             gen,
                             st.cmd_id,
@@ -3120,9 +3275,9 @@ impl OutboundFileManager {
                     };
                     let send_res = match ch.encode() {
                         Ok(wire) => sess
-                            .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_CHUNK, 0, false, &wire)
+                            .send_file_l4(FILE_MSG_CHUNK, &wire)
                             .await
-                            .map_err(|e| ("TransportError".to_string(), e.to_string())),
+                            .map_err(|e| ("TransportError".to_string(), e)),
                         Err(e) => Err(("InvalidArgument".to_string(), e.to_string())),
                     };
                     if let Err(err) = send_res {
@@ -3131,20 +3286,13 @@ impl OutboundFileManager {
                                 transfer_id: tid,
                                 error_code: FILE_ERR_LOCAL_ABORT,
                             };
-                            let _ = sess
-                                .send_l4_raw(
-                                    CHAN_FILE_TRANSFER,
-                                    FILE_MSG_ABORT,
-                                    0,
-                                    false,
-                                    &abort.encode(),
-                                )
-                                .await;
+                            let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
                             emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(err)).await;
                         }
                         return;
                     }
                     st.offset = st.offset.saturating_add(n as u64);
+                    st.last_activity_at = Instant::now();
                     let pct = if st.total_bytes == 0 {
                         100
                     } else {
@@ -3172,15 +3320,7 @@ impl OutboundFileManager {
                             transfer_id: tid,
                             error_code: FILE_ERR_LOCAL_ABORT,
                         };
-                        let _ = sess
-                            .send_l4_raw(
-                                CHAN_FILE_TRANSFER,
-                                FILE_MSG_ABORT,
-                                0,
-                                false,
-                                &abort.encode(),
-                            )
-                            .await;
+                        let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
                         emit_file_cmd_result(
                             gen,
                             st.cmd_id,
@@ -3197,13 +3337,7 @@ impl OutboundFileManager {
                 sha256: st.sha256,
             };
             if let Err(e) = sess
-                .send_l4_raw(
-                    CHAN_FILE_TRANSFER,
-                    FILE_MSG_COMPLETE,
-                    0,
-                    false,
-                    &complete.encode(),
-                )
+                .send_file_l4(FILE_MSG_COMPLETE, &complete.encode())
                 .await
             {
                 if let Some(st) = self.active.remove(&tid) {
@@ -3211,33 +3345,30 @@ impl OutboundFileManager {
                         transfer_id: tid,
                         error_code: FILE_ERR_LOCAL_ABORT,
                     };
-                    let _ = sess
-                        .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
+                    let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
+                    emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(("TransportError".into(), e)))
                         .await;
-                    emit_file_cmd_result(
-                        gen,
-                        st.cmd_id,
-                        actor_tx,
-                        Err(("TransportError".into(), e.to_string())),
-                    )
-                    .await;
                 }
             } else {
-                st.complete_sent_at = Some(Instant::now());
+                let now = Instant::now();
+                st.complete_sent_at = Some(now);
+                st.last_activity_at = now;
             }
         }
     }
 
+    /// Handles `FILE_MSG_COMPLETE_ACK`. Returns `true` if `transfer_id` matched an active
+    /// outbound transfer, or `false` so callers fall through to `FileTransferReceiver`.
     async fn handle_complete_ack(
         &mut self,
         transfer_id: u64,
         status: u8,
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
-    ) {
+    ) -> bool {
         let Some(st) = self.active.remove(&transfer_id) else {
             self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
-            return;
+            return false;
         };
         if status == FILE_COMPLETE_ACK_OK {
             let sha_hex = hex::encode(st.sha256);
@@ -3285,18 +3416,22 @@ impl OutboundFileManager {
             )
             .await;
         }
+        true
     }
 
+    /// Handles `FILE_MSG_ABORT`. Returns `true` if `transfer_id` matched an active outbound
+    /// transfer, or `false` so callers fall through to `FileTransferReceiver` to clean up
+    /// peer-aborted inbound transfers!
     async fn handle_remote_abort(
         &mut self,
         transfer_id: u64,
         error_code: u16,
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
-    ) {
+    ) -> bool {
         let Some(st) = self.active.remove(&transfer_id) else {
             self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
-            return;
+            return false;
         };
         let reason = format!("remote abort {error_code:#06x}");
         let _ = actor_tx
@@ -3316,11 +3451,12 @@ impl OutboundFileManager {
             Err(("FileAborted".into(), reason)),
         )
         .await;
+        true
     }
 
-    async fn cancel_transfer(
+    async fn cancel_transfer<S: FileL4Sender>(
         &mut self,
-        sess: &mut UdpE2eeSession,
+        sess: &mut S,
         transfer_id: u64,
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
@@ -3330,9 +3466,7 @@ impl OutboundFileManager {
                 transfer_id,
                 error_code: FILE_ERR_LOCAL_ABORT,
             };
-            let _ = sess
-                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
-                .await;
+            let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
             let _ = actor_tx
                 .send(ActorMessage::InternalEvent {
                     session_gen: gen,
@@ -3353,9 +3487,10 @@ impl OutboundFileManager {
         }
     }
 
-    async fn abort_all_on_teardown(
+    /// Best-effort teardown abort using non-blocking `actor_tx.try_send` so teardown can never stall.
+    async fn abort_all_on_teardown<S: FileL4Sender>(
         &mut self,
-        sess: &mut UdpE2eeSession,
+        sess: &mut S,
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
     ) {
@@ -3366,18 +3501,108 @@ impl OutboundFileManager {
                 transfer_id: st.transfer_id,
                 error_code: FILE_ERR_LOCAL_ABORT,
             };
-            let _ = sess
-                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
-                .await;
-            emit_file_cmd_result(
-                gen,
-                st.cmd_id,
-                actor_tx,
-                Err(("Aborted".into(), "session closed during file transfer".into())),
-            )
-            .await;
+            let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
+            let _ = actor_tx.try_send(ActorMessage::InternalEvent {
+                session_gen: gen,
+                event: ActorEvent::CommandResult {
+                    cmd_id: st.cmd_id,
+                    ok: false,
+                    data: None,
+                    error_code: Some("Aborted".into()),
+                    error: Some("session closed during file transfer".into()),
+                },
+            });
         }
     }
+}
+
+/// Shared inbound `0x05 FileTransfer` L4 router used by both Host and Controller.
+/// Routes sender-bound replies (`Accept`, `Ack`, `CompleteAck`, `Abort`) to `outbound_files`
+/// FIRST so they NEVER trigger receiver-side role-violation errors (`0x0103`), and falls through
+/// to `file_receiver` for inbound frames and unmatched `Abort`/`CompleteAck` cleanup.
+#[allow(clippy::too_many_arguments)]
+async fn route_inbound_file_l4<S: FileL4Sender>(
+    sess: &mut S,
+    l4_hdr: &v2_transport::L4Header,
+    body: &[u8],
+    outbound_files: &mut OutboundFileManager,
+    file_receiver: &mut FileTransferReceiver,
+    file_err_counter: &mut ChannelFramingErrorCounter,
+    gen: u64,
+    actor_tx: &mpsc::Sender<ActorMessage>,
+) -> Option<String> {
+    match decode_file_l4(l4_hdr, body) {
+        Ok(FileMessage::Accept(acc)) if outbound_files.handle_accept(&acc) => return None,
+        Ok(FileMessage::Ack(ack)) if outbound_files.handle_ack(&ack) => return None,
+        Ok(FileMessage::CompleteAck(cack))
+            if outbound_files
+                .handle_complete_ack(cack.transfer_id, cack.status, gen, actor_tx)
+                .await =>
+        {
+            return None;
+        }
+        Ok(FileMessage::Abort(ab))
+            if outbound_files
+                .handle_remote_abort(ab.transfer_id, ab.error_code, gen, actor_tx)
+                .await =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+
+    match file_receiver.on_l4_frame(l4_hdr, body, Instant::now(), file_err_counter) {
+        FileRecvAction::SendAccept(acc) => {
+            if let Ok(enc) = acc.encode() {
+                let _ = sess.send_file_l4(FILE_MSG_ACCEPT, &enc).await;
+            }
+        }
+        FileRecvAction::SendAck(ack) => {
+            if let Ok(enc) = ack.encode() {
+                let _ = sess.send_file_l4(FILE_MSG_ACK, &enc).await;
+            }
+        }
+        FileRecvAction::SendCompleteAck {
+            ack,
+            saved_path,
+            audit,
+        } => {
+            if let Ok(enc) = ack.encode() {
+                let _ = sess.send_file_l4(FILE_MSG_COMPLETE_ACK, &enc).await;
+            }
+            let _ = actor_tx
+                .send(ActorMessage::InternalEvent {
+                    session_gen: gen,
+                    event: ActorEvent::FileComplete {
+                        transfer_id: audit.transfer_id,
+                        rel_name: audit.rel_name,
+                        bytes: audit.file_size,
+                        sha256_hex: audit.sha256_hex,
+                        saved_path: saved_path.map(|p| p.display().to_string()),
+                    },
+                })
+                .await;
+        }
+        FileRecvAction::SendAbort(ab) => {
+            let enc = ab.encode();
+            let _ = sess.send_file_l4(FILE_MSG_ABORT, &enc).await;
+            let _ = actor_tx
+                .send(ActorMessage::InternalEvent {
+                    session_gen: gen,
+                    event: ActorEvent::FileAborted {
+                        transfer_id: ab.transfer_id,
+                        error_code: ab.error_code,
+                        reason: format!("error_code={:#06x}", ab.error_code),
+                    },
+                })
+                .await;
+        }
+        FileRecvAction::SessionFatal(reason) => {
+            return Some(format!("file_fatal: {reason}"));
+        }
+        FileRecvAction::None => {}
+    }
+    None
 }
 
 /// RAII guard ensuring `release_all_keys()` runs and `releaser_slot` is cleared on ANY exit path
@@ -3732,22 +3957,42 @@ async fn run_active_host_session(
                     match res {
                         Ok((new_pol, is_degraded)) => {
                             let now = now_unix_secs();
-                            if should_accept_policy_update(Some(&effective_policy), &new_pol, now).is_ok() {
-                                effective_policy = new_pol.clone();
-                                allow_clip_flag.store(effective_policy.allow_clipboard(), Ordering::Release);
-                                audio_gate = AudioChannelGate::from_policy(&effective_policy);
-                                audio_gate.set_muted(audio_muted);
-                                clip_receiver.update_policy(effective_policy.clone());
-                                file_receiver.update_policy(effective_policy.clone());
+                            match should_accept_policy_update(Some(&effective_policy), &new_pol, now) {
+                                Ok(()) => {
+                                    effective_policy = new_pol.clone();
+                                    clip_poller.set_policy_allowed(effective_policy.allow_clipboard());
+                                    audio_gate = AudioChannelGate::from_policy(&effective_policy);
+                                    audio_gate.set_muted(audio_muted);
+                                    clip_receiver.update_policy(effective_policy.clone());
+                                    file_receiver.update_policy(effective_policy.clone());
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::PolicyUpdated {
+                                            cmd_id: Some(cmd_id),
+                                            policy: new_pol,
+                                            is_degraded,
+                                        },
+                                    }).await;
+                                }
+                                Err(reason) => {
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::SecurityEvent(SecurityEvent::PolicyDegraded {
+                                            reason: reason.clone(),
+                                        }),
+                                    }).await;
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::CommandResult {
+                                            cmd_id,
+                                            ok: false,
+                                            data: None,
+                                            error_code: Some("PolicyUpdateRejected".into()),
+                                            error: Some(reason),
+                                        },
+                                    }).await;
+                                }
                             }
-                            let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                session_gen: gen,
-                                event: ActorEvent::PolicyUpdated {
-                                    cmd_id: Some(cmd_id),
-                                    policy: new_pol,
-                                    is_degraded,
-                                },
-                            }).await;
                         }
                         Err(e) => {
                             let _ = actor_tx.send(ActorMessage::InternalEvent {
@@ -3818,7 +4063,9 @@ async fn run_active_host_session(
                     }
                 }
                 _ = file_tick.tick(), if outbound_files.has_active() => {
-                    outbound_files.pump_one_step(host_sess.session_mut(), gen, &actor_tx).await;
+                    outbound_files
+                        .pump_one_step(host_sess.session_mut(), &effective_policy, gen, &actor_tx)
+                        .await;
                 }
                 _ = video_tick.tick() => {
                     if let Ok(raw) = capture.capture_frame() {
@@ -3936,58 +4183,19 @@ async fn run_active_host_session(
                                     }
                                 }
                                 V2RecvEvent::FileTransferRaw(raw) => {
-                                    match decode_file_l4(&raw.header, &raw.body) {
-                                        Ok(FileMessage::CompleteAck(cack)) => {
-                                            outbound_files.handle_complete_ack(cack.transfer_id, cack.status, gen, &actor_tx).await;
-                                        }
-                                        Ok(FileMessage::Abort(ab)) => {
-                                            outbound_files.handle_remote_abort(ab.transfer_id, ab.error_code, gen, &actor_tx).await;
-                                        }
-                                        _ => {
-                                            match file_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut file_err_counter) {
-                                                FileRecvAction::SendAccept(acc) => {
-                                                    if let Ok(enc) = acc.encode() {
-                                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &enc).await;
-                                                    }
-                                                }
-                                                FileRecvAction::SendAck(ack) => {
-                                                    if let Ok(enc) = ack.encode() {
-                                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &enc).await;
-                                                    }
-                                                }
-                                                FileRecvAction::SendCompleteAck { ack, saved_path, audit } => {
-                                                    if let Ok(enc) = ack.encode() {
-                                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_COMPLETE_ACK, 0, false, &enc).await;
-                                                    }
-                                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                                        session_gen: gen,
-                                                        event: ActorEvent::FileComplete {
-                                                            transfer_id: audit.transfer_id,
-                                                            rel_name: audit.rel_name,
-                                                            bytes: audit.file_size,
-                                                            sha256_hex: audit.sha256_hex,
-                                                            saved_path: saved_path.map(|p| p.display().to_string()),
-                                                        },
-                                                    }).await;
-                                                }
-                                                FileRecvAction::SendAbort(ab) => {
-                                                    let enc = ab.encode();
-                                                    let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &enc).await;
-                                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                                        session_gen: gen,
-                                                        event: ActorEvent::FileAborted {
-                                                            transfer_id: ab.transfer_id,
-                                                            error_code: ab.error_code,
-                                                            reason: format!("error_code={:#06x}", ab.error_code),
-                                                        },
-                                                    }).await;
-                                                }
-                                                FileRecvAction::SessionFatal(reason) => {
-                                                    break format!("file_fatal: {reason}");
-                                                }
-                                                FileRecvAction::None => {}
-                                            }
-                                        }
+                                    if let Some(fatal) = route_inbound_file_l4(
+                                        host_sess.session_mut(),
+                                        &raw.header,
+                                        &raw.body,
+                                        &mut outbound_files,
+                                        &mut file_receiver,
+                                        &mut file_err_counter,
+                                        gen,
+                                        &actor_tx,
+                                    )
+                                    .await
+                                    {
+                                        break fatal;
                                     }
                                 }
                                 V2RecvEvent::Transport(_) | V2RecvEvent::AudioRaw(_) => {}
@@ -4003,11 +4211,13 @@ async fn run_active_host_session(
         }
     };
 
-    // Abort any in-flight outbound file transfers, release all keys, send close, shut down lease.
-    outbound_files
-        .abort_all_on_teardown(host_sess.session_mut(), gen, &actor_tx)
-        .await;
+    // Mandatory synchronous key release FIRST before any async network/channel teardown!
     let _ = releaser.release_all_keys();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        outbound_files.abort_all_on_teardown(host_sess.session_mut(), gen, &actor_tx),
+    )
+    .await;
     let _ = send_redundant_session_close_3x(host_sess.session_mut(), 0).await;
     let _ = accepted.lease_renewal.shutdown().await;
     end_reason
@@ -4236,20 +4446,40 @@ async fn run_controller_lifecycle_task(
                     match res {
                         Ok((new_pol, is_degraded)) => {
                             let now = now_unix_secs();
-                            if should_accept_policy_update(Some(&effective_policy), &new_pol, now).is_ok() {
-                                effective_policy = new_pol.clone();
-                                allow_clip_flag.store(effective_policy.allow_clipboard(), Ordering::Release);
-                                clip_receiver.update_policy(effective_policy.clone());
-                                file_receiver.update_policy(effective_policy.clone());
+                            match should_accept_policy_update(Some(&effective_policy), &new_pol, now) {
+                                Ok(()) => {
+                                    effective_policy = new_pol.clone();
+                                    clip_poller.set_policy_allowed(effective_policy.allow_clipboard());
+                                    clip_receiver.update_policy(effective_policy.clone());
+                                    file_receiver.update_policy(effective_policy.clone());
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::PolicyUpdated {
+                                            cmd_id: Some(cmd_id),
+                                            policy: new_pol,
+                                            is_degraded,
+                                        },
+                                    }).await;
+                                }
+                                Err(reason) => {
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::SecurityEvent(SecurityEvent::PolicyDegraded {
+                                            reason: reason.clone(),
+                                        }),
+                                    }).await;
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::CommandResult {
+                                            cmd_id,
+                                            ok: false,
+                                            data: None,
+                                            error_code: Some("PolicyUpdateRejected".into()),
+                                            error: Some(reason),
+                                        },
+                                    }).await;
+                                }
                             }
-                            let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                session_gen: gen,
-                                event: ActorEvent::PolicyUpdated {
-                                    cmd_id: Some(cmd_id),
-                                    policy: new_pol,
-                                    is_degraded,
-                                },
-                            }).await;
                         }
                         Err(e) => {
                             let _ = actor_tx.send(ActorMessage::InternalEvent {
@@ -4325,14 +4555,24 @@ async fn run_controller_lifecycle_task(
                     }
                 }
                 _ = file_tick.tick(), if outbound_files.has_active() => {
-                    outbound_files.pump_one_step(&mut ctrl_sess, gen, &actor_tx).await;
+                    outbound_files
+                        .pump_one_step(&mut ctrl_sess, &effective_policy, gen, &actor_tx)
+                        .await;
                 }
                 recv_res = ctrl_sess.recv_v124_event(Duration::from_millis(25)) => {
                     match recv_res {
                         Ok(V2RecvEvent::Transport(TransportEvent::VideoFrame(vf))) => {
                             if let Ok(i420) = decoder.decode_raw(&vf.data) {
                                 video_frames_decoded += 1;
-                                if mailbox.publish_i420(&i420, PixelFormat::Bgra8, now_epoch_ms()).is_ok() {
+                                if mailbox
+                                    .publish_i420_for_session(
+                                        gen,
+                                        &i420,
+                                        PixelFormat::Bgra8,
+                                        now_epoch_ms(),
+                                    )
+                                    .is_ok()
+                                {
                                     events.notify_frame_published();
                                 }
                             }
@@ -4397,50 +4637,19 @@ async fn run_controller_lifecycle_task(
                             }
                         }
                         Ok(V2RecvEvent::FileTransferRaw(raw)) => {
-                            match decode_file_l4(&raw.header, &raw.body) {
-                                Ok(FileMessage::CompleteAck(cack)) => {
-                                    outbound_files.handle_complete_ack(cack.transfer_id, cack.status, gen, &actor_tx).await;
-                                }
-                                Ok(FileMessage::Abort(ab)) => {
-                                    outbound_files.handle_remote_abort(ab.transfer_id, ab.error_code, gen, &actor_tx).await;
-                                }
-                                _ => {
-                                    match file_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut file_err_counter) {
-                                        FileRecvAction::SendAccept(acc) => {
-                                            if let Ok(enc) = acc.encode() {
-                                                let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &enc).await;
-                                            }
-                                        }
-                                        FileRecvAction::SendAck(ack) => {
-                                            if let Ok(enc) = ack.encode() {
-                                                let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &enc).await;
-                                            }
-                                        }
-                                        FileRecvAction::SendCompleteAck { ack, saved_path, audit } => {
-                                            if let Ok(enc) = ack.encode() {
-                                                let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_COMPLETE_ACK, 0, false, &enc).await;
-                                            }
-                                            let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                                session_gen: gen,
-                                                event: ActorEvent::FileComplete {
-                                                    transfer_id: audit.transfer_id,
-                                                    rel_name: audit.rel_name,
-                                                    bytes: audit.file_size,
-                                                    sha256_hex: audit.sha256_hex,
-                                                    saved_path: saved_path.map(|p| p.display().to_string()),
-                                                },
-                                            }).await;
-                                        }
-                                        FileRecvAction::SendAbort(ab) => {
-                                            let enc = ab.encode();
-                                            let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &enc).await;
-                                        }
-                                        FileRecvAction::SessionFatal(reason) => {
-                                            break format!("file_fatal: {reason}");
-                                        }
-                                        FileRecvAction::None => {}
-                                    }
-                                }
+                            if let Some(fatal) = route_inbound_file_l4(
+                                &mut ctrl_sess,
+                                &raw.header,
+                                &raw.body,
+                                &mut outbound_files,
+                                &mut file_receiver,
+                                &mut file_err_counter,
+                                gen,
+                                &actor_tx,
+                            )
+                            .await
+                            {
+                                break fatal;
                             }
                         }
                         Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
@@ -4459,9 +4668,11 @@ async fn run_controller_lifecycle_task(
         }
     };
 
-    outbound_files
-        .abort_all_on_teardown(&mut ctrl_sess, gen, &actor_tx)
-        .await;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        outbound_files.abort_all_on_teardown(&mut ctrl_sess, gen, &actor_tx),
+    )
+    .await;
     if !is_blackholed() {
         let _ = ctrl_sess
             .send_control(CTRL_MSG_SESSION_CLOSE, &0u16.to_be_bytes())
@@ -4619,6 +4830,10 @@ mod tests {
                 && ev["payload"]["stale_generation"] == true
                 && ev["payload"]["detail"]["event"] == "ReplaySessionRejected"
             {
+                // Negative redaction assertion: structured JSON (no raw Debug enum/key dumps)
+                assert!(!raw.contains("ReplaySessionRejected {"));
+                assert!(!raw.contains("BEGIN PRIVATE KEY"));
+                assert!(!raw.contains("residual_keys"));
                 saw_stale_sec = true;
             }
         }
@@ -4644,7 +4859,10 @@ mod tests {
         // Verify dropping pending incoming on destroy triggers RecvError or explicit Reject
         let (_inc2, dec_rx2) = rt.inject_test_incoming([0xBB; 16], sample_cert());
         rt.destroy();
-        assert!(!matches!(dec_rx2.blocking_recv(), Ok(CallDecision::Accept)));
+        assert!(matches!(
+            dec_rx2.blocking_recv(),
+            Err(_) | Ok(CallDecision::Reject { .. })
+        ));
     }
 
     #[test]
@@ -4658,6 +4876,16 @@ mod tests {
         };
         let degraded = EffectiveTenantPolicy::degraded([1u8; 16], [0u8; 32], "cp down");
         assert!(should_accept_policy_update(Some(&valid_v2), &degraded, 5_000).is_err());
+
+        // Higher version (v3) with degraded=true MUST STILL be rejected over unexpired valid v2!
+        let degraded_v3 = EffectiveTenantPolicy {
+            version: 3,
+            exp_unix: 20_000,
+            degraded: true,
+            degraded_reason: Some("partial_verify".into()),
+            ..valid_v2.clone()
+        };
+        assert!(should_accept_policy_update(Some(&valid_v2), &degraded_v3, 5_000).is_err());
 
         let valid_v1 = EffectiveTenantPolicy {
             version: 1,
@@ -4762,6 +4990,257 @@ mod tests {
             std::os::unix::fs::symlink(&base, &link).unwrap();
             assert!(validate_download_dir(&link).is_err());
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    struct VecWireTx {
+        frames: Vec<(u8, Vec<u8>)>,
+    }
+
+    impl FileL4Sender for VecWireTx {
+        fn send_file_l4<'a>(
+            &'a mut self,
+            msg_type: u8,
+            body: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+        {
+            let body_owned = body.to_vec();
+            Box::pin(async move {
+                self.frames.push((msg_type, body_owned));
+                Ok(())
+            })
+        }
+    }
+
+    fn make_l4_hdr(msg_type: u8, body_len: usize) -> v2_transport::L4Header {
+        v2_transport::L4Header {
+            msg_type,
+            flags: 0,
+            stream_seq: 0,
+            body_len: body_len as u16,
+        }
+    }
+
+    fn allow_file_policy(max_file_mb: u32) -> EffectiveTenantPolicy {
+        use crate::session::policy::{TenantPolicyBody, POLICY_FLAG_ALLOW_FILE_TRANSFER};
+        EffectiveTenantPolicy {
+            tenant_id: [0x11; 16],
+            version: 1,
+            exp_unix: u64::MAX,
+            policy_hash: [0x22; 32],
+            body: TenantPolicyBody {
+                schema_ver: 1,
+                flags: POLICY_FLAG_ALLOW_FILE_TRANSFER,
+                max_bw_kbps: 50_000,
+                max_file_mb,
+                max_clipboard_kb: 256,
+            },
+            degraded: false,
+            degraded_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_file_manager_and_receiver_multichunk_abort_and_policy_end_to_end() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("zd-ft-e2e-{}-{uniq}", std::process::id()));
+        let host_dl = base.join("host_dl");
+        let ctrl_dl = base.join("ctrl_dl");
+        std::fs::create_dir_all(&host_dl).unwrap();
+        std::fs::create_dir_all(&ctrl_dl).unwrap();
+
+        let sample_path = base.join("phase5_sample.bin");
+        let sample_data: Vec<u8> = (0..8192usize).map(|i| ((i * 29 + 7) & 0xFF) as u8).collect();
+        let sample_sha = hex::encode(Sha256::digest(&sample_data));
+        std::fs::write(&sample_path, &sample_data).unwrap();
+
+        let allow_pol = allow_file_policy(16);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ActorMessage>(64);
+        let (host_tx, mut host_rx) = mpsc::channel::<ActorMessage>(64);
+
+        let mut ctrl_out = OutboundFileManager::new();
+        let mut ctrl_in = FileTransferReceiver::new(allow_pol.clone(), ctrl_dl);
+        let mut ctrl_err = ChannelFramingErrorCounter::new();
+        let mut ctrl_wire = VecWireTx { frames: Vec::new() };
+
+        let mut host_out = OutboundFileManager::new();
+        let mut host_in = FileTransferReceiver::new(allow_pol.clone(), host_dl.clone());
+        let mut host_err = ChannelFramingErrorCounter::new();
+        let mut host_wire = VecWireTx { frames: Vec::new() };
+
+        // 1. Multi-chunk 8192B (8 chunks) transfer: OFFER -> ACCEPT -> 8x CHUNK/ACK -> COMPLETE -> COMPLETE_ACK(OK)
+        ctrl_out
+            .start_transfer(
+                &mut ctrl_wire,
+                1,
+                101,
+                sample_path.clone(),
+                "phase5_sample.bin".into(),
+                &allow_pol,
+                1,
+                &ctrl_tx,
+            )
+            .await;
+        assert!(ctrl_out.has_active());
+
+        for _step in 0..32 {
+            // Deliver all ctrl -> host frames
+            for (mt, body) in ctrl_wire.frames.drain(..) {
+                let hdr = make_l4_hdr(mt, body.len());
+                let fatal = route_inbound_file_l4(
+                    &mut host_wire,
+                    &hdr,
+                    &body,
+                    &mut host_out,
+                    &mut host_in,
+                    &mut host_err,
+                    1,
+                    &host_tx,
+                )
+                .await;
+                assert!(fatal.is_none(), "unexpected host fatal: {fatal:?}");
+            }
+            // Deliver all host -> ctrl frames (ACCEPT, 8x ACK, COMPLETE_ACK)
+            for (mt, body) in host_wire.frames.drain(..) {
+                let hdr = make_l4_hdr(mt, body.len());
+                let fatal = route_inbound_file_l4(
+                    &mut ctrl_wire,
+                    &hdr,
+                    &body,
+                    &mut ctrl_out,
+                    &mut ctrl_in,
+                    &mut ctrl_err,
+                    1,
+                    &ctrl_tx,
+                )
+                .await;
+                assert!(fatal.is_none(), "unexpected ctrl fatal: {fatal:?}");
+            }
+            if ctrl_out.has_active() {
+                ctrl_out
+                    .pump_one_step(&mut ctrl_wire, &allow_pol, 1, &ctrl_tx)
+                    .await;
+            } else {
+                break;
+            }
+        }
+        assert!(!ctrl_out.has_active(), "outbound transfer should have completed");
+
+        // Verify Host emitted FileComplete with matching SHA-256 and exact file on disk!
+        let mut host_saved_path: Option<String> = None;
+        while let Ok(msg) = host_rx.try_recv() {
+            if let ActorMessage::InternalEvent {
+                event:
+                    ActorEvent::FileComplete {
+                        sha256_hex,
+                        saved_path,
+                        ..
+                    },
+                ..
+            } = msg
+            {
+                assert_eq!(sha256_hex, sample_sha);
+                host_saved_path = saved_path;
+            }
+        }
+        let saved = host_saved_path.expect("host must emit FileComplete with saved_path");
+        let on_disk = std::fs::read(&saved).unwrap();
+        assert_eq!(on_disk, sample_data);
+
+        // Verify Controller emitted CommandResult { cmd_id: 101, ok: true }!
+        let mut ctrl_cmd_ok = false;
+        while let Ok(msg) = ctrl_rx.try_recv() {
+            if let ActorMessage::InternalEvent {
+                event: ActorEvent::CommandResult { cmd_id: 101, ok, .. },
+                ..
+            } = msg
+            {
+                ctrl_cmd_ok = ok;
+            }
+        }
+        assert!(ctrl_cmd_ok, "controller must emit CommandResult ok=true after CompleteAck");
+
+        // 2. Pre-hash policy denial BEFORE Offer MUST NOT send a spurious FILE_MSG_ABORT!
+        let deny_pol = EffectiveTenantPolicy::degraded([0x11; 16], [0x22; 32], "denied");
+        ctrl_wire.frames.clear();
+        ctrl_out
+            .start_transfer(
+                &mut ctrl_wire,
+                2,
+                102,
+                sample_path.clone(),
+                "phase5_sample.bin".into(),
+                &deny_pol,
+                1,
+                &ctrl_tx,
+            )
+            .await;
+        assert!(ctrl_wire.frames.is_empty(), "pre-offer policy deny must send zero wire frames");
+        assert!(!ctrl_out.has_active());
+
+        // 3. Mid-flight policy revocation + peer-abort inbound cleanup fallthrough!
+        ctrl_out
+            .start_transfer(
+                &mut ctrl_wire,
+                3,
+                103,
+                sample_path.clone(),
+                "revoked.bin".into(),
+                &allow_pol,
+                1,
+                &ctrl_tx,
+            )
+            .await;
+        // Deliver OFFER to Host so Host opens an active inbound slot (active_count == 1).
+        for (mt, body) in ctrl_wire.frames.drain(..) {
+            let hdr = make_l4_hdr(mt, body.len());
+            assert!(route_inbound_file_l4(
+                &mut host_wire,
+                &hdr,
+                &body,
+                &mut host_out,
+                &mut host_in,
+                &mut host_err,
+                1,
+                &host_tx,
+            )
+            .await
+            .is_none());
+        }
+        assert_eq!(host_in.active_count(), 1);
+        // Flip policy to deny -> pump_one_step MUST abort transfer #3 with FILE_ERR_POLICY_DENIED!
+        ctrl_out
+            .pump_one_step(&mut ctrl_wire, &deny_pol, 1, &ctrl_tx)
+            .await;
+        assert!(!ctrl_out.has_active());
+        assert_eq!(ctrl_wire.frames.len(), 1);
+        assert_eq!(ctrl_wire.frames[0].0, FILE_MSG_ABORT);
+        // Deliver Controller's ABORT to Host -> handle_remote_abort returns false -> falls through
+        // to `host_in` and immediately cleans up the inbound slot!
+        for (mt, body) in ctrl_wire.frames.drain(..) {
+            let hdr = make_l4_hdr(mt, body.len());
+            assert!(route_inbound_file_l4(
+                &mut host_wire,
+                &hdr,
+                &body,
+                &mut host_out,
+                &mut host_in,
+                &mut host_err,
+                1,
+                &host_tx,
+            )
+            .await
+            .is_none());
+        }
+        assert_eq!(
+            host_in.active_count(),
+            0,
+            "peer ABORT must fall through to FileTransferReceiver and clean up active inbound slot"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

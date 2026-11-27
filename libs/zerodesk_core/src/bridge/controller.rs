@@ -629,11 +629,29 @@ impl V2BridgeController {
 
     /// Runtime hook: updates the effective tenant policy in-place during an active or ready
     /// session without mutating `state` or requiring a `SignalingDeviceCert`.
+    /// Fails closed if an existing unexpired verified policy would be downgraded or degraded.
     pub fn on_policy_updated(&self, policy: EffectiveTenantPolicy) -> Result<(), String> {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.state == BridgeState::Idle {
                 return Err("on_policy_updated forbidden in state Idle".into());
+            }
+            if let Some(cur) = &g.policy {
+                let now = v2_client::now_unix_secs();
+                if !cur.degraded && cur.exp_unix > now {
+                    if policy.degraded {
+                        return Err(
+                            "refusing to overwrite unexpired verified policy with degraded policy"
+                                .into(),
+                        );
+                    }
+                    if policy.version < cur.version {
+                        return Err(format!(
+                            "refusing policy version downgrade ({} < {})",
+                            policy.version, cur.version
+                        ));
+                    }
+                }
             }
             let st = g.state;
             g.policy = Some(policy.clone());
