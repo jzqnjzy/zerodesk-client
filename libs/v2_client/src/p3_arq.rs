@@ -216,6 +216,12 @@ impl P3SendState {
         now: Instant,
     ) -> Result<P3TxFrame, ClientError> {
         let frame_bytes = L4_HDR_LEN.saturating_add(body.len());
+        if frame_bytes > P3_MAX_INFLIGHT_BYTES {
+            return Err(ClientError::Protocol(format!(
+                "p3 frame {frame_bytes}B on chan {:#04x} exceeds max inflight window {P3_MAX_INFLIGHT_BYTES}B",
+                self.chan_id
+            )));
+        }
         if self.inflight.len() >= P3_MAX_INFLIGHT_PKTS
             || self.inflight_bytes.saturating_add(frame_bytes) > P3_MAX_INFLIGHT_BYTES
         {
@@ -252,11 +258,6 @@ impl P3SendState {
 
     fn queue_fast_rtx(&mut self, seq: u32, now: Instant) {
         let min_gap = Duration::from_millis((self.srtt_ms / 2).max(P3_FAST_RTX_MIN_GAP_MS));
-        let rto = self
-            .inflight
-            .get(&seq)
-            .map(|e| self.current_rto(e.retries))
-            .unwrap_or_else(|| self.current_rto(0));
         if let Some(entry) = self.inflight.get_mut(&seq) {
             if entry.sacked {
                 return;
@@ -266,13 +267,48 @@ impl P3SendState {
                     return;
                 }
             }
+            // Do NOT push out `rto_deadline` here; retries are counted uniformly in
+            // `emit_retransmit` so continuous SACKs can never bypass the 8-retry PathFailed cap.
             entry.last_fast_rtx_at = Some(now);
-            entry.last_sent_at = now;
-            entry.rto_deadline = now + rto;
             if !self.pending_rtx.contains(&seq) {
                 self.pending_rtx.push_back(seq);
             }
         }
+    }
+
+    fn emit_retransmit(
+        &mut self,
+        seq: u32,
+        now: Instant,
+        advance_rto: bool,
+    ) -> Result<Option<P3TxFrame>, ClientError> {
+        let next_retries = match self.inflight.get(&seq) {
+            Some(e) if !e.sacked => e.retries.saturating_add(1),
+            _ => return Ok(None),
+        };
+        if check_arq_retry_limit(next_retries).is_err() {
+            return Err(ClientError::PathFailed(format!(
+                "p3 ARQ chan {:#04x} stream_seq {} exceeded 8 retries",
+                self.chan_id, seq
+            )));
+        }
+        let next_rto = self.current_rto(next_retries);
+        let Some(entry) = self.inflight.get_mut(&seq) else {
+            return Ok(None);
+        };
+        entry.retries = next_retries;
+        entry.last_sent_at = now;
+        if advance_rto || now >= entry.rto_deadline {
+            entry.rto_deadline = now + next_rto;
+        }
+        self.rtx_sent_total = self.rtx_sent_total.saturating_add(1);
+        Ok(Some(P3TxFrame {
+            chan_id: self.chan_id,
+            msg_type: entry.msg_type,
+            flags: entry.flags,
+            stream_seq: entry.stream_seq,
+            body: entry.body.clone(),
+        }))
     }
 
     fn on_ack(&mut self, cum_ack_seq: u32, sack_bitmap: u64, now: Instant) {
@@ -354,7 +390,10 @@ impl P3SendState {
             for seq in holes {
                 self.queue_fast_rtx(seq, now);
             }
-        } else if !cum_advances && sack_bitmap == 0 {
+        } else if !cum_advances
+            && sack_bitmap == 0
+            && !(self.send_base == 0 && cum_ack_seq == u32::MAX)
+        {
             self.dup_ack_count = self.dup_ack_count.saturating_add(1);
             if self.dup_ack_count >= P3_DUP_ACK_THRESHOLD {
                 self.dup_ack_count = 0;
@@ -366,17 +405,8 @@ impl P3SendState {
     fn poll_retransmits(&mut self, now: Instant) -> Result<Vec<P3TxFrame>, ClientError> {
         let mut out = Vec::new();
         while let Some(seq) = self.pending_rtx.pop_front() {
-            if let Some(entry) = self.inflight.get(&seq) {
-                if !entry.sacked {
-                    self.rtx_sent_total = self.rtx_sent_total.saturating_add(1);
-                    out.push(P3TxFrame {
-                        chan_id: self.chan_id,
-                        msg_type: entry.msg_type,
-                        flags: entry.flags,
-                        stream_seq: entry.stream_seq,
-                        body: entry.body.clone(),
-                    });
-                }
+            if let Some(frame) = self.emit_retransmit(seq, now, false)? {
+                out.push(frame);
             }
         }
 
@@ -390,29 +420,8 @@ impl P3SendState {
         due_seqs.sort_by_key(|&s| s.wrapping_sub(self.send_base));
 
         for seq in due_seqs {
-            let next_retries = match self.inflight.get(&seq) {
-                Some(e) => e.retries.saturating_add(1),
-                None => continue,
-            };
-            if check_arq_retry_limit(next_retries).is_err() {
-                return Err(ClientError::PathFailed(format!(
-                    "p3 ARQ chan {:#04x} stream_seq {} exceeded 8 retries",
-                    self.chan_id, seq
-                )));
-            }
-            let next_rto = self.current_rto(next_retries);
-            if let Some(entry) = self.inflight.get_mut(&seq) {
-                entry.retries = next_retries;
-                entry.last_sent_at = now;
-                entry.rto_deadline = now + next_rto;
-                self.rtx_sent_total = self.rtx_sent_total.saturating_add(1);
-                out.push(P3TxFrame {
-                    chan_id: self.chan_id,
-                    msg_type: entry.msg_type,
-                    flags: entry.flags,
-                    stream_seq: entry.stream_seq,
-                    body: entry.body.clone(),
-                });
+            if let Some(frame) = self.emit_retransmit(seq, now, true)? {
+                out.push(frame);
             }
         }
         Ok(out)
@@ -951,5 +960,110 @@ mod tests {
         }
         assert!(hit_cap, "expected 2 MiB hard cap error");
         assert!(rx.recv_ooo_bytes(CHAN_FILE_TRANSFER) <= P3_RECV_BUF_MAX_BYTES);
+    }
+
+    #[test]
+    fn fast_rtx_under_continuous_sacks_hits_path_failed_at_8_retries() {
+        let mut now = Instant::now();
+        let mut tx = P3ArqEngine::new();
+        // Send seq 0 (permanently dropped hole) and seq 1 (SACKed).
+        tx.enqueue_send(CHAN_FILE_TRANSFER, 0x03, 0, b"hole0", now)
+            .unwrap();
+        tx.enqueue_send(CHAN_FILE_TRANSFER, 0x03, 0, b"pkt1", now)
+            .unwrap();
+
+        let sack = AckSackFrame {
+            target_chan: CHAN_FILE_TRANSFER,
+            cum_ack_seq: u32::MAX,
+            sack_bitmap: 0b10,
+        };
+
+        let mut hit_path_failed = false;
+        let mut total_rtx = 0usize;
+        for _ in 0..20 {
+            now += Duration::from_millis(120);
+            tx.on_recv_ack(&sack, now);
+            match tx.poll_due(now) {
+                Ok(actions) => {
+                    total_rtx += actions.retransmits.len();
+                    if let Some(dl) = tx.next_deadline(now) {
+                        assert!(dl > now, "poll_due must never leave next_deadline <= now");
+                    }
+                }
+                Err(ClientError::PathFailed(_)) => {
+                    hit_path_failed = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(
+            hit_path_failed,
+            "continuous SACK-bearing ACKs must still hit PathFailed after 8 retries"
+        );
+        assert_eq!(total_rtx, 7, "retries 1..=7 succeed before 8th triggers PathFailed");
+    }
+
+    #[test]
+    fn poll_due_at_expired_deadline_always_advances_or_clears_next_deadline() {
+        let now = Instant::now();
+        let mut eng = P3ArqEngine::new();
+        eng.enqueue_send(CHAN_FILE_TRANSFER, 0x03, 0, b"tx0", now)
+            .unwrap();
+        eng.on_recv_data(
+            CHAN_FILE_TRANSFER,
+            mk_hdr(0, 3),
+            Bytes::from_static(b"rx0"),
+            now,
+        )
+        .unwrap();
+
+        // Advance well past both delayed-ACK (10ms) and initial RTO (600ms).
+        let expired = now + Duration::from_secs(2);
+        let actions = eng.poll_due(expired).unwrap();
+        assert_eq!(actions.acks.len(), 1);
+        assert_eq!(actions.retransmits.len(), 1);
+        let next_dl = eng.next_deadline(expired);
+        assert!(
+            next_dl.is_none_or(|dl| dl > expired),
+            "next_deadline after Ok poll_due must be None or > now, got {next_dl:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_frame_returns_protocol_error_not_backpressure() {
+        let now = Instant::now();
+        let mut tx = P3ArqEngine::new();
+        let huge = vec![0xAAu8; P3_MAX_INFLIGHT_BYTES + 1];
+        let err = tx
+            .enqueue_send(CHAN_FILE_TRANSFER, 0x03, 0, &huge, now)
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::Protocol(_)),
+            "oversized frame must return non-retryable Protocol error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn initial_idle_ack_does_not_trigger_spurious_dup_ack_fast_rtx() {
+        let mut now = Instant::now();
+        let mut tx = P3ArqEngine::new();
+        tx.enqueue_send(CHAN_FILE_TRANSFER, 0x01, 0, b"offer", now)
+            .unwrap();
+
+        let idle_ack = AckSackFrame {
+            target_chan: CHAN_FILE_TRANSFER,
+            cum_ack_seq: u32::MAX,
+            sack_bitmap: 0,
+        };
+        for _ in 0..5 {
+            now += Duration::from_millis(10);
+            tx.on_recv_ack(&idle_ack, now);
+        }
+        let actions = tx.poll_due(now).unwrap();
+        assert!(
+            actions.retransmits.is_empty(),
+            "idle initial ACK must not trigger spurious 3-dup-ACK fast-retransmit"
+        );
     }
 }

@@ -92,6 +92,7 @@ const FILE_COMPLETE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const FILE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_PROGRESS_THROTTLE_INTERVAL: Duration = Duration::from_millis(200);
 const PENDING_CLIP_FRAMES_CAP: usize = 256;
+const PENDING_CLIP_BYTES_CAP: usize = 4 * 1024 * 1024;
 const PENDING_FILE_CTRL_CAP: usize = 128;
 const FILE_ERR_LOCAL_ABORT: u16 = 0x0500;
 const ACTOR_CHANNEL_CAP: usize = 256;
@@ -3076,26 +3077,105 @@ impl OutboundFileManager {
     }
 
     fn enqueue_ctrl_retry(&mut self, msg_type: u8, body: &[u8]) {
-        if self.pending_ctrl_frames.len() < PENDING_FILE_CTRL_CAP {
-            self.pending_ctrl_frames.push_back((msg_type, body.to_vec()));
+        if self.pending_ctrl_frames.len() >= PENDING_FILE_CTRL_CAP {
+            if let Some(pos) = self
+                .pending_ctrl_frames
+                .iter()
+                .position(|(mt, _)| *mt == FILE_MSG_ACK)
+            {
+                self.pending_ctrl_frames.remove(pos);
+            } else {
+                // Queue is full of critical frames (ACCEPT / COMPLETE_ACK / ABORT); never drop
+                // them in favor of a FILE_MSG_ACK (or overflow the cap).
+                return;
+            }
         }
+        self.pending_ctrl_frames.push_back((msg_type, body.to_vec()));
     }
 
     /// Processes an inbound `FILE_MSG_ACCEPT` from the peer. Returns `true` if it matched an
     /// active outbound transfer (consumed), or `false` if unknown.
-    fn handle_accept(&mut self, acc: &FileAccept) -> bool {
+    async fn handle_accept<S: FileL4Sender>(
+        &mut self,
+        sess: &mut S,
+        acc: &FileAccept,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) -> bool {
         let Some(st) = self.active.get_mut(&acc.transfer_id) else {
             self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
             return false;
         };
-        if st.accepted || acc.resume_offset != 0 {
+        if st.accepted {
             return true;
         }
-        let resume = acc.resume_offset.min(st.total_bytes);
+        if acc.resume_offset > st.total_bytes || acc.initial_window_end_offset < acc.resume_offset {
+            if let Some(st) = self.active.remove(&acc.transfer_id) {
+                let abort = FileAbort {
+                    transfer_id: st.transfer_id,
+                    error_code: FILE_ERR_LOCAL_ABORT,
+                };
+                let ab_wire = abort.encode();
+                if matches!(
+                    sess.send_file_l4(FILE_MSG_ABORT, &ab_wire).await,
+                    Err(FileSendError::Backpressure)
+                ) {
+                    self.enqueue_ctrl_retry(FILE_MSG_ABORT, &ab_wire);
+                }
+                let reason = format!(
+                    "invalid FILE_ACCEPT resume_offset={} window_end={} for total_bytes={}",
+                    acc.resume_offset, acc.initial_window_end_offset, st.total_bytes
+                );
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::FileAborted {
+                            transfer_id: st.transfer_id,
+                            error_code: FILE_ERR_LOCAL_ABORT,
+                            reason: reason.clone(),
+                        },
+                    })
+                    .await;
+                emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(("ProtocolError".into(), reason)))
+                    .await;
+            }
+            return true;
+        }
+        if acc.resume_offset > 0 {
+            if let Err(e) = st.file.seek(SeekFrom::Start(acc.resume_offset)) {
+                if let Some(st) = self.active.remove(&acc.transfer_id) {
+                    let abort = FileAbort {
+                        transfer_id: st.transfer_id,
+                        error_code: FILE_ERR_LOCAL_ABORT,
+                    };
+                    let ab_wire = abort.encode();
+                    if matches!(
+                        sess.send_file_l4(FILE_MSG_ABORT, &ab_wire).await,
+                        Err(FileSendError::Backpressure)
+                    ) {
+                        self.enqueue_ctrl_retry(FILE_MSG_ABORT, &ab_wire);
+                    }
+                    let reason = format!("seek to resume_offset {} failed: {e}", acc.resume_offset);
+                    let _ = actor_tx
+                        .send(ActorMessage::InternalEvent {
+                            session_gen: gen,
+                            event: ActorEvent::FileAborted {
+                                transfer_id: st.transfer_id,
+                                error_code: FILE_ERR_LOCAL_ABORT,
+                                reason: reason.clone(),
+                            },
+                        })
+                        .await;
+                    emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(("IoError".into(), reason)))
+                        .await;
+                }
+                return true;
+            }
+        }
         let clamped_win = acc.initial_window_end_offset.min(st.total_bytes);
         st.accepted = true;
-        st.offset = resume;
-        st.acked_offset = resume;
+        st.offset = acc.resume_offset;
+        st.acked_offset = acc.resume_offset;
         st.window_end_offset = clamped_win;
         st.last_activity_at = Instant::now();
         true
@@ -3254,14 +3334,34 @@ impl OutboundFileManager {
         actor_tx: &mpsc::Sender<ActorMessage>,
     ) {
         // 0. Drain any receiver control replies deferred by L4 p3 backpressure first.
-        while let Some((msg_type, body)) = self.pending_ctrl_frames.front() {
-            match sess.send_file_l4(*msg_type, body).await {
-                Ok(()) => {
-                    self.pending_ctrl_frames.pop_front();
+        //    When file transfer policy is revoked, drop queued FILE_MSG_ACCEPT rather than
+        //    inviting a doomed transfer. When bulk is paused, still allow FILE_MSG_ABORT through.
+        if !policy.allow_file_transfer() {
+            self.pending_ctrl_frames
+                .retain(|(mt, _)| *mt != FILE_MSG_ACCEPT);
+        }
+        if sess.is_bulk_paused() {
+            let mut idx = 0usize;
+            while idx < self.pending_ctrl_frames.len() {
+                if self.pending_ctrl_frames[idx].0 == FILE_MSG_ABORT {
+                    let body = &self.pending_ctrl_frames[idx].1;
+                    match sess.send_file_l4(FILE_MSG_ABORT, body).await {
+                        Ok(()) | Err(FileSendError::Transport(_)) => {
+                            self.pending_ctrl_frames.remove(idx);
+                            continue;
+                        }
+                        Err(FileSendError::Backpressure) => return,
+                    }
                 }
-                Err(FileSendError::Backpressure) => return,
-                Err(FileSendError::Transport(_)) => {
-                    self.pending_ctrl_frames.pop_front();
+                idx += 1;
+            }
+        } else {
+            while let Some((msg_type, body)) = self.pending_ctrl_frames.front() {
+                match sess.send_file_l4(*msg_type, body).await {
+                    Ok(()) | Err(FileSendError::Transport(_)) => {
+                        self.pending_ctrl_frames.pop_front();
+                    }
+                    Err(FileSendError::Backpressure) => return,
                 }
             }
         }
@@ -3458,7 +3558,40 @@ impl OutboundFileManager {
                     match sess.send_file_l4(FILE_MSG_CHUNK, &wire).await {
                         Ok(()) => {}
                         Err(FileSendError::Backpressure) => {
-                            let _ = st.file.seek(SeekFrom::Start(st.offset));
+                            if let Err(seek_err) = st.file.seek(SeekFrom::Start(st.offset)) {
+                                if let Some(st) = self.active.remove(&tid) {
+                                    let abort = FileAbort {
+                                        transfer_id: tid,
+                                        error_code: FILE_ERR_LOCAL_ABORT,
+                                    };
+                                    let ab_wire = abort.encode();
+                                    if matches!(
+                                        sess.send_file_l4(FILE_MSG_ABORT, &ab_wire).await,
+                                        Err(FileSendError::Backpressure)
+                                    ) {
+                                        self.enqueue_ctrl_retry(FILE_MSG_ABORT, &ab_wire);
+                                    }
+                                    let reason =
+                                        format!("rewind file after backpressure failed: {seek_err}");
+                                    let _ = actor_tx
+                                        .send(ActorMessage::InternalEvent {
+                                            session_gen: gen,
+                                            event: ActorEvent::FileAborted {
+                                                transfer_id: tid,
+                                                error_code: FILE_ERR_LOCAL_ABORT,
+                                                reason: reason.clone(),
+                                            },
+                                        })
+                                        .await;
+                                    emit_file_cmd_result(
+                                        gen,
+                                        st.cmd_id,
+                                        actor_tx,
+                                        Err(("IoError".into(), reason)),
+                                    )
+                                    .await;
+                                }
+                            }
                             return;
                         }
                         Err(FileSendError::Transport(e)) => {
@@ -3729,7 +3862,9 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
 ) -> Option<String> {
     match decode_file_l4(l4_hdr, body) {
         Ok(FileMessage::Accept(acc)) => {
-            let _ = outbound_files.handle_accept(&acc);
+            let _ = outbound_files
+                .handle_accept(sess, &acc, gen, actor_tx)
+                .await;
             return None;
         }
         Ok(FileMessage::Ack(ack)) => {
@@ -3826,44 +3961,111 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
     None
 }
 
-async fn send_or_queue_clip_frame(
-    sess: &mut UdpE2eeSession,
-    pending: &mut VecDeque<(u8, Vec<u8>)>,
-    msg_type: u8,
-    body: &[u8],
-) {
-    if !pending.is_empty() {
-        if pending.len() < PENDING_CLIP_FRAMES_CAP {
-            pending.push_back((msg_type, body.to_vec()));
-        }
-        return;
-    }
-    if matches!(
-        sess.send_l4_raw(CHAN_CLIPBOARD, msg_type, 0, false, body)
-            .await,
-        Err(v2_client::ClientError::P3Backpressure { .. })
-    ) && pending.len() < PENDING_CLIP_FRAMES_CAP
+trait ClipL4Sender {
+    fn send_clip_l4<'a>(
+        &'a mut self,
+        msg_type: u8,
+        body: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>>;
+}
+
+impl ClipL4Sender for UdpE2eeSession {
+    fn send_clip_l4<'a>(
+        &'a mut self,
+        msg_type: u8,
+        body: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>>
     {
-        pending.push_back((msg_type, body.to_vec()));
+        Box::pin(async move {
+            match self
+                .send_l4_raw(CHAN_CLIPBOARD, msg_type, 0, false, body)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(v2_client::ClientError::P3Backpressure { .. }) => {
+                    Err(FileSendError::Backpressure)
+                }
+                Err(e) => Err(FileSendError::Transport(e.to_string())),
+            }
+        })
     }
 }
 
-async fn drain_pending_clip_frames(
-    sess: &mut UdpE2eeSession,
-    pending: &mut VecDeque<(u8, Vec<u8>)>,
-) {
-    while let Some((msg_type, body)) = pending.front() {
-        match sess
-            .send_l4_raw(CHAN_CLIPBOARD, *msg_type, 0, false, body)
-            .await
+struct PendingClipQueue {
+    frames: VecDeque<(u8, Vec<u8>)>,
+    buffered_bytes: usize,
+}
+
+impl PendingClipQueue {
+    fn new() -> Self {
+        Self {
+            frames: VecDeque::new(),
+            buffered_bytes: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.buffered_bytes = 0;
+    }
+
+    fn push(&mut self, msg_type: u8, body: &[u8]) {
+        if msg_type == CLIP_MSG_SYNC {
+            // Starting a new clipboard transfer supersedes any stale queued frames from an
+            // earlier transfer so orphaned chunks are never sent after a blackout.
+            self.clear();
+        }
+        if self.frames.len() >= PENDING_CLIP_FRAMES_CAP
+            || self.buffered_bytes.saturating_add(body.len()) > PENDING_CLIP_BYTES_CAP
         {
-            Ok(_) => {
+            return;
+        }
+        self.buffered_bytes = self.buffered_bytes.saturating_add(body.len());
+        self.frames.push_back((msg_type, body.to_vec()));
+    }
+
+    fn front(&self) -> Option<&(u8, Vec<u8>)> {
+        self.frames.front()
+    }
+
+    fn pop_front(&mut self) -> Option<(u8, Vec<u8>)> {
+        let popped = self.frames.pop_front()?;
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(popped.1.len());
+        Some(popped)
+    }
+}
+
+async fn send_or_queue_clip_frame<S: ClipL4Sender>(
+    sess: &mut S,
+    pending: &mut PendingClipQueue,
+    msg_type: u8,
+    body: &[u8],
+) {
+    if msg_type == CLIP_MSG_SYNC {
+        pending.clear();
+    } else if !pending.is_empty() {
+        pending.push(msg_type, body);
+        return;
+    }
+    if matches!(
+        sess.send_clip_l4(msg_type, body).await,
+        Err(FileSendError::Backpressure)
+    ) {
+        pending.push(msg_type, body);
+    }
+}
+
+async fn drain_pending_clip_frames<S: ClipL4Sender>(sess: &mut S, pending: &mut PendingClipQueue) {
+    while let Some((msg_type, body)) = pending.front() {
+        match sess.send_clip_l4(*msg_type, body).await {
+            Ok(()) | Err(FileSendError::Transport(_)) => {
                 pending.pop_front();
             }
-            Err(v2_client::ClientError::P3Backpressure { .. }) => break,
-            Err(_) => {
-                pending.pop_front();
-            }
+            Err(FileSendError::Backpressure) => break,
         }
     }
 }
@@ -4228,7 +4430,7 @@ async fn run_active_host_session(
         FileTransferReceiver::new(effective_policy.clone(), adapters.download_dir.clone());
     let mut file_err_counter = ChannelFramingErrorCounter::new();
     let mut outbound_files = OutboundFileManager::new();
-    let mut pending_clip_frames: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
+    let mut pending_clip_frames = PendingClipQueue::new();
     let mut next_transfer_id: u64 = 1;
 
     // 6. Non-blocking policy refresh result channel.
@@ -4710,7 +4912,7 @@ async fn run_controller_lifecycle_task(
     let mut file_receiver = FileTransferReceiver::new(effective_policy.clone(), download_dir);
     let mut file_err_counter = ChannelFramingErrorCounter::new();
     let mut outbound_files = OutboundFileManager::new();
-    let mut pending_clip_frames: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
+    let mut pending_clip_frames = PendingClipQueue::new();
     let mut next_transfer_id: u64 = 1;
 
     let (pol_tx, mut pol_rx) =
@@ -5785,11 +5987,19 @@ mod tests {
         assert_eq!(wire.frames[0].0, FILE_MSG_OFFER);
         wire.frames.clear();
 
-        assert!(ofm.handle_accept(&FileAccept {
-            transfer_id: 10,
-            resume_offset: 0,
-            initial_window_end_offset: 0,
-        }));
+        assert!(
+            ofm.handle_accept(
+                &mut wire,
+                &FileAccept {
+                    transfer_id: 10,
+                    resume_offset: 0,
+                    initial_window_end_offset: 0,
+                },
+                1,
+                &tx_chan,
+            )
+            .await
+        );
         // Bulk pause MUST block even FILE_COMPLETE for a 0-byte file.
         wire.bulk_paused = true;
         ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
@@ -5824,11 +6034,19 @@ mod tests {
         .await;
         wire.frames.clear();
 
-        assert!(ofm.handle_accept(&FileAccept {
-            transfer_id: 11,
-            resume_offset: 0,
-            initial_window_end_offset: 2048,
-        }));
+        assert!(
+            ofm.handle_accept(
+                &mut wire,
+                &FileAccept {
+                    transfer_id: 11,
+                    resume_offset: 0,
+                    initial_window_end_offset: 2048,
+                },
+                1,
+                &tx_chan,
+            )
+            .await
+        );
 
         // Inject Backpressure on chunk 0: must rewind cursor and send exact bytes 0..1024 on retry!
         wire.inject_backpressure_once = true;
@@ -5860,12 +6078,13 @@ mod tests {
         ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
         assert!(wire.frames.is_empty());
 
-        // Spoofed ACK past total_bytes is ignored without unlocking FILE_COMPLETE.
+        // Spoofed ACK past total_bytes is ignored without mutating acked_offset or unlocking FILE_COMPLETE.
         assert!(ofm.handle_ack(&FileAck {
             transfer_id: 11,
             next_expected_offset: 4096,
             window_end_offset: 4096,
         }));
+        assert_eq!(ofm.active.get(&11).unwrap().acked_offset, 1024);
         ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
         assert!(wire.frames.is_empty());
 
@@ -5925,6 +6144,244 @@ mod tests {
             }
         }
         assert!(saw_timeout, "expected Timeout CommandResult for cmd_id=203");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    struct ControllableClipTx {
+        frames: Vec<(u8, Vec<u8>)>,
+        backpressure_count: usize,
+    }
+
+    impl ClipL4Sender for ControllableClipTx {
+        fn send_clip_l4<'a>(
+            &'a mut self,
+            msg_type: u8,
+            body: &'a [u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>,
+        > {
+            let body_owned = body.to_vec();
+            Box::pin(async move {
+                if self.backpressure_count > 0 {
+                    self.backpressure_count -= 1;
+                    return Err(FileSendError::Backpressure);
+                }
+                self.frames.push((msg_type, body_owned));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_file_manager_resume_offset_ctrl_priority_and_clip_queue() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("zd-ft-res-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let allow_pol = allow_file_policy(16);
+        let deny_pol = EffectiveTenantPolicy::degraded([1; 16], [2; 32], "denied");
+        let (tx_chan, _rx_chan) = mpsc::channel::<ActorMessage>(64);
+        let mut ofm = OutboundFileManager::new();
+        let mut wire = ControllableFileTx {
+            frames: Vec::new(),
+            bulk_paused: false,
+            inject_backpressure_once: false,
+        };
+
+        let payload: Vec<u8> = (0..2048usize).map(|i| ((i * 19 + 3) & 0xFF) as u8).collect();
+        let path = base.join("resume_me.bin");
+        std::fs::write(&path, &payload).unwrap();
+
+        // 1. resume_offset == total_bytes > 0 -> immediately emits FILE_COMPLETE without chunks
+        ofm.start_transfer(
+            &mut wire,
+            30,
+            301,
+            path.clone(),
+            "resume_me.bin".into(),
+            &allow_pol,
+            1,
+            &tx_chan,
+        )
+        .await;
+        wire.frames.clear();
+        assert!(
+            ofm.handle_accept(
+                &mut wire,
+                &FileAccept {
+                    transfer_id: 30,
+                    resume_offset: 2048,
+                    initial_window_end_offset: 2048,
+                },
+                1,
+                &tx_chan,
+            )
+            .await
+        );
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_COMPLETE);
+        assert!(
+            ofm.handle_complete_ack(30, FILE_COMPLETE_ACK_OK, 1, &tx_chan)
+                .await
+        );
+        wire.frames.clear();
+
+        // 2. 0 < resume_offset < total_bytes -> seeks to exact offset, sends 1024..2048, waits for ACK
+        ofm.start_transfer(
+            &mut wire,
+            31,
+            302,
+            path.clone(),
+            "resume_me.bin".into(),
+            &allow_pol,
+            1,
+            &tx_chan,
+        )
+        .await;
+        wire.frames.clear();
+        assert!(
+            ofm.handle_accept(
+                &mut wire,
+                &FileAccept {
+                    transfer_id: 31,
+                    resume_offset: 1024,
+                    initial_window_end_offset: 2048,
+                },
+                1,
+                &tx_chan,
+            )
+            .await
+        );
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_CHUNK);
+        let resumed_chunk = FileChunk::decode(&wire.frames[0].1).unwrap();
+        assert_eq!(resumed_chunk.offset, 1024);
+        assert_eq!(resumed_chunk.data, &payload[1024..]);
+        wire.frames.clear();
+
+        // Must NOT emit FILE_COMPLETE until FILE_ACK(2048) arrives
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(wire.frames.is_empty());
+        assert!(ofm.handle_ack(&FileAck {
+            transfer_id: 31,
+            next_expected_offset: 2048,
+            window_end_offset: 2048,
+        }));
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_COMPLETE);
+        assert!(
+            ofm.handle_complete_ack(31, FILE_COMPLETE_ACK_OK, 1, &tx_chan)
+                .await
+        );
+        wire.frames.clear();
+
+        // 3. Invalid resume_offset > total_bytes -> aborts immediately (does not hang for 30s!)
+        ofm.start_transfer(
+            &mut wire,
+            32,
+            303,
+            path,
+            "resume_me.bin".into(),
+            &allow_pol,
+            1,
+            &tx_chan,
+        )
+        .await;
+        wire.frames.clear();
+        assert!(
+            ofm.handle_accept(
+                &mut wire,
+                &FileAccept {
+                    transfer_id: 32,
+                    resume_offset: 4096,
+                    initial_window_end_offset: 4096,
+                },
+                1,
+                &tx_chan,
+            )
+            .await
+        );
+        assert!(!ofm.has_active());
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_ABORT);
+        wire.frames.clear();
+
+        // 4. Control-frame retry queue priority: evicts oldest FILE_MSG_ACK at cap 128 while
+        //    preserving ACCEPT/COMPLETE_ACK/ABORT; policy deny drops ACCEPT; bulk pause still drains ABORT!
+        for _ in 0..PENDING_FILE_CTRL_CAP {
+            ofm.enqueue_ctrl_retry(FILE_MSG_ACK, b"ack");
+        }
+        ofm.enqueue_ctrl_retry(FILE_MSG_COMPLETE_ACK, b"cack");
+        ofm.enqueue_ctrl_retry(FILE_MSG_ACCEPT, b"acc");
+        ofm.enqueue_ctrl_retry(FILE_MSG_ABORT, b"ab");
+        assert_eq!(ofm.pending_ctrl_frames.len(), PENDING_FILE_CTRL_CAP);
+        assert!(ofm
+            .pending_ctrl_frames
+            .iter()
+            .any(|(mt, _)| *mt == FILE_MSG_COMPLETE_ACK));
+        assert!(ofm
+            .pending_ctrl_frames
+            .iter()
+            .any(|(mt, _)| *mt == FILE_MSG_ACCEPT));
+        assert!(ofm
+            .pending_ctrl_frames
+            .iter()
+            .any(|(mt, _)| *mt == FILE_MSG_ABORT));
+
+        // With policy revoked AND bulk_paused=true: FILE_MSG_ACCEPT dropped, FILE_MSG_ABORT still drains!
+        wire.bulk_paused = true;
+        ofm.pump_one_step(&mut wire, &deny_pol, 1, &tx_chan).await;
+        assert!(!ofm
+            .pending_ctrl_frames
+            .iter()
+            .any(|(mt, _)| *mt == FILE_MSG_ACCEPT));
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_ABORT);
+        wire.frames.clear();
+
+        // 5. PendingClipQueue: backpressure retry, superseded CLIP_MSG_SYNC eviction, and 4 MiB byte cap!
+        let mut clip_tx = ControllableClipTx {
+            frames: Vec::new(),
+            backpressure_count: 2,
+        };
+        let mut clip_q = PendingClipQueue::new();
+        send_or_queue_clip_frame(&mut clip_tx, &mut clip_q, CLIP_MSG_SYNC, b"old-sync").await;
+        send_or_queue_clip_frame(&mut clip_tx, &mut clip_q, CLIP_MSG_CHUNK, b"old-chunk-1").await;
+        assert_eq!(clip_q.frames.len(), 2);
+
+        // Starting a new clipboard transfer (CLIP_MSG_SYNC) evicts stale queued frames!
+        send_or_queue_clip_frame(&mut clip_tx, &mut clip_q, CLIP_MSG_SYNC, b"new-sync").await;
+        send_or_queue_clip_frame(&mut clip_tx, &mut clip_q, CLIP_MSG_CHUNK, b"new-chunk-1").await;
+        assert_eq!(clip_q.frames.len(), 2);
+        assert_eq!(clip_q.frames[0], (CLIP_MSG_SYNC, b"new-sync".to_vec()));
+        assert_eq!(clip_q.frames[1], (CLIP_MSG_CHUNK, b"new-chunk-1".to_vec()));
+
+        // Drain after backpressure clears delivers ONLY the new transfer in order!
+        drain_pending_clip_frames(&mut clip_tx, &mut clip_q).await;
+        assert!(clip_q.is_empty());
+        assert_eq!(clip_q.buffered_bytes, 0);
+        assert_eq!(
+            clip_tx.frames,
+            vec![
+                (CLIP_MSG_SYNC, b"new-sync".to_vec()),
+                (CLIP_MSG_CHUNK, b"new-chunk-1".to_vec()),
+            ]
+        );
+
+        // Hard 4 MiB byte cap prevents unbounded RAM growth even under <256 frames!
+        let big_chunk = vec![0x77u8; 1024 * 1024];
+        for _ in 0..6 {
+            clip_q.push(CLIP_MSG_CHUNK, &big_chunk);
+        }
+        assert_eq!(clip_q.buffered_bytes, PENDING_CLIP_BYTES_CAP);
+        assert_eq!(clip_q.frames.len(), 4);
 
         let _ = std::fs::remove_dir_all(&base);
     }

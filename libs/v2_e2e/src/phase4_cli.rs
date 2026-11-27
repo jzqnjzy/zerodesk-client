@@ -32,7 +32,7 @@ use v2_e2e::{
     AuditRecord, ChannelFramingErrorCounter, ClipMessage, ClipSync, ClipboardReceiver,
     ClipboardRecvAction, CloseReason, DecodedVideoDelivery, DesktopControllerClient,
     DesktopControllerSession, DesktopHostDaemon, DesktopHostSession, DryRunSink, FileChunk,
-    FileComplete, FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver, HidEchoAck,
+    FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver, HidEchoAck,
     HidInputExecutor, HidPayload, InputError, JitterPlayoutAction, KeyEvent, MouseEvent, MouseKind,
     NoopUiCallback, OpusWireFrame, SafeHidKey, SessionError, SharedVisualMarker,
     SyntheticAnimatedSource, SyntheticMultiToneSource, TransportMode, UiCallbackDispatcher,
@@ -1537,10 +1537,7 @@ async fn push_file_transfer_p4b(
             }
         }
         if !complete_sent && !bulk_paused && win.ready_for_complete() {
-            let comp = FileComplete {
-                transfer_id,
-                sha256,
-            };
+            let comp = win.peek_complete();
             match session
                 .send_l4_raw(
                     CHAN_FILE_TRANSFER,
@@ -1552,7 +1549,7 @@ async fn push_file_transfer_p4b(
                 .await
             {
                 Ok(_) => {
-                    let _ = win.build_complete(Instant::now());
+                    win.commit_complete(Instant::now());
                     complete_sent = true;
                     *last_tx = Instant::now();
                 }
@@ -1976,6 +1973,11 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                 // to verify Edge L2 allowed_mask AND remote Host defense-in-depth!
                 let expect_clip_deny = clipboard_local_policy_denied;
                 let expect_file_deny = file_local_policy_denied;
+                // When BOTH clipboard and file transfer are denied, Edge L2 drops all p3 frames,
+                // so use `send_negative_policy_probe` (bypasses ARQ with stream_seq=u32::MAX).
+                // When only ONE channel is denied, Edge forwards p3 to Host, so use
+                // `send_l4_bypass_local_policy` (keeps ARQ) to reliably elicit Host's
+                // FILE_ABORT(0x0401) or CLIP_ACK(POLICY_DENIED).
                 let edge_drops_p3 = expect_clip_deny && expect_file_deny;
 
                 if expect_clip_deny {

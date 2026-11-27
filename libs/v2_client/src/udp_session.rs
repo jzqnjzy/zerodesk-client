@@ -940,6 +940,20 @@ impl UdpE2eeSession {
                     if header.flags.pp != 0 {
                         continue;
                     }
+                    // Noise_IK msg2 minimum size is 32B ephemeral pubkey + 16B AEAD tag.
+                    // Reject short junk before touching snow HandshakeState; snow 0.10 restores
+                    // its symmetricstate checkpoint on read_message AEAD failure.
+                    const NOISE_IK_MSG2_MIN_LEN: usize = 48;
+                    if payload.len() < NOISE_IK_MSG2_MIN_LEN {
+                        bad_msg2_attempts = bad_msg2_attempts.saturating_add(1);
+                        if bad_msg2_attempts >= MAX_HANDSHAKE_INITIATOR_BAD_MSG2 {
+                            return Err(ClientError::Protocol(format!(
+                                "E2EE Noise_IK msg2 too short ({}B < {NOISE_IK_MSG2_MIN_LEN}B)",
+                                payload.len()
+                            )));
+                        }
+                        continue;
+                    }
                     match hs.read_message(&payload) {
                         Ok(_) => break payload,
                         Err(e) => {
@@ -1259,6 +1273,11 @@ impl UdpE2eeSession {
         body: &[u8],
     ) -> Result<u32, ClientError> {
         if is_p3_channel(chan_id) {
+            if discardable || !frame_end || frame_id != 0 {
+                return Err(ClientError::Protocol(format!(
+                    "p3 chan {chan_id:#04x} requires discardable=false, frame_end=true, frame_id=0"
+                )));
+            }
             self.poll_arq().await?;
             let tx = self
                 .p3_arq
@@ -1365,6 +1384,8 @@ impl UdpE2eeSession {
                 .await
             }
             CHAN_AUDIO => {
+                // CHAN_AUDIO (0x02, pp=1) is not a p3 channel (`!is_p3_channel(CHAN_AUDIO)`)
+                // and therefore never enters P3ArqEngine.
                 self.send_l4_internal(chan_id, msg_type, 0, false, true, 0, body)
                     .await
             }
@@ -3218,13 +3239,20 @@ mod tests {
                             } else if let Some(dst) = peer_a {
                                 if hdr.flags.pp == 0 {
                                     b2a_pp0_seen += 1;
-                                    // Drop the FIRST msg2 and inject early pp=1 Audio, pp=2 Video, AND 2 corrupt pp=0 packets!
+                                    // Drop the FIRST msg2 and inject early pp=1 Audio, pp=2 Video,
+                                    // a truncated <48B pp=0 packet, AND a full-length >=48B tampered
+                                    // copy of msg2 (flipping the AEAD tag to empirically prove snow 0.10
+                                    // restores symmetricstate checkpoint on AEAD failure)!
                                     if b2a_pp0_seen == 1 {
+                                        let mut tampered_msg2 = body.to_vec();
+                                        if let Some(last) = tampered_msg2.last_mut() {
+                                            *last ^= 0xFF;
+                                        }
                                         for (pp, payload) in [
                                             (1u8, b"early-audio-before-msg2".as_slice()),
                                             (2u8, b"early-video-before-msg2".as_slice()),
-                                            (0u8, b"corrupt-pp0-packet-1".as_slice()),
-                                            (0u8, b"corrupt-pp0-packet-2".as_slice()),
+                                            (0u8, b"short-corrupt-pp0".as_slice()),
+                                            (0u8, tampered_msg2.as_slice()),
                                         ] {
                                             let inj = AccessHeaderV11 {
                                                 flags: AccessFlags {
@@ -3340,5 +3368,74 @@ mod tests {
 
         let _ = stop_tx.send(()).await;
         relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn handshake_initiator_fails_closed_after_8_corrupt_pp0_packets() {
+        let edge_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge_addr = edge_sock.local_addr().unwrap();
+        let cid = [0x91; 8];
+        let hs = [0x92; 32];
+        let keys = AccessKeys::derive(cid, hs, 0).unwrap();
+        let mut link = UdpAccessLink::connect(&edge_addr.to_string(), &keys, 10_000)
+            .await
+            .unwrap();
+        link.auto_leg_nack = false;
+
+        let kb = keys.clone();
+        let edge_task = tokio::spawn(async move {
+            let mut rx_ep =
+                AccessEpochState::new(cid, hs, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut buf = [0u8; 2048];
+            let (n, peer) = edge_sock.recv_from(&mut buf).await.unwrap();
+            let _ = rx_ep.verify_udp_packet(&buf[..n], now_ms()).unwrap();
+            for seq in 1..=(MAX_HANDSHAKE_INITIATOR_BAD_MSG2 as u32) {
+                let hdr = AccessHeaderV11 {
+                    flags: AccessFlags {
+                        pp: 0,
+                        discardable: false,
+                        frame_end: false,
+                        is_ctrl_edge: false,
+                        dir_edge_to_client: true,
+                        rtx: false,
+                    },
+                    route_cid: cid,
+                    access_epoch: 0,
+                    leg_seq: seq,
+                    mac_64: [0; 8],
+                };
+                let corrupt_msg2 = vec![0xA5u8; 64];
+                let w = seal_udp_v11(&kb.udp_key_e2c, hdr, &corrupt_msg2).unwrap();
+                let _ = edge_sock.send_to(&w, peer).await;
+            }
+        });
+
+        let fx = build_handshake_fixture();
+        let err = match UdpE2eeSession::handshake_initiator(
+            link,
+            &fx.prologue,
+            &fx.priv_a,
+            &fx.pub_b,
+            &fx.deleg_b,
+            &fx.dev_b,
+            &fx.spki_b,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_a,
+            fx.dev_a,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(4),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected handshake to fail closed after 8 corrupt pp=0 packets"),
+            Err(e) => e,
+        };
+        assert!(
+            !matches!(err, ClientError::Timeout(_)),
+            "expected immediate fail-closed Noise/Protocol error, got {err:?}"
+        );
+        edge_task.await.unwrap();
     }
 }

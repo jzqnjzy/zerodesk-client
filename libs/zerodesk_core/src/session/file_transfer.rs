@@ -810,24 +810,31 @@ impl FileSenderWindow {
                 reason: "FILE_ACCEPT transfer_id mismatch".into(),
             });
         }
-        if accept.resume_offset != 0 {
+        if accept.resume_offset > self.file_size {
             return Err(FileTransferError::InvalidFraming {
                 error_code: FILE_ERR_INVALID_FRAMING,
-                reason: "FILE_ACCEPT resume_offset must be 0".into(),
+                reason: format!(
+                    "FILE_ACCEPT resume_offset({}) > file_size({})",
+                    accept.resume_offset, self.file_size
+                ),
             });
         }
         if accept.initial_window_end_offset > self.file_size
-            || (self.file_size >= 1 && accept.initial_window_end_offset == 0)
+            || accept.initial_window_end_offset < accept.resume_offset
+            || (accept.resume_offset < self.file_size
+                && accept.initial_window_end_offset == accept.resume_offset)
         {
             return Err(FileTransferError::InvalidFraming {
                 error_code: FILE_ERR_INVALID_FRAMING,
                 reason: format!(
-                    "FILE_ACCEPT initial_window_end_offset={} invalid for file_size={}",
-                    accept.initial_window_end_offset, self.file_size
+                    "FILE_ACCEPT initial_window_end_offset={} invalid for resume_offset={} file_size={}",
+                    accept.initial_window_end_offset, accept.resume_offset, self.file_size
                 ),
             });
         }
         self.accepted = true;
+        self.max_sent_offset = accept.resume_offset;
+        self.next_expected_offset = accept.resume_offset;
         self.window_end_offset = accept.initial_window_end_offset;
         self.last_progress_at = now;
         Ok(())
@@ -920,13 +927,21 @@ impl FileSenderWindow {
         self.accepted && !self.complete_sent && self.next_expected_offset == self.file_size
     }
 
-    pub fn build_complete(&mut self, now: Instant) -> FileComplete {
-        self.complete_sent = true;
-        self.last_progress_at = now;
+    pub fn peek_complete(&self) -> FileComplete {
         FileComplete {
             transfer_id: self.transfer_id,
             sha256: self.sha256,
         }
+    }
+
+    pub fn commit_complete(&mut self, now: Instant) {
+        self.complete_sent = true;
+        self.last_progress_at = now;
+    }
+
+    pub fn build_complete(&mut self, now: Instant) -> FileComplete {
+        self.commit_complete(now);
+        self.peek_complete()
     }
 
     pub fn is_stalled(&self, now: Instant) -> bool {
@@ -2028,5 +2043,67 @@ mod tests {
             other => panic!("expected SendCompleteAck for 0-byte file, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sender_window_resume_offset_full_and_partial_boundaries() {
+        let now = Instant::now();
+        let pol = allow_file_policy(16);
+        let payload = vec![0xCDu8; 2048];
+        let sha: [u8; 32] = Sha256::digest(&payload).into();
+
+        // 1. resume_offset == file_size (2048) -> immediately ready_for_complete without chunks!
+        let (mut full_resume, _) =
+            FileSenderWindow::new(&pol, 21, "resumed_full.bin", 2048, 1024, sha, now).unwrap();
+        full_resume
+            .on_accept(
+                &FileAccept {
+                    transfer_id: 21,
+                    resume_offset: 2048,
+                    initial_window_end_offset: 2048,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(full_resume.next_expected_offset(), 2048);
+        assert_eq!(full_resume.max_sent_offset(), 2048);
+        assert!(full_resume.next_chunk_range(false).is_none());
+        assert!(full_resume.ready_for_complete());
+        let peeked = full_resume.peek_complete();
+        assert_eq!(peeked.transfer_id, 21);
+        assert_eq!(peeked.sha256, sha);
+        assert!(full_resume.ready_for_complete(), "peek_complete must not mark complete_sent");
+        full_resume.commit_complete(now);
+        assert!(!full_resume.ready_for_complete());
+
+        // 2. partial resume_offset = 1024 < 2048 -> NOT ready until remaining 1024B sent AND ACKed!
+        let (mut partial_resume, _) =
+            FileSenderWindow::new(&pol, 22, "resumed_partial.bin", 2048, 1024, sha, now).unwrap();
+        partial_resume
+            .on_accept(
+                &FileAccept {
+                    transfer_id: 22,
+                    resume_offset: 1024,
+                    initial_window_end_offset: 2048,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(partial_resume.next_expected_offset(), 1024);
+        assert!(!partial_resume.ready_for_complete());
+        assert_eq!(partial_resume.next_chunk_range(false), Some((1024, 1024)));
+        partial_resume.mark_chunk_sent(1024, 1024, now);
+        assert!(!partial_resume.ready_for_complete());
+        partial_resume
+            .on_ack(
+                &FileAck {
+                    transfer_id: 22,
+                    next_expected_offset: 2048,
+                    window_end_offset: 2048,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(partial_resume.ready_for_complete());
     }
 }

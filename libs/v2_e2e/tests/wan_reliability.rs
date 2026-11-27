@@ -12,10 +12,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::UdpSocket, sync::mpsc};
@@ -23,10 +20,10 @@ use v2_client::{AccessKeys, UdpAccessLink, UdpE2eeSession, V2RecvEvent};
 use v2_e2e::{
     decode_clipboard_l4, decode_file_l4, prepare_outbound_clipboard, ChannelFramingErrorCounter,
     ClipMessage, ClipboardReceiver, ClipboardRecvAction, EffectiveTenantPolicy, FileChunk,
-    FileComplete, FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver,
-    CLIP_ACK_OK, CLIP_MIME_IMAGE_PNG, CLIP_MSG_ACK, CLIP_MSG_CHUNK, CLIP_MSG_SYNC,
-    FILE_COMPLETE_ACK_OK, FILE_ERR_POLICY_DENIED, FILE_MSG_ABORT, FILE_MSG_ACCEPT, FILE_MSG_ACK,
-    FILE_MSG_CHUNK, FILE_MSG_COMPLETE, FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER,
+    FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver, CLIP_ACK_OK,
+    CLIP_MIME_IMAGE_PNG, CLIP_MSG_ACK, CLIP_MSG_CHUNK, CLIP_MSG_SYNC, FILE_COMPLETE_ACK_OK,
+    FILE_ERR_POLICY_DENIED, FILE_MSG_ABORT, FILE_MSG_ACCEPT, FILE_MSG_ACK, FILE_MSG_CHUNK,
+    FILE_MSG_COMPLETE, FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER,
 };
 use v2_transport::{
     seal_udp_v11, AccessEpochState, AccessFlags, AccessHeaderV11, EdgeCtrlFrame,
@@ -169,11 +166,14 @@ async fn spawn_wan_session_pair(
                 .unwrap();
         let mut peer_a: Option<SocketAddr> = None;
         let mut peer_b: Option<SocketAddr> = None;
-        let seq_to_a = Arc::new(AtomicUsize::new(1));
-        let seq_to_b = Arc::new(AtomicUsize::new(1));
+        let mut seq_to_a = 1u32;
+        let mut seq_to_b = 1u32;
         let mut a2b_p3_seen = 0usize;
         let mut b2a_p3_seen = 0usize;
-        let mut prng = profile.prng_seed;
+        // Separate per-direction fixed-seed PRNGs so drop/reorder decisions are 100% deterministic
+        // independent of tokio::select! polling order.
+        let mut prng_a2b = profile.prng_seed;
+        let mut prng_b2a = profile.prng_seed ^ 0x9E37_79B9_7F4A_7C15;
         let mut ba = [0u8; 4096];
         let mut bb = [0u8; 4096];
 
@@ -184,7 +184,7 @@ async fn spawn_wan_session_pair(
                     peer_a = Some(src);
                     if let Ok((hdr, body)) = rx_a.verify_udp_packet(&ba[..n], 100) {
                         if hdr.flags.is_ctrl_edge {
-                            if let Ok(EdgeCtrlFrame::Ping { ts_us }) = v2_transport::EdgeCtrlFrame::decode(body) {
+                            if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
                                 let ph = AccessHeaderV11 {
                                     flags: AccessFlags {
                                         pp: 0, discardable: false, frame_end: false,
@@ -195,9 +195,16 @@ async fn spawn_wan_session_pair(
                                 let w = seal_udp_v11(
                                     &ka.udp_key_e2c,
                                     ph,
-                                    &v2_transport::EdgeCtrlFrame::Pong { ts_us }.encode(),
+                                    &EdgeCtrlFrame::Pong { ts_us }.encode(),
                                 ).unwrap();
-                                let _ = ra.send_to(&w, src).await;
+                                let sock_out = Arc::clone(&ra);
+                                let ping_delay_ms = profile.one_way_ms;
+                                tokio::spawn(async move {
+                                    if ping_delay_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(ping_delay_ms)).await;
+                                    }
+                                    let _ = sock_out.send_to(&w, src).await;
+                                });
                             }
                         } else if let Some(dst) = peer_b {
                             let is_p3 = hdr.flags.pp == 3;
@@ -207,7 +214,7 @@ async fn spawn_wan_session_pair(
                                     continue;
                                 }
                             }
-                            if profile.drop_pct_a2b > 0 && (xorshift64(&mut prng) % 100) < u64::from(profile.drop_pct_a2b) {
+                            if profile.drop_pct_a2b > 0 && (xorshift64(&mut prng_a2b) % 100) < u64::from(profile.drop_pct_a2b) {
                                 continue;
                             }
                             let mut delay_ms = profile.one_way_ms;
@@ -218,19 +225,21 @@ async fn spawn_wan_session_pair(
                                     }
                                 }
                             }
-                            if profile.reorder_pct > 0 && (xorshift64(&mut prng) % 100) < u64::from(profile.reorder_pct) {
+                            if profile.reorder_pct > 0 && (xorshift64(&mut prng_a2b) % 100) < u64::from(profile.reorder_pct) {
                                 delay_ms = delay_ms.saturating_add(profile.reorder_extra_ms);
                             }
+                            // Assign leg_seq at ingress BEFORE spawning delayed delivery so
+                            // reordered packets arrive with genuine out-of-order leg_seq.
+                            let leg_seq = seq_to_b;
+                            seq_to_b = seq_to_b.wrapping_add(1);
                             let payload = body.to_vec();
                             let flags = hdr.flags;
                             let sock_out = Arc::clone(&rb);
-                            let seq_counter = Arc::clone(&seq_to_b);
                             let key_out = *kb.udp_key_e2c;
                             tokio::spawn(async move {
                                 if delay_ms > 0 {
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                 }
-                                let leg_seq = seq_counter.fetch_add(1, Ordering::Relaxed) as u32;
                                 let fh = AccessHeaderV11 {
                                     flags: AccessFlags {
                                         pp: flags.pp,
@@ -255,7 +264,7 @@ async fn spawn_wan_session_pair(
                     peer_b = Some(src);
                     if let Ok((hdr, body)) = rx_b.verify_udp_packet(&bb[..n], 100) {
                         if hdr.flags.is_ctrl_edge {
-                            if let Ok(EdgeCtrlFrame::Ping { ts_us }) = v2_transport::EdgeCtrlFrame::decode(body) {
+                            if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
                                 let ph = AccessHeaderV11 {
                                     flags: AccessFlags {
                                         pp: 0, discardable: false, frame_end: false,
@@ -266,9 +275,16 @@ async fn spawn_wan_session_pair(
                                 let w = seal_udp_v11(
                                     &kb.udp_key_e2c,
                                     ph,
-                                    &v2_transport::EdgeCtrlFrame::Pong { ts_us }.encode(),
+                                    &EdgeCtrlFrame::Pong { ts_us }.encode(),
                                 ).unwrap();
-                                let _ = rb.send_to(&w, src).await;
+                                let sock_out = Arc::clone(&rb);
+                                let ping_delay_ms = profile.one_way_ms;
+                                tokio::spawn(async move {
+                                    if ping_delay_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(ping_delay_ms)).await;
+                                    }
+                                    let _ = sock_out.send_to(&w, src).await;
+                                });
                             }
                         } else if let Some(dst) = peer_a {
                             let is_p3 = hdr.flags.pp == 3;
@@ -278,23 +294,23 @@ async fn spawn_wan_session_pair(
                                     continue;
                                 }
                             }
-                            if profile.drop_pct_b2a > 0 && (xorshift64(&mut prng) % 100) < u64::from(profile.drop_pct_b2a) {
+                            if profile.drop_pct_b2a > 0 && (xorshift64(&mut prng_b2a) % 100) < u64::from(profile.drop_pct_b2a) {
                                 continue;
                             }
                             let mut delay_ms = profile.one_way_ms;
-                            if profile.reorder_pct > 0 && (xorshift64(&mut prng) % 100) < u64::from(profile.reorder_pct) {
+                            if profile.reorder_pct > 0 && (xorshift64(&mut prng_b2a) % 100) < u64::from(profile.reorder_pct) {
                                 delay_ms = delay_ms.saturating_add(profile.reorder_extra_ms);
                             }
+                            let leg_seq = seq_to_a;
+                            seq_to_a = seq_to_a.wrapping_add(1);
                             let payload = body.to_vec();
                             let flags = hdr.flags;
                             let sock_out = Arc::clone(&ra);
-                            let seq_counter = Arc::clone(&seq_to_a);
                             let key_out = *ka.udp_key_e2c;
                             tokio::spawn(async move {
                                 if delay_ms > 0 {
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                                 }
-                                let leg_seq = seq_counter.fetch_add(1, Ordering::Relaxed) as u32;
                                 let fh = AccessHeaderV11 {
                                     flags: AccessFlags {
                                         pp: flags.pp,
@@ -405,10 +421,7 @@ async fn run_file_transfer_sender_window(
             }
         }
         if !complete_sent && win.ready_for_complete() {
-            let comp = FileComplete {
-                transfer_id,
-                sha256,
-            };
+            let comp = win.peek_complete();
             match sess
                 .send_l4_raw(
                     CHAN_FILE_TRANSFER,
@@ -420,7 +433,7 @@ async fn run_file_transfer_sender_window(
                 .await
             {
                 Ok(_) => {
-                    let _ = win.build_complete(StdInstant::now());
+                    win.commit_complete(StdInstant::now());
                     complete_sent = true;
                 }
                 Err(v2_client::ClientError::P3Backpressure { .. }) => {}
