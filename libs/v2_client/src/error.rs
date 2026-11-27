@@ -35,4 +35,8 @@ pub enum ClientError {
     Identity(#[from] IdentityError),
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
+    #[error("p3 ARQ send window backpressure on channel {chan_id:#04x}")]
+    P3Backpressure { chan_id: u8 },
+    #[error("path failed (0x0502): {0}")]
+    PathFailed(String),
 }

@@ -6,6 +6,7 @@ pub mod bridge;
 pub mod config;
 pub mod control_plane;
 pub mod error;
+pub mod p3_arq;
 pub mod signaling;
 pub mod tls443;
 pub mod udp_session;
@@ -32,6 +33,11 @@ pub use control_plane::{
     POLICY_FETCH_TBS_LEN,
 };
 pub use error::ClientError;
+pub use p3_arq::{
+    is_p3_channel, AckSackFrame, P3ArqEngine, ACK_SACK_STREAM_SEQ, ACK_SACK_WIRE_LEN,
+    CTRL_MSG_ACK_SACK, P3_MAX_INFLIGHT_BYTES, P3_MAX_INFLIGHT_PKTS, P3_PROBE_STREAM_SEQ,
+    P3_RECV_BUF_MAX_BYTES,
+};
 pub use signaling::{
     build_register_pop_tbs, decode_delegation_pb, decode_signaling_frame, encode_delegation_pb,
     encode_signaling_frame, parse_signaling_host, resolve_signaling_tls, HeartbeatMsg,

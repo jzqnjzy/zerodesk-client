@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::p3_arq::P3_PROBE_STREAM_SEQ;
 use crate::{
     access_ctrl::AccessKeys,
     error::ClientError,
+    p3_arq::{
+        is_p3_channel, AckSackFrame, P3ArqEngine, ACK_SACK_STREAM_SEQ, ACK_SACK_WIRE_LEN,
+        CTRL_MSG_ACK_SACK,
+    },
     tls443::{DualTls443Client, StreamRecvEvent},
 };
 use bytes::Bytes;
@@ -11,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, VecDeque},
     net::SocketAddr,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, time::Instant};
 use v2_identity::{ControlPreemptToken, DelegationStatement};
 #[cfg(any(test, feature = "test-utils"))]
 use v2_transport::CIPHER_AESGCM;
@@ -200,6 +206,7 @@ impl ActiveTransportMode {
 
 const UDP_PENDING_RX_CAP: usize = 512;
 const MAX_HANDSHAKE_RESPONDER_ATTEMPTS: usize = 16;
+const MAX_HANDSHAKE_INITIATOR_BAD_MSG2: usize = 8;
 const MAX_CONSECUTIVE_BAD_L3_FRAMES: u32 = 32;
 
 /// Layer 2 UDP 28B Access Transport link to a single `v2-edge` PoP.
@@ -862,6 +869,7 @@ pub struct UdpE2eeSession {
     actuator_receiver: ActuatorReceiver,
     stream_dedup: StreamSeqDedup,
     next_stream_seq: [u32; 9],
+    p3_arq: P3ArqEngine,
     hs_replay: Option<HandshakeReplayCache>,
     invalid_l3_frames_dropped: u64,
 }
@@ -900,6 +908,7 @@ impl UdpE2eeSession {
         })?;
         let mut rtx_interval = HANDSHAKE_RTX_INITIAL_INTERVAL;
         let mut next_rtx = Instant::now().checked_add(rtx_interval).unwrap_or(deadline);
+        let mut bad_msg2_attempts = 0usize;
         let msg2 = loop {
             let now = Instant::now();
             let Some(rem) = deadline
@@ -925,7 +934,23 @@ impl UdpE2eeSession {
                 rem
             };
             match link.recv_packet(slice).await {
-                Ok(UdpRecvEvent::L3Data { payload, .. }) => break payload,
+                Ok(UdpRecvEvent::L3Data { header, payload }) => {
+                    // Responder always sends Noise_IK msg2 on pp=0; silently discard early
+                    // pp=1/2/3 media/bulk packets that overtook a delayed or dropped msg2.
+                    if header.flags.pp != 0 {
+                        continue;
+                    }
+                    match hs.read_message(&payload) {
+                        Ok(_) => break payload,
+                        Err(e) => {
+                            bad_msg2_attempts = bad_msg2_attempts.saturating_add(1);
+                            if bad_msg2_attempts >= MAX_HANDSHAKE_INITIATOR_BAD_MSG2 {
+                                return Err(e.into());
+                            }
+                            continue;
+                        }
+                    }
+                }
                 Ok(UdpRecvEvent::EdgeCtrl(_)) => continue,
                 Err(ClientError::Timeout(_)) => {
                     let now = Instant::now();
@@ -941,7 +966,6 @@ impl UdpE2eeSession {
                 Err(e) => return Err(e),
             }
         };
-        let _ = hs.read_message(&msg2)?;
         let out = hs.finish_split(
             Some(peer_delegation),
             expected_peer_device_id,
@@ -1056,6 +1080,7 @@ impl UdpE2eeSession {
             actuator_receiver: ActuatorReceiver::new(tenant_id, local_device_id, 1),
             stream_dedup: StreamSeqDedup::default(),
             next_stream_seq: [0; 9],
+            p3_arq: P3ArqEngine::new(),
             hs_replay: None,
             invalid_l3_frames_dropped: 0,
         }
@@ -1081,6 +1106,7 @@ impl UdpE2eeSession {
             actuator_receiver: ActuatorReceiver::new(tenant_id, local_device_id, 1),
             stream_dedup: StreamSeqDedup::default(),
             next_stream_seq: [0; 9],
+            p3_arq: P3ArqEngine::new(),
             hs_replay: None,
             invalid_l3_frames_dropped: 0,
         }
@@ -1137,12 +1163,50 @@ impl UdpE2eeSession {
             .apply_preempt_token(token, ca_spki_der, now_unix)?)
     }
 
+    pub fn next_arq_deadline(&self) -> Option<Instant> {
+        self.p3_arq.next_deadline(Instant::now())
+    }
+
+    pub async fn poll_arq(&mut self) -> Result<(), ClientError> {
+        let actions = self.p3_arq.poll_due(Instant::now())?;
+        for ack in actions.acks {
+            self.send_ack_sack(&ack).await?;
+        }
+        for rtx in actions.retransmits {
+            self.send_l4_with_seq(
+                rtx.chan_id,
+                rtx.msg_type,
+                rtx.flags,
+                rtx.stream_seq,
+                false,
+                true,
+                0,
+                &rtx.body,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub fn p3_arq_inflight_pkts(&self, chan_id: u8) -> usize {
+        self.p3_arq.inflight_pkts(chan_id)
+    }
+
+    pub fn p3_arq_inflight_bytes(&self, chan_id: u8) -> usize {
+        self.p3_arq.inflight_bytes(chan_id)
+    }
+
+    pub fn p3_arq_rtx_sent(&self, chan_id: u8) -> u64 {
+        self.p3_arq.rtx_sent_total(chan_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    async fn send_l4_internal(
+    async fn send_l4_with_seq(
         &mut self,
         chan_id: u8,
         msg_type: u8,
         flags: u8,
+        stream_seq: u32,
         discardable: bool,
         frame_end: bool,
         frame_id: u32,
@@ -1152,10 +1216,6 @@ impl UdpE2eeSession {
             .ok_or_else(|| TransportError::InvalidFraming(format!("unknown chan_id {chan_id}")))?;
         let body_len = u16::try_from(body.len())
             .map_err(|_| TransportError::InvalidFraming("L4 body exceeds u16::MAX".into()))?;
-        let idx = chan_id as usize;
-        let stream_seq = self.next_stream_seq[idx];
-        self.next_stream_seq[idx] = stream_seq.wrapping_add(1);
-
         let l4_hdr = L4Header {
             msg_type,
             flags,
@@ -1168,6 +1228,68 @@ impl UdpE2eeSession {
         self.link
             .send_l3_packet(pp, discardable, frame_end, frame_id, &l3_wire)
             .await
+    }
+
+    async fn send_ack_sack(&mut self, ack: &AckSackFrame) -> Result<(), ClientError> {
+        let payload = ack.encode();
+        let _ = self
+            .send_l4_with_seq(
+                CHAN_TRANSPORT_CTRL,
+                CTRL_MSG_ACK_SACK,
+                0,
+                ACK_SACK_STREAM_SEQ,
+                false,
+                true,
+                0,
+                &payload,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_l4_internal(
+        &mut self,
+        chan_id: u8,
+        msg_type: u8,
+        flags: u8,
+        discardable: bool,
+        frame_end: bool,
+        frame_id: u32,
+        body: &[u8],
+    ) -> Result<u32, ClientError> {
+        if is_p3_channel(chan_id) {
+            self.poll_arq().await?;
+            let tx = self
+                .p3_arq
+                .enqueue_send(chan_id, msg_type, flags, body, Instant::now())?;
+            return self
+                .send_l4_with_seq(
+                    chan_id,
+                    tx.msg_type,
+                    tx.flags,
+                    tx.stream_seq,
+                    false,
+                    true,
+                    0,
+                    &tx.body,
+                )
+                .await;
+        }
+        let idx = chan_id as usize;
+        let stream_seq = self.next_stream_seq[idx];
+        self.next_stream_seq[idx] = stream_seq.wrapping_add(1);
+        self.send_l4_with_seq(
+            chan_id,
+            msg_type,
+            flags,
+            stream_seq,
+            discardable,
+            frame_end,
+            frame_id,
+            body,
+        )
+        .await
     }
 
     pub async fn send_channel_frame(
@@ -1217,11 +1339,47 @@ impl UdpE2eeSession {
         }
     }
 
-    /// Sends a raw negative-test wire probe on `0x02 Audio`, `0x04 Clipboard`, or `0x05 FileTransfer`
-    /// bypassing only the local policy check so E2E harnesses can verify Edge + remote Host
-    /// defense-in-depth rejection. Never permits `CHAN_INPUT_HID` or `CHAN_REALTIME_ACTUATOR`.
+    /// Sends a raw negative-test wire probe expected to be dropped at Edge L2 (`AllDenied`),
+    /// bypassing both local policy and `p3` ARQ (`stream_seq = u32::MAX`) so Edge-dropped probes
+    /// create zero ARQ retries or sequence holes. Never permits `CHAN_INPUT_HID` or
+    /// `CHAN_REALTIME_ACTUATOR`.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn send_negative_policy_probe(
+        &mut self,
+        chan_id: u8,
+        msg_type: u8,
+        body: &[u8],
+    ) -> Result<u32, ClientError> {
+        match chan_id {
+            CHAN_CLIPBOARD | CHAN_FILE_TRANSFER => {
+                self.send_l4_with_seq(
+                    chan_id,
+                    msg_type,
+                    0,
+                    P3_PROBE_STREAM_SEQ,
+                    false,
+                    true,
+                    0,
+                    body,
+                )
+                .await
+            }
+            CHAN_AUDIO => {
+                self.send_l4_internal(chan_id, msg_type, 0, false, true, 0, body)
+                    .await
+            }
+            _ => Err(TransportError::InvalidFraming(format!(
+                "send_negative_policy_probe only permits Audio/Clipboard/FileTransfer, got {chan_id:#04x}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Sends a raw wire frame bypassing only the local policy check while retaining full `p3` ARQ
+    /// reliability so partial-deny tests (where Edge forwards `p3` and remote Host must reply
+    /// `POLICY_DENIED` / `FILE_ABORT(0x0401)`) remain reliable under WAN loss.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn send_l4_bypass_local_policy(
         &mut self,
         chan_id: u8,
         msg_type: u8,
@@ -1233,7 +1391,7 @@ impl UdpE2eeSession {
                     .await
             }
             _ => Err(TransportError::InvalidFraming(format!(
-                "send_negative_policy_probe only permits Audio/Clipboard/FileTransfer, got {chan_id:#04x}"
+                "send_l4_bypass_local_policy only permits Audio/Clipboard/FileTransfer, got {chan_id:#04x}"
             ))
             .into()),
         }
@@ -1331,14 +1489,44 @@ impl UdpE2eeSession {
         &mut self,
         deadline: Instant,
     ) -> Result<(u8, L4Header, Vec<u8>, u64), ClientError> {
+        self.poll_arq().await?;
         let mut consecutive_bad_l3 = 0u32;
         loop {
-            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            if let Some(ready) = self.p3_arq.pop_ready() {
+                return Ok((ready.chan_id, ready.header, ready.body.to_vec(), now_ms()));
+            }
+            let now_inst = Instant::now();
+            let Some(rem) = deadline.checked_duration_since(now_inst) else {
                 return Err(ClientError::Timeout("E2EE recv_event timed out".into()));
             };
-            let (hdr, l3_bytes) = match self.link.recv_packet(rem).await? {
-                UdpRecvEvent::EdgeCtrl(_) => continue,
-                UdpRecvEvent::L3Data { header, payload } => (header, payload),
+            let wait = if let Some(arq_dl) = self.p3_arq.next_deadline(now_inst) {
+                match arq_dl.checked_duration_since(now_inst) {
+                    Some(until_arq) if !until_arq.is_zero() => rem.min(until_arq),
+                    _ => {
+                        self.poll_arq().await?;
+                        continue;
+                    }
+                }
+            } else {
+                rem
+            };
+            let (hdr, l3_bytes) = match self.link.recv_packet(wait).await {
+                Ok(UdpRecvEvent::EdgeCtrl(_)) => {
+                    self.poll_arq().await?;
+                    continue;
+                }
+                Ok(UdpRecvEvent::L3Data { header, payload }) => (header, payload),
+                Err(ClientError::Timeout(_)) => {
+                    self.poll_arq().await?;
+                    if self.p3_arq.has_ready() {
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(ClientError::Timeout("E2EE recv_event timed out".into()));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             if let Some(cache) = &self.hs_replay {
                 let expired = match cache {
@@ -1386,6 +1574,26 @@ impl UdpE2eeSession {
                 }
             };
             let (l4_hdr, body) = decode_l4_frame(&pt)?;
+            if l3_hdr.chan_id == CHAN_TRANSPORT_CTRL
+                && l4_hdr.msg_type == CTRL_MSG_ACK_SACK
+                && body.len() == ACK_SACK_WIRE_LEN
+                && is_p3_channel(body[0])
+            {
+                let ack = AckSackFrame::decode(body)?;
+                self.p3_arq.on_recv_ack(&ack, Instant::now());
+                self.poll_arq().await?;
+                continue;
+            }
+            if is_p3_channel(l3_hdr.chan_id) {
+                self.p3_arq.on_recv_data(
+                    l3_hdr.chan_id,
+                    l4_hdr,
+                    Bytes::copy_from_slice(body),
+                    Instant::now(),
+                )?;
+                self.poll_arq().await?;
+                continue;
+            }
             if !self.stream_dedup.mark_if_new(l3_hdr.chan_id, l4_hdr.stream_seq) {
                 continue;
             }
@@ -2666,5 +2874,471 @@ mod tests {
 
         let _ = fixture.stop_tx.send(()).await;
         fixture.relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn p3_arq_sack_hole_rtx_uses_fresh_l3_unified_seq_and_same_stream_seq() {
+        let relay_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = relay_a.local_addr().unwrap();
+        let addr_b = relay_b.local_addr().unwrap();
+
+        let cid_a = [0x51; 8];
+        let cid_b = [0x52; 8];
+        let hs_a = [0x53; 32];
+        let hs_b = [0x54; 32];
+        let keys_a = AccessKeys::derive(cid_a, hs_a, 0).unwrap();
+        let keys_b = AccessKeys::derive(cid_b, hs_b, 0).unwrap();
+
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let seen_p3_l3_seqs = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+        let seen_clone = Arc::clone(&seen_p3_l3_seqs);
+        let ka = keys_a.clone();
+        let kb = keys_b.clone();
+        let relay_task = tokio::spawn(async move {
+            let mut rx_a =
+                AccessEpochState::new(cid_a, hs_a, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut rx_b =
+                AccessEpochState::new(cid_b, hs_b, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut peer_a: Option<SocketAddr> = None;
+            let mut peer_b: Option<SocketAddr> = None;
+            let mut seq_to_a = 1u32;
+            let mut seq_to_b = 1u32;
+            let mut a2b_p3_idx = 0usize;
+            let mut ba = [0u8; 2048];
+            let mut bb = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    _ = stop_rx.recv() => break,
+                    Ok((n, src)) = relay_a.recv_from(&mut ba) => {
+                        peer_a = Some(src);
+                        if let Ok((hdr, body)) = rx_a.verify_udp_packet(&ba[..n], 100) {
+                            if hdr.flags.is_ctrl_edge {
+                                if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
+                                    let ph = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: 0, discardable: false, frame_end: false,
+                                            is_ctrl_edge: true, dir_edge_to_client: true, rtx: false,
+                                        },
+                                        route_cid: cid_a, access_epoch: 0, leg_seq: 0, mac_64: [0; 8],
+                                    };
+                                    let w = seal_udp_v11(&ka.udp_key_e2c, ph, &EdgeCtrlFrame::Pong { ts_us }.encode()).unwrap();
+                                    let _ = relay_a.send_to(&w, src).await;
+                                }
+                            } else if let Some(dst) = peer_b {
+                                if hdr.flags.pp == 3 {
+                                    // L3 header unified_seq is big-endian u64 in bytes 1..9 of the plaintext L3 header.
+                                    if body.len() >= 9 {
+                                        let u_seq = u64::from_be_bytes([
+                                            body[1], body[2], body[3], body[4],
+                                            body[5], body[6], body[7], body[8],
+                                        ]);
+                                        seen_clone.lock().await.push(u_seq);
+                                    }
+                                    a2b_p3_idx += 1;
+                                    // Drop ONLY the 2nd p3 packet (stream_seq=1) once!
+                                    if a2b_p3_idx == 2 {
+                                        continue;
+                                    }
+                                }
+                                let fh = AccessHeaderV11 {
+                                    flags: AccessFlags {
+                                        pp: hdr.flags.pp, discardable: hdr.flags.discardable, frame_end: false,
+                                        is_ctrl_edge: false, dir_edge_to_client: true, rtx: false,
+                                    },
+                                    route_cid: cid_b, access_epoch: 0, leg_seq: seq_to_b, mac_64: [0; 8],
+                                };
+                                seq_to_b = seq_to_b.wrapping_add(1);
+                                let w = seal_udp_v11(&kb.udp_key_e2c, fh, body).unwrap();
+                                let _ = relay_b.send_to(&w, dst).await;
+                            }
+                        }
+                    }
+                    Ok((n, src)) = relay_b.recv_from(&mut bb) => {
+                        peer_b = Some(src);
+                        if let Ok((hdr, body)) = rx_b.verify_udp_packet(&bb[..n], 100) {
+                            if hdr.flags.is_ctrl_edge {
+                                if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
+                                    let ph = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: 0, discardable: false, frame_end: false,
+                                            is_ctrl_edge: true, dir_edge_to_client: true, rtx: false,
+                                        },
+                                        route_cid: cid_b, access_epoch: 0, leg_seq: 0, mac_64: [0; 8],
+                                    };
+                                    let w = seal_udp_v11(&kb.udp_key_e2c, ph, &EdgeCtrlFrame::Pong { ts_us }.encode()).unwrap();
+                                    let _ = relay_b.send_to(&w, src).await;
+                                }
+                            } else if let Some(dst) = peer_a {
+                                let fh = AccessHeaderV11 {
+                                    flags: AccessFlags {
+                                        pp: hdr.flags.pp, discardable: hdr.flags.discardable, frame_end: false,
+                                        is_ctrl_edge: false, dir_edge_to_client: true, rtx: false,
+                                    },
+                                    route_cid: cid_a, access_epoch: 0, leg_seq: seq_to_a, mac_64: [0; 8],
+                                };
+                                seq_to_a = seq_to_a.wrapping_add(1);
+                                let w = seal_udp_v11(&ka.udp_key_e2c, fh, body).unwrap();
+                                let _ = relay_a.send_to(&w, dst).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut link_a = UdpAccessLink::connect(&addr_a.to_string(), &keys_a, 10_000)
+            .await
+            .unwrap();
+        let mut link_b = UdpAccessLink::connect(&addr_b.to_string(), &keys_b, 10_000)
+            .await
+            .unwrap();
+        link_a.auto_leg_nack = false;
+        link_b.auto_leg_nack = false;
+        link_a.ping_with_retry(1, Duration::from_secs(1)).await.unwrap();
+        link_b.ping_with_retry(1, Duration::from_secs(1)).await.unwrap();
+
+        let allow_pol = VerifiedTenantPolicy {
+            tenant_id: [0x11; 16],
+            policy_version: 1,
+            policy_hash: [0x22; 32],
+            allow_file_transfer: true,
+            allow_clipboard: true,
+            allow_file_clipboard: true,
+            allow_tcp_tunnel: false,
+            allow_terminal: false,
+            allow_realtime_actuator: false,
+            bw_cap_kbps: 20_000,
+            exhaust_policy: QuotaExhaustPolicy::Throttle256Kbps,
+        };
+        let mut sess_a = UdpE2eeSession::from_keys(link_a, [0xA1; 32], [0xB2; 32], allow_pol.clone(), [0x01; 16]);
+        let mut sess_b = UdpE2eeSession::from_keys(link_b, [0xB2; 32], [0xA1; 32], allow_pol, [0x02; 16]);
+
+        // Send 4 p3 frames: seq 0, 1 (dropped!), 2, 3
+        for idx in 0u8..4 {
+            sess_a
+                .send_l4_raw(CHAN_FILE_TRANSFER, 0x03, 0, false, &[idx, 0xCC, 0xDD])
+                .await
+                .unwrap();
+        }
+
+        // Drive both endpoints concurrently so sess_b emits ACK_SACK(cum=0, bitmap=0b110) and
+        // sess_a fast-retransmits seq 1 with a FRESH L3 unified_seq!
+        let recv_task = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while got.len() < 4 {
+                match sess_b.recv_v124_event(Duration::from_secs(2)).await.unwrap() {
+                    V2RecvEvent::FileTransferRaw(raw) => got.push((raw.header.stream_seq, raw.body.to_vec())),
+                    other => panic!("unexpected event on sess_b: {other:?}"),
+                }
+            }
+            // Wait briefly so final ACK reaches sess_a
+            let _ = sess_b.recv_v124_event(Duration::from_millis(40)).await;
+            (sess_b, got)
+        });
+
+        let ack_deadline = Instant::now() + Duration::from_secs(2);
+        while sess_a.p3_arq_inflight_pkts(CHAN_FILE_TRANSFER) > 0 && Instant::now() < ack_deadline {
+            let _ = sess_a.recv_v124_event(Duration::from_millis(20)).await;
+        }
+        let (_sess_b, got) = recv_task.await.unwrap();
+
+        assert_eq!(
+            got,
+            vec![
+                (0, vec![0, 0xCC, 0xDD]),
+                (1, vec![1, 0xCC, 0xDD]),
+                (2, vec![2, 0xCC, 0xDD]),
+                (3, vec![3, 0xCC, 0xDD]),
+            ]
+        );
+        assert!(sess_a.p3_arq_rtx_sent(CHAN_FILE_TRANSFER) >= 1);
+        assert_eq!(sess_a.p3_arq_inflight_pkts(CHAN_FILE_TRANSFER), 0);
+
+        let l3_seqs = seen_p3_l3_seqs.lock().await;
+        assert!(l3_seqs.len() >= 5, "expected original 4 + >=1 rtx, got {l3_seqs:?}");
+        // Every transmitted L3 packet (including RTX of stream_seq=1) MUST have a strictly distinct L3 unified_seq!
+        let unique: BTreeSet<u64> = l3_seqs.iter().copied().collect();
+        assert_eq!(unique.len(), l3_seqs.len());
+
+        let _ = stop_tx.send(()).await;
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn p3_negative_policy_probe_leaves_zero_arq_state_and_stray_u32_max_dropped() {
+        // 1. Dropped probe creates zero ARQ inflight / timers
+        let fx_drop = spawn_lossy_udp_relay_pair(1, 0, false).await;
+        let allow_pol = VerifiedTenantPolicy {
+            tenant_id: [0x11; 16],
+            policy_version: 1,
+            policy_hash: [0x22; 32],
+            allow_file_transfer: true,
+            allow_clipboard: true,
+            allow_file_clipboard: true,
+            allow_tcp_tunnel: false,
+            allow_terminal: false,
+            allow_realtime_actuator: false,
+            bw_cap_kbps: 20_000,
+            exhaust_policy: QuotaExhaustPolicy::Throttle256Kbps,
+        };
+        let mut sess_a =
+            UdpE2eeSession::from_keys(fx_drop.link_a, [0xA1; 32], [0xB2; 32], allow_pol.clone(), [0x01; 16]);
+        let mut sess_b =
+            UdpE2eeSession::from_keys(fx_drop.link_b, [0xB2; 32], [0xA1; 32], allow_pol.clone(), [0x02; 16]);
+
+        sess_a
+            .send_negative_policy_probe(CHAN_FILE_TRANSFER, 0x01, b"dropped-probe")
+            .await
+            .unwrap();
+        assert_eq!(sess_a.p3_arq_inflight_pkts(CHAN_FILE_TRANSFER), 0);
+        assert!(sess_a.next_arq_deadline().is_none());
+
+        // Subsequent real frame MUST start cleanly at stream_seq=0 and deliver without holes!
+        sess_a
+            .send_l4_raw(CHAN_FILE_TRANSFER, 0x01, 0, false, b"real-seq-0")
+            .await
+            .unwrap();
+        match sess_b.recv_v124_event(Duration::from_secs(1)).await.unwrap() {
+            V2RecvEvent::FileTransferRaw(raw) => {
+                assert_eq!(raw.header.stream_seq, 0);
+                assert_eq!(raw.body.as_ref(), b"real-seq-0");
+            }
+            other => panic!("expected real-seq-0, got {other:?}"),
+        }
+        let _ = fx_drop.stop_tx.send(()).await;
+        fx_drop.relay_task.abort();
+
+        // 2. Undropped stray u32::MAX probe arriving at receiver is silently dropped without polluting ARQ
+        let fx_pass = spawn_lossy_udp_relay_pair(0, 0, false).await;
+        let mut sess_a2 =
+            UdpE2eeSession::from_keys(fx_pass.link_a, [0xA1; 32], [0xB2; 32], allow_pol.clone(), [0x01; 16]);
+        let mut sess_b2 =
+            UdpE2eeSession::from_keys(fx_pass.link_b, [0xB2; 32], [0xA1; 32], allow_pol, [0x02; 16]);
+
+        sess_a2
+            .send_negative_policy_probe(CHAN_CLIPBOARD, 0x01, b"stray-probe")
+            .await
+            .unwrap();
+        sess_a2
+            .send_l4_raw(CHAN_CLIPBOARD, 0x01, 0, false, b"valid-clip-0")
+            .await
+            .unwrap();
+        match sess_b2.recv_v124_event(Duration::from_secs(1)).await.unwrap() {
+            V2RecvEvent::ClipboardRaw(raw) => {
+                assert_eq!(raw.header.stream_seq, 0);
+                assert_eq!(raw.body.as_ref(), b"valid-clip-0");
+            }
+            other => panic!("expected valid-clip-0, got {other:?}"),
+        }
+        let _ = fx_pass.stop_tx.send(()).await;
+        fx_pass.relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn handshake_initiator_tolerates_early_media_and_corrupt_pp0_before_delayed_msg2() {
+        let relay_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = relay_a.local_addr().unwrap();
+        let addr_b = relay_b.local_addr().unwrap();
+
+        let cid_a = [0x71; 8];
+        let cid_b = [0x72; 8];
+        let hs_a = [0x73; 32];
+        let hs_b = [0x74; 32];
+        let keys_a = AccessKeys::derive(cid_a, hs_a, 0).unwrap();
+        let keys_b = AccessKeys::derive(cid_b, hs_b, 0).unwrap();
+
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let ka = keys_a.clone();
+        let kb = keys_b.clone();
+        let relay_task = tokio::spawn(async move {
+            let mut rx_a =
+                AccessEpochState::new(cid_a, hs_a, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut rx_b =
+                AccessEpochState::new(cid_b, hs_b, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let mut peer_a: Option<SocketAddr> = None;
+            let mut peer_b: Option<SocketAddr> = None;
+            let mut seq_to_a = 1u32;
+            let mut seq_to_b = 1u32;
+            let mut b2a_pp0_seen = 0usize;
+            let mut ba = [0u8; 2048];
+            let mut bb = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    _ = stop_rx.recv() => break,
+                    Ok((n, src)) = relay_a.recv_from(&mut ba) => {
+                        peer_a = Some(src);
+                        if let Ok((hdr, body)) = rx_a.verify_udp_packet(&ba[..n], 100) {
+                            if hdr.flags.is_ctrl_edge {
+                                if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
+                                    let ph = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: 0, discardable: false, frame_end: false,
+                                            is_ctrl_edge: true, dir_edge_to_client: true, rtx: false,
+                                        },
+                                        route_cid: cid_a, access_epoch: 0, leg_seq: 0, mac_64: [0; 8],
+                                    };
+                                    let w = seal_udp_v11(&ka.udp_key_e2c, ph, &EdgeCtrlFrame::Pong { ts_us }.encode()).unwrap();
+                                    let _ = relay_a.send_to(&w, src).await;
+                                }
+                            } else if let Some(dst) = peer_b {
+                                let fh = AccessHeaderV11 {
+                                    flags: AccessFlags {
+                                        pp: hdr.flags.pp, discardable: hdr.flags.discardable, frame_end: false,
+                                        is_ctrl_edge: false, dir_edge_to_client: true, rtx: false,
+                                    },
+                                    route_cid: cid_b, access_epoch: 0, leg_seq: seq_to_b, mac_64: [0; 8],
+                                };
+                                seq_to_b = seq_to_b.wrapping_add(1);
+                                let w = seal_udp_v11(&kb.udp_key_e2c, fh, body).unwrap();
+                                let _ = relay_b.send_to(&w, dst).await;
+                            }
+                        }
+                    }
+                    Ok((n, src)) = relay_b.recv_from(&mut bb) => {
+                        peer_b = Some(src);
+                        if let Ok((hdr, body)) = rx_b.verify_udp_packet(&bb[..n], 100) {
+                            if hdr.flags.is_ctrl_edge {
+                                if let Ok(EdgeCtrlFrame::Ping { ts_us }) = EdgeCtrlFrame::decode(body) {
+                                    let ph = AccessHeaderV11 {
+                                        flags: AccessFlags {
+                                            pp: 0, discardable: false, frame_end: false,
+                                            is_ctrl_edge: true, dir_edge_to_client: true, rtx: false,
+                                        },
+                                        route_cid: cid_b, access_epoch: 0, leg_seq: 0, mac_64: [0; 8],
+                                    };
+                                    let w = seal_udp_v11(&kb.udp_key_e2c, ph, &EdgeCtrlFrame::Pong { ts_us }.encode()).unwrap();
+                                    let _ = relay_b.send_to(&w, src).await;
+                                }
+                            } else if let Some(dst) = peer_a {
+                                if hdr.flags.pp == 0 {
+                                    b2a_pp0_seen += 1;
+                                    // Drop the FIRST msg2 and inject early pp=1 Audio, pp=2 Video, AND 2 corrupt pp=0 packets!
+                                    if b2a_pp0_seen == 1 {
+                                        for (pp, payload) in [
+                                            (1u8, b"early-audio-before-msg2".as_slice()),
+                                            (2u8, b"early-video-before-msg2".as_slice()),
+                                            (0u8, b"corrupt-pp0-packet-1".as_slice()),
+                                            (0u8, b"corrupt-pp0-packet-2".as_slice()),
+                                        ] {
+                                            let inj = AccessHeaderV11 {
+                                                flags: AccessFlags {
+                                                    pp, discardable: false, frame_end: false,
+                                                    is_ctrl_edge: false, dir_edge_to_client: true, rtx: false,
+                                                },
+                                                route_cid: cid_a, access_epoch: 0, leg_seq: seq_to_a, mac_64: [0; 8],
+                                            };
+                                            seq_to_a = seq_to_a.wrapping_add(1);
+                                            let w = seal_udp_v11(&ka.udp_key_e2c, inj, payload).unwrap();
+                                            let _ = relay_a.send_to(&w, dst).await;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                let fh = AccessHeaderV11 {
+                                    flags: AccessFlags {
+                                        pp: hdr.flags.pp, discardable: hdr.flags.discardable, frame_end: false,
+                                        is_ctrl_edge: false, dir_edge_to_client: true, rtx: false,
+                                    },
+                                    route_cid: cid_a, access_epoch: 0, leg_seq: seq_to_a, mac_64: [0; 8],
+                                };
+                                seq_to_a = seq_to_a.wrapping_add(1);
+                                let w = seal_udp_v11(&ka.udp_key_e2c, fh, body).unwrap();
+                                let _ = relay_a.send_to(&w, dst).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut link_a = UdpAccessLink::connect(&addr_a.to_string(), &keys_a, 10_000)
+            .await
+            .unwrap();
+        let mut link_b = UdpAccessLink::connect(&addr_b.to_string(), &keys_b, 10_000)
+            .await
+            .unwrap();
+        link_a.auto_leg_nack = false;
+        link_b.auto_leg_nack = false;
+        link_a.ping_with_retry(1, Duration::from_secs(1)).await.unwrap();
+        link_b.ping_with_retry(1, Duration::from_secs(1)).await.unwrap();
+
+        let fx = build_handshake_fixture();
+        let prologue_b = fx.prologue.clone();
+        let priv_b = fx.priv_b;
+        let deleg_a = fx.deleg_a.clone();
+        let dev_a = fx.dev_a;
+        let spki_a = fx.spki_a.clone();
+        let exp_u = fx.exp_u;
+        let now_u = fx.now_u;
+        let policy_b = fx.policy_b.clone();
+        let dev_b = fx.dev_b;
+
+        let resp_task = tokio::spawn(async move {
+            let (mut sess_b, out_b) = UdpE2eeSession::handshake_responder(
+                link_b,
+                &prologue_b,
+                &priv_b,
+                &deleg_a,
+                &dev_a,
+                &spki_a,
+                exp_u,
+                now_u,
+                policy_b,
+                dev_b,
+                L3_MTU_DEFAULT,
+                Duration::from_secs(4),
+            )
+            .await
+            .unwrap();
+            // Responder immediately sends early pp=1 Audio before receiving retransmitted msg1,
+            // then enters recv_event (which replays cached msg2 when initiator retransmits msg1!).
+            sess_b
+                .send_audio(&AudioPacket {
+                    ts: 1,
+                    dtx: false,
+                    payload: Bytes::from_static(b"host-early-audio"),
+                })
+                .await
+                .unwrap();
+            let ev = sess_b.recv_event(Duration::from_secs(4)).await.unwrap();
+            (sess_b, out_b, ev)
+        });
+
+        let (mut sess_a, out_a) = UdpE2eeSession::handshake_initiator(
+            link_a,
+            &fx.prologue,
+            &fx.priv_a,
+            &fx.pub_b,
+            &fx.deleg_b,
+            &fx.dev_b,
+            &fx.spki_b,
+            fx.exp_u,
+            fx.now_u,
+            fx.policy_a,
+            fx.dev_a,
+            L3_MTU_DEFAULT,
+            Duration::from_secs(4),
+        )
+        .await
+        .unwrap();
+        sess_a
+            .send_control(0x09, b"AFTER-EARLY-MEDIA-OK")
+            .await
+            .unwrap();
+        let (_sess_b, out_b, ev_b) = resp_task.await.unwrap();
+        assert_eq!(out_a.hs_hash, out_b.hs_hash);
+        assert!(matches!(
+            ev_b,
+            TransportEvent::Control(ref f) if f.msg_type == 0x09 && f.payload.as_ref() == b"AFTER-EARLY-MEDIA-OK"
+        ));
+
+        let _ = stop_tx.send(()).await;
+        relay_task.abort();
     }
 }
