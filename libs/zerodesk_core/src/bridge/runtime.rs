@@ -3421,7 +3421,7 @@ impl OutboundFileManager {
 
     /// Handles `FILE_MSG_ABORT`. Returns `true` if `transfer_id` matched an active outbound
     /// transfer, or `false` so callers fall through to `FileTransferReceiver` to clean up
-    /// peer-aborted inbound transfers!
+    /// peer-aborted inbound transfers (does NOT count unmatched aborts as unknown drops).
     async fn handle_remote_abort(
         &mut self,
         transfer_id: u64,
@@ -3430,7 +3430,6 @@ impl OutboundFileManager {
         actor_tx: &mpsc::Sender<ActorMessage>,
     ) -> bool {
         let Some(st) = self.active.remove(&transfer_id) else {
-            self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
             return false;
         };
         let reason = format!("remote abort {error_code:#06x}");
@@ -3517,9 +3516,9 @@ impl OutboundFileManager {
 }
 
 /// Shared inbound `0x05 FileTransfer` L4 router used by both Host and Controller.
-/// Routes sender-bound replies (`Accept`, `Ack`, `CompleteAck`, `Abort`) to `outbound_files`
-/// FIRST so they NEVER trigger receiver-side role-violation errors (`0x0103`), and falls through
-/// to `file_receiver` for inbound frames and unmatched `Abort`/`CompleteAck` cleanup.
+/// Unconditionally intercepts strictly sender-bound replies (`Accept`, `Ack`, `CompleteAck`) so
+/// late/stale/cancelled replies NEVER fall through to `file_receiver` and trigger `0x0103` role
+/// violations. Only `Abort` falls through to `file_receiver` when unmatched in `outbound_files`.
 #[allow(clippy::too_many_arguments)]
 async fn route_inbound_file_l4<S: FileL4Sender>(
     sess: &mut S,
@@ -3532,13 +3531,18 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
     actor_tx: &mpsc::Sender<ActorMessage>,
 ) -> Option<String> {
     match decode_file_l4(l4_hdr, body) {
-        Ok(FileMessage::Accept(acc)) if outbound_files.handle_accept(&acc) => return None,
-        Ok(FileMessage::Ack(ack)) if outbound_files.handle_ack(&ack) => return None,
-        Ok(FileMessage::CompleteAck(cack))
-            if outbound_files
+        Ok(FileMessage::Accept(acc)) => {
+            let _ = outbound_files.handle_accept(&acc);
+            return None;
+        }
+        Ok(FileMessage::Ack(ack)) => {
+            let _ = outbound_files.handle_ack(&ack);
+            return None;
+        }
+        Ok(FileMessage::CompleteAck(cack)) => {
+            let _ = outbound_files
                 .handle_complete_ack(cack.transfer_id, cack.status, gen, actor_tx)
-                .await =>
-        {
+                .await;
             return None;
         }
         Ok(FileMessage::Abort(ab))
@@ -3887,7 +3891,7 @@ async fn run_active_host_session(
     } else {
         Box::new(adapters.mem_clip.clone())
     };
-    let mut clip_poller = ClipboardPoller::new(clip_backend, Arc::clone(&allow_clip_flag));
+    let mut clip_poller = ClipboardPoller::new(clip_backend, allow_clip_flag);
     let mut clip_receiver = ClipboardReceiver::new(effective_policy.clone());
     let mut clip_err_counter = ChannelFramingErrorCounter::new();
     let mut next_clip_id: u64 = 1;
@@ -4353,7 +4357,7 @@ async fn run_controller_lifecycle_task(
     } else {
         Box::new(mem_clip.clone())
     };
-    let mut clip_poller = ClipboardPoller::new(clip_backend, Arc::clone(&allow_clip_flag));
+    let mut clip_poller = ClipboardPoller::new(clip_backend, allow_clip_flag);
     let mut clip_receiver = ClipboardReceiver::new(effective_policy.clone());
     let mut clip_err_counter = ChannelFramingErrorCounter::new();
     let mut next_clip_id: u64 = 1;
@@ -5239,6 +5243,77 @@ mod tests {
             host_in.active_count(),
             0,
             "peer ABORT must fall through to FileTransferReceiver and clean up active inbound slot"
+        );
+
+        // 4. Stale/unmatched Accept, Ack, and CompleteAck after cancel_transfer MUST NEVER fall
+        //    through to FileTransferReceiver or trigger 0x0103 / SessionFatal (even >= 3 frames)!
+        ctrl_out
+            .start_transfer(
+                &mut ctrl_wire,
+                4,
+                104,
+                sample_path.clone(),
+                "cancelled.bin".into(),
+                &allow_pol,
+                1,
+                &ctrl_tx,
+            )
+            .await;
+        ctrl_out
+            .cancel_transfer(&mut ctrl_wire, 4, 1, &ctrl_tx)
+            .await;
+        assert!(!ctrl_out.has_active());
+        ctrl_wire.frames.clear();
+
+        let dropped_before = ctrl_out.unknown_peer_msgs_dropped;
+        let stale_accept = FileAccept {
+            transfer_id: 4,
+            resume_offset: 0,
+            initial_window_end_offset: 4096,
+        }
+        .encode()
+        .unwrap();
+        let stale_ack = FileAck {
+            transfer_id: 4,
+            next_expected_offset: 1024,
+            window_end_offset: 4096,
+        }
+        .encode()
+        .unwrap();
+        let stale_cack = crate::session::file_transfer::FileCompleteAck {
+            transfer_id: 4,
+            status: FILE_COMPLETE_ACK_OK,
+        }
+        .encode()
+        .unwrap();
+
+        for (mt, body) in [
+            (FILE_MSG_ACCEPT, stale_accept.to_vec()),
+            (FILE_MSG_ACK, stale_ack.to_vec()),
+            (FILE_MSG_ACK, stale_ack.to_vec()),
+            (FILE_MSG_COMPLETE_ACK, stale_cack.to_vec()),
+        ] {
+            let hdr = make_l4_hdr(mt, body.len());
+            let fatal = route_inbound_file_l4(
+                &mut ctrl_wire,
+                &hdr,
+                &body,
+                &mut ctrl_out,
+                &mut ctrl_in,
+                &mut ctrl_err,
+                1,
+                &ctrl_tx,
+            )
+            .await;
+            assert!(
+                fatal.is_none(),
+                "stale sender-bound reply must never trigger 0x0103/SessionFatal: {fatal:?}"
+            );
+        }
+        assert_eq!(ctrl_out.unknown_peer_msgs_dropped, dropped_before + 4);
+        assert!(
+            ctrl_wire.frames.is_empty(),
+            "stale Accept/Ack/CompleteAck must produce zero wire replies"
         );
 
         let _ = std::fs::remove_dir_all(&base);
