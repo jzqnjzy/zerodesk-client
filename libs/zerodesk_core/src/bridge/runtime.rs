@@ -4635,8 +4635,10 @@ async fn run_active_host_session(
                         };
                         if let Ok(i420) = i420_res {
                             pts_ms += frame_period.as_millis() as i64;
-                            if let Err(SessionError::Video(e @ VideoError::CodecFailed { .. })) =
-                                host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await
+                            if let Err(SessionError::Video(
+                                e @ (VideoError::CodecFailed { .. }
+                                | VideoError::HardwareUnavailable(_)),
+                            )) = host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await
                             {
                                 break format!("video_codec_failed: {e}");
                             }
@@ -5200,7 +5202,10 @@ async fn run_controller_lifecycle_task(
                                         last_idr_req_at = Some(Instant::now());
                                     }
                                 }
-                                Err(e @ VideoError::CodecFailed { .. }) => {
+                                Err(
+                                    e @ (VideoError::CodecFailed { .. }
+                                    | VideoError::HardwareUnavailable(_)),
+                                ) => {
                                     break format!("video_codec_failed: {e}");
                                 }
                                 Err(_) => {}

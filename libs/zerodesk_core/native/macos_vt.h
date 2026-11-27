@@ -66,6 +66,16 @@ typedef struct ZdVtDecodedBgraFrame {
     int32_t os_status;
 } ZdVtDecodedBgraFrame;
 
+typedef struct ZdVtDecodedNv12Frame {
+    const uint8_t *y_data;  /* borrowed tightly-packed Y plane until next decode or destroy */
+    const uint8_t *uv_data; /* borrowed tightly-packed interleaved UV plane */
+    uint32_t width;
+    uint32_t height;
+    uint32_t y_stride;
+    uint32_t uv_stride;
+    int32_t os_status;
+} ZdVtDecodedNv12Frame;
+
 typedef struct ZdVtAnnexbSlice {
     size_t offset;
     size_t len;
@@ -128,6 +138,14 @@ int32_t zd_vt_dec_decode_annexb_into(
     uint8_t *dst_bgra,
     size_t dst_bgra_cap,
     ZdVtDecodedBgraFrame *out_frame
+);
+/* Native NV12 (420YpCbCr8BiPlanarVideoRange) decode variant for I420 callers:
+ * avoids RGB gamut clipping and redundant YUV->BGRA->I420 conversion. */
+int32_t zd_vt_dec_decode_annexb_nv12(
+    ZdVtDecoder *dec,
+    const uint8_t *data,
+    size_t len,
+    ZdVtDecodedNv12Frame *out_frame
 );
 void zd_vt_dec_destroy(ZdVtDecoder *dec);
 

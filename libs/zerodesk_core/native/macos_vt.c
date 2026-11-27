@@ -966,6 +966,7 @@ void zd_vt_enc_invalidate_session_for_test(ZdVtEncoder *enc) {
 
 struct ZdVtDecoder {
     uint32_t codec_id;
+    OSType output_pixfmt;
     CMVideoFormatDescriptionRef format_desc;
     VTDecompressionSessionRef session;
 
@@ -985,9 +986,17 @@ struct ZdVtDecoder {
     uint8_t *caller_bgra_dst;
     size_t caller_bgra_cap;
     const uint8_t *out_bgra_ptr;
+
+    /* Tightly-packed native NV12 output buffers for zero-clipping I420 callers. */
+    uint8_t *nv12_y_buf;
+    size_t nv12_y_cap;
+    uint8_t *nv12_uv_buf;
+    size_t nv12_uv_cap;
+
     uint32_t out_width;
     uint32_t out_height;
     uint32_t out_stride;
+    uint32_t out_uv_stride;
     int32_t out_status;
     int32_t out_os_status;
     bool has_output;
@@ -1031,6 +1040,7 @@ static void zd_vt_dec_output_cb(
     dec->out_width = 0u;
     dec->out_height = 0u;
     dec->out_stride = 0u;
+    dec->out_uv_stride = 0u;
 
     if ((infoFlags & kVTDecodeInfo_Asynchronous) != 0u) {
         dec->out_status = ZD_VT_ERR_DECODE_ASYNC;
@@ -1045,14 +1055,9 @@ static void zd_vt_dec_output_cb(
         return;
     }
 
-    if (CVPixelBufferGetPixelFormatType(imageBuffer) != kCVPixelFormatType_32BGRA) {
-        dec->out_status = ZD_VT_ERR_INTERNAL;
-        return;
-    }
-
+    OSType pixfmt = CVPixelBufferGetPixelFormatType(imageBuffer);
     size_t w_sz = CVPixelBufferGetWidth(imageBuffer);
     size_t h_sz = CVPixelBufferGetHeight(imageBuffer);
-    size_t bpr = CVPixelBufferGetBytesPerRow(imageBuffer);
 
     if (w_sz > UINT32_MAX || h_sz > UINT32_MAX ||
         !zd_vt_dims_valid((uint32_t)w_sz, (uint32_t)h_sz)) {
@@ -1062,6 +1067,66 @@ static void zd_vt_dec_output_cb(
 
     uint32_t w = (uint32_t)w_sz;
     uint32_t h = (uint32_t)h_sz;
+
+    if (pixfmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        if ((w & 1u) != 0u || (h & 1u) != 0u) {
+            dec->out_status = ZD_VT_ERR_SAFETY_CAP;
+            return;
+        }
+        size_t y_bytes = (size_t)w * (size_t)h;
+        size_t uv_h = (size_t)(h / 2u);
+        size_t uv_bytes = (size_t)w * uv_h;
+        size_t max_y_bytes = (size_t)ZD_VT_MAX_PIXELS;
+        if (!zd_vt_buf_reserve(&dec->nv12_y_buf, &dec->nv12_y_cap, y_bytes, max_y_bytes) ||
+            !zd_vt_buf_reserve(&dec->nv12_uv_buf, &dec->nv12_uv_cap, uv_bytes, max_y_bytes)) {
+            dec->out_status = ZD_VT_ERR_ALLOC;
+            return;
+        }
+
+        CVReturn lock_rc = CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        if (lock_rc != kCVReturnSuccess) {
+            dec->out_status = ZD_VT_ERR_INTERNAL;
+            return;
+        }
+        const uint8_t *src_y = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0u);
+        size_t src_y_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0u);
+        const uint8_t *src_uv = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1u);
+        size_t src_uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1u);
+        if (src_y == NULL || src_uv == NULL || src_y_bpr < (size_t)w || src_uv_bpr < (size_t)w) {
+            CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+            dec->out_status = ZD_VT_ERR_INTERNAL;
+            return;
+        }
+        if (src_y_bpr == (size_t)w) {
+            memcpy(dec->nv12_y_buf, src_y, y_bytes);
+        } else {
+            for (uint32_t row = 0u; row < h; ++row) {
+                memcpy(dec->nv12_y_buf + (size_t)row * (size_t)w, src_y + (size_t)row * src_y_bpr, w);
+            }
+        }
+        if (src_uv_bpr == (size_t)w) {
+            memcpy(dec->nv12_uv_buf, src_uv, uv_bytes);
+        } else {
+            for (size_t row = 0u; row < uv_h; ++row) {
+                memcpy(dec->nv12_uv_buf + row * (size_t)w, src_uv + row * src_uv_bpr, w);
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+
+        dec->out_width = w;
+        dec->out_height = h;
+        dec->out_stride = w;
+        dec->out_uv_stride = w;
+        dec->out_status = ZD_VT_OK;
+        return;
+    }
+
+    if (pixfmt != kCVPixelFormatType_32BGRA) {
+        dec->out_status = ZD_VT_ERR_INTERNAL;
+        return;
+    }
+
+    size_t bpr = CVPixelBufferGetBytesPerRow(imageBuffer);
     size_t row_bytes = (size_t)w * 4u;
     if (bpr < row_bytes) {
         dec->out_status = ZD_VT_ERR_INTERNAL;
@@ -1224,8 +1289,9 @@ static int32_t zd_vt_dec_configure_from_idr(
         kCFBooleanTrue
     );
 
+    OSType dst_pixfmt = (dec->output_pixfmt != 0u) ? dec->output_pixfmt : kCVPixelFormatType_32BGRA;
     bool ok = zd_vt_dict_set_int32(dst_attrs, kCVPixelBufferPixelFormatTypeKey,
-                                   (int32_t)kCVPixelFormatType_32BGRA);
+                                   (int32_t)dst_pixfmt);
     CFDictionarySetValue(dst_attrs, kCVPixelBufferIOSurfacePropertiesKey, io_surf);
     CFRelease(io_surf);
 
@@ -1291,18 +1357,20 @@ int32_t zd_vt_dec_create(uint32_t codec_id, ZdVtDecoder **out_dec) {
     return ZD_VT_OK;
 }
 
-int32_t zd_vt_dec_decode_annexb_into(
+static int32_t zd_vt_dec_decode_annexb_common(
     ZdVtDecoder *dec,
     const uint8_t *data,
     size_t len,
+    OSType desired_pixfmt,
     uint8_t *dst_bgra,
     size_t dst_bgra_cap,
-    ZdVtDecodedBgraFrame *out_frame
+    int32_t *out_os_status
 ) {
-    if (dec == NULL || data == NULL || len == 0u || out_frame == NULL) {
+    if (dec->output_pixfmt == 0u) {
+        dec->output_pixfmt = desired_pixfmt;
+    } else if (dec->output_pixfmt != desired_pixfmt) {
         return ZD_VT_ERR_INVALID_ARG;
     }
-    memset(out_frame, 0, sizeof(*out_frame));
 
     ZdVtAnnexbParseResult parsed;
     int32_t parse_rc = zd_vt_parse_annexb(dec->codec_id, data, len, &parsed);
@@ -1314,7 +1382,7 @@ int32_t zd_vt_dec_decode_annexb_into(
         int32_t cfg_os = 0;
         int32_t cfg_rc = zd_vt_dec_configure_from_idr(dec, data, &parsed, &cfg_os);
         if (cfg_rc != ZD_VT_OK) {
-            out_frame->os_status = cfg_os;
+            *out_os_status = cfg_os;
             return cfg_rc;
         }
     } else if (dec->session == NULL || dec->format_desc == NULL) {
@@ -1370,7 +1438,7 @@ int32_t zd_vt_dec_decode_annexb_into(
         &block
     );
     if (st != noErr || block == NULL) {
-        out_frame->os_status = (int32_t)st;
+        *out_os_status = (int32_t)st;
         return ZD_VT_ERR_INTERNAL;
     }
 
@@ -1390,7 +1458,7 @@ int32_t zd_vt_dec_decode_annexb_into(
     CFRelease(block);
 
     if (st != noErr || sample == NULL) {
-        out_frame->os_status = (int32_t)st;
+        *out_os_status = (int32_t)st;
         return ZD_VT_ERR_INTERNAL;
     }
 
@@ -1404,6 +1472,7 @@ int32_t zd_vt_dec_decode_annexb_into(
     dec->out_width = 0u;
     dec->out_height = 0u;
     dec->out_stride = 0u;
+    dec->out_uv_stride = 0u;
 
     VTDecodeInfoFlags info_flags = 0;
     OSStatus dec_st = VTDecompressionSessionDecodeFrame(
@@ -1419,21 +1488,42 @@ int32_t zd_vt_dec_decode_annexb_into(
 
     if ((info_flags & kVTDecodeInfo_Asynchronous) != 0u) {
         VTDecompressionSessionWaitForAsynchronousFrames(dec->session);
-        out_frame->os_status = (int32_t)dec_st;
+        *out_os_status = (int32_t)dec_st;
         return ZD_VT_ERR_DECODE_ASYNC;
     }
 
     if (dec_st != noErr) {
-        out_frame->os_status = (int32_t)dec_st;
+        *out_os_status = (int32_t)dec_st;
         return zd_vt_map_dec_osstatus(dec_st);
     }
 
     if (!dec->has_output) {
         return ZD_VT_ERR_NO_OUTPUT;
     }
-    out_frame->os_status = dec->out_os_status;
-    if (dec->out_status != ZD_VT_OK) {
-        return dec->out_status;
+    *out_os_status = dec->out_os_status;
+    return dec->out_status;
+}
+
+int32_t zd_vt_dec_decode_annexb_into(
+    ZdVtDecoder *dec,
+    const uint8_t *data,
+    size_t len,
+    uint8_t *dst_bgra,
+    size_t dst_bgra_cap,
+    ZdVtDecodedBgraFrame *out_frame
+) {
+    if (dec == NULL || data == NULL || len == 0u || out_frame == NULL) {
+        return ZD_VT_ERR_INVALID_ARG;
+    }
+    memset(out_frame, 0, sizeof(*out_frame));
+
+    int32_t os_status = 0;
+    int32_t rc = zd_vt_dec_decode_annexb_common(
+        dec, data, len, kCVPixelFormatType_32BGRA, dst_bgra, dst_bgra_cap, &os_status
+    );
+    out_frame->os_status = os_status;
+    if (rc != ZD_VT_OK) {
+        return rc;
     }
 
     out_frame->data = dec->out_bgra_ptr;
@@ -1453,6 +1543,35 @@ int32_t zd_vt_dec_decode_annexb(
     return zd_vt_dec_decode_annexb_into(dec, data, len, NULL, 0u, out_frame);
 }
 
+int32_t zd_vt_dec_decode_annexb_nv12(
+    ZdVtDecoder *dec,
+    const uint8_t *data,
+    size_t len,
+    ZdVtDecodedNv12Frame *out_frame
+) {
+    if (dec == NULL || data == NULL || len == 0u || out_frame == NULL) {
+        return ZD_VT_ERR_INVALID_ARG;
+    }
+    memset(out_frame, 0, sizeof(*out_frame));
+
+    int32_t os_status = 0;
+    int32_t rc = zd_vt_dec_decode_annexb_common(
+        dec, data, len, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, 0u, &os_status
+    );
+    out_frame->os_status = os_status;
+    if (rc != ZD_VT_OK) {
+        return rc;
+    }
+
+    out_frame->y_data = dec->nv12_y_buf;
+    out_frame->uv_data = dec->nv12_uv_buf;
+    out_frame->width = dec->out_width;
+    out_frame->height = dec->out_height;
+    out_frame->y_stride = dec->out_stride;
+    out_frame->uv_stride = dec->out_uv_stride;
+    return ZD_VT_OK;
+}
+
 void zd_vt_dec_destroy(ZdVtDecoder *dec) {
     if (dec == NULL) {
         return;
@@ -1464,6 +1583,10 @@ void zd_vt_dec_destroy(ZdVtDecoder *dec) {
     dec->avcc_buf = NULL;
     free(dec->bgra_buf);
     dec->bgra_buf = NULL;
+    free(dec->nv12_y_buf);
+    dec->nv12_y_buf = NULL;
+    free(dec->nv12_uv_buf);
+    dec->nv12_uv_buf = NULL;
     free(dec);
 }
 

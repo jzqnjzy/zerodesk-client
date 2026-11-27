@@ -1216,19 +1216,23 @@ impl V2VideoDecoder {
                 self.consecutive_failures = 0;
                 Ok(val)
             }
+            Err(err @ VideoError::NeedIdr(_)) => {
+                // Waiting for an IDR after packet loss or session rebuild must not falsely
+                // accumulate toward the fatal consecutive decode-failure disconnect limit.
+                Err(err)
+            }
             Err(err @ VideoError::CodecFailed { .. }) => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                self.consecutive_failures = 0;
                 Err(err)
             }
             Err(err) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 if self.consecutive_failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                    let count = self.consecutive_failures;
+                    self.consecutive_failures = 0;
                     Err(VideoError::CodecFailed {
                         codec: self.codec,
-                        reason: format!(
-                            "{} consecutive decode failures (last: {err})",
-                            self.consecutive_failures
-                        ),
+                        reason: format!("{count} consecutive decode failures (last: {err})"),
                     })
                 } else {
                     Err(err)
@@ -1339,8 +1343,15 @@ impl V2VideoDecoder {
         match self.decode_raw_frame(data)? {
             DecodedVideoFrame::Bgra(bgra) => Ok(bgra),
             DecodedVideoFrame::I420(i420) => {
-                let stride = i420.width * 4;
-                let mut out = vec![0u8; stride * i420.height];
+                i420.validate()?;
+                let stride = i420
+                    .width
+                    .checked_mul(4)
+                    .ok_or_else(|| VideoError::Decoder("BGRA stride overflow".into()))?;
+                let byte_len = stride
+                    .checked_mul(i420.height)
+                    .ok_or_else(|| VideoError::Decoder("BGRA buffer size overflow".into()))?;
+                let mut out = vec![0u8; byte_len];
                 let uv_w = i420.width / 2;
                 let rc = unsafe {
                     scrap::I420ToARGB(
@@ -1372,6 +1383,10 @@ impl V2VideoDecoder {
     }
 
     pub fn decode_raw(&mut self, data: &[u8]) -> Result<I420Frame, VideoError> {
+        if let InnerDecoder::Vt(dec) = &mut self.inner {
+            let res = dec.decode_annexb_i420(data);
+            return self.track_decode_outcome(res);
+        }
         self.decode_raw_frame(data)?.into_i420()
     }
 
@@ -1390,7 +1405,14 @@ impl V2VideoDecoder {
     }
 
     pub fn decode_assembled(&mut self, frame: &AssembledVideoFrame) -> Result<I420Frame, VideoError> {
-        self.decode_assembled_frame(frame)?.into_i420()
+        let expected = self.codec.codec_id();
+        if frame.codec_id != expected {
+            return Err(VideoError::CodecMismatch {
+                expected,
+                actual: frame.codec_id,
+            });
+        }
+        self.decode_raw(&frame.data)
     }
 
     pub fn decode_and_measure(

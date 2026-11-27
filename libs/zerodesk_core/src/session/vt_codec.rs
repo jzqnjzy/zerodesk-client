@@ -167,6 +167,32 @@ mod macos_ffi {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct ZdVtDecodedNv12Frame {
+        pub y_data: *const u8,
+        pub uv_data: *const u8,
+        pub width: u32,
+        pub height: u32,
+        pub y_stride: u32,
+        pub uv_stride: u32,
+        pub os_status: i32,
+    }
+
+    impl Default for ZdVtDecodedNv12Frame {
+        fn default() -> Self {
+            Self {
+                y_data: std::ptr::null(),
+                uv_data: std::ptr::null(),
+                width: 0,
+                height: 0,
+                y_stride: 0,
+                uv_stride: 0,
+                os_status: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy, Default)]
     pub struct ZdVtAnnexbSlice {
         pub offset: usize,
@@ -244,6 +270,13 @@ mod macos_ffi {
             dst_bgra: *mut u8,
             dst_bgra_cap: usize,
             out_frame: *mut ZdVtDecodedBgraFrame,
+        ) -> i32;
+
+        pub fn zd_vt_dec_decode_annexb_nv12(
+            dec: *mut ZdVtDecoder,
+            data: *const u8,
+            len: usize,
+            out_frame: *mut ZdVtDecodedNv12Frame,
         ) -> i32;
 
         pub fn zd_vt_dec_destroy(dec: *mut ZdVtDecoder);
@@ -781,12 +814,20 @@ impl VtEncoder {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VtOutputMode {
+    Bgra,
+    Nv12,
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) struct VtDecoder {
     codec: VideoCodec,
     codec_id: u32,
     raw: macos_ffi::RawVtDecoder,
     rebuilds: VtRebuildTracker,
     last_bgra_len: usize,
+    output_mode: Option<VtOutputMode>,
 }
 
 #[cfg(target_os = "macos")]
@@ -805,11 +846,106 @@ impl VtDecoder {
             raw,
             rebuilds: VtRebuildTracker::default(),
             last_bgra_len: 0,
+            output_mode: None,
         })
     }
 
     pub(crate) fn total_rebuilds(&self) -> u64 {
         self.rebuilds.total_rebuilds()
+    }
+
+    fn handle_session_invalid(&mut self, os_status: i32) -> VideoError {
+        if !self.rebuilds.record_and_allow(Instant::now()) {
+            return VideoError::CodecFailed {
+                codec: self.codec,
+                reason: format!(
+                    "VideoToolbox decoder exceeded 1 rebuild per 30s window (os_status={os_status})"
+                ),
+            };
+        }
+        match macos_ffi::RawVtDecoder::new(self.codec_id) {
+            Ok(fresh) => {
+                self.raw = fresh;
+                self.output_mode = None;
+                VideoError::NeedIdr(format!(
+                    "VideoToolbox decoder rebuilt after session invalidation (os_status={os_status}); IDR required"
+                ))
+            }
+            Err(e) => VideoError::CodecFailed {
+                codec: self.codec,
+                reason: format!("VideoToolbox decoder rebuild failed: {e}"),
+            },
+        }
+    }
+
+    pub(crate) fn decode_annexb_i420(&mut self, data: &[u8]) -> Result<I420Frame, VideoError> {
+        if data.is_empty() {
+            return Err(VideoError::InvalidInput("empty Annex-B video frame".into()));
+        }
+        if self.output_mode == Some(VtOutputMode::Bgra) {
+            let bgra = self.decode_annexb_bgra(data)?;
+            return bgra_to_i420_bt709(&bgra);
+        }
+
+        let mut out = macos_ffi::ZdVtDecodedNv12Frame::default();
+        let rc = unsafe {
+            macos_ffi::zd_vt_dec_decode_annexb_nv12(
+                self.raw.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                &mut out,
+            )
+        };
+        match rc {
+            macos_ffi::ZD_VT_OK => {
+                if out.y_data.is_null()
+                    || out.uv_data.is_null()
+                    || out.width == 0
+                    || out.height == 0
+                    || (out.width & 1) != 0
+                    || (out.height & 1) != 0
+                {
+                    return Err(VideoError::NoOutputFrame);
+                }
+                self.output_mode = Some(VtOutputMode::Nv12);
+                let w = out.width as usize;
+                let h = out.height as usize;
+                let uv_w = w / 2;
+                let uv_h = h / 2;
+                let mut y = vec![0u8; w * h];
+                let mut u = vec![0u8; uv_w * uv_h];
+                let mut v = vec![0u8; uv_w * uv_h];
+                let cvt_rc = unsafe {
+                    scrap::NV12ToI420(
+                        out.y_data,
+                        out.y_stride as i32,
+                        out.uv_data,
+                        out.uv_stride as i32,
+                        y.as_mut_ptr(),
+                        w as i32,
+                        u.as_mut_ptr(),
+                        uv_w as i32,
+                        v.as_mut_ptr(),
+                        uv_w as i32,
+                        w as i32,
+                        h as i32,
+                    )
+                };
+                if cvt_rc != 0 {
+                    return Err(VideoError::Decoder(format!(
+                        "libyuv NV12ToI420 failed with rc={cvt_rc}"
+                    )));
+                }
+                I420Frame::new(w, h, y, u, v)
+            }
+            macos_ffi::ZD_VT_ERR_DECODE_ASYNC => Err(VideoError::CodecFailed {
+                codec: self.codec,
+                reason: "VideoToolbox decoder violated synchronous invariant (kVTDecodeInfo_Asynchronous)"
+                    .into(),
+            }),
+            macos_ffi::ZD_VT_ERR_SESSION_INVALID => Err(self.handle_session_invalid(out.os_status)),
+            other => Err(macos_ffi::map_vt_error(other, out.os_status, false)),
+        }
     }
 
     pub(crate) fn decode_annexb_bgra_into(
@@ -818,8 +954,36 @@ impl VtDecoder {
         dst: &mut Vec<u8>,
     ) -> Result<(usize, usize, usize), VideoError> {
         if data.is_empty() {
-            return Err(VideoError::NeedIdr("empty Annex-B video frame".into()));
+            return Err(VideoError::InvalidInput("empty Annex-B video frame".into()));
         }
+        if self.output_mode == Some(VtOutputMode::Nv12) {
+            let i420 = self.decode_annexb_i420(data)?;
+            let stride = i420.width * 4;
+            let byte_len = stride * i420.height;
+            dst.resize(byte_len, 0);
+            let uv_w = i420.width / 2;
+            let rc = unsafe {
+                scrap::H420ToARGB(
+                    i420.y.as_ptr(),
+                    i420.width as i32,
+                    i420.u.as_ptr(),
+                    uv_w as i32,
+                    i420.v.as_ptr(),
+                    uv_w as i32,
+                    dst.as_mut_ptr(),
+                    stride as i32,
+                    i420.width as i32,
+                    i420.height as i32,
+                )
+            };
+            if rc != 0 {
+                return Err(VideoError::Decoder(format!(
+                    "libyuv H420ToARGB failed with rc={rc}"
+                )));
+            }
+            return Ok((i420.width, i420.height, stride));
+        }
+
         dst.clear();
         if self.last_bgra_len > dst.capacity() {
             dst.reserve(self.last_bgra_len);
@@ -847,6 +1011,7 @@ impl VtDecoder {
                 if out.data.is_null() || out.len == 0 || out.width == 0 || out.height == 0 {
                     return Err(VideoError::NoOutputFrame);
                 }
+                self.output_mode = Some(VtOutputMode::Bgra);
                 self.last_bgra_len = out.len;
                 if !dst_ptr.is_null() && std::ptr::eq(out.data, dst_ptr) && out.len <= dst_cap {
                     // C callback copied directly from CVPixelBuffer into `dst` (single copy!).
@@ -862,28 +1027,7 @@ impl VtDecoder {
                 reason: "VideoToolbox decoder violated synchronous invariant (kVTDecodeInfo_Asynchronous)"
                     .into(),
             }),
-            macos_ffi::ZD_VT_ERR_SESSION_INVALID => {
-                if !self.rebuilds.record_and_allow(Instant::now()) {
-                    return Err(VideoError::CodecFailed {
-                        codec: self.codec,
-                        reason: format!(
-                            "VideoToolbox decoder exceeded 1 rebuild per 30s window (os_status={})",
-                            out.os_status
-                        ),
-                    });
-                }
-                let fresh = macos_ffi::RawVtDecoder::new(self.codec_id).map_err(|e| {
-                    VideoError::CodecFailed {
-                        codec: self.codec,
-                        reason: format!("VideoToolbox decoder rebuild failed: {e}"),
-                    }
-                })?;
-                self.raw = fresh;
-                Err(VideoError::NeedIdr(format!(
-                    "VideoToolbox decoder rebuilt after session invalidation (os_status={}); IDR required",
-                    out.os_status
-                )))
-            }
+            macos_ffi::ZD_VT_ERR_SESSION_INVALID => Err(self.handle_session_invalid(out.os_status)),
             other => Err(macos_ffi::map_vt_error(other, out.os_status, false)),
         }
     }
@@ -921,6 +1065,12 @@ impl VtDecoder {
         0
     }
 
+    pub(crate) fn decode_annexb_i420(&mut self, _data: &[u8]) -> Result<I420Frame, VideoError> {
+        Err(VideoError::HardwareUnavailable(
+            "VideoToolbox unavailable".into(),
+        ))
+    }
+
     pub(crate) fn decode_annexb_bgra_into(
         &mut self,
         _data: &[u8],
@@ -941,11 +1091,15 @@ impl VtDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::video::{
-        compute_y_psnr, compute_y_ssim, generate_desktop_scene_i420, local_v2_cap_bits,
-        local_v2_cap_bits_with_vt_disable, negotiate_video_codec, read_desktop_scene_frame_idx,
-        DecodedVideoFrame, V2VideoDecoder, V2VideoEncoder, DEFAULT_H264_1080P_BITRATE_BPS,
-        DEFAULT_HEVC_1080P_BITRATE_BPS, MAX_CONSECUTIVE_DECODE_FAILURES,
+    use crate::session::{
+        capture::{detect_visual_marker, overlay_visual_marker},
+        video::{
+            compute_y_psnr, compute_y_ssim, generate_animated_i420, generate_desktop_scene_i420,
+            local_v2_cap_bits, local_v2_cap_bits_with_vt_disable, negotiate_video_codec,
+            read_desktop_scene_frame_idx, DecodedVideoFrame, V2VideoDecoder, V2VideoEncoder,
+            DEFAULT_H264_1080P_BITRATE_BPS, DEFAULT_HEVC_1080P_BITRATE_BPS,
+            MAX_CONSECUTIVE_DECODE_FAILURES,
+        },
     };
     use v2_transport::{
         VideoReassembler, VideoSlice, CAP_CODEC_AV1, CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW,
@@ -1239,29 +1393,150 @@ mod tests {
             let idr = enc.encode_i420_with_idr(&f0, 0, true).unwrap();
 
             let mut dec = V2VideoDecoder::new(codec).unwrap();
-            let bad = [0x00u8, 0x00, 0x00, 0x01, 0x01, 0xAA, 0xBB]; // non-IDR before active param sets
-            for attempt in 1..MAX_CONSECUTIVE_DECODE_FAILURES {
-                let err = dec.decode_raw_bgra(&bad).unwrap_err();
+            // Prolonged NeedIdr (e.g. non-IDR P-frames awaiting IDR after packet loss) must NOT
+            // accumulate consecutive_decode_failures or falsely disconnect.
+            let non_idr = [0x00u8, 0x00, 0x00, 0x01, 0x01, 0xAA, 0xBB];
+            for _ in 0..(MAX_CONSECUTIVE_DECODE_FAILURES + 10) {
+                let err = dec.decode_raw_bgra(&non_idr).unwrap_err();
                 assert!(matches!(err, VideoError::NeedIdr(_)));
+                assert_eq!(dec.consecutive_decode_failures(), 0);
+            }
+
+            // 29 consecutive real decode errors increment the counter without failing closed yet.
+            for attempt in 1..MAX_CONSECUTIVE_DECODE_FAILURES {
+                let err = dec.decode_raw_bgra(&[]).unwrap_err();
+                assert!(matches!(err, VideoError::InvalidInput(_)));
                 assert_eq!(dec.consecutive_decode_failures(), attempt);
             }
             // Valid IDR resets consecutive failure counter to 0.
             let _ = dec.decode_raw_bgra(&idr.data).unwrap();
             assert_eq!(dec.consecutive_decode_failures(), 0);
 
-            // Now trigger 30 consecutive failures -> CodecFailed on the 30th.
-            let garbage = [0xFFu8, 0xEE, 0xDD, 0xCC];
+            // 30 consecutive real decode errors escalate to CodecFailed and reset counter to 0.
             for attempt in 1..MAX_CONSECUTIVE_DECODE_FAILURES {
-                let err = dec.decode_raw_bgra(&garbage).unwrap_err();
+                let err = dec.decode_raw_bgra(&[]).unwrap_err();
                 assert!(!matches!(err, VideoError::CodecFailed { .. }));
                 assert_eq!(dec.consecutive_decode_failures(), attempt);
             }
-            let fatal = dec.decode_raw_bgra(&garbage).unwrap_err();
+            let fatal = dec.decode_raw_bgra(&[]).unwrap_err();
             assert!(
                 matches!(fatal, VideoError::CodecFailed { codec: c, .. } if c == codec),
                 "{} expected CodecFailed at 30th consecutive failure, got {fatal:?}",
                 codec.name()
             );
+            assert_eq!(dec.consecutive_decode_failures(), 0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_vt_visual_marker_and_color_card_accuracy_h264_hevc() {
+        const W: usize = 1280;
+        const H: usize = 720;
+        const MARKER_X: i32 = 320;
+        const MARKER_Y: i32 = 240;
+
+        // Part 1: Exact v2-hostd visual marker (SyntheticAnimatedSource + overlay_visual_marker)
+        // round-tripped through real VideoToolbox H.264 & HEVC encode_i420 -> decode_raw -> detect_visual_marker.
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let mut enc = V2VideoEncoder::new(codec, W as u32, H as u32, 2.0, Some(60)).unwrap();
+            let mut dec = V2VideoDecoder::new(codec).unwrap();
+
+            for idx in 0..15u32 {
+                let mut src = generate_animated_i420(W, H, idx);
+                let marked = idx >= 2;
+                if marked {
+                    overlay_visual_marker(&mut src, MARKER_X, MARKER_Y);
+                }
+                let encoded = enc.encode_i420(&src, (idx as i64) * 33).unwrap();
+                let decoded_i420 = dec.decode_raw(&encoded.data).unwrap();
+                let check = detect_visual_marker(&decoded_i420, MARKER_X, MARKER_Y);
+                if marked {
+                    assert!(
+                        check.detected,
+                        "{} frame {idx} missed visual marker: inner_y={:.1}, border_y={:.1}, inner_v={:.1}",
+                        codec.name(),
+                        check.inner_mean_y,
+                        check.border_mean_y,
+                        check.inner_mean_v
+                    );
+                } else {
+                    assert!(
+                        !check.detected,
+                        "{} unmarked frame {idx} falsely detected visual marker",
+                        codec.name()
+                    );
+                }
+            }
+        }
+
+        // Part 2: Known 8-patch RGB color card through direct 32BGRA encode_bgra -> decode_raw_bgra.
+        // Verifies BT.709 colorimetry accuracy (<= 5 per R/G/B channel) and zero R/B channel swap.
+        const CW: usize = 512;
+        const CH: usize = 128;
+        let patches: &[(u8, u8, u8, &str)] = &[
+            (255, 0, 0, "red"),
+            (0, 255, 0, "green"),
+            (0, 0, 255, "blue"),
+            (255, 255, 255, "white"),
+            (0, 0, 0, "black"),
+            (255, 255, 0, "yellow"),
+            (0, 255, 255, "cyan"),
+            (255, 0, 255, "magenta"),
+        ];
+        let patch_w = CW / patches.len();
+        let mut bgra_card = vec![0u8; CW * CH * 4];
+        for row in 0..CH {
+            for (p_idx, &(r, g, b, _)) in patches.iter().enumerate() {
+                for col in (p_idx * patch_w)..((p_idx + 1) * patch_w) {
+                    let off = (row * CW + col) * 4;
+                    // BGRA8 byte order in memory: [B, G, R, A]
+                    bgra_card[off] = b;
+                    bgra_card[off + 1] = g;
+                    bgra_card[off + 2] = r;
+                    bgra_card[off + 3] = 255;
+                }
+            }
+        }
+
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let mut enc =
+                V2VideoEncoder::new_with_vt_config(codec, CW as u32, CH as u32, 30, 8_000_000, 60)
+                    .unwrap();
+            let mut dec = V2VideoDecoder::new(codec).unwrap();
+            let encoded = enc
+                .encode_bgra(&bgra_card, CW, CH, CW * 4, 0, true)
+                .unwrap();
+            let decoded = dec.decode_raw_bgra(&encoded.data).unwrap();
+            assert_eq!((decoded.width, decoded.height), (CW, CH));
+
+            for (p_idx, &(er, eg, eb, label)) in patches.iter().enumerate() {
+                let x0 = p_idx * patch_w + 16;
+                let x1 = (p_idx + 1) * patch_w - 16;
+                let mut sum_b = 0.0f64;
+                let mut sum_g = 0.0f64;
+                let mut sum_r = 0.0f64;
+                let mut cnt = 0.0f64;
+                for row in 24..(CH - 24) {
+                    for col in x0..x1 {
+                        let off = row * decoded.stride + col * 4;
+                        sum_b += decoded.data[off] as f64;
+                        sum_g += decoded.data[off + 1] as f64;
+                        sum_r += decoded.data[off + 2] as f64;
+                        cnt += 1.0;
+                    }
+                }
+                let mr = sum_r / cnt;
+                let mg = sum_g / cnt;
+                let mb = sum_b / cnt;
+                assert!(
+                    (mr - er as f64).abs() <= 5.0
+                        && (mg - eg as f64).abs() <= 5.0
+                        && (mb - eb as f64).abs() <= 5.0,
+                    "{} color card patch '{label}' mismatch: expected RGB=({er},{eg},{eb}), got ({mr:.1},{mg:.1},{mb:.1})",
+                    codec.name()
+                );
+            }
         }
     }
 
