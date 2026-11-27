@@ -88,9 +88,19 @@ public final class InteractiveMetalNSView: MTKView {
         true
     }
 
+    public override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        _inputTracker?.releaseAll(reason: .windowResignedKey)
+        scrollQuantizer.reset()
+        return ok
+    }
+
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         installLifecycleObservers()
+        if window != nil && _isSessionActive {
+            installKeyMonitor()
+        }
     }
 
     public override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -222,26 +232,30 @@ public final class InteractiveMetalNSView: MTKView {
             return false
         }
 
-        guard let usageId = keyMapper.lookup(event.keyCode) else {
-            return false
-        }
+        let usageId = keyMapper.lookup(event.keyCode)
         let mods = Self.hidModifiers(from: event.modifierFlags)
 
         switch event.type {
         case .keyDown:
-            let forwarded = tracker.handleKeyDown(usageId: usageId, modifiers: mods)
-            if !forwarded {
+            switch tracker.handleKeyDownEvent(usageId: usageId, modifiers: mods) {
+            case .forwarded:
+                return true
+            case .emergencyEscapeTriggered:
                 // Emergency escape combo (Ctrl+Opt+Cmd+Escape) intercepted locally.
                 scrollQuantizer.reset()
                 onEmergencyEscape?()
+                return true
+            case .ignored:
+                return false
             }
-            return true
 
         case .keyUp:
+            guard let usageId else { return false }
             tracker.handleKeyUp(usageId: usageId, modifiers: mods)
             return true
 
         case .flagsChanged:
+            guard let usageId else { return false }
             let isDown = Self.isModifierKeyDown(keyCode: event.keyCode, flags: event.modifierFlags)
             tracker.handleFlagsChanged(modifierUsageId: usageId, isPressed: isDown, modifiers: mods)
             return false
@@ -299,11 +313,10 @@ public final class InteractiveMetalNSView: MTKView {
     }
 
     public override func mouseUp(with event: NSEvent) {
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: true) else {
+        guard _isSessionActive, let tracker = _inputTracker else {
             return
         }
-        tracker.handleMouseUp(button: HidMouseButtonMask.left, x: pt.x, y: pt.y)
+        tracker.handleMouseUp(button: HidMouseButtonMask.left, point: mappedPoint(for: event, isDragging: true))
     }
 
     public override func rightMouseDown(with event: NSEvent) {
@@ -316,11 +329,10 @@ public final class InteractiveMetalNSView: MTKView {
     }
 
     public override func rightMouseUp(with event: NSEvent) {
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: true) else {
+        guard _isSessionActive, let tracker = _inputTracker else {
             return
         }
-        tracker.handleMouseUp(button: HidMouseButtonMask.right, x: pt.x, y: pt.y)
+        tracker.handleMouseUp(button: HidMouseButtonMask.right, point: mappedPoint(for: event, isDragging: true))
     }
 
     public override func otherMouseDown(with event: NSEvent) {
@@ -334,12 +346,12 @@ public final class InteractiveMetalNSView: MTKView {
     }
 
     public override func otherMouseUp(with event: NSEvent) {
-        guard let tracker = _inputTracker,
-              let bit = Self.otherMouseButtonMask(event.buttonNumber),
-              let pt = mappedPoint(for: event, isDragging: true) else {
+        guard _isSessionActive,
+              let tracker = _inputTracker,
+              let bit = Self.otherMouseButtonMask(event.buttonNumber) else {
             return
         }
-        tracker.handleMouseUp(button: bit, x: pt.x, y: pt.y)
+        tracker.handleMouseUp(button: bit, point: mappedPoint(for: event, isDragging: true))
     }
 
     public override func scrollWheel(with event: NSEvent) {

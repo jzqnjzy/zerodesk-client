@@ -239,6 +239,15 @@ final class Phase7BInteractiveAndMetalTests: XCTestCase {
             let modifiers: UInt8
         }
 
+        struct MouseRecord: Equatable {
+            let kind: RemoteMouseKind
+            let x: Int
+            let y: Int
+            let buttons: UInt8
+            let wheelDx: Int16
+            let wheelDy: Int16
+        }
+
         struct ReleaseRecord: Equatable {
             let keys: [UInt16]
             let buttons: UInt8
@@ -248,12 +257,19 @@ final class Phase7BInteractiveAndMetalTests: XCTestCase {
 
         private let lock = NSLock()
         private var _keyEvents: [KeyRecord] = []
+        private var _mouseEvents: [MouseRecord] = []
         private var _releases: [ReleaseRecord] = []
 
         var keyEvents: [KeyRecord] {
             lock.lock()
             defer { lock.unlock() }
             return _keyEvents
+        }
+
+        var mouseEvents: [MouseRecord] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _mouseEvents
         }
 
         var releases: [ReleaseRecord] {
@@ -269,7 +285,9 @@ final class Phase7BInteractiveAndMetalTests: XCTestCase {
         }
 
         func sendMouseEvent(kind: RemoteMouseKind, x: Int, y: Int, buttons: UInt8, wheelDx: Int16, wheelDy: Int16) {
-            _ = (kind, x, y, buttons, wheelDx, wheelDy)
+            lock.lock()
+            _mouseEvents.append(MouseRecord(kind: kind, x: x, y: y, buttons: buttons, wheelDx: wheelDx, wheelDy: wheelDy))
+            lock.unlock()
         }
 
         func flushReleaseAll(keys: [UInt16], buttons: UInt8, reason: ReleaseReason, timeoutMs: UInt32) {
@@ -361,6 +379,80 @@ final class Phase7BInteractiveAndMetalTests: XCTestCase {
         let bridgeElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - bridgeStartNs) / 1_000_000.0
         XCTAssertTrue(reply.ok)
         XCTAssertLessThanOrEqual(bridgeElapsedMs, 100.0, "live bridge releaseAllInput exceeded 100ms")
+    }
+
+    func testUnmappedKeyNeverTriggersEmergencyEscapeAndNilCoordMouseUpReleasesButton() {
+        let sink = MockRemoteInputSink()
+        let tracker = PressedInputTracker(sink: sink)
+        let keyMapper = MacHidKeyMap()
+        var emergencyEscapeCallbacks = 0
+
+        // Hold a normal key so any accidental releaseAll would be observable.
+        XCTAssertEqual(tracker.handleKeyDownEvent(usageId: 0x04, modifiers: 0), .forwarded)
+
+        // (a) Unmapped macOS keyCode (kVK_Function = 0x3F -> nil) and forbidden 0x66 Keyboard Power
+        //     must return .ignored and NEVER trigger emergency escape or releaseAll.
+        let unmappedUsage = keyMapper.lookup(0x3F)
+        XCTAssertNil(unmappedUsage)
+        for candidate in [unmappedUsage, Optional<UInt16>(0x66), Optional<UInt16>(0x00)] {
+            let outcome = tracker.handleKeyDownEvent(
+                usageId: candidate,
+                modifiers: HidModifierMask.ctrl | HidModifierMask.alt | HidModifierMask.meta
+            )
+            XCTAssertEqual(outcome, .ignored)
+            if outcome == .emergencyEscapeTriggered {
+                emergencyEscapeCallbacks += 1
+            }
+        }
+        XCTAssertEqual(emergencyEscapeCallbacks, 0, "unmapped/ignored keys must never trigger emergency escape")
+        XCTAssertTrue(sink.releases.isEmpty)
+        XCTAssertTrue(tracker.hasAnyPressedInput)
+
+        // Real Ctrl+Opt+Cmd+Escape MUST return .emergencyEscapeTriggered and invoke callback + releaseAll.
+        let escapeOutcome = tracker.handleKeyDownEvent(
+            usageId: MacHidKeyMap.escapeUsageId,
+            modifiers: HidModifierMask.ctrl | HidModifierMask.alt | HidModifierMask.meta
+        )
+        XCTAssertEqual(escapeOutcome, .emergencyEscapeTriggered)
+        if escapeOutcome == .emergencyEscapeTriggered {
+            emergencyEscapeCallbacks += 1
+        }
+        XCTAssertEqual(emergencyEscapeCallbacks, 1)
+        XCTAssertEqual(sink.releases.count, 1)
+        XCTAssertEqual(sink.releases.first?.reason, .emergencyEscapeHotkey)
+        XCTAssertFalse(tracker.hasAnyPressedInput)
+
+        // (b) Mouse button release with nil mapped coordinate (e.g., invalid/zero remoteSize)
+        //     must still release held buttons using the last valid remote point (or (0, 0)).
+        tracker.handleMouseDown(button: HidMouseButtonMask.left, x: 320, y: 240)
+        tracker.handleMouseDown(button: HidMouseButtonMask.right, x: 320, y: 240)
+        XCTAssertTrue(tracker.hasPressedMouseButtons)
+
+        let unmappablePoint = RemoteCoordinateMapper.mapPoint(
+            CGPoint(x: 100, y: 100),
+            viewSize: CGSize(width: 800, height: 600),
+            remoteSize: RemoteSize(width: 0, height: 0),
+            origin: .bottomLeft,
+            isDragging: true
+        )
+        XCTAssertNil(unmappablePoint)
+
+        tracker.handleMouseUp(button: HidMouseButtonMask.left, point: unmappablePoint)
+        XCTAssertEqual(tracker.snapshotState().mouseButtons, HidMouseButtonMask.right)
+        tracker.handleMouseUp(button: HidMouseButtonMask.right, point: nil)
+        XCTAssertFalse(tracker.hasPressedMouseButtons)
+        XCTAssertEqual(tracker.snapshotState().mouseButtons, 0)
+
+        let upEvents = sink.mouseEvents.filter { $0.kind == .buttonUp }
+        XCTAssertEqual(upEvents.count, 2)
+        XCTAssertEqual(upEvents[0], .init(kind: .buttonUp, x: 320, y: 240, buttons: HidMouseButtonMask.right, wheelDx: 0, wheelDy: 0))
+        XCTAssertEqual(upEvents[1], .init(kind: .buttonUp, x: 320, y: 240, buttons: 0, wheelDx: 0, wheelDy: 0))
+
+        // Fresh tracker with no prior valid point falls back cleanly to (0, 0).
+        let freshSink = MockRemoteInputSink()
+        let freshTracker = PressedInputTracker(sink: freshSink)
+        freshTracker.handleMouseUp(button: HidMouseButtonMask.middle, point: nil)
+        XCTAssertEqual(freshSink.mouseEvents, [.init(kind: .buttonUp, x: 0, y: 0, buttons: 0, wheelDx: 0, wheelDy: 0)])
     }
 
     // MARK: - 4. Metal GPU Renderer 1080p Benchmark, Zero-Work Idle Skip & Color Accuracy

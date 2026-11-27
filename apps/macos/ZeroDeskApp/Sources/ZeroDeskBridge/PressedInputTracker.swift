@@ -36,6 +36,14 @@ public struct ReleaseAllSnapshot: Sendable, Equatable {
     }
 }
 
+/// Distinct outcome of processing a keyboard `keyDown` event so callers never confuse
+/// an ignored/unmapped key with a local emergency escape trigger.
+public enum KeyDownOutcome: Sendable, Equatable {
+    case forwarded
+    case emergencyEscapeTriggered
+    case ignored
+}
+
 /// Sink receiving outbound interactive HID events and bounded synchronous `release_all` flushes.
 public protocol RemoteInputSink: Sendable {
     func sendKeyEvent(usageId: UInt16, down: Bool, modifiers: UInt8)
@@ -73,6 +81,7 @@ public final class PressedInputTracker: @unchecked Sendable {
     private var pressedKeys: Set<UInt16> = []
     private var modifierMask: UInt8 = 0
     private var mouseButtons: UInt8 = 0
+    private var lastValidMousePoint: RemotePoint = RemotePoint(x: 0, y: 0)
     private let sink: any RemoteInputSink
     private let releaseTimeoutMs: UInt32
 
@@ -102,15 +111,17 @@ public final class PressedInputTracker: @unchecked Sendable {
         return (pressedKeys, modifierMask, mouseButtons)
     }
 
-    /// Records and forwards a key press.
-    /// Returns `false` if intercepted locally as `Ctrl + Opt + Cmd + Escape` (after triggering
-    /// `releaseAll(.emergencyEscapeHotkey)`), or `true` if forwarded to the remote peer.
+    /// Classifies and processes a `keyDown` event with explicit distinction between `.forwarded`,
+    /// `.emergencyEscapeTriggered`, and `.ignored` (nil/unmapped or non-whitelisted usage IDs).
     @discardableResult
-    public func handleKeyDown(usageId: UInt16, modifiers: UInt8) -> Bool {
+    public func handleKeyDownEvent(usageId: UInt16?, modifiers: UInt8) -> KeyDownOutcome {
+        guard let usageId, MacHidKeyMap.isWhitelistedUsageId(usageId) else {
+            return .ignored
+        }
         let maskedMods = modifiers & HidModifierMask.validMask
         if MacHidKeyMap.isEmergencyEscapeCombo(usageId: usageId, modifiers: maskedMods) {
             releaseAll(reason: .emergencyEscapeHotkey)
-            return false
+            return .emergencyEscapeTriggered
         }
 
         let effectiveMods: UInt8
@@ -125,7 +136,15 @@ public final class PressedInputTracker: @unchecked Sendable {
         lock.unlock()
 
         sink.sendKeyEvent(usageId: usageId, down: true, modifiers: effectiveMods)
-        return true
+        return .forwarded
+    }
+
+    /// Records and forwards a key press.
+    /// Returns `false` if intercepted locally as `Ctrl + Opt + Cmd + Escape` (after triggering
+    /// `releaseAll(.emergencyEscapeHotkey)`) or ignored, or `true` if forwarded to the remote peer.
+    @discardableResult
+    public func handleKeyDown(usageId: UInt16, modifiers: UInt8) -> Bool {
+        handleKeyDownEvent(usageId: usageId, modifiers: modifiers) == .forwarded
     }
 
     /// Records and forwards a key release (including `Cmd + key` releases captured by local monitor).
@@ -172,6 +191,7 @@ public final class PressedInputTracker: @unchecked Sendable {
 
         lock.lock()
         mouseButtons |= bit
+        lastValidMousePoint = RemotePoint(x: x, y: y)
         let currentButtons = mouseButtons
         lock.unlock()
 
@@ -186,18 +206,32 @@ public final class PressedInputTracker: @unchecked Sendable {
     }
 
     public func handleMouseUp(button: UInt8, x: Int, y: Int) {
+        handleMouseUp(button: button, point: RemotePoint(x: x, y: y))
+    }
+
+    /// Releases a mouse button even when coordinate mapping returns `nil` (e.g., zero/invalid
+    /// remote dimensions or out-of-rect release), falling back to the last valid remote point
+    /// (or `(0, 0)`) so held mouse buttons are never stranded.
+    public func handleMouseUp(button: UInt8, point: RemotePoint?) {
         let bit = button & HidMouseButtonMask.validMask
         guard bit != 0 else { return }
 
+        let targetPoint: RemotePoint
         lock.lock()
         mouseButtons &= ~bit
+        if let point {
+            lastValidMousePoint = point
+            targetPoint = point
+        } else {
+            targetPoint = lastValidMousePoint
+        }
         let currentButtons = mouseButtons
         lock.unlock()
 
         sink.sendMouseEvent(
             kind: .buttonUp,
-            x: x,
-            y: y,
+            x: targetPoint.x,
+            y: targetPoint.y,
             buttons: currentButtons,
             wheelDx: 0,
             wheelDy: 0
@@ -206,6 +240,7 @@ public final class PressedInputTracker: @unchecked Sendable {
 
     public func handleMouseMove(x: Int, y: Int) {
         lock.lock()
+        lastValidMousePoint = RemotePoint(x: x, y: y)
         let currentButtons = mouseButtons
         lock.unlock()
 
