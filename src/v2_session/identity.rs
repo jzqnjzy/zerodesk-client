@@ -261,6 +261,16 @@ impl PersistentV2Identity {
         let policy_ver_path = identity_dir.join(POLICY_VERSION_FILE_NAME);
         let disk_policy_version = Self::read_policy_version_locked(&policy_ver_path)?;
         let last_policy_version = disk_policy_version.max(persisted.last_policy_version);
+        if !policy_ver_path.exists() && persisted.last_policy_version > 0 {
+            let file = PersistedPolicyVersionFile {
+                version: PERSISTED_POLICY_VERSION_SCHEMA,
+                last_policy_version: persisted.last_policy_version,
+            };
+            let bytes = serde_json::to_vec_pretty(&file).map_err(|e| {
+                IdentityStoreError::Storage(format!("serialize {POLICY_VERSION_FILE_NAME}: {e}"))
+            })?;
+            write_file_atomic_0600(&policy_ver_path, &bytes)?;
+        }
 
         Ok(Self {
             identity_dir: identity_dir.to_path_buf(),
@@ -706,6 +716,52 @@ mod tests {
         }
         // Idempotent repeat of 8 succeeds without error
         assert_eq!(inst_b.advance_policy_version(8).unwrap(), 8);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_identity_v2_migrates_last_policy_version_before_persist_identity() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zd-pv-leg-{}-{uniq}", std::process::id()));
+        ensure_dir_0700(&dir).unwrap();
+
+        // Seed a legacy identity_v2.json with last_policy_version = 7 and NO policy_version_v2.json
+        let ks = SoftwareDeviceKeyStore::generate();
+        let pkcs8 = ks.to_pkcs8_der().unwrap();
+        let legacy_json = serde_json::json!({
+            "version": 1,
+            "device_id_hex": "11".repeat(16),
+            "p256_pkcs8_der_b64": B64.encode(pkcs8.as_slice()),
+            "last_policy_version": 7
+        });
+        write_file_atomic_0600(
+            &dir.join(IDENTITY_FILE_NAME),
+            &serde_json::to_vec_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+        assert!(!dir.join(POLICY_VERSION_FILE_NAME).exists());
+
+        // load_or_create MUST migrate 7 -> policy_version_v2.json immediately under flock
+        let loaded = PersistentV2Identity::load_or_create(&dir).unwrap();
+        assert_eq!(loaded.last_policy_version(), 7);
+        assert!(dir.join(POLICY_VERSION_FILE_NAME).exists());
+
+        // Calling persist_identity() BEFORE any advance_policy_version() MUST preserve 7 on disk
+        loaded.persist_identity().unwrap();
+
+        let mut reloaded = PersistentV2Identity::load_or_create(&dir).unwrap();
+        assert_eq!(reloaded.last_policy_version(), 7);
+        match reloaded.advance_policy_version(6) {
+            Err(IdentityStoreError::PolicyRollback {
+                attempted: 6,
+                persisted: 7,
+            }) => {}
+            other => panic!("expected PolicyRollback(6 < 7), got {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

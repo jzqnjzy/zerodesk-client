@@ -560,9 +560,10 @@ impl V2BridgeController {
     }
 
     /// Runtime hook: called when device bootstrap/policy refresh completes with CA-verified cert &
-    /// policy. Enforces explicit source-state guards: if already `Streaming`, updates cert & policy
-    /// ONLY without clobbering active session state; rejects invalid states (`Idle`/`Dialing`/
-    /// `Incoming`/`Closing`).
+    /// policy. Enforces explicit source-state guards: rejects ONLY `BridgeState::Idle`; during
+    /// active/transition states (`Dialing | Incoming | Streaming | Closing`), updates cert & policy
+    /// in-place WITHOUT changing `state`, `pending_incoming_session_id_hex`, `incoming_accepted`,
+    /// or `active_session_id_hex`.
     pub fn on_bootstrap_complete(
         &self,
         local_cert: &SignalingDeviceCert,
@@ -572,14 +573,21 @@ impl V2BridgeController {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             match g.state {
-                BridgeState::Streaming => {
+                BridgeState::Idle => {
+                    return Err("on_bootstrap_complete forbidden in state Idle".into());
+                }
+                BridgeState::Dialing
+                | BridgeState::Incoming
+                | BridgeState::Streaming
+                | BridgeState::Closing => {
+                    let st = g.state;
                     g.local_device_id_hex = Some(hex::encode(local_cert.device_id));
                     g.local_tenant_id_hex = Some(hex::encode(local_cert.tenant_id));
                     g.policy = Some(policy.clone());
                     g.push_event(
                         "policy_refreshed",
                         serde_json::json!({
-                            "state": BridgeState::Streaming,
+                            "state": st,
                             "policy_degraded": policy.degraded,
                         }),
                     );
@@ -605,11 +613,6 @@ impl V2BridgeController {
                             "policy_degraded": policy.degraded,
                         }),
                     );
-                }
-                other => {
-                    return Err(format!(
-                        "on_bootstrap_complete forbidden in state {other:?}"
-                    ));
                 }
             }
         }
@@ -1413,6 +1416,7 @@ mod tests {
         EffectiveTenantPolicy {
             tenant_id: tid,
             version: 2,
+            exp_unix: u64::MAX,
             policy_hash: [0x55; 32],
             body: TenantPolicyBody {
                 schema_ver: 1,
@@ -1708,6 +1712,30 @@ mod tests {
         assert!(!contra_reject.ok);
         assert_eq!(
             contra_reject.error_code.as_deref(),
+            Some("illegal_state_transition")
+        );
+
+        // on_bootstrap_complete during Incoming MUST return Ok, update policy, and preserve
+        // state == Incoming + incoming_accepted + pending_incoming_session_id_hex!
+        let mut incoming_refreshed = full_policy(tid);
+        incoming_refreshed.version = 5;
+        ctrl.on_bootstrap_complete(&local_cert, incoming_refreshed, true)
+            .unwrap();
+        assert_eq!(ctrl.state(), BridgeState::Incoming);
+        let inc_snap = ctrl.snapshot();
+        assert_eq!(inc_snap.policy.unwrap().version, 5);
+        assert_eq!(
+            inc_snap.pending_incoming_session_id_hex.as_deref(),
+            Some(hex::encode([0xCCu8; 16]).as_str())
+        );
+        // incoming_accepted must still be true (a subsequent reject_incoming still fails!)
+        let still_accepted: BridgeResponseEnvelope = serde_json::from_str(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"reject_incoming"}"#),
+        )
+        .unwrap();
+        assert!(!still_accepted.ok);
+        assert_eq!(
+            still_accepted.error_code.as_deref(),
             Some("illegal_state_transition")
         );
 

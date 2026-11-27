@@ -2579,7 +2579,17 @@ impl ChildGroupGuard {
 
         let status = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(st)) => st,
-            Ok(Err(e)) => return Err(format!("wait child: {e}")),
+            Ok(Err(e)) => {
+                #[cfg(unix)]
+                if let Some(pgid) = self.pgid {
+                    unsafe {
+                        let _ = kill(-pgid, 9);
+                    }
+                }
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                return Err(format!("wait child: {e}"));
+            }
             Err(_) => {
                 #[cfg(unix)]
                 if let Some(pgid) = self.pgid {
@@ -2588,7 +2598,52 @@ impl ChildGroupGuard {
                     }
                 }
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                return Err("child process timed out".into());
+            }
+        };
+        let out_str = out_task.await.unwrap_or_default();
+        let err_str = err_task.await.unwrap_or_default();
+        Ok((status, out_str, err_str))
+    }
+
+    pub(crate) async fn wait_and_reap_on_err(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(std::process::ExitStatus, String, String), String> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| "child already consumed".to_string())?;
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let out_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stdout.take() {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stderr.take() {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(st)) => st,
+            Ok(Err(e)) => {
+                self.sigkill_group();
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                return Err(format!("wait child: {e}"));
+            }
+            Err(_) => {
+                self.sigkill_group();
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
                 return Err("child process timed out".into());
             }
         };

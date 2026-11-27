@@ -839,13 +839,17 @@ impl DesktopHostDaemon {
 
     async fn refresh_policy_if_needed(&mut self, force: bool) {
         let elapsed = self.policy_resolved_at.elapsed();
+        let now_unix = now_unix_secs();
+        let current_expired =
+            self.effective_policy.exp_unix > 0 && now_unix > self.effective_policy.exp_unix;
         let should_refresh = force
+            || current_expired
             || (self.effective_policy.degraded && elapsed >= POLICY_DEGRADED_REFRESH_DEBOUNCE)
             || elapsed >= POLICY_REFRESH_INTERVAL;
         if !should_refresh {
             return;
         }
-        if let Ok((_cert, pol)) = resolve_verified_tenant_policy(
+        match resolve_verified_tenant_policy(
             &self.cp,
             &mut self.identity,
             &self.ca_spki_der,
@@ -857,8 +861,20 @@ impl DesktopHostDaemon {
         )
         .await
         {
-            self.effective_policy = pol;
-            self.policy_resolved_at = Instant::now();
+            Ok((_cert, pol)) => {
+                // Never clobber a valid, unexpired policy with a degraded policy from a transient
+                // refresh error (unless current policy is already degraded or expired).
+                if !pol.degraded || self.effective_policy.degraded || current_expired {
+                    self.effective_policy = pol;
+                }
+                self.policy_resolved_at = Instant::now();
+            }
+            Err(e) => {
+                self.callbacks.emit_security_event(SecurityEvent::PolicyDegraded {
+                    reason: format!("policy refresh error: {e}"),
+                });
+                self.policy_resolved_at = Instant::now();
+            }
         }
     }
 
@@ -1486,10 +1502,14 @@ impl DesktopControllerClient {
     ) -> Result<ConnectedControllerSession, ManagerError> {
         self.callbacks.emit_state(V2SessionState::Connecting);
         let elapsed = self.policy_resolved_at.elapsed();
-        if (self.effective_policy.degraded && elapsed >= POLICY_DEGRADED_REFRESH_DEBOUNCE)
+        let now_unix = now_unix_secs();
+        let current_expired =
+            self.effective_policy.exp_unix > 0 && now_unix > self.effective_policy.exp_unix;
+        if current_expired
+            || (self.effective_policy.degraded && elapsed >= POLICY_DEGRADED_REFRESH_DEBOUNCE)
             || elapsed >= POLICY_REFRESH_INTERVAL
         {
-            if let Ok((_cert, pol)) = resolve_verified_tenant_policy(
+            match resolve_verified_tenant_policy(
                 &self.cp,
                 &mut self.identity,
                 &self.ca_spki_der,
@@ -1501,8 +1521,18 @@ impl DesktopControllerClient {
             )
             .await
             {
-                self.effective_policy = pol;
-                self.policy_resolved_at = Instant::now();
+                Ok((_cert, pol)) => {
+                    if !pol.degraded || self.effective_policy.degraded || current_expired {
+                        self.effective_policy = pol;
+                    }
+                    self.policy_resolved_at = Instant::now();
+                }
+                Err(e) => {
+                    self.callbacks.emit_security_event(SecurityEvent::PolicyDegraded {
+                        reason: format!("policy refresh error: {e}"),
+                    });
+                    self.policy_resolved_at = Instant::now();
+                }
             }
         }
         let ctrl_cert = self

@@ -1220,6 +1220,7 @@ impl UdpE2eeSession {
     /// Sends a raw negative-test wire probe on `0x02 Audio`, `0x04 Clipboard`, or `0x05 FileTransfer`
     /// bypassing only the local policy check so E2E harnesses can verify Edge + remote Host
     /// defense-in-depth rejection. Never permits `CHAN_INPUT_HID` or `CHAN_REALTIME_ACTUATOR`.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn send_negative_policy_probe(
         &mut self,
         chan_id: u8,

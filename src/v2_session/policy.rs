@@ -251,6 +251,8 @@ fn validate_strict_der_ecdsa_sig_len(sig_der: &[u8]) -> Result<(), PolicyError> 
 pub struct EffectiveTenantPolicy {
     pub tenant_id: [u8; 16],
     pub version: u64,
+    #[serde(default)]
+    pub exp_unix: u64,
     pub policy_hash: [u8; 32],
     pub body: TenantPolicyBody,
     pub degraded: bool,
@@ -263,6 +265,7 @@ impl EffectiveTenantPolicy {
         Self {
             tenant_id,
             version: 0,
+            exp_unix: 0,
             policy_hash,
             body: TenantPolicyBody::degraded_baseline(),
             degraded: true,
@@ -489,6 +492,7 @@ pub fn verify_raw_tenant_policy_blob(
     PolicyVerifyOutcome::Verified(EffectiveTenantPolicy {
         tenant_id: blob.tenant_id,
         version: blob.version,
+        exp_unix: blob.exp_unix,
         policy_hash: blob.policy_hash,
         body,
         degraded: false,

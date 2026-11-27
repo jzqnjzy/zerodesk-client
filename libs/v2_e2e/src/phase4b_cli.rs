@@ -73,6 +73,10 @@ enum CaseMode {
     /// Edge allows `p3` for Clipboard so raw `FILE_OFFER` reaches Host over the wire and Host
     /// MUST reply `FILE_ABORT(0x0401)` live over the wire!
     PartialDeniedFileOnly,
+    /// `allow_file_transfer=true, allow_clipboard=false, allow_audio=false`:
+    /// Edge allows `p3` for FileTransfer so raw `CLIP_SYNC` reaches Host over the wire and Host
+    /// MUST reply `CLIP_ACK(POLICY_DENIED)` live over the wire!
+    PartialDeniedClipOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +123,8 @@ struct Phase4bE2eReport {
     scenario_b_denied_policy: Option<Phase4bCaseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scenario_b2_host_wire_file_abort_0x0401: Option<Phase4bCaseReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scenario_b3_host_wire_clip_ack_denied: Option<Phase4bCaseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scenario_c1_ctrl_drop_udp_fallback: Option<Phase4bCaseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,7 +340,7 @@ async fn run_phase4b_case(
         ctl_cmd.arg("--drop-udp");
     }
     match spec.mode {
-        CaseMode::AllDenied | CaseMode::PartialDeniedFileOnly => {
+        CaseMode::AllDenied | CaseMode::PartialDeniedFileOnly | CaseMode::PartialDeniedClipOnly => {
             ctl_cmd.arg("--probe-denied-channels");
         }
         CaseMode::Allowed { send_file_twice } => {
@@ -355,24 +361,31 @@ async fn run_phase4b_case(
         ctl_cmd.arg("--signaling-tls");
     }
 
-    let ctl_child = match ChildGroupGuard::spawn_in_group(&mut ctl_cmd) {
+    let mut ctl_child = match ChildGroupGuard::spawn_in_group(&mut ctl_cmd) {
         Ok(c) => c,
         Err(e) => {
             host_child.sigkill_group();
-            let _ = host_child.wait_with_output(Duration::from_secs(2)).await;
+            let _ = host_child.wait_and_reap_on_err(Duration::from_secs(2)).await;
             return failed_case_report(spec.name, e);
         }
     };
 
     // Await Controller first (it sends 3x SESSION_CLOSE(0x0000) and exits first).
-    // On any Controller error/timeout, IMMEDIATELY kill & bounded-reap Host so no leaked
-    // v2-hostd can interfere with subsequent C1/C2/C3 cases!
-    let ctl_res = ctl_child.wait_with_output(Duration::from_secs(60)).await;
+    // Explicitly sigkill_group() + bounded-reap BOTH ctl_child on ctl_res error/timeout AND
+    // host_child on host_res error/timeout (even when ctl_res succeeded)!
+    let ctl_res = ctl_child.wait_and_reap_on_err(Duration::from_secs(60)).await;
     let host_res = match &ctl_res {
-        Ok(_) => host_child.wait_with_output(Duration::from_secs(20)).await,
+        Ok(_) => {
+            let res = host_child.wait_and_reap_on_err(Duration::from_secs(20)).await;
+            if res.is_err() {
+                host_child.sigkill_group();
+            }
+            res
+        }
         Err(_) => {
+            ctl_child.sigkill_group();
             host_child.sigkill_group();
-            let _ = host_child.wait_with_output(Duration::from_secs(3)).await;
+            let _ = host_child.wait_and_reap_on_err(Duration::from_secs(3)).await;
             Err("host terminated after controller timeout/error".into())
         }
     };
@@ -559,6 +572,40 @@ async fn run_phase4b_case(
             }
             if h.file_transfers_completed != 0 || !h.file_saved_paths.is_empty() {
                 checks.push("partial-denied file transfer unexpectedly saved file".into());
+            }
+        }
+        CaseMode::PartialDeniedClipOnly => {
+            // Layer 1: Controller local policy denies clipboard & audio
+            if !c.clipboard_local_policy_denied || !c.audio_local_policy_denied {
+                checks.push(
+                    "partial-denied controller local policy failed to deny clipboard/audio".into(),
+                );
+            }
+            // Layer 3 (Host wire enforcement): Edge allows p3 (allow_file_transfer=true), so raw
+            // CLIP_SYNC reaches Host and Host MUST reply CLIP_ACK(POLICY_DENIED) live over the wire!
+            if c.clipboard_acks_denied < 1 || h.clipboard_acks_denied < 1 {
+                checks.push(format!(
+                    "host wire CLIP_ACK(POLICY_DENIED) missing: ctl={}, host={}",
+                    c.clipboard_acks_denied, h.clipboard_acks_denied
+                ));
+            }
+            if h.clipboard_received_text != 0
+                || h.clipboard_received_png != 0
+                || c.clipboard_acks_ok != 0
+            {
+                checks.push(format!(
+                    "partial-denied clipboard unexpectedly delivered: text={}, png={}, acks_ok={}",
+                    h.clipboard_received_text, h.clipboard_received_png, c.clipboard_acks_ok
+                ));
+            }
+            if h.audio_policy_denied < 1
+                || h.audio_frames_sent != 0
+                || c.audio_frames_received != 0
+            {
+                checks.push(format!(
+                    "partial-denied audio gate mismatch: denied={}, sent={}, recv={}",
+                    h.audio_policy_denied, h.audio_frames_sent, c.audio_frames_received
+                ));
             }
         }
         CaseMode::Allowed { send_file_twice } => {
@@ -826,7 +873,7 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
         None
     };
 
-    let (scenario_b, scenario_b2) = if filter.run_b() {
+    let (scenario_b, scenario_b2, scenario_b3) = if filter.run_b() {
         // B1: All privileged channels denied -> Controller local + Edge L2 allowed_mask + Host Audio deny
         let tid_hex = hex::encode(random_bytes::<16>());
         let enroll = format!("v2-p4b-deny-{}", hex::encode(random_bytes::<8>()));
@@ -953,9 +1000,73 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
             &sample_sha_hex,
         )
         .await;
-        (Some(b1), Some(b2))
+
+        // B3: Partial deny (allow_file_transfer=true, allow_clipboard=false, allow_audio=false)
+        // Edge permits p3 for FileTransfer so raw CLIP_SYNC reaches Host and Host replies CLIP_ACK(POLICY_DENIED) live!
+        let tid3_hex = hex::encode(random_bytes::<16>());
+        let enroll3 = format!("v2-p4b-cdeny-{}", hex::encode(random_bytes::<8>()));
+        let req3 = CreateTenantReq {
+            tenant_id_hex: tid3_hex.clone(),
+            name: Some("zerodesk-p4b-partial-clip-denied".into()),
+            home_region: Some("local".into()),
+            plan_tier: Some("restricted-file".into()),
+            monthly_quota_bytes: 20 * 1024 * 1024 * 1024,
+            bw_cap_kbps: 50_000,
+            exhaust_policy: 0,
+            allow_file_transfer: true,
+            enrollment_token: enroll3.clone(),
+            enrollment_ttl_sec: 3600,
+            policy_hash_hex: None,
+            allow_clipboard: Some(false),
+            allow_file_clipboard: Some(false),
+            allow_tcp_tunnel: Some(false),
+            allow_terminal: Some(false),
+            allow_audio: Some(false),
+            max_file_mb: Some(64),
+            max_clipboard_kb: Some(0),
+        };
+        if let Err(e) = cp.create_tenant(admin_token, &req3).await {
+            eprintln!("create partial-clip-denied tenant failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        let host_id3 = work_dir.join("cdeny_host_id");
+        let ctrl_id3 = work_dir.join("cdeny_ctrl_id");
+        if let Err(e) = ensure_dir_0700(&host_id3).and_then(|_| ensure_dir_0700(&ctrl_id3)) {
+            eprintln!("create partial-clip-denied identity dirs: {e}");
+            return ExitCode::FAILURE;
+        }
+        let spec_b3 = Phase4bCaseSpec {
+            name: "scenario_b3_host_wire_clip_ack_denied",
+            host_transport: "udp",
+            host_drop_udp: false,
+            ctl_transport: "udp",
+            ctl_drop_udp: false,
+            expected_host_mode: "udp",
+            expected_ctl_mode: "udp",
+            check_host_fallback_lt_3s: false,
+            check_ctl_fallback_lt_3s: false,
+            mode: CaseMode::PartialDeniedClipOnly,
+        };
+        let b3 = run_phase4b_case(
+            &exe,
+            &spec_b3,
+            &config_path,
+            resolved_ca.as_deref(),
+            signaling_tls,
+            &host_id3,
+            &ctrl_id3,
+            &work_dir,
+            &tid3_hex,
+            &enroll3,
+            codec,
+            frames,
+            &sample_file_path,
+            &sample_sha_hex,
+        )
+        .await;
+        (Some(b1), Some(b2), Some(b3))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let (scenario_c1, scenario_c2, scenario_c3) = if filter.run_c() {
@@ -1076,6 +1187,7 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
         &scenario_a,
         &scenario_b,
         &scenario_b2,
+        &scenario_b3,
         &scenario_c1,
         &scenario_c2,
         &scenario_c3,
@@ -1090,6 +1202,7 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
         scenario_a_allowed_udp: scenario_a,
         scenario_b_denied_policy: scenario_b,
         scenario_b2_host_wire_file_abort_0x0401: scenario_b2,
+        scenario_b3_host_wire_clip_ack_denied: scenario_b3,
         scenario_c1_ctrl_drop_udp_fallback: scenario_c1,
         scenario_c2_host_drop_udp_fallback: scenario_c2,
         scenario_c3_tls443_only: scenario_c3,

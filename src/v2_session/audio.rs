@@ -1254,6 +1254,7 @@ mod tests {
         let allowed = EffectiveTenantPolicy {
             tenant_id: [1; 16],
             version: 1,
+            exp_unix: u64::MAX,
             policy_hash: [2; 32],
             body: TenantPolicyBody {
                 schema_ver: 1,

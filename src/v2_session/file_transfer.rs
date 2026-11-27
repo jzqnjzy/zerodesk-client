@@ -1504,6 +1504,7 @@ mod tests {
         EffectiveTenantPolicy {
             tenant_id: [0x11; 16],
             version: 1,
+            exp_unix: u64::MAX,
             policy_hash: [0x22; 32],
             body: TenantPolicyBody {
                 schema_ver: 1,
