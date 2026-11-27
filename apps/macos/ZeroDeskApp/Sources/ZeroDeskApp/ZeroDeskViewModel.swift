@@ -41,6 +41,7 @@ public final class ZeroDeskViewModel: ObservableObject {
     private let identityDirPath: String
     private var isFrameFetchScheduled = false
     private var hasPendingFrame = false
+    private var frameGeneration: UInt64 = 0
 
     public init() {
         guard let appSupport = FileManager.default.urls(
@@ -144,6 +145,9 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func stopHost() {
+        frameGeneration &+= 1
+        hasPendingFrame = false
+        latestFrame = nil
         runSimpleCommand(["cmd": "stop_host"], label: "Stop Host")
     }
 
@@ -157,8 +161,10 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func disconnect() {
-        runSimpleCommand(["cmd": "disconnect"], label: "Disconnect")
+        frameGeneration &+= 1
+        hasPendingFrame = false
         latestFrame = nil
+        runSimpleCommand(["cmd": "disconnect"], label: "Disconnect")
     }
 
     public func acceptIncoming() {
@@ -198,6 +204,9 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func shutdown() {
+        frameGeneration &+= 1
+        hasPendingFrame = false
+        latestFrame = nil
         if let client {
             _ = try? client.execCommand(["cmd": "disconnect"])
             _ = try? client.execCommand(["cmd": "stop_host"])
@@ -242,6 +251,8 @@ public final class ZeroDeskViewModel: ObservableObject {
                 verifiedByCa: verifiedByCa
             )
         } else if ev.kind == "SessionEnded" {
+            frameGeneration &+= 1
+            hasPendingFrame = false
             latestFrame = nil
             incomingCall = nil
         }
@@ -254,6 +265,7 @@ public final class ZeroDeskViewModel: ObservableObject {
             return
         }
         guard let client else { return }
+        let gen = frameGeneration
         isFrameFetchScheduled = true
         hasPendingFrame = false
         Task { @MainActor [weak self] in
@@ -262,11 +274,11 @@ public final class ZeroDeskViewModel: ObservableObject {
             }.value
             guard let self else { return }
             self.isFrameFetchScheduled = false
-            if let captured {
+            if let captured, gen == self.frameGeneration {
                 self.latestFrame = captured.image
                 self.frameCounter = captured.seq
             }
-            if self.hasPendingFrame {
+            if self.hasPendingFrame, gen == self.frameGeneration {
                 self.hasPendingFrame = false
                 self.scheduleFrameFetch()
             }

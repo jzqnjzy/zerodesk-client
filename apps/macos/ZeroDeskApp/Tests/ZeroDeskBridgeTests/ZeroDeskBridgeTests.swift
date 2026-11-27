@@ -51,10 +51,17 @@ final class ZeroDeskBridgeTests: XCTestCase {
             "authorization: basic \(canary)",
             "https://user:\(canary)@host.example/path",
             "https://example.test/api?foo=1&access_token=\(canary)&bar=2",
+            "https://example.test/api?foo=1&api_key=\(canary)&bar=2",
+            "https://example.test/obj?X-Amz-Signature=\(canary)",
+            "https://example.test/cb?code=\(canary)",
+            "wss://relay.example/v2/stream?opaque=\(canary)",
+            "?password=\(canary)",
+            "?client_secret=\(canary)",
         ]
         for sample in samples {
             let clean = sanitizeLogMessage(sample)
             XCTAssertFalse(clean.contains(canary), "sanitizer leaked canary for sample: \(sample) -> \(clean)")
+            XCTAssertEqual(sanitizeLogMessage(clean), clean, "sanitizeLogMessage is not idempotent for: \(sample)")
         }
     }
 
@@ -173,10 +180,38 @@ final class ZeroDeskBridgeTests: XCTestCase {
         }
     }
 
-    func testCreateAndImmediateDropNoDeadlock() throws {
-        for _ in 0..<200 {
-            _ = try ZeroDeskBridgeClient()
+    private func currentProcessThreadCount() -> Int {
+        var threads: thread_act_array_t?
+        var count: mach_msg_type_number_t = 0
+        let kr = task_threads(mach_task_self_, &threads, &count)
+        guard kr == KERN_SUCCESS else { return -1 }
+        if let threads {
+            for i in 0..<Int(count) {
+                mach_port_deallocate(mach_task_self_, threads[i])
+            }
+            let size = vm_size_t(Int(count) * MemoryLayout<thread_t>.stride)
+            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: threads), size)
         }
+        return Int(count)
+    }
+
+    func testCreateAndImmediateDropNoDeadlock() throws {
+        let beforeThreads = currentProcessThreadCount()
+        XCTAssertGreaterThan(beforeThreads, 0)
+        for _ in 0..<200 {
+            try autoreleasepool {
+                _ = try ZeroDeskBridgeClient()
+            }
+        }
+        // Allow OS thread teardown after deinit -> close() joins bridge state.
+        Thread.sleep(forTimeInterval: 0.05)
+        let afterThreads = currentProcessThreadCount()
+        XCTAssertGreaterThan(afterThreads, 0)
+        XCTAssertLessThanOrEqual(
+            afterThreads,
+            beforeThreads + 16,
+            "worker threads leaked across 200 create/immediate-drop cycles (before=\(beforeThreads), after=\(afterThreads))"
+        )
     }
 
     func testZeroCallbacksAfterCloseAndConcurrentTSan() throws {

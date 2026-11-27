@@ -83,15 +83,17 @@ private enum SanitizerRegex {
         let patterns: [(String, String)] = [
             (#"(?i)\bbearer\s+[^\s,;"]+"#, "Bearer <redacted>"),
             (#"(?i)\bbasic\s+[^\s,;"]+"#, "Basic <redacted>"),
-            (#"(?i)([?&][\w-]*token)=[^&\s]+"#, "$1=<redacted>"),
+            (#"(?i)([?&][\w-]*(?:token|secret|password|passwd|key|auth|signature|code|session))=[^&\s"'#]+"#, "$1=<redacted>"),
             (#"(?i)("(?:[^"]*(?:token|secret|key)[^"]*)"\s*:\s*)"[^"]*""#, #"$1"<redacted>""#),
             (#"://[^/\s@]+@"#, "://<redacted>@"),
+            (#"(?i)(\b(?:https?|wss?)://[^\s"'?#]+)\?[^\s"'#]*"#, "$1?<redacted>"),
         ]
-        return patterns.compactMap { pattern, template in
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-                return nil
+        return patterns.map { pattern, template in
+            do {
+                return (try NSRegularExpression(pattern: pattern, options: []), template)
+            } catch {
+                preconditionFailure("Invalid sanitizer regex pattern '\(pattern)': \(error)")
             }
-            return (regex, template)
         }
     }()
 }

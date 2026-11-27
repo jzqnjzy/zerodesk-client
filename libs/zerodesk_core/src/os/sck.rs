@@ -42,6 +42,9 @@ pub const SCK_STALE_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 /// permission fails closed instead of silently streaming a frozen frame forever.
 pub const SCK_MAX_SILENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Minimum interval between repeated TCC `preflight()` XPC checks during prolonged silent-idle.
+pub const SCK_IDLE_PREFLIGHT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Stack chunk size for zero-allocation audio interleaving / ingestion on the RT callback path.
 const AUDIO_INGEST_STACK_CHUNK: usize = 512;
 
@@ -728,6 +731,7 @@ mod macos_sck_impl {
     pub struct MacOsSckScreenCapture {
         inner: Arc<SckStreamInner>,
         last_raw: Option<(RawCapturedFrame, Instant)>,
+        last_idle_preflight: Option<Instant>,
     }
 
     impl MacOsSckScreenCapture {
@@ -772,12 +776,13 @@ mod macos_sck_impl {
                 .take_latest_wait(Duration::from_millis(250))
             {
                 self.last_raw = Some((latest.raw.clone(), latest.received_at));
+                self.last_idle_preflight = None;
                 return Ok(latest.raw);
             }
             // ScreenCaptureKit only emits frames on display damage: smoothly reuse `last_raw` on
             // a static screen as long as `stream_failed` is false; if silent beyond
-            // `SCK_MAX_SILENT_IDLE_TIMEOUT`, re-verify TCC screen-recording permission so revoked
-            // access fails closed instead of streaming a frozen frame indefinitely.
+            // `SCK_MAX_SILENT_IDLE_TIMEOUT`, re-verify TCC screen-recording permission at most once
+            // per `SCK_IDLE_PREFLIGHT_INTERVAL` so revoked access fails closed without hammering tccd.
             let failed = self.inner.stream_failed.load(Ordering::Acquire);
             let err_msg = if failed {
                 self.inner
@@ -788,14 +793,24 @@ mod macos_sck_impl {
             } else {
                 None
             };
-            if let Some((_, received_at)) = &self.last_raw {
+            if let Some(received_at) = self.last_raw.as_ref().map(|(_, ts)| *ts) {
+                let now = Instant::now();
+                let should_probe = self.last_idle_preflight.is_none_or(|prev| {
+                    now.saturating_duration_since(prev) >= SCK_IDLE_PREFLIGHT_INTERVAL
+                });
                 check_stream_health(
                     failed,
                     err_msg.as_deref(),
-                    *received_at,
-                    Instant::now(),
+                    received_at,
+                    now,
                     SCK_MAX_SILENT_IDLE_TIMEOUT,
-                    preflight,
+                    || {
+                        if !should_probe {
+                            return true;
+                        }
+                        self.last_idle_preflight = Some(now);
+                        preflight()
+                    },
                 )?;
             }
             resolve_idle_capture_frame(
@@ -953,6 +968,7 @@ mod macos_sck_impl {
         let video_cap: Box<dyn OsScreenCapture> = Box::new(MacOsSckScreenCapture {
             inner: Arc::clone(&inner),
             last_raw: None,
+            last_idle_preflight: None,
         });
         let audio_cap: Option<Box<dyn OsAudioCapture>> = audio_cons.map(|consumer| {
             Box::new(MacOsSckAudioCapture {
