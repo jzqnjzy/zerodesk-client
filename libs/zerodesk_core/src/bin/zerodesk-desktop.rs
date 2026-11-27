@@ -151,10 +151,15 @@ fn has_flag(args: &[String], name: &str) -> bool {
 }
 
 fn build_runtime_from_flags(args: &[String]) -> Result<RuntimeDropGuard, String> {
+    let watchdog_report = flag_value(args, "--watchdog-report").map(std::path::PathBuf::from);
+    let enable_watchdog = has_flag(args, "--hid-watchdog") || watchdog_report.is_some();
     let mut opts = V2BridgeRuntimeOptions {
         use_os_capture: has_flag(args, "--os-capture"),
+        legacy_capture_fallback: has_flag(args, "--legacy-capture-fallback"),
         use_os_audio: has_flag(args, "--os-audio"),
         use_os_clipboard: has_flag(args, "--os-clipboard"),
+        enable_hid_watchdog_subprocess: enable_watchdog,
+        watchdog_report_path: watchdog_report,
         ..V2BridgeRuntimeOptions::default()
     };
     if has_flag(args, "--real-os-input") {
@@ -188,11 +193,13 @@ fn cmd_bridge_stdio(args: &[String]) -> ExitCode {
         args,
         &[
             "--os-capture",
+            "--legacy-capture-fallback",
             "--os-audio",
             "--os-clipboard",
+            "--hid-watchdog",
             "--real-os-input",
         ],
-        &[],
+        &["--watchdog-report"],
     ) {
         write_stderr_line(&format!("bridge-stdio: {e}"));
         return ExitCode::from(2);
@@ -246,13 +253,15 @@ fn cmd_bridge_stdio(args: &[String]) -> ExitCode {
 fn cmd_host(args: &[String]) -> ExitCode {
     let bool_flags: &[&str] = &[
         "--os-capture",
+        "--legacy-capture-fallback",
         "--os-audio",
         "--os-clipboard",
+        "--hid-watchdog",
         "--real-os-input",
         #[cfg(feature = "e2e-fault-injection")]
         "--auto-accept",
     ];
-    if let Err(e) = validate_flags(args, bool_flags, &["--config"]) {
+    if let Err(e) = validate_flags(args, bool_flags, &["--config", "--watchdog-report"]) {
         write_stderr_line(&format!("host: {e}"));
         return ExitCode::from(2);
     }

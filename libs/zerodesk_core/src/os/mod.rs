@@ -6,6 +6,9 @@ pub mod capture;
 pub mod clipboard;
 pub mod dryrun;
 pub mod input;
+pub mod sck;
+pub mod watchdog_proto;
+pub mod watchdog_supervisor;
 
 use crate::{
     frame::PixelFormat,
@@ -36,6 +39,7 @@ pub enum OsError {
     PermissionDenied(OsPermission),
     CaptureFailed(String),
     AudioUnavailable(String),
+    UnsupportedAudioFormat(String),
     ClipboardUnavailable(String),
     UnsupportedPlatform(&'static str),
     InvalidData(String),
@@ -49,6 +53,7 @@ impl fmt::Display for OsError {
             Self::PermissionDenied(p) => write!(f, "OS permission denied: {p:?}"),
             Self::CaptureFailed(msg) => write!(f, "OS capture failed: {msg}"),
             Self::AudioUnavailable(msg) => write!(f, "OS audio unavailable: {msg}"),
+            Self::UnsupportedAudioFormat(msg) => write!(f, "unsupported OS audio format: {msg}"),
             Self::ClipboardUnavailable(msg) => write!(f, "OS clipboard unavailable: {msg}"),
             Self::UnsupportedPlatform(msg) => write!(f, "unsupported platform/feature: {msg}"),
             Self::InvalidData(msg) => write!(f, "invalid OS adapter data: {msg}"),
@@ -87,6 +92,9 @@ pub trait OsScreenCapture: Send {
     fn dimensions(&self) -> (u32, u32);
     fn capture_frame(&mut self) -> Result<RawCapturedFrame, OsError>;
 }
+
+/// Pair of screen capture handle plus optional co-hosted system audio capture (e.g. ScreenCaptureKit).
+pub type OsCapturePair = (Box<dyn OsScreenCapture>, Option<Box<dyn OsAudioCapture>>);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseReport {

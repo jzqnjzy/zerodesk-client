@@ -40,12 +40,39 @@ fn link_macos_frameworks() {
     }
 }
 
+fn compile_macos_sck() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+        && env::var_os("CARGO_FEATURE_OS_SCK").is_some()
+    {
+        println!("cargo:rerun-if-changed=native/macos_sck.h");
+        println!("cargo:rerun-if-changed=native/macos_sck.m");
+
+        cc::Build::new()
+            .file("native/macos_sck.m")
+            .include("native")
+            .flag("-fobjc-arc")
+            .flag("-mmacosx-version-min=13.0")
+            .flag("-Wall")
+            .flag("-Wextra")
+            .flag("-Werror")
+            .compile("zerodesk_macos_sck");
+
+        println!("cargo:rustc-link-lib=framework=ScreenCaptureKit");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ZERODESK_LIBOPUS_PREFIX");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
     link_macos_frameworks();
+    compile_macos_sck();
 
     if let Ok(prefix) = env::var("ZERODESK_LIBOPUS_PREFIX") {
         let lib_dir = PathBuf::from(&prefix).join("lib");

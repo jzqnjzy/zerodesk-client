@@ -13,7 +13,7 @@ use crate::{
     frame::{FrameError, FrameInfo, FrameMailbox, PixelFormat},
     os::{
         audio::{open_os_audio_capture, open_os_audio_playback, AudioStatusChanged},
-        capture::{convert_captured_stride_to_i420, create_os_screen_capture},
+        capture::{convert_captured_stride_to_i420, create_os_screen_capture_with_policy},
         clipboard::{
             create_os_clipboard_backend, validate_clipboard_png_bytes, ClipboardPoller,
         },
@@ -22,6 +22,9 @@ use crate::{
             SilentAudioCapture, SilentAudioPlayback, SyntheticScreenSource,
         },
         input::{create_real_os_hid_sink, RealInputPermit},
+        watchdog_supervisor::{
+            HidWatchdogConfig, HidWatchdogSupervisor, WatchdogSupervisedHidSink,
+        },
         EmergencyKeyReleaser, OsAudioCapture, OsAudioPlayback, OsHidSink, OsScreenCapture,
     },
     session::{
@@ -102,8 +105,12 @@ fn now_epoch_ms() -> u64 {
 /// Defaults are strictly zero-OS-side-effect (DryRun HID, Synthetic capture, Silent audio, MemoryClipboard).
 pub struct V2BridgeRuntimeOptions {
     pub use_os_capture: bool,
+    pub legacy_capture_fallback: bool,
     pub use_os_audio: bool,
     pub use_os_clipboard: bool,
+    pub enable_hid_watchdog_subprocess: bool,
+    pub watchdog_report_path: Option<PathBuf>,
+    pub watchdog_bin_path: Option<PathBuf>,
     pub real_input_permit: Option<Arc<RealInputPermit>>,
     pub dryrun_journal: DryRunHidJournal,
     pub memory_clipboard: MemoryClipboardBackend,
@@ -121,8 +128,12 @@ impl Default for V2BridgeRuntimeOptions {
     fn default() -> Self {
         Self {
             use_os_capture: false,
+            legacy_capture_fallback: false,
             use_os_audio: false,
             use_os_clipboard: false,
+            enable_hid_watchdog_subprocess: false,
+            watchdog_report_path: None,
+            watchdog_bin_path: None,
             real_input_permit: None,
             dryrun_journal: DryRunHidJournal::new(),
             memory_clipboard: MemoryClipboardBackend::new(),
@@ -1626,8 +1637,12 @@ impl BridgeActor {
         let total_tasks = Arc::clone(&self.spawned_tasks_total);
         let releaser_slot = Arc::clone(&self.emergency_releaser);
         let use_os_capture = self.options.use_os_capture;
+        let legacy_capture_fallback = self.options.legacy_capture_fallback;
         let use_os_audio = self.options.use_os_audio;
         let use_os_clipboard = self.options.use_os_clipboard;
+        let enable_hid_watchdog_subprocess = self.options.enable_hid_watchdog_subprocess;
+        let watchdog_report_path = self.options.watchdog_report_path.clone();
+        let watchdog_bin_path = self.options.watchdog_bin_path.clone();
         let dryrun_journal = self.options.dryrun_journal.clone();
         let mem_clip = self.options.memory_clipboard.clone();
         let synth_w = self.options.synthetic_width;
@@ -1647,8 +1662,12 @@ impl BridgeActor {
                 releaser_slot,
                 HostTaskAdapters {
                     use_os_capture,
+                    legacy_capture_fallback,
                     use_os_audio,
                     use_os_clipboard,
+                    enable_hid_watchdog_subprocess,
+                    watchdog_report_path,
+                    watchdog_bin_path,
                     real_input_permit,
                     dryrun_journal,
                     mem_clip,
@@ -3635,8 +3654,12 @@ impl Drop for ReleaserDropGuard {
 
 struct HostTaskAdapters {
     use_os_capture: bool,
+    legacy_capture_fallback: bool,
     use_os_audio: bool,
     use_os_clipboard: bool,
+    enable_hid_watchdog_subprocess: bool,
+    watchdog_report_path: Option<PathBuf>,
+    watchdog_bin_path: Option<PathBuf>,
     real_input_permit: Option<Arc<RealInputPermit>>,
     dryrun_journal: DryRunHidJournal,
     mem_clip: MemoryClipboardBackend,
@@ -3806,10 +3829,14 @@ async fn run_active_host_session(
     adapters.dryrun_journal.resume_for_new_session();
 
     // 1. HID sink (DryRun by default; triple-gated RealInput only when Arc<RealInputPermit> provided).
-    let mut hid_sink: Box<dyn OsHidSink> = if let Some(permit) = adapters.real_input_permit.clone()
+    let mut using_real_input = false;
+    let base_hid_sink: Box<dyn OsHidSink> = if let Some(permit) = adapters.real_input_permit.clone()
     {
         match create_real_os_hid_sink(permit) {
-            Ok(real) => real,
+            Ok(real) => {
+                using_real_input = true;
+                real
+            }
             Err(e) => {
                 let _ = actor_tx
                     .send(ActorMessage::InternalEvent {
@@ -3826,13 +3853,67 @@ async fn run_active_host_session(
     } else {
         Box::new(DryRunHidSink::with_journal(adapters.dryrun_journal.clone()))
     };
+    let mut hid_sink: Box<dyn OsHidSink> = if adapters.enable_hid_watchdog_subprocess {
+        let wd_cfg = HidWatchdogConfig {
+            binary_path: adapters.watchdog_bin_path.clone(),
+            dry_run_report_path: adapters.watchdog_report_path.clone(),
+            real_os_input: using_real_input,
+            ..HidWatchdogConfig::default()
+        };
+        match HidWatchdogSupervisor::spawn(wd_cfg) {
+            Ok(sup) => {
+                let tx_deg = actor_tx.clone();
+                let on_degraded = Arc::new(move |reason: String| {
+                    let _ = tx_deg.try_send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::HostCapabilityDegraded {
+                            capability: "hid_watchdog".into(),
+                            reason,
+                        },
+                    });
+                });
+                Box::new(WatchdogSupervisedHidSink::new(
+                    base_hid_sink,
+                    Arc::new(sup),
+                    Some(on_degraded),
+                ))
+            }
+            Err(e) => {
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::HostCapabilityDegraded {
+                            capability: "hid_watchdog".into(),
+                            reason: e.to_string(),
+                        },
+                    })
+                    .await;
+                if using_real_input {
+                    // Fail closed: never allow unsupervised real OS HID injection when watchdog was requested.
+                    Box::new(DryRunHidSink::with_journal(adapters.dryrun_journal.clone()))
+                } else {
+                    base_hid_sink
+                }
+            }
+        }
+    } else {
+        base_hid_sink
+    };
     let releaser = hid_sink.emergency_releaser();
     let _releaser_guard = ReleaserDropGuard::arm(Arc::clone(&releaser), releaser_slot);
 
-    // 2. Capture source (Synthetic by default, OS capture if requested with explicit degradation event).
+    // 2. Capture source (Synthetic by default; OS capture tries ScreenCaptureKit first and fails
+    //    closed with HostCapabilityDegraded unless `legacy_capture_fallback` is explicitly true).
+    let mut sck_audio_cap: Option<Box<dyn OsAudioCapture>> = None;
     let mut capture: Box<dyn OsScreenCapture> = if adapters.use_os_capture {
-        match create_os_screen_capture() {
-            Ok(cap) => cap,
+        match create_os_screen_capture_with_policy(
+            adapters.use_os_audio,
+            adapters.legacy_capture_fallback,
+        ) {
+            Ok((cap, maybe_audio)) => {
+                sck_audio_cap = maybe_audio;
+                cap
+            }
             Err(e) => {
                 let _ = actor_tx
                     .send(ActorMessage::InternalEvent {
@@ -3843,7 +3924,8 @@ async fn run_active_host_session(
                         },
                     })
                     .await;
-                Box::new(SyntheticScreenSource::new(adapters.synth_w, adapters.synth_h))
+                let _ = accepted.lease_renewal.shutdown().await;
+                return format!("os_capture failed closed: {e}");
             }
         }
     } else {
@@ -3863,8 +3945,11 @@ async fn run_active_host_session(
     };
     let mut host_sess = DesktopHostSession::new(accepted.e2ee_session, encoder);
 
-    // 3. Audio source & Opus encoder (graceful degradation via AudioStatusChanged).
-    let mut os_audio_cap: Box<dyn OsAudioCapture> = if adapters.use_os_audio {
+    // 3. Audio source & Opus encoder (prefers ScreenCaptureKit system audio loopback when available;
+    //    graceful degradation via AudioStatusChanged).
+    let mut os_audio_cap: Box<dyn OsAudioCapture> = if let Some(sck_aud) = sck_audio_cap {
+        sck_aud
+    } else if adapters.use_os_audio {
         match open_os_audio_capture() {
             Ok(cap) => cap,
             Err(status) => {

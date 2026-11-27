@@ -19,9 +19,14 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 name = "zerodesk-desktop"
 path = "src/bin/zerodesk-desktop.rs"
 
+[[bin]]
+name = "zerodesk-hid-watchdog"
+path = "src/bin/zerodesk-hid-watchdog.rs"
+
 [features]
-default = ["os-capture", "os-audio", "os-clipboard"]
+default = ["os-capture", "os-sck", "os-audio", "os-clipboard"]
 os-capture = ["dep:core-graphics", "dep:core-foundation"]
+os-sck = []
 os-audio = ["dep:cpal"]
 os-clipboard = ["dep:arboard"]
 real-input = []
@@ -54,6 +59,9 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.9", optional = true }
 core-graphics = { version = "0.23", optional = true }
+
+[build-dependencies]
+cc = "1.0"
 
 [dev-dependencies]
 cc = "1.0"

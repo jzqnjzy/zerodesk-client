@@ -314,6 +314,60 @@ mod macos_real_input {
         }
     }
 
+    /// Posts `keyUp` for every key in `keys`, unconditionally posts `keyUp` for all 8 standard
+    /// modifier usages (`0xE0..=0xE7`), and posts `mouseUp` for all bits set in `buttons`.
+    /// Requires `AXIsProcessTrusted()` (fail-closed).
+    pub fn emergency_release_macos_keys_and_buttons(
+        keys: &[u16],
+        buttons: u8,
+    ) -> Result<ReleaseReport, OsError> {
+        if !is_accessibility_trusted() {
+            return Err(OsError::PermissionDenied(OsPermission::Accessibility));
+        }
+        let mut released_keys = 0usize;
+        let mut residual_keys = 0usize;
+        let mut already_released = BTreeSet::new();
+        for &usage in keys {
+            if let Some(kc) = hid_usage_to_macos_keycode(usage) {
+                if post_key_event(kc, false, 0) {
+                    released_keys += 1;
+                    already_released.insert(usage);
+                } else {
+                    residual_keys += 1;
+                }
+            }
+        }
+        for mod_usage in ALL_MODIFIER_HID_USAGES {
+            if !already_released.contains(&mod_usage) {
+                if let Some(kc) = hid_usage_to_macos_keycode(mod_usage) {
+                    let _ = post_key_event(kc, false, 0);
+                }
+            }
+        }
+        let mut released_buttons = 0usize;
+        let mut residual_buttons = 0usize;
+        let origin = CGPoint { x: 0.0, y: 0.0 };
+        for (mask, ev_type, btn) in [
+            (1u8 << 0, K_CG_EVENT_LEFT_MOUSE_UP, K_CG_MOUSE_BUTTON_LEFT),
+            (1u8 << 1, K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_MOUSE_BUTTON_RIGHT),
+            (1u8 << 2, K_CG_EVENT_OTHER_MOUSE_UP, K_CG_MOUSE_BUTTON_CENTER),
+        ] {
+            if (buttons & mask) != 0 {
+                if post_mouse_event(ev_type, origin, btn) {
+                    released_buttons += 1;
+                } else {
+                    residual_buttons += 1;
+                }
+            }
+        }
+        Ok(ReleaseReport {
+            released_keys,
+            released_buttons,
+            residual_keys,
+            residual_buttons,
+        })
+    }
+
     /// Stateless emergency releaser: sets `interlocked = true`, snapshots & clears pressed state
     /// under a tiny lock, drops lock, posts `keyUp`/`mouseUp` + all 8 modifier `keyUp`s directly
     /// to `CGEventPost` without borrowing `MacOsHidSink`.
@@ -607,6 +661,28 @@ pub fn create_real_os_hid_sink(permit: Arc<RealInputPermit>) -> Result<Box<dyn O
         let _ = permit;
         Err(OsError::UnsupportedPlatform(
             "real OS HID sink unavailable on this platform/feature set",
+        ))
+    }
+}
+
+/// Releases all specified HID keys, all 8 standard modifiers, and mouse buttons directly via OS APIs.
+/// Triple-gated: requires `cfg(target_os = "macos")`, `feature = "real-input"`, `RealInputPermit`,
+/// and `AXIsProcessTrusted()`.
+pub fn emergency_release_real_os_keys(
+    permit: &RealInputPermit,
+    keys: &[u16],
+    buttons: u8,
+) -> Result<super::ReleaseReport, OsError> {
+    let _ = permit;
+    #[cfg(all(target_os = "macos", feature = "real-input"))]
+    {
+        macos_real_input::emergency_release_macos_keys_and_buttons(keys, buttons)
+    }
+    #[cfg(not(all(target_os = "macos", feature = "real-input")))]
+    {
+        let _ = (keys, buttons);
+        Err(OsError::UnsupportedPlatform(
+            "real OS HID emergency release unavailable on this platform/feature set",
         ))
     }
 }

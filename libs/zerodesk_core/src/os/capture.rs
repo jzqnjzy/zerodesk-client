@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
-use super::{OsError, OsScreenCapture, RawCapturedFrame};
+use super::{OsCapturePair, OsError, OsScreenCapture, RawCapturedFrame};
 use crate::{
     frame::{checked_frame_byte_len, PixelFormat},
     session::{capture::bgra_to_i420_bt601, video::I420Frame},
@@ -103,14 +103,18 @@ pub fn validate_cg_bitmap_info(
 
 /// Non-interactive screen capture permission preflight (NEVER triggers an OS permission prompt).
 pub fn preflight_screen_capture_permission() -> Result<bool, OsError> {
-    #[cfg(all(target_os = "macos", feature = "os-capture"))]
+    #[cfg(all(target_os = "macos", feature = "os-sck"))]
+    {
+        super::sck::preflight_sck_permission()
+    }
+    #[cfg(all(target_os = "macos", not(feature = "os-sck"), feature = "os-capture"))]
     {
         extern "C" {
             fn CGPreflightScreenCaptureAccess() -> bool;
         }
         Ok(unsafe { CGPreflightScreenCaptureAccess() })
     }
-    #[cfg(not(all(target_os = "macos", feature = "os-capture")))]
+    #[cfg(not(all(target_os = "macos", any(feature = "os-sck", feature = "os-capture"))))]
     {
         Err(OsError::UnsupportedPlatform(
             "os-capture screen permission probe not implemented on this platform",
@@ -261,18 +265,55 @@ mod macos_impl {
 #[cfg(all(target_os = "macos", feature = "os-capture"))]
 pub use macos_impl::MacOsScreenCapture;
 
-/// Constructs the platform's native OS screen capture adapter (or returns `UnsupportedPlatform`).
-pub fn create_os_screen_capture() -> Result<Box<dyn OsScreenCapture>, OsError> {
-    #[cfg(all(target_os = "macos", feature = "os-capture"))]
+/// Constructs the platform's native OS screen capture adapter (plus optional ScreenCaptureKit
+/// system audio loopback capture on macOS).
+///
+/// On macOS with `os-sck`: tries ScreenCaptureKit FIRST. If permission is denied or start fails,
+/// fails closed UNLESS `legacy_capture_fallback` is explicitly `true`.
+pub fn create_os_screen_capture_with_policy(
+    capture_audio: bool,
+    legacy_capture_fallback: bool,
+) -> Result<OsCapturePair, OsError> {
+    #[cfg(all(target_os = "macos", feature = "os-sck"))]
     {
-        Ok(Box::new(MacOsScreenCapture::new()?))
+        let sck_cfg = super::sck::SckCaptureConfig {
+            capture_audio,
+            ..super::sck::SckCaptureConfig::default()
+        };
+        match super::sck::open_sck_capture(sck_cfg) {
+            Ok(pair) => Ok(pair),
+            Err(sck_err) => {
+                if !legacy_capture_fallback {
+                    return Err(sck_err);
+                }
+                #[cfg(feature = "os-capture")]
+                {
+                    Ok((Box::new(MacOsScreenCapture::new()?), None))
+                }
+                #[cfg(not(feature = "os-capture"))]
+                {
+                    Err(sck_err)
+                }
+            }
+        }
     }
-    #[cfg(not(all(target_os = "macos", feature = "os-capture")))]
+    #[cfg(all(target_os = "macos", not(feature = "os-sck"), feature = "os-capture"))]
     {
+        let _ = (capture_audio, legacy_capture_fallback);
+        Ok((Box::new(MacOsScreenCapture::new()?), None))
+    }
+    #[cfg(not(all(target_os = "macos", any(feature = "os-sck", feature = "os-capture"))))]
+    {
+        let _ = (capture_audio, legacy_capture_fallback);
         Err(OsError::UnsupportedPlatform(
             "native screen capture adapter unavailable on this build/platform",
         ))
     }
+}
+
+/// Constructs the platform's native OS screen capture adapter (fail-closed; no silent legacy fallback).
+pub fn create_os_screen_capture() -> Result<Box<dyn OsScreenCapture>, OsError> {
+    create_os_screen_capture_with_policy(false, false).map(|(cap, _)| cap)
 }
 
 #[cfg(test)]
