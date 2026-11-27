@@ -173,12 +173,17 @@ public struct ContentView: View {
     private var mainCanvasArea: some View {
         VStack(spacing: 0) {
             ZStack {
-                Color.black.opacity(0.92)
-                if let cg = vm.latestFrame {
-                    Image(decorative: cg, scale: 1.0)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                } else {
+                Color.black
+                if let renderer = vm.metalRenderer {
+                    RemoteMetalView(
+                        renderer: renderer,
+                        inputTracker: vm.inputTracker,
+                        isSessionActive: vm.isSessionStreaming,
+                        remoteSize: vm.remoteSize,
+                        onEmergencyEscape: vm.handleEmergencyEscapeTriggered
+                    )
+                }
+                if !vm.hasVideoFrame {
                     VStack(spacing: 8) {
                         Image(systemName: "desktopcomputer")
                             .font(.system(size: 40))
@@ -186,21 +191,28 @@ public struct ContentView: View {
                         Text("No Active Video Stream")
                             .foregroundColor(.secondary)
                     }
+                    .allowsHitTesting(false)
                 }
                 VStack {
                     HStack {
                         Spacer()
-                        Text("Frame #\(vm.frameCounter)")
-                            .font(.caption.monospaced())
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.black.opacity(0.6))
-                            .foregroundColor(.white)
-                            .cornerRadius(6)
+                        HStack(spacing: 10) {
+                            Text("Codec: \(vm.activeCodecLabel.uppercased())")
+                            Text(String(format: "%.1f FPS", vm.renderFps))
+                            Text(String(format: "Metal: %.2f ms", vm.metalRenderMs))
+                            Text("Frame #\(vm.frameCounter)")
+                        }
+                        .font(.caption.monospaced())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.65))
+                        .foregroundColor(.white)
+                        .cornerRadius(6)
                     }
                     Spacer()
                 }
                 .padding(10)
+                .allowsHitTesting(false)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -301,6 +313,9 @@ private struct SettingsSheetView: View {
                     Text("TLS 443").tag("tls443")
                 }
                 Picker("Codec", selection: $vm.codec) {
+                    Text("Auto (HEVC/H.264/VP9)").tag("auto")
+                    Text("HEVC").tag("hevc")
+                    Text("H.264").tag("h264")
                     Text("VP9").tag("vp9")
                     Text("AV1").tag("av1")
                 }

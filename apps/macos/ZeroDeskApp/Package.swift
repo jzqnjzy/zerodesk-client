@@ -20,6 +20,7 @@ let macosSystemLinkerSettings: [LinkerSetting] = [
     .linkedFramework("IOSurface"),
     .linkedFramework("AVFoundation"),
     .linkedFramework("Metal"),
+    .linkedFramework("MetalKit"),
     .linkedFramework("QuartzCore"),
     .linkedFramework("SystemConfiguration"),
     .linkedFramework("IOKit"),

@@ -300,3 +300,35 @@ public struct CapturedFrameImage: @unchecked Sendable {
     public let droppedUiFrames: UInt64
     public let image: CGImage
 }
+
+/// Raw BGRA8 frame fetched directly from Rust's `FrameMailbox` for zero-CGImage Metal texture upload.
+public struct CapturedBGRAFrame: Sendable {
+    public let seq: UInt64
+    public let width: Int
+    public let height: Int
+    public let stride: Int
+    public let pixelFormat: UInt32
+    public let ptsMs: UInt64
+    public let droppedUiFrames: UInt64
+    public let data: Data
+
+    public init(
+        seq: UInt64,
+        width: Int,
+        height: Int,
+        stride: Int,
+        pixelFormat: UInt32 = 1,
+        ptsMs: UInt64 = 0,
+        droppedUiFrames: UInt64 = 0,
+        data: Data
+    ) {
+        self.seq = seq
+        self.width = width
+        self.height = height
+        self.stride = stride
+        self.pixelFormat = pixelFormat
+        self.ptsMs = ptsMs
+        self.droppedUiFrames = droppedUiFrames
+        self.data = data
+    }
+}

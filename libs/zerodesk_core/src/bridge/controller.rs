@@ -284,6 +284,8 @@ struct BridgeCommandEnvelope {
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
     pub mime_kind: Option<u8>,
     #[serde(default)]
     pub payload_b64: Option<String>,
@@ -336,6 +338,17 @@ impl BridgeResponseEnvelope {
     }
 }
 
+pub fn normalize_codec_setting(raw: &str) -> Result<String, V2ConfigError> {
+    let norm = raw.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "" | "auto" => Ok("auto".to_string()),
+        "hevc" | "h264" | "vp9" | "av1" => Ok(norm),
+        other => Err(V2ConfigError::InvalidValue(format!(
+            "unsupported codec '{other}' (expected auto, hevc, h264, vp9, or av1)"
+        ))),
+    }
+}
+
 impl BridgePersistedConfig {
     pub fn validate(&self) -> Result<(), V2ConfigError> {
         if self.v != BRIDGE_ABI_VERSION {
@@ -358,6 +371,9 @@ impl BridgePersistedConfig {
             return Err(V2ConfigError::InvalidValue(
                 "identity_dir must not be empty".into(),
             ));
+        }
+        if !self.codec.trim().is_empty() {
+            let _ = normalize_codec_setting(&self.codec)?;
         }
         if self.fps == 0 || self.fps > 120 {
             return Err(V2ConfigError::InvalidValue(format!(
@@ -1211,6 +1227,44 @@ impl V2BridgeController {
                 );
                 (
                     BridgeResponseEnvelope::ok(serde_json::json!({ "transport_mode": mode })),
+                    true,
+                )
+            }
+            "set_codec" => {
+                let Some(codec_str) = env.codec.as_deref() else {
+                    return (
+                        BridgeResponseEnvelope::err(
+                            "missing_field",
+                            "set_codec requires 'codec' (auto|hevc|h264|vp9|av1)",
+                        ),
+                        false,
+                    );
+                };
+                let norm = match normalize_codec_setting(codec_str) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return (
+                            BridgeResponseEnvelope::err("invalid_argument", e.to_string()),
+                            false,
+                        );
+                    }
+                };
+                let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !g.allows_config_mutation() {
+                    return (
+                        BridgeResponseEnvelope::err(
+                            "illegal_state_transition",
+                            format!("set_codec forbidden in state {:?}", g.state),
+                        ),
+                        false,
+                    );
+                }
+                if let Some(cfg) = g.config.as_mut() {
+                    cfg.codec = norm.clone();
+                }
+                g.push_event("codec_changed", serde_json::json!({ "codec": norm }));
+                (
+                    BridgeResponseEnvelope::ok(serde_json::json!({ "codec": norm })),
                     true,
                 )
             }

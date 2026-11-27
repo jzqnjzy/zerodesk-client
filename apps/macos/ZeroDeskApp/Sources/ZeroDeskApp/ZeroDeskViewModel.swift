@@ -2,7 +2,6 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 import AppKit
-import CoreGraphics
 import Foundation
 import ZeroDeskBridge
 
@@ -17,8 +16,12 @@ public struct IncomingCallPrompt: Identifiable, Sendable {
 public final class ZeroDeskViewModel: ObservableObject {
     @Published public var snapshot: BridgeSnapshot?
     @Published public var selftest: OsSelftestReport?
-    @Published public var latestFrame: CGImage?
+    @Published public var hasVideoFrame: Bool = false
+    @Published public var remoteSize: RemoteSize = RemoteSize(width: 0, height: 0)
     @Published public var frameCounter: UInt64 = 0
+    @Published public var activeCodecLabel: String = "auto"
+    @Published public var renderFps: Double = 0
+    @Published public var metalRenderMs: Double = 0
     @Published public var incomingCall: IncomingCallPrompt?
     @Published public var statusMessage: String = "Idle"
     @Published public var eventLog: [String] = []
@@ -32,8 +35,15 @@ public final class ZeroDeskViewModel: ObservableObject {
     @Published public var controlPlaneEndpoint: String = "https://127.0.0.1:8443"
     @Published public var signalingAddr: String = "127.0.0.1:8444"
     @Published public var transportMode: String = "auto"
-    @Published public var codec: String = "vp9"
+    @Published public var codec: String = "auto"
     @Published public var enrollmentTokenDraft: String = ""
+
+    public let metalRenderer: MetalVideoRenderer?
+    public private(set) var inputTracker: PressedInputTracker?
+
+    public var isSessionStreaming: Bool {
+        snapshot?.state == "streaming"
+    }
 
     private var client: ZeroDeskBridgeClient?
     private let configDirPath: String
@@ -42,8 +52,12 @@ public final class ZeroDeskViewModel: ObservableObject {
     private var isFrameFetchScheduled = false
     private var hasPendingFrame = false
     private var frameGeneration: UInt64 = 0
+    private var fpsWindowStartNs: UInt64 = 0
+    private var fpsWindowFrames: UInt64 = 0
 
     public init() {
+        self.metalRenderer = try? MetalVideoRenderer()
+
         guard let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -52,6 +66,7 @@ public final class ZeroDeskViewModel: ObservableObject {
             self.configFilePath = ""
             self.identityDirPath = ""
             self.client = nil
+            self.inputTracker = nil
             refreshSelftest()
             setStatus("Failed to locate Application Support directory")
             return
@@ -70,6 +85,7 @@ public final class ZeroDeskViewModel: ObservableObject {
                 }
             }
             self.client = bridge
+            self.inputTracker = PressedInputTracker(sink: bridge)
             refreshSnapshot()
             if FileManager.default.fileExists(atPath: configFilePath) {
                 if let reply = try? bridge.loadConfig(at: configFilePath), reply.ok {
@@ -94,12 +110,19 @@ public final class ZeroDeskViewModel: ObservableObject {
         guard let client else { return }
         do {
             let snap = try client.snapshot()
+            let wasStreaming = snapshot?.state == "streaming"
             snapshot = snap
+            if wasStreaming && snap.state != "streaming" {
+                inputTracker?.releaseAll(reason: .sessionLeftConnected)
+            }
             if let cfg = snap.config, !isSettingsPresented {
                 controlPlaneEndpoint = cfg.controlPlaneEndpoint
                 signalingAddr = cfg.signalingAddr
                 transportMode = cfg.transportMode
                 codec = cfg.codec
+                if !isSessionStreaming {
+                    activeCodecLabel = cfg.codec
+                }
             }
         } catch {
             appendLog("snapshot failed: \(error)")
@@ -141,13 +164,11 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func startHost() {
-        runSimpleCommand(["cmd": "start_host"], label: "Start Host")
+        runSimpleCommand(["cmd": "start_host", "codec": codec], label: "Start Host")
     }
 
     public func stopHost() {
-        frameGeneration &+= 1
-        hasPendingFrame = false
-        latestFrame = nil
+        clearVideoState(releaseReason: .sessionLeftConnected)
         runSimpleCommand(["cmd": "stop_host"], label: "Stop Host")
     }
 
@@ -157,14 +178,21 @@ public final class ZeroDeskViewModel: ObservableObject {
             setStatus("Enter a 32-hex target Device ID")
             return
         }
-        runSimpleCommand(["cmd": "dial", "target_device_id_hex": trimmed], label: "Dial")
+        activeCodecLabel = codec
+        runSimpleCommand(
+            ["cmd": "dial", "target_device_id_hex": trimmed, "codec": codec],
+            label: "Dial"
+        )
     }
 
     public func disconnect() {
-        frameGeneration &+= 1
-        hasPendingFrame = false
-        latestFrame = nil
+        clearVideoState(releaseReason: .sessionLeftConnected)
         runSimpleCommand(["cmd": "disconnect"], label: "Disconnect")
+    }
+
+    public func handleEmergencyEscapeTriggered() {
+        setStatus("Emergency Escape (Ctrl+Opt+Cmd+Esc): released all remote inputs")
+        appendLog("Emergency Escape: sent release_all")
     }
 
     public func acceptIncoming() {
@@ -204,15 +232,28 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func shutdown() {
-        frameGeneration &+= 1
-        hasPendingFrame = false
-        latestFrame = nil
+        clearVideoState(releaseReason: .viewTeardownOrTerminate)
         if let client {
+            _ = try? client.releaseAllInput(reason: .viewTeardownOrTerminate)
             _ = try? client.execCommand(["cmd": "disconnect"])
             _ = try? client.execCommand(["cmd": "stop_host"])
             client.close()
         }
+        inputTracker = nil
         client = nil
+    }
+
+    private func clearVideoState(releaseReason: ReleaseReason) {
+        inputTracker?.releaseAll(reason: releaseReason)
+        frameGeneration &+= 1
+        hasPendingFrame = false
+        hasVideoFrame = false
+        remoteSize = RemoteSize(width: 0, height: 0)
+        renderFps = 0
+        metalRenderMs = 0
+        fpsWindowStartNs = 0
+        fpsWindowFrames = 0
+        metalRenderer?.clearFrame()
     }
 
     private func runSimpleCommand(_ cmd: [String: Any], label: String) {
@@ -240,6 +281,15 @@ public final class ZeroDeskViewModel: ObservableObject {
             scheduleFrameFetch()
             return
         }
+        if ev.kind == "QoeTelemetry" {
+            if let active = ev.payloadJSON["active_codec"], !active.isEmpty {
+                activeCodecLabel = active
+            }
+            if let renderer = metalRenderer {
+                metalRenderMs = renderer.lastUploadAndDrawMs
+            }
+            return
+        }
 
         appendLog("[\(ev.seq)] \(ev.kind)")
         if ev.kind == "IncomingCall", let incomingId = ev.payloadJSON["incoming_id"] {
@@ -251,9 +301,7 @@ public final class ZeroDeskViewModel: ObservableObject {
                 verifiedByCa: verifiedByCa
             )
         } else if ev.kind == "SessionEnded" {
-            frameGeneration &+= 1
-            hasPendingFrame = false
-            latestFrame = nil
+            clearVideoState(releaseReason: .sessionLeftConnected)
             incomingCall = nil
         }
         refreshSnapshot()
@@ -270,18 +318,40 @@ public final class ZeroDeskViewModel: ObservableObject {
         hasPendingFrame = false
         Task { @MainActor [weak self] in
             let captured = await Task.detached(priority: .userInitiated) {
-                try? client.fetchLatestFrameCGImage()
+                try? client.fetchLatestFrameBGRA()
             }.value
             guard let self else { return }
             self.isFrameFetchScheduled = false
             if let captured, gen == self.frameGeneration {
-                self.latestFrame = captured.image
+                self.metalRenderer?.submitFrame(captured)
+                self.hasVideoFrame = true
+                self.remoteSize = RemoteSize(width: captured.width, height: captured.height)
                 self.frameCounter = captured.seq
+                self.updateRenderTelemetry()
             }
             if self.hasPendingFrame, gen == self.frameGeneration {
                 self.hasPendingFrame = false
                 self.scheduleFrameFetch()
             }
+        }
+    }
+
+    private func updateRenderTelemetry() {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if fpsWindowStartNs == 0 {
+            fpsWindowStartNs = nowNs
+            fpsWindowFrames = 1
+        } else {
+            fpsWindowFrames &+= 1
+            let elapsedNs = nowNs - fpsWindowStartNs
+            if elapsedNs >= 500_000_000 {
+                renderFps = Double(fpsWindowFrames) / (Double(elapsedNs) / 1_000_000_000.0)
+                fpsWindowStartNs = nowNs
+                fpsWindowFrames = 0
+            }
+        }
+        if let renderer = metalRenderer {
+            metalRenderMs = renderer.lastUploadAndDrawMs
         }
     }
 

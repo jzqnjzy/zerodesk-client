@@ -3,8 +3,8 @@
 
 use super::{
     controller::{
-        load_config_json, BridgePersistedConfig, BridgeSnapshot, BridgeState, PolicySummary,
-        RedactedConfigView, V2BridgeController, VerifiedCallerDisplay,
+        load_config_json, normalize_codec_setting, BridgePersistedConfig, BridgeSnapshot,
+        BridgeState, PolicySummary, RedactedConfigView, V2BridgeController, VerifiedCallerDisplay,
     },
     events::BridgeEventHub,
     json_abi::{parse_and_validate_command, RuntimeCommandEnvelope, RuntimeReplyEnvelope},
@@ -47,7 +47,10 @@ use crate::{
             FILE_MSG_ACCEPT, FILE_MSG_ACK, FILE_MSG_CHUNK, FILE_MSG_COMPLETE,
             FILE_MSG_COMPLETE_ACK, FILE_MSG_OFFER, FILE_RECOMMENDED_CHUNK_SIZE,
         },
-        hid::{decode_hid_frame, encode_hid_frame, HidPayload, KeyEvent, MouseEvent, MouseKind},
+        hid::{
+            decode_hid_frame, encode_hid_frame, required_modifier_bit_for_usage, HidPayload,
+            KeyEvent, MouseEvent, MouseKind, MOUSE_BUTTONS_VALID_MASK,
+        },
         identity::PersistentV2Identity,
         manager::{
             CallDecision, DesktopControllerClient, DesktopHostDaemon, IncomingCall, SecurityEvent,
@@ -60,15 +63,15 @@ use crate::{
             CTRL_MSG_REQUEST_IDR, CTRL_MSG_SESSION_CLOSE,
         },
         video::{
-            local_v2_cap_bits, DecodedVideoFrame, V2VideoDecoder, V2VideoEncoder, VideoCodec,
-            VideoError,
+            local_v2_cap_bits, negotiate_video_codec, DecodedVideoFrame, V2VideoDecoder,
+            V2VideoEncoder, VideoCodec, VideoError,
         },
     },
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     panic::{catch_unwind, AssertUnwindSafe},
@@ -92,6 +95,7 @@ use v2_transport::{
 };
 
 pub const SYNC_CMD_TIMEOUT: Duration = Duration::from_millis(500);
+pub const RELEASE_ALL_FLUSH_TIMEOUT: Duration = Duration::from_millis(150);
 pub const UNIFIED_SHUTDOWN_BUDGET: Duration = Duration::from_secs(3);
 pub const DEFAULT_RING_TIMEOUT: Duration = Duration::from_secs(15);
 const POLICY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -189,8 +193,102 @@ enum ActiveRole {
     Controller,
 }
 
+#[derive(Debug, Default)]
+struct ControllerHidState {
+    pressed_keys: BTreeSet<u32>,
+    pressed_buttons: u8,
+    last_mouse_pos: (i32, i32),
+}
+
+impl ControllerHidState {
+    fn record_outbound(&mut self, payload: &HidPayload) {
+        match payload {
+            HidPayload::Key(ev) => {
+                if ev.down {
+                    self.pressed_keys.insert(ev.usb_hid_usage);
+                } else {
+                    self.pressed_keys.remove(&ev.usb_hid_usage);
+                }
+            }
+            HidPayload::Mouse(ev) => {
+                match ev.kind {
+                    MouseKind::MoveAbs | MouseKind::Down | MouseKind::Up => {
+                        self.last_mouse_pos = (ev.x_or_dx, ev.y_or_dy);
+                    }
+                    MouseKind::MoveRel | MouseKind::Wheel => {}
+                }
+                self.pressed_buttons = ev.buttons & MOUSE_BUTTONS_VALID_MASK;
+            }
+            HidPayload::EchoAck(_) => {}
+        }
+    }
+
+    fn has_pressed(&self) -> bool {
+        !self.pressed_keys.is_empty() || self.pressed_buttons != 0
+    }
+
+    /// Atomically clears tracked controller HID state and builds `spec/04` §6 release frames
+    /// (non-modifier keys first, then modifier keys, then mouse button release if any held).
+    fn take_release_all_payloads(
+        &mut self,
+        extra_keys: &[u16],
+        extra_buttons: u8,
+        now_ms: u64,
+    ) -> (Vec<HidPayload>, usize, usize) {
+        let mut keys = std::mem::take(&mut self.pressed_keys);
+        for &k in extra_keys {
+            if k != 0 {
+                keys.insert(u32::from(k));
+            }
+        }
+        let buttons_to_release =
+            self.pressed_buttons | (extra_buttons & MOUSE_BUTTONS_VALID_MASK);
+        self.pressed_buttons = 0;
+
+        let mut regular = Vec::new();
+        let mut modifiers = Vec::new();
+        for usage in keys {
+            if required_modifier_bit_for_usage(usage).is_some() {
+                modifiers.push(usage);
+            } else {
+                regular.push(usage);
+            }
+        }
+
+        let released_keys = regular.len() + modifiers.len();
+        let released_buttons = buttons_to_release.count_ones() as usize;
+        let mut payloads = Vec::with_capacity(released_keys + usize::from(buttons_to_release != 0));
+        for usage in regular.into_iter().chain(modifiers.into_iter()) {
+            payloads.push(HidPayload::Key(KeyEvent {
+                down: false,
+                modifiers: 0,
+                usb_hid_usage: usage,
+                unicode_scalar: 0,
+                client_ts_ms: now_ms,
+            }));
+        }
+        if buttons_to_release != 0 {
+            payloads.push(HidPayload::Mouse(MouseEvent {
+                kind: MouseKind::Up,
+                buttons: 0,
+                x_or_dx: self.last_mouse_pos.0,
+                y_or_dy: self.last_mouse_pos.1,
+                wheel_dx: 0,
+                wheel_dy: 0,
+                client_ts_ms: now_ms,
+            }));
+        }
+        (payloads, released_keys, released_buttons)
+    }
+}
+
 enum SessionAction {
     SendHid(HidPayload),
+    ReleaseAll {
+        keys: Vec<u16>,
+        buttons: u8,
+        ack: Option<oneshot::Sender<(usize, usize)>>,
+    },
     SendClipboard {
         mime_kind: u8,
         bytes: Vec<u8>,
@@ -1095,7 +1193,27 @@ impl BridgeActor {
 
     async fn unified_shutdown_session(&mut self, return_to_listening: bool) {
         self.clear_pending_incoming("session_shutdown");
-        self.active_session_tx = None;
+        let active_tx = self.active_session_tx.take();
+
+        // Flush controller remote release_all BEFORE cancelling the session or tearing down data-plane.
+        if self.role == ActiveRole::Controller {
+            if let Some(tx) = active_tx {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                if tokio::time::timeout(
+                    RELEASE_ALL_FLUSH_TIMEOUT,
+                    tx.send(SessionAction::ReleaseAll {
+                        keys: Vec::new(),
+                        buttons: 0,
+                        ack: Some(ack_tx),
+                    }),
+                )
+                .await
+                .is_ok()
+                {
+                    let _ = tokio::time::timeout(RELEASE_ALL_FLUSH_TIMEOUT, ack_rx).await;
+                }
+            }
+        }
 
         if let Some(tok) = self.session_cancel.take() {
             tok.cancel();
@@ -1461,6 +1579,42 @@ impl BridgeActor {
                     )
                 }
             }
+            "set_codec" => {
+                let Some(codec_str) = env.codec.as_deref() else {
+                    return RuntimeReplyEnvelope::err(
+                        "InvalidArgument",
+                        "set_codec requires 'codec' (auto|hevc|h264|vp9|av1)",
+                    );
+                };
+                let norm = match normalize_codec_setting(codec_str) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return RuntimeReplyEnvelope::err("InvalidArgument", e.to_string());
+                    }
+                };
+                let cmd = serde_json::json!({
+                    "v": 1,
+                    "cmd": "set_codec",
+                    "codec": norm,
+                });
+                let resp_raw = self.controller.execute_command_json(&cmd.to_string());
+                let parsed: serde_json::Value = serde_json::from_str(&resp_raw).unwrap_or_default();
+                if parsed["ok"].as_bool() == Some(true) {
+                    if let Some(cfg) = self.loaded_config.as_mut() {
+                        cfg.codec = norm;
+                    }
+                    self.drain_controller_events_to_hub();
+                    self.sync_snapshot();
+                    RuntimeReplyEnvelope::ok(parsed["data"].clone())
+                } else {
+                    RuntimeReplyEnvelope::err(
+                        parsed["error_code"]
+                            .as_str()
+                            .unwrap_or("IllegalStateTransition"),
+                        parsed["error"].as_str().unwrap_or("set_codec failed"),
+                    )
+                }
+            }
             "set_audio_mute" => {
                 let Some(muted) = env.muted else {
                     return RuntimeReplyEnvelope::err(
@@ -1512,8 +1666,11 @@ impl BridgeActor {
             "disconnect" => self.handle_disconnect().await,
             "accept_incoming" => self.handle_incoming_decision(true, env),
             "reject_incoming" => self.handle_incoming_decision(false, env),
-            "send_hid_key" => self.handle_send_hid_key(env),
+            "send_hid_key" => self.handle_send_hid_key(env, None),
+            "key_down" => self.handle_send_hid_key(env, Some(true)),
+            "key_up" => self.handle_send_hid_key(env, Some(false)),
             "send_hid_mouse" => self.handle_send_hid_mouse(env),
+            "release_all" => self.handle_release_all(env).await,
             "send_clipboard" => self.handle_send_clipboard_cmd(env),
             "send_file" => {
                 if let Some(path) = env.path.as_deref() {
@@ -1560,7 +1717,10 @@ impl BridgeActor {
         }
     }
 
-    fn build_client_config(&self) -> Result<V2ClientConfig, RuntimeReplyEnvelope> {
+    fn build_client_config(
+        &self,
+        codec_override: Option<&str>,
+    ) -> Result<(V2ClientConfig, bool), RuntimeReplyEnvelope> {
         let Some(cfg) = &self.loaded_config else {
             return Err(RuntimeReplyEnvelope::err(
                 "MissingConfig",
@@ -1579,11 +1739,18 @@ impl BridgeActor {
                 "config missing 'edge_b'",
             ));
         };
-        let codec = if cfg.codec.trim().is_empty() {
-            VideoCodec::Vp9
+        let raw_codec = codec_override.unwrap_or(cfg.codec.as_str()).trim();
+        let (codec, codec_auto) = if raw_codec.is_empty() {
+            (VideoCodec::Vp9, false)
+        } else if raw_codec.eq_ignore_ascii_case("auto") {
+            let local_caps = local_v2_cap_bits();
+            let auto_codec =
+                negotiate_video_codec(local_caps, local_caps, None).unwrap_or(VideoCodec::Vp9);
+            (auto_codec, true)
         } else {
-            VideoCodec::parse_name(&cfg.codec)
-                .map_err(|e| RuntimeReplyEnvelope::err("InvalidConfig", e.to_string()))?
+            let parsed = VideoCodec::parse_name(raw_codec)
+                .map_err(|e| RuntimeReplyEnvelope::err("InvalidConfig", e.to_string()))?;
+            (parsed, false)
         };
         let v2_cfg = V2ClientConfig {
             control_plane_endpoint: cfg.control_plane_endpoint.clone(),
@@ -1609,7 +1776,7 @@ impl BridgeActor {
         v2_cfg
             .validate()
             .map_err(|e| RuntimeReplyEnvelope::err("InvalidConfig", e.to_string()))?;
-        Ok(v2_cfg)
+        Ok((v2_cfg, codec_auto))
     }
 
     fn handle_start_host(&mut self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
@@ -1638,7 +1805,7 @@ impl BridgeActor {
             );
         }
 
-        let client_cfg = match self.build_client_config() {
+        let (client_cfg, codec_auto) = match self.build_client_config(env.codec.as_deref()) {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -1697,6 +1864,7 @@ impl BridgeActor {
                 gen,
                 cmd_id,
                 client_cfg,
+                codec_auto,
                 cancel,
                 actor_tx,
                 events,
@@ -1786,7 +1954,7 @@ impl BridgeActor {
                 );
             }
         };
-        let client_cfg = match self.build_client_config() {
+        let (client_cfg, codec_auto) = match self.build_client_config(env.codec.as_deref()) {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -1841,6 +2009,7 @@ impl BridgeActor {
                 gen,
                 cmd_id,
                 client_cfg,
+                codec_auto,
                 target_bytes,
                 cancel,
                 actor_tx,
@@ -1953,7 +2122,11 @@ impl BridgeActor {
         }))
     }
 
-    fn handle_send_hid_key(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+    fn handle_send_hid_key(
+        &self,
+        env: RuntimeCommandEnvelope,
+        down_override: Option<bool>,
+    ) -> RuntimeReplyEnvelope {
         if self.controller.state() != BridgeState::Streaming {
             return RuntimeReplyEnvelope::err(
                 "IllegalStateTransition",
@@ -1978,7 +2151,7 @@ impl BridgeActor {
                 "send_hid_key requires 'usb_hid_usage'",
             );
         };
-        let Some(down) = env.down else {
+        let Some(down) = down_override.or(env.down) else {
             return RuntimeReplyEnvelope::err("InvalidArgument", "send_hid_key requires 'down'");
         };
         let scalar = env.unicode_scalar.unwrap_or(0);
@@ -1995,6 +2168,9 @@ impl BridgeActor {
             unicode_scalar: scalar,
             client_ts_ms: now_epoch_ms(),
         };
+        if let Err(e) = ev.validate() {
+            return RuntimeReplyEnvelope::err("InvalidArgument", e.to_string());
+        }
         if tx.try_send(SessionAction::SendHid(HidPayload::Key(ev))).is_err() {
             return RuntimeReplyEnvelope::err("Busy", "session action queue full");
         }
@@ -2040,10 +2216,10 @@ impl BridgeActor {
             }
         };
         let buttons = env.buttons.unwrap_or(0);
-        if buttons & !0x07 != 0 {
+        if buttons & !MOUSE_BUTTONS_VALID_MASK != 0 {
             return RuntimeReplyEnvelope::err(
                 "InvalidArgument",
-                "mouse buttons bitmask must fit within 0x07",
+                "mouse buttons bitmask must fit within 0x1F",
             );
         }
         let (x_or_dx, y_or_dy) = match kind {
@@ -2065,6 +2241,9 @@ impl BridgeActor {
             wheel_dy: env.wheel_y.unwrap_or(0),
             client_ts_ms: now_epoch_ms(),
         };
+        if let Err(e) = ev.validate() {
+            return RuntimeReplyEnvelope::err("InvalidArgument", e.to_string());
+        }
         if tx
             .try_send(SessionAction::SendHid(HidPayload::Mouse(ev)))
             .is_err()
@@ -2072,6 +2251,68 @@ impl BridgeActor {
             return RuntimeReplyEnvelope::err("Busy", "session action queue full");
         }
         RuntimeReplyEnvelope::ok(serde_json::json!({ "sent": true }))
+    }
+
+    async fn handle_release_all(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        let buttons = env.buttons.unwrap_or(0);
+        if buttons & !MOUSE_BUTTONS_VALID_MASK != 0 {
+            return RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                "mouse buttons bitmask must fit within 0x1F",
+            );
+        }
+        if self.role == ActiveRole::Host {
+            let releaser_opt = self
+                .emergency_releaser
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(releaser) = releaser_opt {
+                let _ = releaser.release_all_keys();
+            }
+        }
+        let Some(tx) = &self.active_session_tx else {
+            return RuntimeReplyEnvelope::ok(serde_json::json!({
+                "released_keys": 0,
+                "released_buttons": 0,
+                "active_session": false,
+            }));
+        };
+        if self.controller.state() != BridgeState::Streaming {
+            return RuntimeReplyEnvelope::ok(serde_json::json!({
+                "released_keys": 0,
+                "released_buttons": 0,
+                "active_session": false,
+            }));
+        }
+        let keys = env.keys.unwrap_or_default();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if tokio::time::timeout(
+            RELEASE_ALL_FLUSH_TIMEOUT,
+            tx.send(SessionAction::ReleaseAll {
+                keys,
+                buttons,
+                ack: Some(ack_tx),
+            }),
+        )
+        .await
+        .is_err()
+        {
+            return RuntimeReplyEnvelope::err("Busy", "release_all flush timed out");
+        }
+        match tokio::time::timeout(RELEASE_ALL_FLUSH_TIMEOUT, ack_rx).await {
+            Ok(Ok((released_keys, released_buttons))) => RuntimeReplyEnvelope::ok(serde_json::json!({
+                "released_keys": released_keys,
+                "released_buttons": released_buttons,
+                "active_session": true,
+            })),
+            _ => RuntimeReplyEnvelope::ok(serde_json::json!({
+                "released_keys": 0,
+                "released_buttons": 0,
+                "active_session": true,
+                "timed_out": true,
+            })),
+        }
     }
 
     fn handle_send_clipboard_cmd(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
@@ -2287,7 +2528,7 @@ impl BridgeActor {
             }
         }
         // Fallback: refresh directly via Control Plane using loaded config even while Ready/Listening.
-        let client_cfg = match self.build_client_config() {
+        let (client_cfg, _) = match self.build_client_config(None) {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -4124,6 +4365,7 @@ async fn run_host_lifecycle_task(
     gen: u64,
     cmd_id: u64,
     cfg: V2ClientConfig,
+    codec_auto: bool,
     cancel: CancellationToken,
     actor_tx: mpsc::Sender<ActorMessage>,
     events: Arc<BridgeEventHub>,
@@ -4235,6 +4477,7 @@ async fn run_host_lifecycle_task(
         let end_reason = run_active_host_session(
             gen,
             &cfg,
+            codec_auto,
             accepted,
             cancel.clone(),
             actor_tx.clone(),
@@ -4264,6 +4507,7 @@ async fn run_host_lifecycle_task(
 async fn run_active_host_session(
     gen: u64,
     cfg: &V2ClientConfig,
+    codec_auto: bool,
     accepted: crate::session::manager::AcceptedHostSession,
     cancel: CancellationToken,
     actor_tx: mpsc::Sender<ActorMessage>,
@@ -4387,7 +4631,14 @@ async fn run_active_host_session(
     let enc_w = (cap_w & !1).clamp(32, 1920);
     let enc_h = (cap_h & !1).clamp(32, 1080);
 
-    let encoder = match V2VideoEncoder::new(cfg.codec, enc_w, enc_h, 2.0, Some(cfg.fps as usize)) {
+    let negotiated_codec = if codec_auto {
+        negotiate_video_codec(local_v2_cap_bits(), accepted.peer_cert.cap_bits, None)
+            .unwrap_or(cfg.codec)
+    } else {
+        cfg.codec
+    };
+    let encoder =
+        match V2VideoEncoder::new(negotiated_codec, enc_w, enc_h, 2.0, Some(cfg.fps as usize)) {
         Ok(e) => e,
         Err(e) => {
             // `_releaser_guard` automatically releases keys and clears `releaser_slot` on return.
@@ -4613,6 +4864,12 @@ async fn run_active_host_session(
                             });
                         }
                         SessionAction::SendHid(_) => {}
+                        SessionAction::ReleaseAll { ack, .. } => {
+                            let _ = releaser.release_all_keys();
+                            if let Some(tx) = ack {
+                                let _ = tx.send((0, 0));
+                            }
+                        }
                     }
                 }
                 _ = file_tick.tick(), if outbound_files.has_active() || !pending_clip_frames.is_empty() => {
@@ -4796,6 +5053,7 @@ async fn run_controller_lifecycle_task(
     gen: u64,
     cmd_id: u64,
     cfg: V2ClientConfig,
+    codec_auto: bool,
     target_device_id: [u8; 16],
     cancel: CancellationToken,
     actor_tx: mpsc::Sender<ActorMessage>,
@@ -4877,7 +5135,13 @@ async fn run_controller_lifecycle_task(
         return;
     }
 
-    let mut decoder = match V2VideoDecoder::new(cfg.codec) {
+    let negotiated_codec = if codec_auto {
+        negotiate_video_codec(local_v2_cap_bits(), connected.peer_cert.cap_bits, None)
+            .unwrap_or(cfg.codec)
+    } else {
+        cfg.codec
+    };
+    let mut decoder = match V2VideoDecoder::new(negotiated_codec) {
         Ok(d) => d,
         Err(e) => {
             let _ = connected.lease_renewal.shutdown().await;
@@ -4948,6 +5212,7 @@ async fn run_controller_lifecycle_task(
     let mut lease_expired_rx = connected.lease_renewal.subscribe_expired();
     let mut video_frames_decoded: u64 = 0;
     let mut last_idr_req_at: Option<Instant> = None;
+    let mut hid_state = ControllerHidState::default();
 
     let is_blackholed = || -> bool {
         #[cfg(feature = "e2e-fault-injection")]
@@ -5007,6 +5272,7 @@ async fn run_controller_lifecycle_task(
                         "audio_frames_decoded": audio_frames_decoded,
                         "audio_dtx_frames": audio_dtx_frames,
                         "active_transport_mode": ctrl_sess.active_transport_mode().label(),
+                        "active_codec": decoder.codec().name(),
                     }));
                 }
                 _ = clip_tick.tick() => {
@@ -5090,10 +5356,28 @@ async fn run_controller_lifecycle_task(
                     match action {
                         SessionAction::SetAudioMute(m) => { audio_muted = m; }
                         SessionAction::SendHid(payload) => {
+                            hid_state.record_outbound(&payload);
                             if !is_blackholed() {
                                 if let Ok(frame) = encode_hid_frame(&payload) {
                                     let _ = ctrl_sess.send_hid(&frame).await;
                                 }
+                            }
+                        }
+                        SessionAction::ReleaseAll { keys, buttons, ack } => {
+                            let (payloads, released_keys, released_buttons) =
+                                hid_state.take_release_all_payloads(&keys, buttons, now_epoch_ms());
+                            if !is_blackholed() {
+                                let _ = tokio::time::timeout(RELEASE_ALL_FLUSH_TIMEOUT, async {
+                                    for payload in &payloads {
+                                        if let Ok(frame) = encode_hid_frame(payload) {
+                                            let _ = ctrl_sess.send_hid(&frame).await;
+                                        }
+                                    }
+                                })
+                                .await;
+                            }
+                            if let Some(tx) = ack {
+                                let _ = tx.send((released_keys, released_buttons));
                             }
                         }
                         SessionAction::SendClipboard { mime_kind, bytes } => {
@@ -5302,6 +5586,18 @@ async fn run_controller_lifecycle_task(
         }
     };
 
+    // Flush any remaining held controller HID keys/buttons BEFORE data-plane teardown!
+    if !is_blackholed() && hid_state.has_pressed() {
+        let (payloads, _, _) = hid_state.take_release_all_payloads(&[], 0, now_epoch_ms());
+        let _ = tokio::time::timeout(RELEASE_ALL_FLUSH_TIMEOUT, async {
+            for payload in &payloads {
+                if let Ok(frame) = encode_hid_frame(payload) {
+                    let _ = ctrl_sess.send_hid(&frame).await;
+                }
+            }
+        })
+        .await;
+    }
     let _ = tokio::time::timeout(
         Duration::from_millis(500),
         outbound_files.abort_all_on_teardown(&mut ctrl_sess, gen, &actor_tx),
@@ -6445,5 +6741,120 @@ mod tests {
         assert_eq!(clip_q.frames.len(), 4);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn controller_hid_state_release_all_encodes_spec04_frames_and_is_idempotent() {
+        let mut st = ControllerHidState::default();
+        assert!(!st.has_pressed());
+
+        st.record_outbound(&HidPayload::Key(KeyEvent {
+            down: true,
+            modifiers: 0x02,
+            usb_hid_usage: 0xE0, // LeftCtrl
+            unicode_scalar: 0,
+            client_ts_ms: 100,
+        }));
+        st.record_outbound(&HidPayload::Key(KeyEvent {
+            down: true,
+            modifiers: 0x02,
+            usb_hid_usage: 0x04, // A
+            unicode_scalar: 0,
+            client_ts_ms: 101,
+        }));
+        st.record_outbound(&HidPayload::Mouse(MouseEvent {
+            kind: MouseKind::Down,
+            buttons: 0x05, // Left + Middle
+            x_or_dx: 320,
+            y_or_dy: 240,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 102,
+        }));
+        assert!(st.has_pressed());
+
+        let (payloads, rel_keys, rel_btns) = st.take_release_all_payloads(&[0x05], 0x02, 200);
+        assert_eq!(rel_keys, 3); // A (0x04), B (0x05), LeftCtrl (0xE0)
+        assert_eq!(rel_btns, 3); // Left + Right + Middle (0x07)
+        assert!(!st.has_pressed());
+
+        // Regular keys released before modifiers, followed by Mouse Up with buttons=0.
+        assert_eq!(payloads.len(), 4);
+        match payloads[0] {
+            HidPayload::Key(k) => {
+                assert!(!k.down);
+                assert_eq!(k.usb_hid_usage, 0x04);
+            }
+            _ => panic!("expected regular key release first"),
+        }
+        match payloads[2] {
+            HidPayload::Key(k) => {
+                assert!(!k.down);
+                assert_eq!(k.usb_hid_usage, 0xE0);
+            }
+            _ => panic!("expected modifier key release after regular keys"),
+        }
+        match payloads[3] {
+            HidPayload::Mouse(m) => {
+                assert_eq!(m.kind, MouseKind::Up);
+                assert_eq!(m.buttons, 0);
+                assert_eq!((m.x_or_dx, m.y_or_dy), (320, 240));
+            }
+            _ => panic!("expected mouse release last"),
+        }
+        for p in &payloads {
+            let wire = encode_hid_frame(p).expect("release_all payload must be spec/04 valid");
+            assert_eq!(decode_hid_frame(&wire).unwrap(), *p);
+        }
+
+        // Second release_all is a safe idempotent no-op.
+        let (payloads2, rel_keys2, rel_btns2) = st.take_release_all_payloads(&[], 0, 201);
+        assert!(payloads2.is_empty());
+        assert_eq!(rel_keys2, 0);
+        assert_eq!(rel_btns2, 0);
+    }
+
+    #[test]
+    fn bridge_runtime_release_all_and_codec_selection_commands() {
+        let rt = V2BridgeRuntime::new().unwrap();
+
+        // release_all when idle is an idempotent no-op.
+        let rel: serde_json::Value = serde_json::from_str(
+            &rt.exec_json(r#"{"v":1,"cmd":"release_all","keys":[4,224],"buttons":1}"#),
+        )
+        .unwrap();
+        assert_eq!(rel["ok"], true);
+        assert_eq!(rel["data"]["active_session"], false);
+        assert_eq!(rel["data"]["released_keys"], 0);
+
+        // release_all rejects reserved mouse button bits (> 0x1F).
+        let bad_rel: serde_json::Value =
+            serde_json::from_str(&rt.exec_json(r#"{"v":1,"cmd":"release_all","buttons":128}"#))
+                .unwrap();
+        assert_eq!(bad_rel["ok"], false);
+        assert_eq!(bad_rel["error_code"], "InvalidArgument");
+
+        // key_down / key_up require active Streaming session.
+        let kd: serde_json::Value = serde_json::from_str(
+            &rt.exec_json(r#"{"v":1,"cmd":"key_down","usage_id":4,"modifiers":0}"#),
+        )
+        .unwrap();
+        assert_eq!(kd["ok"], false);
+        assert_eq!(kd["error_code"], "IllegalStateTransition");
+
+        // set_codec accepts auto/hevc/h264/vp9/av1 and rejects invalid names.
+        for codec in ["auto", "hevc", "h264", "vp9", "av1"] {
+            let reply: serde_json::Value = serde_json::from_str(
+                &rt.exec_json(&format!(r#"{{"v":1,"cmd":"set_codec","codec":"{codec}"}}"#)),
+            )
+            .unwrap();
+            assert_eq!(reply["ok"], true, "codec {codec} should be accepted");
+            assert_eq!(reply["data"]["codec"], codec);
+        }
+        let bad_codec: serde_json::Value =
+            serde_json::from_str(&rt.exec_json(r#"{"v":1,"cmd":"set_codec","codec":"mpeg2"}"#))
+                .unwrap();
+        assert_eq!(bad_codec["ok"], false);
+        assert_eq!(bad_codec["error_code"], "InvalidArgument");
     }
 }

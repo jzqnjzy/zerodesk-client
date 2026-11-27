@@ -32,6 +32,8 @@ pub struct RuntimeCommandEnvelope {
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
     pub mime_kind: Option<u8>,
     #[serde(default)]
     pub payload_b64: Option<String>,
@@ -47,10 +49,12 @@ pub struct RuntimeCommandEnvelope {
     pub down: Option<bool>,
     #[serde(default)]
     pub modifiers: Option<u8>,
-    #[serde(default)]
+    #[serde(default, alias = "usage_id")]
     pub usb_hid_usage: Option<u16>,
     #[serde(default)]
     pub unicode_scalar: Option<u32>,
+    #[serde(default)]
+    pub keys: Option<Vec<u16>>,
     #[serde(default)]
     pub mouse_kind: Option<String>,
     #[serde(default)]
@@ -63,9 +67,9 @@ pub struct RuntimeCommandEnvelope {
     pub dy: Option<i16>,
     #[serde(default)]
     pub buttons: Option<u8>,
-    #[serde(default)]
+    #[serde(default, alias = "wheel_dx")]
     pub wheel_x: Option<i16>,
-    #[serde(default)]
+    #[serde(default, alias = "wheel_dy")]
     pub wheel_y: Option<i16>,
     #[serde(default)]
     pub download_dir: Option<String>,
@@ -95,6 +99,7 @@ impl fmt::Debug for RuntimeCommandEnvelope {
             .field("reason", &self.reason)
             .field("muted", &self.muted)
             .field("mode", &self.mode)
+            .field("codec", &self.codec)
             .field("mime_kind", &self.mime_kind)
             .field("payload_b64", &b64_redacted)
             .field("text", &text_redacted)
@@ -105,6 +110,7 @@ impl fmt::Debug for RuntimeCommandEnvelope {
             .field("modifiers", &self.modifiers)
             .field("usb_hid_usage", &self.usb_hid_usage)
             .field("unicode_scalar", &self.unicode_scalar)
+            .field("keys", &self.keys)
             .field("mouse_kind", &self.mouse_kind)
             .field("download_dir", &self.download_dir)
             .field("ring_timeout_ms", &self.ring_timeout_ms)
@@ -331,6 +337,31 @@ mod tests {
             parse_and_validate_command(r#"{"v":1,"cmd":"send_hid_key","unicode_scalar":65}"#)
                 .unwrap();
         assert_eq!(ok_unicode.unicode_scalar, Some(65));
+
+        let ok_aliases = parse_and_validate_command(
+            r#"{"v":1,"cmd":"send_hid_mouse","mouse_kind":"wheel","wheel_dx":-3,"wheel_dy":5,"buttons":1}"#,
+        )
+        .unwrap();
+        assert_eq!(ok_aliases.wheel_x, Some(-3));
+        assert_eq!(ok_aliases.wheel_y, Some(5));
+
+        let ok_key_alias = parse_and_validate_command(
+            r#"{"v":1,"cmd":"key_down","usage_id":4,"modifiers":2}"#,
+        )
+        .unwrap();
+        assert_eq!(ok_key_alias.usb_hid_usage, Some(4));
+        assert_eq!(ok_key_alias.modifiers, Some(2));
+
+        let ok_release = parse_and_validate_command(
+            r#"{"v":1,"cmd":"release_all","keys":[4,224],"buttons":3,"reason":"windowResignedKey"}"#,
+        )
+        .unwrap();
+        assert_eq!(ok_release.keys, Some(vec![4, 224]));
+        assert_eq!(ok_release.buttons, Some(3));
+
+        let ok_codec =
+            parse_and_validate_command(r#"{"v":1,"cmd":"set_codec","codec":"auto"}"#).unwrap();
+        assert_eq!(ok_codec.codec.as_deref(), Some("auto"));
     }
 
     #[test]

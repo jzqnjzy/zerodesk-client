@@ -34,7 +34,20 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
     }
 
     private final class ResultBox<T>: @unchecked Sendable {
-        var result: Result<T, Error>?
+        private let lock = NSLock()
+        private var storage: Result<T, Error>?
+
+        func store(_ value: Result<T, Error>) {
+            lock.lock()
+            storage = value
+            lock.unlock()
+        }
+
+        func load() -> Result<T, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
     }
 
     private final class BridgeState: @unchecked Sendable {
@@ -157,8 +170,8 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
     }
 
     /// Executes a raw JSON command against `V2BridgeRuntime::exec_json`.
-    public func execRawJSON(_ json: String) throws -> Data {
-        try performOnBridgeThread { handle in
+    public func execRawJSON(_ json: String, timeoutMs: UInt32? = nil) throws -> Data {
+        try performOnBridgeThread(timeoutMs: timeoutMs) { handle in
             let utf8 = Array(json.utf8)
             var outBuf = ZeroDeskOwnedBuffer(ptr: nil, len: 0, cap: 0)
             let rc: Int32 = utf8.withUnsafeBufferPointer { raw in
@@ -173,7 +186,7 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
     }
 
     /// Executes a JSON command and decodes the structured `BridgeCommandReply`.
-    public func execCommand(_ payload: [String: Any]) throws -> BridgeCommandReply {
+    public func execCommand(_ payload: [String: Any], timeoutMs: UInt32? = nil) throws -> BridgeCommandReply {
         var dict = payload
         dict["v"] = Int(ZERODESK_V2_ABI_VERSION)
         let encoded: Data
@@ -183,12 +196,100 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
             throw ZeroDeskBridgeError.protocolError("encode command JSON failed: \(error)")
         }
         let jsonStr = String(decoding: encoded, as: UTF8.self)
-        let replyData = try execRawJSON(jsonStr)
+        let replyData = try execRawJSON(jsonStr, timeoutMs: timeoutMs)
         do {
             return try JSONDecoder().decode(BridgeCommandReply.self, from: replyData)
         } catch {
             throw ZeroDeskBridgeError.protocolError("decode command reply failed: \(error)")
         }
+    }
+
+    /// Sends a mouse HID event (`move_abs`, `button_down`, `button_up`, `wheel`).
+    @discardableResult
+    public func sendMouse(
+        kind: RemoteMouseKind,
+        x: Int,
+        y: Int,
+        buttons: UInt8,
+        wheelDx: Int16 = 0,
+        wheelDy: Int16 = 0
+    ) throws -> BridgeCommandReply {
+        let clampedX = min(max(x, 0), Int(UInt16.max))
+        let clampedY = min(max(y, 0), Int(UInt16.max))
+        let payload: [String: Any] = [
+            "cmd": "send_hid_mouse",
+            "mouse_kind": kind.rawValue,
+            "x": clampedX,
+            "y": clampedY,
+            "buttons": Int(buttons & HidMouseButtonMask.validMask),
+            "wheel_dx": Int(wheelDx),
+            "wheel_dy": Int(wheelDy),
+        ]
+        return try execCommand(payload)
+    }
+
+    /// Sends a keyboard HID event (`key_down` / `key_up` via `send_hid_key`).
+    @discardableResult
+    public func sendKey(
+        usageId: UInt16,
+        down: Bool,
+        modifiers: UInt8,
+        unicodeScalar: UInt32 = 0
+    ) throws -> BridgeCommandReply {
+        var payload: [String: Any] = [
+            "cmd": "send_hid_key",
+            "usb_hid_usage": Int(usageId),
+            "down": down,
+            "modifiers": Int(modifiers & HidModifierMask.validMask),
+        ]
+        if unicodeScalar != 0 {
+            payload["unicode_scalar"] = Int(unicodeScalar)
+        }
+        return try execCommand(payload)
+    }
+
+    /// Synchronously flushes `release_all` on the bridge worker thread within a strict bounded budget
+    /// (`<= 200 ms`) so `resignKey`, `didResignActive`, and app teardown never hang the UI thread.
+    @discardableResult
+    public func releaseAllInput(
+        keys: [UInt16] = [],
+        buttons: UInt8 = 0,
+        reason: ReleaseReason = .sessionLeftConnected,
+        timeoutMs: UInt32 = PressedInputTracker.defaultReleaseTimeoutMs
+    ) throws -> BridgeCommandReply {
+        let boundedTimeout = min(max(timeoutMs, 1), PressedInputTracker.maxReleaseTimeoutMs)
+        let payload: [String: Any] = [
+            "cmd": "release_all",
+            "keys": keys.map { Int($0) },
+            "buttons": Int(buttons & HidMouseButtonMask.validMask),
+            "reason": reason.rawValue,
+        ]
+        return try execCommand(payload, timeoutMs: boundedTimeout)
+    }
+
+    /// Non-blocking FIFO enqueue of a fire-and-forget JSON command onto the single worker thread.
+    /// Any subsequent synchronous `releaseAllInput` executes strictly AFTER enqueued commands.
+    private func enqueueFireAndForgetCommand(_ payload: [String: Any]) {
+        var dict = payload
+        dict["v"] = Int(ZERODESK_V2_ABI_VERSION)
+        guard let encoded = try? JSONSerialization.data(withJSONObject: dict, options: []) else {
+            return
+        }
+        let utf8 = Array(encoded)
+        let work = WorkBox { handle in
+            var outBuf = ZeroDeskOwnedBuffer(ptr: nil, len: 0, cap: 0)
+            _ = utf8.withUnsafeBufferPointer { raw in
+                zerodesk_v2_exec_json(handle, raw.baseAddress, raw.count, &outBuf)
+            }
+            zerodesk_v2_buffer_free(outBuf)
+        }
+
+        state.condition.lock()
+        if !state.closing && !state.exited {
+            state.workQueue.append(work)
+            state.condition.signal()
+        }
+        state.condition.unlock()
     }
 
     /// Fetches the current redacted `BridgeSnapshot` JSON from Rust.
@@ -319,9 +420,10 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         }
     }
 
-    /// Two-phase frame fetch (`frame_info` -> allocate -> `take_latest_frame`, up to 3 retries on
-    /// `BUFFER_TOO_SMALL`) returning a ready-to-render `CGImage`, or `nil` when no frame exists.
-    public func fetchLatestFrameCGImage() throws -> CapturedFrameImage? {
+    /// Two-phase raw BGRA frame fetch (`frame_info` -> allocate -> `take_latest_frame`, up to 3
+    /// retries on `BUFFER_TOO_SMALL`) returning raw pixel bytes for direct Metal `MTLTexture.replaceRegion`
+    /// upload with ZERO `CGImage` conversion.
+    public func fetchLatestFrameBGRA() throws -> CapturedBGRAFrame? {
         try performOnBridgeThread { handle in
             for _ in 0..<Self.maxFrameCopyRetries {
                 var info = ZeroDeskFrameInfo(
@@ -381,30 +483,51 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
                 }
 
                 let slice = copiedInfo.byte_len == cap ? pixelData : pixelData.prefix(copiedInfo.byte_len)
-                let cgImage = try Self.makeCGImage(
-                    data: slice,
-                    width: width,
-                    height: height,
-                    stride: stride,
-                    pixelFormat: copiedInfo.pixel_format
-                )
-                return CapturedFrameImage(
+                return CapturedBGRAFrame(
                     seq: copiedInfo.seq,
                     width: width,
                     height: height,
+                    stride: stride,
+                    pixelFormat: copiedInfo.pixel_format,
                     ptsMs: copiedInfo.pts_ms,
                     droppedUiFrames: copiedInfo.dropped_ui_frames,
-                    image: cgImage
+                    data: slice
                 )
             }
             throw ZeroDeskBridgeError.bufferTooSmall
         }
     }
 
-    private func performOnBridgeThread<T: Sendable>(_ op: @escaping @Sendable (UInt64) throws -> T) throws -> T {
+    /// Two-phase frame fetch (`frame_info` -> allocate -> `take_latest_frame`, up to 3 retries on
+    /// `BUFFER_TOO_SMALL`) returning a ready-to-render `CGImage`, or `nil` when no frame exists.
+    public func fetchLatestFrameCGImage() throws -> CapturedFrameImage? {
+        guard let raw = try fetchLatestFrameBGRA() else {
+            return nil
+        }
+        let cgImage = try Self.makeCGImage(
+            data: raw.data,
+            width: raw.width,
+            height: raw.height,
+            stride: raw.stride,
+            pixelFormat: raw.pixelFormat
+        )
+        return CapturedFrameImage(
+            seq: raw.seq,
+            width: raw.width,
+            height: raw.height,
+            ptsMs: raw.ptsMs,
+            droppedUiFrames: raw.droppedUiFrames,
+            image: cgImage
+        )
+    }
+
+    private func performOnBridgeThread<T: Sendable>(
+        timeoutMs: UInt32? = nil,
+        _ op: @escaping @Sendable (UInt64) throws -> T
+    ) throws -> T {
         let box = ResultBox<T>()
         let work = WorkBox { handle in
-            box.result = Result { try op(handle) }
+            box.store(Result { try op(handle) })
         }
 
         state.condition.lock()
@@ -416,8 +539,15 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         state.condition.signal()
         state.condition.unlock()
 
-        work.sem.wait()
-        guard let res = box.result else {
+        if let timeoutMs {
+            let waitRes = work.sem.wait(timeout: .now() + .milliseconds(Int(timeoutMs)))
+            if waitRes == .timedOut {
+                throw ZeroDeskBridgeError.timeout
+            }
+        } else {
+            work.sem.wait()
+        }
+        guard let res = box.load() else {
             throw ZeroDeskBridgeError.closed
         }
         return try res.get()
@@ -599,5 +729,51 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         if chmod(path, 0o700) != 0 {
             throw ZeroDeskBridgeError.ioError("chmod(0700) failed for \(path)")
         }
+    }
+}
+
+extension ZeroDeskBridgeClient: RemoteInputSink {
+    public func sendKeyEvent(usageId: UInt16, down: Bool, modifiers: UInt8) {
+        enqueueFireAndForgetCommand([
+            "cmd": "send_hid_key",
+            "usb_hid_usage": Int(usageId),
+            "down": down,
+            "modifiers": Int(modifiers & HidModifierMask.validMask),
+        ])
+    }
+
+    public func sendMouseEvent(
+        kind: RemoteMouseKind,
+        x: Int,
+        y: Int,
+        buttons: UInt8,
+        wheelDx: Int16,
+        wheelDy: Int16
+    ) {
+        let clampedX = min(max(x, 0), Int(UInt16.max))
+        let clampedY = min(max(y, 0), Int(UInt16.max))
+        enqueueFireAndForgetCommand([
+            "cmd": "send_hid_mouse",
+            "mouse_kind": kind.rawValue,
+            "x": clampedX,
+            "y": clampedY,
+            "buttons": Int(buttons & HidMouseButtonMask.validMask),
+            "wheel_dx": Int(wheelDx),
+            "wheel_dy": Int(wheelDy),
+        ])
+    }
+
+    public func flushReleaseAll(
+        keys: [UInt16],
+        buttons: UInt8,
+        reason: ReleaseReason,
+        timeoutMs: UInt32
+    ) {
+        _ = try? releaseAllInput(
+            keys: keys,
+            buttons: buttons,
+            reason: reason,
+            timeoutMs: timeoutMs
+        )
     }
 }
