@@ -779,3 +779,21 @@ int32_t zd_sck_get_dimensions(
     *out_height = atomic_load_explicit(&h->active_height, memory_order_acquire);
     return ZD_SCK_OK;
 }
+
+/* Weak fallback for scrap::quartz::Display::scale() so standalone staticlib/XCFramework
+ * consumers (e.g. ZeroDeskApp SwiftUI) resolve BackingScaleFactor without colliding with
+ * strong definitions in Rust CLI binaries or RustDesk's macos.mm. */
+__attribute__((weak)) float BackingScaleFactor(uint32_t display) {
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode((CGDirectDisplayID)display);
+    if (mode == NULL) {
+        return 1.0f;
+    }
+    size_t pixel_w = CGDisplayModeGetPixelWidth(mode);
+    CGDisplayModeRelease(mode);
+    size_t point_w = CGDisplayPixelsWide((CGDirectDisplayID)display);
+    if (point_w == 0 || pixel_w == 0) {
+        return 1.0f;
+    }
+    float scale = (float)pixel_w / (float)point_w;
+    return (scale > 1.0f) ? scale : 1.0f;
+}

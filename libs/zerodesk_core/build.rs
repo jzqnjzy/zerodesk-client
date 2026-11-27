@@ -30,6 +30,51 @@ fn try_pkg_config_opus() -> bool {
     found_lib
 }
 
+fn try_pkg_config_opus_libdir() -> Option<PathBuf> {
+    let output = Command::new("pkg-config")
+        .args(["--variable=libdir", "opus"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if dir.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(dir))
+    }
+}
+
+fn try_link_static_opus() -> bool {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(prefix) = env::var("ZERODESK_LIBOPUS_PREFIX") {
+        candidates.push(PathBuf::from(prefix).join("lib"));
+    }
+    if let Some(pc_dir) = try_pkg_config_opus_libdir() {
+        candidates.push(pc_dir);
+    }
+    for dir in [
+        "/opt/homebrew/opt/opus/lib",
+        "/opt/homebrew/lib",
+        "/usr/local/opt/opus/lib",
+        "/usr/local/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib",
+    ] {
+        candidates.push(PathBuf::from(dir));
+    }
+    for dir in candidates {
+        if dir.join("libopus.a").is_file() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=opus");
+            return true;
+        }
+    }
+    false
+}
+
 fn link_macos_frameworks() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
@@ -70,10 +115,19 @@ fn compile_macos_sck() {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ZERODESK_LIBOPUS_PREFIX");
+    println!("cargo:rerun-if-env-changed=ZERODESK_STATIC_CODECS");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
     link_macos_frameworks();
     compile_macos_sck();
+
+    let static_codecs = env::var("ZERODESK_STATIC_CODECS").as_deref() == Ok("1");
+    if static_codecs {
+        if try_link_static_opus() {
+            return;
+        }
+        panic!("ZERODESK_STATIC_CODECS=1 requested, but libopus.a was not found in ZERODESK_LIBOPUS_PREFIX, pkg-config, or standard lib dirs");
+    }
 
     if let Ok(prefix) = env::var("ZERODESK_LIBOPUS_PREFIX") {
         let lib_dir = PathBuf::from(&prefix).join("lib");

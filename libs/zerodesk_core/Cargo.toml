@@ -11,6 +11,9 @@ description = "ZeroDesk V2 desktop core library: session engine, FrameMailbox, a
 [workspace]
 resolver = "2"
 
+[profile.release]
+panic = "unwind"
+
 [lib]
 name = "zerodesk_core"
 crate-type = ["rlib", "staticlib", "cdylib"]

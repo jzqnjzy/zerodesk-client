@@ -130,7 +130,7 @@ if [ -d apps/macos ]; then
 fi
 
 rc=0
-grep -rn --exclude-dir=target "cloud-backend" "${CLEANROOM_PATHS[@]}" || rc=$?
+grep -rn --exclude-dir=target --exclude-dir=.build --exclude-dir=Vendor --exclude-dir=dist "cloud-backend" "${CLEANROOM_PATHS[@]}" || rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "FAIL: forbidden cloud-backend reference detected!" >&2
   exit 1
@@ -156,7 +156,7 @@ fi
 : >"$TMP_SPDX_LIST"
 for root in "${SPDX_ROOTS[@]}"; do
   root_tmp="$(mktemp "${TMPDIR:-/tmp}/zd-spdx-root.XXXXXX")"
-  if ! find "$root" -not -path "*/target/*" -not -path "*/.build/*" -type f \
+  if ! find "$root" -not -path "*/target/*" -not -path "*/.build/*" -not -path "*/Vendor/*" -not -path "*/dist/*" -type f \
     \( -name "*.rs" -o -name "*.h" -o -name "*.c" -o -name "*.m" -o -name "*.mm" \
        -o -name "*.cpp" -o -name "*.hpp" -o -name "*.swift" -o -name "*.metal" -o -name "*.sh" \) \
     >"$root_tmp"; then
@@ -175,9 +175,9 @@ for root in "${SPDX_ROOTS[@]}"; do
 done
 
 scripts_tmp="$(mktemp "${TMPDIR:-/tmp}/zd-spdx-scripts.XXXXXX")"
-if ! find scripts -maxdepth 1 -type f -name "check-*.sh" >"$scripts_tmp"; then
+if ! find scripts -maxdepth 1 -type f \( -name "check-*.sh" -o -name "build-macos-*.sh" \) >"$scripts_tmp"; then
   rm -f "$scripts_tmp"
-  echo "FAIL: find failed for scripts/check-*.sh" >&2
+  echo "FAIL: find failed for scripts/*.sh" >&2
   exit 1
 fi
 scripts_cnt="$(wc -l <"$scripts_tmp" | tr -d ' ')"

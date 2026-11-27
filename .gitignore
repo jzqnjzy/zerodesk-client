@@ -60,3 +60,7 @@ flutter/web/
 /third_party/libdrmtap/
 # Local git worktrees
 .worktrees/
+# ZeroDesk macOS SwiftUI build/vendor artifacts (rebuilt via scripts/build-macos-*.sh)
+apps/macos/ZeroDeskApp/Vendor/
+apps/macos/ZeroDeskApp/.build/
+apps/macos/ZeroDeskApp/dist/
