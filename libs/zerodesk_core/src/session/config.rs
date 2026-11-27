@@ -107,15 +107,16 @@ pub struct V2ClientConfig {
     pub bw_cap_kbps: u32,
     pub transport_mode: TransportMode,
     pub udp_probe_timeout_ms: u64,
-    /// Test/E2E hook simulating a local firewall blocking UDP (`--drop-udp`) so `Auto`
+    /// E2E-only hook simulating a local firewall blocking UDP (`--drop-udp`) so `Auto`
     /// exercises the real UDP probe failure -> Dual TLS-443 fallback path.
+    #[cfg(feature = "e2e-fault-injection")]
     pub drop_udp_for_test: bool,
 }
 
 impl fmt::Debug for V2ClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("V2ClientConfig")
-            .field("control_plane_endpoint", &self.control_plane_endpoint)
+        let mut s = f.debug_struct("V2ClientConfig");
+        s.field("control_plane_endpoint", &self.control_plane_endpoint)
             .field("signaling_addr", &self.signaling_addr)
             .field("signaling_tls", &self.signaling_tls)
             .field("edge_a", &self.edge_a)
@@ -134,9 +135,10 @@ impl fmt::Debug for V2ClientConfig {
             .field("lease_renew_interval_sec", &self.lease_renew_interval_sec)
             .field("bw_cap_kbps", &self.bw_cap_kbps)
             .field("transport_mode", &self.transport_mode)
-            .field("udp_probe_timeout_ms", &self.udp_probe_timeout_ms)
-            .field("drop_udp_for_test", &self.drop_udp_for_test)
-            .finish()
+            .field("udp_probe_timeout_ms", &self.udp_probe_timeout_ms);
+        #[cfg(feature = "e2e-fault-injection")]
+        s.field("drop_udp_for_test", &self.drop_udp_for_test);
+        s.finish()
     }
 }
 
@@ -229,7 +231,19 @@ impl V2ClientConfig {
             bw_cap_kbps: DEFAULT_BW_CAP_KBPS,
             transport_mode: TransportMode::Auto,
             udp_probe_timeout_ms: DEFAULT_UDP_PROBE_TIMEOUT_MS,
+            #[cfg(feature = "e2e-fault-injection")]
             drop_udp_for_test: false,
+        }
+    }
+
+    pub fn should_drop_udp_for_test(&self) -> bool {
+        #[cfg(feature = "e2e-fault-injection")]
+        {
+            self.drop_udp_for_test
+        }
+        #[cfg(not(feature = "e2e-fault-injection"))]
+        {
+            false
         }
     }
 
@@ -460,26 +474,44 @@ fn verify_file_meta_0600(meta: &fs::Metadata, path: &Path) -> Result<(), V2Confi
     Ok(())
 }
 
-/// Opens `path` with `O_NOFOLLOW` on Unix, verifies `f.metadata()` (regular file, `0600`,
-/// `uid == geteuid()`), and reads directly from the verified open file descriptor (zero TOCTOU).
+/// Maximum allowed size of a `0600` config/identity file read by `read_file_0600_to_string`.
+pub const MAX_0600_FILE_BYTES: u64 = 64 * 1024;
+
+/// Opens `path` with `O_NOFOLLOW | O_NONBLOCK` on Unix, verifies `f.metadata()` (regular file,
+/// `0600`, `uid == geteuid()`, `len <= 64 KiB`), and reads with a bounded `.take(64 KiB + 1)`
+/// directly from the verified open file descriptor (zero TOCTOU, FIFO-safe).
 pub fn read_file_0600_to_string(path: &Path) -> Result<String, V2ConfigError> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = opts
+    let file = opts
         .open(path)
         .map_err(|e| V2ConfigError::Io(format!("open '{}': {e}", path.display())))?;
     let meta = file
         .metadata()
         .map_err(|e| V2ConfigError::Io(format!("fstat '{}': {e}", path.display())))?;
     verify_file_meta_0600(&meta, path)?;
+    if meta.len() > MAX_0600_FILE_BYTES {
+        return Err(V2ConfigError::InvalidValue(format!(
+            "file '{}' size {}B exceeds {MAX_0600_FILE_BYTES}B cap",
+            path.display(),
+            meta.len()
+        )));
+    }
     let mut content = String::new();
-    file.read_to_string(&mut content)
+    file.take(MAX_0600_FILE_BYTES + 1)
+        .read_to_string(&mut content)
         .map_err(|e| V2ConfigError::Io(format!("read '{}': {e}", path.display())))?;
+    if content.len() as u64 > MAX_0600_FILE_BYTES {
+        return Err(V2ConfigError::InvalidValue(format!(
+            "file '{}' exceeded {MAX_0600_FILE_BYTES}B cap while reading",
+            path.display()
+        )));
+    }
     Ok(content)
 }
 
@@ -650,6 +682,7 @@ mod tests {
             bw_cap_kbps: 50_000,
             transport_mode: TransportMode::Auto,
             udp_probe_timeout_ms: DEFAULT_UDP_PROBE_TIMEOUT_MS,
+            #[cfg(feature = "e2e-fault-injection")]
             drop_udp_for_test: false,
         }
     }
@@ -746,6 +779,22 @@ mod tests {
             fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
             cfg.validate().unwrap();
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_0600_rejects_oversized_file() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zd-cfg-big-{}-{uniq}", std::process::id()));
+        ensure_dir_0700(&dir).unwrap();
+        let big_file = dir.join("oversized.json");
+        let payload = vec![b'a'; (MAX_0600_FILE_BYTES as usize) + 1];
+        write_file_atomic_0600(&big_file, &payload).unwrap();
+        let err = read_file_0600_to_string(&big_file).unwrap_err();
+        assert!(matches!(err, V2ConfigError::InvalidValue(_)));
         let _ = fs::remove_dir_all(&dir);
     }
 }

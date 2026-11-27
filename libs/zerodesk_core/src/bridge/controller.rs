@@ -527,6 +527,13 @@ impl V2BridgeController {
             .state
     }
 
+    pub fn allows_config_mutation(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allows_config_mutation()
+    }
+
     pub fn snapshot(&self) -> BridgeSnapshot {
         self.inner
             .lock()
@@ -615,6 +622,28 @@ impl V2BridgeController {
                     );
                 }
             }
+        }
+        self.event_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Runtime hook: updates the effective tenant policy in-place during an active or ready
+    /// session without mutating `state` or requiring a `SignalingDeviceCert`.
+    pub fn on_policy_updated(&self, policy: EffectiveTenantPolicy) -> Result<(), String> {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.state == BridgeState::Idle {
+                return Err("on_policy_updated forbidden in state Idle".into());
+            }
+            let st = g.state;
+            g.policy = Some(policy.clone());
+            g.push_event(
+                "policy_refreshed",
+                serde_json::json!({
+                    "state": st,
+                    "policy_degraded": policy.degraded,
+                }),
+            );
         }
         self.event_notify.notify_waiters();
         Ok(())

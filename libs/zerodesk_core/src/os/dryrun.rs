@@ -7,21 +7,20 @@ use super::{
 };
 use crate::{
     frame::PixelFormat,
+    os::audio::OS_AUDIO_FRAME_SAMPLES,
     session::{
-        capture::bgra_to_i420_bt601,
         hid::{KeyEvent, MouseEvent, MouseKind},
         video::{generate_animated_i420, I420Frame},
     },
 };
 use scrap::I420ToARGB;
 use std::{
-    collections::BTreeSet,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc, Mutex,
-    },
+    collections::{BTreeSet, VecDeque},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+pub const MAX_JOURNAL_ENTRIES: usize = 10_000;
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -47,7 +46,8 @@ impl SyntheticScreenSource {
     }
 
     pub fn next_i420(&mut self) -> I420Frame {
-        let frame = generate_animated_i420(self.width as usize, self.height as usize, self.frame_idx);
+        let frame =
+            generate_animated_i420(self.width as usize, self.height as usize, self.frame_idx);
         self.frame_idx = self.frame_idx.wrapping_add(1);
         frame
     }
@@ -92,15 +92,9 @@ impl OsScreenCapture for SyntheticScreenSource {
     }
 }
 
-/// Helper to convert a `RawCapturedFrame` (BGRA8/RGBA8) into `I420Frame`.
+/// Converts a `RawCapturedFrame` (BGRA8 or RGBA8) into `I420Frame` with full bounds & stride validation.
 pub fn raw_captured_to_i420(frame: &RawCapturedFrame) -> Result<I420Frame, OsError> {
-    bgra_to_i420_bt601(
-        &frame.data,
-        frame.stride as usize,
-        frame.width as usize,
-        frame.height as usize,
-    )
-    .map_err(|e| OsError::CaptureFailed(e.to_string()))
+    super::capture::convert_captured_stride_to_i420(frame)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,15 +107,29 @@ pub struct DryRunHidJournalEntry {
 }
 
 #[derive(Debug, Default)]
-struct DryRunPressedState {
+struct DryRunJournalState {
+    entries: VecDeque<DryRunHidJournalEntry>,
+    dropped_entries: u64,
     keys: BTreeSet<u16>,
     buttons: u8,
+    interlocked: bool,
 }
 
+impl DryRunJournalState {
+    fn push_entry(&mut self, entry: DryRunHidJournalEntry) {
+        if self.entries.len() >= MAX_JOURNAL_ENTRIES {
+            self.entries.pop_front();
+            self.dropped_entries = self.dropped_entries.saturating_add(1);
+        }
+        self.entries.push_back(entry);
+    }
+}
+
+/// Thread-safe, bounded HID journal storing pressed-key state and recorded events under ONE mutex
+/// so emergency releases and in-flight events are strictly ordered and atomic.
 #[derive(Clone, Default)]
 pub struct DryRunHidJournal {
-    entries: Arc<Mutex<Vec<DryRunHidJournalEntry>>>,
-    pressed: Arc<Mutex<DryRunPressedState>>,
+    state: Arc<Mutex<DryRunJournalState>>,
 }
 
 impl DryRunHidJournal {
@@ -130,14 +138,24 @@ impl DryRunHidJournal {
     }
 
     pub fn entries(&self) -> Vec<DryRunHidJournalEntry> {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .entries
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn dropped_entries(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dropped_entries
     }
 
     pub fn pressed_keys(&self) -> Vec<u16> {
-        self.pressed
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keys
@@ -147,134 +165,116 @@ impl DryRunHidJournal {
     }
 
     pub fn pressed_buttons(&self) -> u8 {
-        self.pressed
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .buttons
     }
 
     pub fn is_all_released(&self) -> bool {
-        let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         g.keys.is_empty() && g.buttons == 0
     }
 
-    pub fn record_key_public(&self, ev: &KeyEvent) {
-        self.record_key(ev);
+    pub fn is_interlocked(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .interlocked
     }
 
-    pub fn record_mouse_public(&self, ev: &MouseEvent) {
-        self.record_mouse(ev);
+    /// Resumes acceptance of new dry-run HID events for a fresh session after emergency release.
+    pub fn resume_for_new_session(&self) {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.interlocked = false;
+    }
+
+    fn record_key(&self, ev: &KeyEvent) -> Result<(), OsError> {
+        let Ok(usage) = u16::try_from(ev.usb_hid_usage) else {
+            return Err(OsError::InvalidData(format!(
+                "USB HID usage {:#x} exceeds u16 range",
+                ev.usb_hid_usage
+            )));
+        };
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if g.interlocked {
+            return Err(OsError::Interlocked);
+        }
+        if ev.down {
+            g.keys.insert(usage);
+        } else {
+            g.keys.remove(&usage);
+        }
+        let buttons = g.buttons;
+        let snapshot: Vec<u16> = g.keys.iter().copied().collect();
+        g.push_entry(DryRunHidJournalEntry {
+            kind: if ev.down {
+                "key_down".into()
+            } else {
+                "key_up".into()
+            },
+            key_usage: Some(usage),
+            buttons,
+            pressed_keys_snapshot: snapshot,
+            timestamp_ms: now_epoch_ms(),
+        });
+        Ok(())
+    }
+
+    fn record_mouse(&self, ev: &MouseEvent) -> Result<(), OsError> {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if g.interlocked {
+            return Err(OsError::Interlocked);
+        }
+        let masked_buttons = ev.buttons & 0x1F;
+        match ev.kind {
+            MouseKind::Down => g.buttons |= masked_buttons,
+            MouseKind::Up => g.buttons &= !masked_buttons,
+            MouseKind::MoveAbs | MouseKind::MoveRel => g.buttons = masked_buttons,
+            MouseKind::Wheel => {}
+        }
+        let buttons = g.buttons;
+        let snapshot: Vec<u16> = g.keys.iter().copied().collect();
+        g.push_entry(DryRunHidJournalEntry {
+            kind: format!("mouse_{:?}", ev.kind).to_ascii_lowercase(),
+            key_usage: None,
+            buttons,
+            pressed_keys_snapshot: snapshot,
+            timestamp_ms: now_epoch_ms(),
+        });
+        Ok(())
     }
 
     pub fn emergency_release_all(&self) -> ReleaseReport {
-        let releaser = DryRunEmergencyKeyReleaser {
-            journal: self.clone(),
-        };
-        releaser.release_all_keys()
-    }
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.interlocked = true;
+        let keys_to_release: Vec<u16> = g.keys.iter().copied().collect();
+        let buttons_to_release = g.buttons;
+        g.keys.clear();
+        g.buttons = 0;
 
-    fn record_key(&self, ev: &KeyEvent) {
-        let usage = (ev.usb_hid_usage & 0xFFFF) as u16;
-        let (buttons, snapshot) = {
-            let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
-            if ev.down {
-                g.keys.insert(usage);
-            } else {
-                g.keys.remove(&usage);
-            }
-            (g.buttons, g.keys.iter().copied().collect::<Vec<_>>())
-        };
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(DryRunHidJournalEntry {
-                kind: if ev.down {
-                    "key_down".into()
-                } else {
-                    "key_up".into()
-                },
-                key_usage: Some(usage),
-                buttons,
-                pressed_keys_snapshot: snapshot,
-                timestamp_ms: now_epoch_ms(),
-            });
-    }
-
-    fn record_mouse(&self, ev: &MouseEvent) {
-        let (buttons, snapshot) = {
-            let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
-            match ev.kind {
-                MouseKind::Down => g.buttons |= ev.buttons,
-                MouseKind::Up => g.buttons &= !ev.buttons,
-                MouseKind::MoveAbs | MouseKind::MoveRel => g.buttons = ev.buttons,
-                MouseKind::Wheel => {}
-            }
-            (g.buttons, g.keys.iter().copied().collect::<Vec<_>>())
-        };
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(DryRunHidJournalEntry {
-                kind: format!("mouse_{:?}", ev.kind).to_ascii_lowercase(),
-                key_usage: None,
-                buttons,
-                pressed_keys_snapshot: snapshot,
-                timestamp_ms: now_epoch_ms(),
-            });
-    }
-}
-
-/// Independent stateless emergency releaser for `DryRunHidSink`.
-/// Reads the pressed-key set under a tiny lock, drops the lock immediately, and appends
-/// synthetic release entries without borrowing `DryRunHidSink`.
-#[derive(Clone)]
-pub struct DryRunEmergencyKeyReleaser {
-    journal: DryRunHidJournal,
-}
-
-impl EmergencyKeyReleaser for DryRunEmergencyKeyReleaser {
-    fn release_all_keys(&self) -> ReleaseReport {
-        let (keys_to_release, buttons_to_release) = {
-            let mut g = self
-                .journal
-                .pressed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let keys: Vec<u16> = g.keys.iter().copied().collect();
-            let buttons = g.buttons;
-            g.keys.clear();
-            g.buttons = 0;
-            (keys, buttons)
-        };
         let ts = now_epoch_ms();
         let mut released_keys = 0usize;
         let mut released_buttons = 0usize;
-        {
-            let mut log = self
-                .journal
-                .entries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for usage in &keys_to_release {
-                released_keys += 1;
-                log.push(DryRunHidJournalEntry {
-                    kind: "emergency_key_up".into(),
-                    key_usage: Some(*usage),
-                    buttons: 0,
-                    pressed_keys_snapshot: Vec::new(),
-                    timestamp_ms: ts,
-                });
-            }
-            if buttons_to_release != 0 {
-                released_buttons = buttons_to_release.count_ones() as usize;
-                log.push(DryRunHidJournalEntry {
-                    kind: "emergency_mouse_up".into(),
-                    key_usage: None,
-                    buttons: 0,
-                    pressed_keys_snapshot: Vec::new(),
-                    timestamp_ms: ts,
-                });
-            }
+        for usage in &keys_to_release {
+            released_keys += 1;
+            g.push_entry(DryRunHidJournalEntry {
+                kind: "emergency_key_up".into(),
+                key_usage: Some(*usage),
+                buttons: 0,
+                pressed_keys_snapshot: Vec::new(),
+                timestamp_ms: ts,
+            });
+        }
+        if buttons_to_release != 0 {
+            released_buttons = buttons_to_release.count_ones() as usize;
+            g.push_entry(DryRunHidJournalEntry {
+                kind: "emergency_mouse_up".into(),
+                key_usage: None,
+                buttons: 0,
+                pressed_keys_snapshot: Vec::new(),
+                timestamp_ms: ts,
+            });
         }
         ReleaseReport {
             released_keys,
@@ -285,7 +285,19 @@ impl EmergencyKeyReleaser for DryRunEmergencyKeyReleaser {
     }
 }
 
-/// Zero-OS-injection HID sink with full journal + independent `EmergencyKeyReleaser`.
+/// Independent stateless emergency releaser for `DryRunHidSink`.
+#[derive(Clone)]
+pub struct DryRunEmergencyKeyReleaser {
+    journal: DryRunHidJournal,
+}
+
+impl EmergencyKeyReleaser for DryRunEmergencyKeyReleaser {
+    fn release_all_keys(&self) -> ReleaseReport {
+        self.journal.emergency_release_all()
+    }
+}
+
+/// Zero-OS-injection HID sink with bounded journal + independent `EmergencyKeyReleaser`.
 #[derive(Clone, Default)]
 pub struct DryRunHidSink {
     journal: DryRunHidJournal,
@@ -296,6 +308,11 @@ impl DryRunHidSink {
         Self::default()
     }
 
+    pub fn with_journal(journal: DryRunHidJournal) -> Self {
+        journal.resume_for_new_session();
+        Self { journal }
+    }
+
     pub fn journal(&self) -> &DryRunHidJournal {
         &self.journal
     }
@@ -303,13 +320,11 @@ impl DryRunHidSink {
 
 impl OsHidSink for DryRunHidSink {
     fn send_key(&mut self, ev: &KeyEvent) -> Result<(), OsError> {
-        self.journal.record_key(ev);
-        Ok(())
+        self.journal.record_key(ev)
     }
 
     fn send_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsError> {
-        self.journal.record_mouse(ev);
-        Ok(())
+        self.journal.record_mouse(ev)
     }
 
     fn emergency_releaser(&self) -> Arc<dyn EmergencyKeyReleaser> {
@@ -325,6 +340,12 @@ pub struct SilentAudioCapture;
 
 impl OsAudioCapture for SilentAudioCapture {
     fn read_frame(&mut self, out_pcm: &mut [f32]) -> Result<bool, OsError> {
+        if out_pcm.len() != OS_AUDIO_FRAME_SAMPLES {
+            return Err(OsError::InvalidData(format!(
+                "expected {OS_AUDIO_FRAME_SAMPLES} PCM samples, got {}",
+                out_pcm.len()
+            )));
+        }
         out_pcm.fill(0.0);
         Ok(true)
     }
@@ -337,17 +358,29 @@ pub struct SilentAudioPlayback {
 }
 
 impl OsAudioPlayback for SilentAudioPlayback {
-    fn write_frame(&mut self, _pcm: &[f32]) -> Result<(), OsError> {
+    fn write_frame(&mut self, pcm: &[f32]) -> Result<bool, OsError> {
+        if pcm.len() != OS_AUDIO_FRAME_SAMPLES {
+            return Err(OsError::InvalidData(format!(
+                "expected {OS_AUDIO_FRAME_SAMPLES} PCM samples, got {}",
+                pcm.len()
+            )));
+        }
         self.frames_played = self.frames_played.saturating_add(1);
-        Ok(())
+        Ok(true)
     }
 }
 
-/// Pure in-memory clipboard backend with simulated `change_count` (never touches OS clipboard).
+#[derive(Debug, Default)]
+struct MemoryClipboardInner {
+    text: Option<String>,
+    change_count: i64,
+}
+
+/// Pure in-memory clipboard backend with atomic `(text, change_count)` updates
+/// (never touches OS clipboard).
 #[derive(Clone, Default)]
 pub struct MemoryClipboardBackend {
-    text: Arc<Mutex<Option<String>>>,
-    change_count: Arc<AtomicI64>,
+    inner: Arc<Mutex<MemoryClipboardInner>>,
 }
 
 impl MemoryClipboardBackend {
@@ -356,27 +389,101 @@ impl MemoryClipboardBackend {
     }
 
     pub fn set_local_text(&self, text: impl Into<String>) {
-        *self.text.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.into());
-        self.change_count.fetch_add(1, Ordering::AcqRel);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.text = Some(text.into());
+        g.change_count = g.change_count.saturating_add(1);
     }
 
     pub fn current_text(&self) -> Option<String> {
-        self.text.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .text
+            .clone()
+    }
+
+    /// Zeroizes and clears stored clipboard text on shutdown.
+    pub fn clear(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut s) = g.text.take() {
+            // SAFETY: wiping bytes to 0 produces valid UTF-8 NUL bytes before drop.
+            for b in unsafe { s.as_bytes_mut() } {
+                unsafe { std::ptr::write_volatile(b, 0) };
+            }
+        }
     }
 }
 
 impl OsClipboardBackend for MemoryClipboardBackend {
     fn read_change_count(&mut self) -> Option<i64> {
-        Some(self.change_count.load(Ordering::Acquire))
+        Some(
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .change_count,
+        )
     }
 
     fn read_text(&mut self) -> Result<Option<String>, OsError> {
-        Ok(self.text.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .text
+            .clone())
     }
 
     fn write_text(&mut self, text: &str) -> Result<(), OsError> {
-        *self.text.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
-        self.change_count.fetch_add(1, Ordering::AcqRel);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.text = Some(text.to_string());
+        g.change_count = g.change_count.saturating_add(1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dryrun_journal_is_bounded_and_interlocked_after_emergency_release() {
+        let mut sink = DryRunHidSink::new();
+        let releaser = sink.emergency_releaser();
+        for i in 0..(MAX_JOURNAL_ENTRIES + 50) {
+            sink.send_key(&KeyEvent {
+                down: i % 2 == 0,
+                modifiers: 0,
+                usb_hid_usage: 0x04,
+                unicode_scalar: 0,
+                client_ts_ms: i as u64,
+            })
+            .unwrap();
+        }
+        assert_eq!(sink.journal().entries().len(), MAX_JOURNAL_ENTRIES);
+        assert_eq!(sink.journal().dropped_entries(), 50);
+
+        // Out-of-u16 usage MUST fail closed (never masked to valid usage!)
+        assert!(sink
+            .send_key(&KeyEvent {
+                down: true,
+                modifiers: 0,
+                usb_hid_usage: 0x0001_0004,
+                unicode_scalar: 0,
+                client_ts_ms: 999,
+            })
+            .is_err());
+
+        let _ = releaser.release_all_keys();
+        assert!(sink.journal().is_interlocked());
+        assert_eq!(
+            sink.send_key(&KeyEvent {
+                down: true,
+                modifiers: 0,
+                usb_hid_usage: 0x04,
+                unicode_scalar: 0,
+                client_ts_ms: 1000,
+            }),
+            Err(OsError::Interlocked)
+        );
     }
 }

@@ -54,6 +54,84 @@ use zerodesk_core::{
     os::{input::RealInputPermit, os_selftest},
 };
 
+static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_termination_signal(_sig: libc::c_int) {
+    SIGNAL_STOP.store(true, Ordering::Release);
+}
+
+fn install_signal_handlers() {
+    SIGNAL_STOP.store(false, Ordering::Release);
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_termination_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_termination_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// RAII guard guaranteeing `V2BridgeRuntime::destroy()` always runs on every exit path.
+struct RuntimeDropGuard(Arc<V2BridgeRuntime>);
+
+impl RuntimeDropGuard {
+    fn rt(&self) -> &Arc<V2BridgeRuntime> {
+        &self.0
+    }
+}
+
+impl Drop for RuntimeDropGuard {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+fn write_stdout_line(line: &str) {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+fn write_stderr_line(line: &str) {
+    let mut err = io::stderr().lock();
+    let _ = writeln!(err, "{line}");
+}
+
+/// Validates CLI flags strictly: rejects any unknown flag or missing value with exit code 2.
+fn validate_flags(args: &[String], bool_flags: &[&str], value_flags: &[&str]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if bool_flags.contains(&arg) {
+            i += 1;
+            continue;
+        }
+        if value_flags.contains(&arg) {
+            if i + 1 >= args.len() {
+                return Err(format!("flag '{arg}' requires a value"));
+            }
+            i += 2;
+            continue;
+        }
+        if let Some((flag, val)) = arg.split_once('=') {
+            if value_flags.contains(&flag) {
+                if val.is_empty() {
+                    return Err(format!("flag '{flag}' requires a non-empty value"));
+                }
+                i += 1;
+                continue;
+            }
+        }
+        return Err(format!("unknown CLI flag or argument: '{arg}'"));
+    }
+    Ok(())
+}
+
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
@@ -72,44 +150,61 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-fn build_runtime_from_flags(args: &[String]) -> Result<Arc<V2BridgeRuntime>, String> {
+fn build_runtime_from_flags(args: &[String]) -> Result<RuntimeDropGuard, String> {
     let mut opts = V2BridgeRuntimeOptions {
         use_os_capture: has_flag(args, "--os-capture"),
         use_os_audio: has_flag(args, "--os-audio"),
         use_os_clipboard: has_flag(args, "--os-clipboard"),
-        drop_udp_override: has_flag(args, "--drop-udp"),
         ..V2BridgeRuntimeOptions::default()
     };
     if has_flag(args, "--real-os-input") {
         let permit = RealInputPermit::from_explicit_opt_in(true).map_err(|e| e.to_string())?;
-        opts.real_input_permit = Some(permit);
+        opts.real_input_permit = Some(Arc::new(permit));
     }
     let rt = V2BridgeRuntime::with_options(opts)?;
-    Ok(Arc::new(rt))
+    Ok(RuntimeDropGuard(Arc::new(rt)))
 }
 
-fn cmd_os_selftest() -> ExitCode {
+fn cmd_os_selftest(args: &[String]) -> ExitCode {
+    if let Err(e) = validate_flags(args, &[], &[]) {
+        write_stderr_line(&format!("os-selftest: {e}"));
+        return ExitCode::from(2);
+    }
     let report = os_selftest();
     match serde_json::to_string_pretty(&report) {
         Ok(json) => {
-            println!("{json}");
+            write_stdout_line(&json);
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("failed to serialize os-selftest report: {e}");
+            write_stderr_line(&format!("failed to serialize os-selftest report: {e}"));
             ExitCode::FAILURE
         }
     }
 }
 
 fn cmd_bridge_stdio(args: &[String]) -> ExitCode {
-    let rt = match build_runtime_from_flags(args) {
-        Ok(r) => r,
+    if let Err(e) = validate_flags(
+        args,
+        &[
+            "--os-capture",
+            "--os-audio",
+            "--os-clipboard",
+            "--real-os-input",
+        ],
+        &[],
+    ) {
+        write_stderr_line(&format!("bridge-stdio: {e}"));
+        return ExitCode::from(2);
+    }
+    let guard = match build_runtime_from_flags(args) {
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("bridge-stdio init failed: {e}");
+            write_stderr_line(&format!("bridge-stdio init failed: {e}"));
             return ExitCode::FAILURE;
         }
     };
+    let rt = Arc::clone(guard.rt());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_ev = Arc::clone(&stop);
     let rt_ev = Arc::clone(&rt);
@@ -120,9 +215,7 @@ fn cmd_bridge_stdio(args: &[String]) -> ExitCode {
         while !stop_ev.load(Ordering::Acquire) {
             if let Some(ev_json) = rt_ev.poll_event_json_timeout(Duration::from_millis(100)) {
                 let _g = stdout_ev.lock().unwrap_or_else(|e| e.into_inner());
-                let mut out = io::stdout().lock();
-                let _ = writeln!(out, "{{\"stream\":\"event\",\"body\":{ev_json}}}");
-                let _ = out.flush();
+                write_stdout_line(&format!("{{\"stream\":\"event\",\"body\":{ev_json}}}"));
             }
         }
     });
@@ -136,86 +229,136 @@ fn cmd_bridge_stdio(args: &[String]) -> ExitCode {
         }
         let reply = rt.exec_json(trimmed);
         let _g = stdout_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = io::stdout().lock();
-        let _ = writeln!(out, "{{\"stream\":\"reply\",\"body\":{reply}}}");
-        let _ = out.flush();
+        write_stdout_line(&format!("{{\"stream\":\"reply\",\"body\":{reply}}}"));
     }
 
+    // Strict ordered shutdown: stop event thread -> join -> drain residual events -> destroy runtime!
     stop.store(true, Ordering::Release);
-    rt.destroy();
     let _ = ev_thread.join();
+    while let Some(ev_json) = rt.poll_event_json() {
+        let _g = stdout_lock.lock().unwrap_or_else(|e| e.into_inner());
+        write_stdout_line(&format!("{{\"stream\":\"event\",\"body\":{ev_json}}}"));
+    }
+    drop(guard);
     ExitCode::SUCCESS
 }
 
 fn cmd_host(args: &[String]) -> ExitCode {
+    let bool_flags: &[&str] = &[
+        "--os-capture",
+        "--os-audio",
+        "--os-clipboard",
+        "--real-os-input",
+        #[cfg(feature = "e2e-fault-injection")]
+        "--auto-accept",
+    ];
+    if let Err(e) = validate_flags(args, bool_flags, &["--config"]) {
+        write_stderr_line(&format!("host: {e}"));
+        return ExitCode::from(2);
+    }
     let Some(cfg_path) = flag_value(args, "--config") else {
-        eprintln!("usage: zerodesk-desktop host --config <path.json> [--os-capture] [--os-audio] [--os-clipboard] [--real-os-input]");
-        return ExitCode::FAILURE;
+        write_stderr_line(
+            "usage: zerodesk-desktop host --config <path.json> [--os-capture] [--os-audio] [--os-clipboard] [--real-os-input]",
+        );
+        return ExitCode::from(2);
     };
-    let rt = match build_runtime_from_flags(args) {
-        Ok(r) => r,
+    install_signal_handlers();
+    let guard = match build_runtime_from_flags(args) {
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("host init failed: {e}");
+            write_stderr_line(&format!("host init failed: {e}"));
             return ExitCode::FAILURE;
         }
     };
+    let rt = guard.rt();
     let load_cmd = serde_json::json!({ "v": 1, "cmd": "load_config", "path": cfg_path });
     let load_reply = rt.exec_json(&load_cmd.to_string());
-    println!("{load_reply}");
+    write_stdout_line(&load_reply);
     let load_val: serde_json::Value = serde_json::from_str(&load_reply).unwrap_or_default();
     if load_val["ok"].as_bool() != Some(true) {
-        rt.destroy();
         return ExitCode::FAILURE;
     }
 
     let start_reply = rt.exec_json(r#"{"v":1,"cmd":"start_host"}"#);
-    println!("{start_reply}");
+    write_stdout_line(&start_reply);
+    let start_val: serde_json::Value = serde_json::from_str(&start_reply).unwrap_or_default();
+    if start_val["ok"].as_bool() != Some(true) {
+        return ExitCode::FAILURE;
+    }
+
+    #[cfg(feature = "e2e-fault-injection")]
     let auto_accept = has_flag(args, "--auto-accept");
 
-    // Pump events until EOF/SIGINT/session termination.
-    while let Some(ev_str) = rt.poll_event_json_timeout(Duration::from_secs(60)) {
-        println!("{ev_str}");
-        if auto_accept {
+    let mut failed = false;
+    while !SIGNAL_STOP.load(Ordering::Acquire) {
+        if let Some(ev_str) = rt.poll_event_json_timeout(Duration::from_millis(100)) {
+            write_stdout_line(&ev_str);
             if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&ev_str) {
-                if ev["kind"].as_str() == Some("IncomingCall") {
+                if ev["kind"].as_str() == Some("CommandResult")
+                    && ev["payload"]["cmd"].as_str() == Some("start_host")
+                    && ev["payload"]["ok"].as_bool() == Some(false)
+                {
+                    failed = true;
+                    break;
+                }
+                #[cfg(feature = "e2e-fault-injection")]
+                if auto_accept && ev["kind"].as_str() == Some("IncomingCall") {
                     if let Some(inc_id) = ev["payload"]["incoming_id"].as_str() {
                         let acc = serde_json::json!({
                             "v": 1,
                             "cmd": "accept_incoming",
                             "incoming_id": inc_id,
                         });
-                        println!("{}", rt.exec_json(&acc.to_string()));
+                        write_stdout_line(&rt.exec_json(&acc.to_string()));
                     }
                 }
             }
         }
     }
-    rt.destroy();
-    ExitCode::SUCCESS
+    if SIGNAL_STOP.load(Ordering::Acquire) {
+        let _ = rt.exec_json(r#"{"v":1,"cmd":"stop_host"}"#);
+    }
+    drop(guard);
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn cmd_connect(args: &[String]) -> ExitCode {
+    if let Err(e) = validate_flags(
+        args,
+        &["--os-audio", "--os-clipboard"],
+        &["--config", "--target"],
+    ) {
+        write_stderr_line(&format!("connect: {e}"));
+        return ExitCode::from(2);
+    }
     let Some(cfg_path) = flag_value(args, "--config") else {
-        eprintln!("usage: zerodesk-desktop connect --config <path.json> --target <32-hex-device-id>");
-        return ExitCode::FAILURE;
+        write_stderr_line(
+            "usage: zerodesk-desktop connect --config <path.json> --target <32-hex-device-id>",
+        );
+        return ExitCode::from(2);
     };
     let Some(target) = flag_value(args, "--target") else {
-        eprintln!("connect requires --target <32-hex-device-id>");
-        return ExitCode::FAILURE;
+        write_stderr_line("connect requires --target <32-hex-device-id>");
+        return ExitCode::from(2);
     };
-    let rt = match build_runtime_from_flags(args) {
-        Ok(r) => r,
+    install_signal_handlers();
+    let guard = match build_runtime_from_flags(args) {
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("connect init failed: {e}");
+            write_stderr_line(&format!("connect init failed: {e}"));
             return ExitCode::FAILURE;
         }
     };
+    let rt = guard.rt();
     let load_cmd = serde_json::json!({ "v": 1, "cmd": "load_config", "path": cfg_path });
     let load_reply = rt.exec_json(&load_cmd.to_string());
-    println!("{load_reply}");
+    write_stdout_line(&load_reply);
     let load_val: serde_json::Value = serde_json::from_str(&load_reply).unwrap_or_default();
     if load_val["ok"].as_bool() != Some(true) {
-        rt.destroy();
         return ExitCode::FAILURE;
     }
 
@@ -224,30 +367,54 @@ fn cmd_connect(args: &[String]) -> ExitCode {
         "cmd": "dial",
         "target_device_id_hex": target,
     });
-    println!("{}", rt.exec_json(&dial_cmd.to_string()));
+    let dial_reply = rt.exec_json(&dial_cmd.to_string());
+    write_stdout_line(&dial_reply);
+    let dial_val: serde_json::Value = serde_json::from_str(&dial_reply).unwrap_or_default();
+    if dial_val["ok"].as_bool() != Some(true) {
+        return ExitCode::FAILURE;
+    }
 
-    while let Some(ev_str) = rt.poll_event_json_timeout(Duration::from_secs(30)) {
-        println!("{ev_str}");
-        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&ev_str) {
-            if ev["kind"].as_str() == Some("SessionEnded") {
-                break;
+    let mut failed = false;
+    while !SIGNAL_STOP.load(Ordering::Acquire) {
+        if let Some(ev_str) = rt.poll_event_json_timeout(Duration::from_millis(100)) {
+            write_stdout_line(&ev_str);
+            if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&ev_str) {
+                if ev["kind"].as_str() == Some("CommandResult")
+                    && ev["payload"]["cmd"].as_str() == Some("dial")
+                    && ev["payload"]["ok"].as_bool() == Some(false)
+                {
+                    failed = true;
+                    break;
+                }
+                if ev["kind"].as_str() == Some("SessionEnded") {
+                    break;
+                }
             }
         }
     }
-    rt.destroy();
-    ExitCode::SUCCESS
+    if SIGNAL_STOP.load(Ordering::Acquire) {
+        let _ = rt.exec_json(r#"{"v":1,"cmd":"disconnect"}"#);
+    }
+    drop(guard);
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("os-selftest") => cmd_os_selftest(),
+        Some("os-selftest") => cmd_os_selftest(&args[2..]),
         Some("bridge-stdio") => cmd_bridge_stdio(&args[2..]),
         Some("host") => cmd_host(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
         _ => {
-            eprintln!("usage: zerodesk-desktop <os-selftest|bridge-stdio|host|connect> [args...]");
-            ExitCode::FAILURE
+            write_stderr_line(
+                "usage: zerodesk-desktop <os-selftest|bridge-stdio|host|connect> [args...]",
+            );
+            ExitCode::from(2)
         }
     }
 }

@@ -26,6 +26,7 @@ os-audio = ["dep:cpal"]
 os-clipboard = ["dep:arboard"]
 real-input = []
 os-input = ["dep:enigo"]
+e2e-fault-injection = []
 
 [dependencies]
 arboard = { version = "3.6", default-features = false, optional = true }

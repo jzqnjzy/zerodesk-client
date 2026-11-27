@@ -5,9 +5,13 @@ use super::controller::{
     BridgePersistedConfig, BRIDGE_ABI_VERSION, BRIDGE_MAX_CMD_JSON_BYTES,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+pub const MIN_RING_TIMEOUT_MS: u64 = 1_000;
+pub const MAX_RING_TIMEOUT_MS: u64 = 120_000;
 
 /// Parsed, validated command request accepted by `V2BridgeRuntime::exec_json`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RuntimeCommandEnvelope {
     pub v: u32,
     pub cmd: String,
@@ -40,8 +44,6 @@ pub struct RuntimeCommandEnvelope {
     #[serde(default)]
     pub transfer_id: Option<u64>,
     #[serde(default)]
-    pub drop_udp: Option<bool>,
-    #[serde(default)]
     pub down: Option<bool>,
     #[serde(default)]
     pub modifiers: Option<u8>,
@@ -69,6 +71,45 @@ pub struct RuntimeCommandEnvelope {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub ring_timeout_ms: Option<u64>,
+}
+
+impl fmt::Debug for RuntimeCommandEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg_redacted = self.config.as_ref().map(|_| "<redacted>");
+        let b64_redacted = self
+            .payload_b64
+            .as_ref()
+            .map(|s| format!("<redacted len={}>", s.len()));
+        let text_redacted = self
+            .text
+            .as_ref()
+            .map(|s| format!("<redacted len={}>", s.len()));
+        f.debug_struct("RuntimeCommandEnvelope")
+            .field("v", &self.v)
+            .field("cmd", &self.cmd)
+            .field("path", &self.path)
+            .field("config", &cfg_redacted)
+            .field("target_device_id_hex", &self.target_device_id_hex)
+            .field("incoming_id", &self.incoming_id)
+            .field("session_id_hex", &self.session_id_hex)
+            .field("reason", &self.reason)
+            .field("muted", &self.muted)
+            .field("mode", &self.mode)
+            .field("mime_kind", &self.mime_kind)
+            .field("payload_b64", &b64_redacted)
+            .field("text", &text_redacted)
+            .field("rel_name", &self.rel_name)
+            .field("file_size", &self.file_size)
+            .field("transfer_id", &self.transfer_id)
+            .field("down", &self.down)
+            .field("modifiers", &self.modifiers)
+            .field("usb_hid_usage", &self.usb_hid_usage)
+            .field("unicode_scalar", &self.unicode_scalar)
+            .field("mouse_kind", &self.mouse_kind)
+            .field("download_dir", &self.download_dir)
+            .field("ring_timeout_ms", &self.ring_timeout_ms)
+            .finish()
+    }
 }
 
 /// Structured reply envelope returned synchronously by `V2BridgeRuntime::exec_json`.
@@ -208,11 +249,35 @@ pub fn parse_and_validate_command(raw: &str) -> Result<RuntimeCommandEnvelope, R
             ),
         ));
     }
-    if env.cmd.trim().is_empty() || env.cmd.len() > 64 {
+    if env.cmd.is_empty()
+        || env.cmd.len() > 64
+        || !env
+            .cmd
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
         return Err(RuntimeReplyEnvelope::err(
             "InvalidArgument",
-            "command name must be 1..=64 bytes",
+            "command name must be 1..=64 ASCII [A-Za-z0-9_.-] characters",
         ));
+    }
+    if let Some(ms) = env.ring_timeout_ms {
+        if !(MIN_RING_TIMEOUT_MS..=MAX_RING_TIMEOUT_MS).contains(&ms) {
+            return Err(RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                format!(
+                    "ring_timeout_ms {ms} outside [{MIN_RING_TIMEOUT_MS}, {MAX_RING_TIMEOUT_MS}]"
+                ),
+            ));
+        }
+    }
+    if let Some(scalar) = env.unicode_scalar {
+        if scalar != 0 && char::from_u32(scalar).is_none() {
+            return Err(RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                format!("unicode_scalar 0x{scalar:x} is not a valid Unicode scalar value"),
+            ));
+        }
     }
     Ok(env)
 }
@@ -245,6 +310,12 @@ mod tests {
             r#"{"v":2,"cmd":"snapshot"}"#,
             "{\"v\":1,\"cmd\":\"snap\0shot\"}",
             r#"{"v":1,"cmd":""}"#,
+            r#"{"v":1,"cmd":"bad cmd!"}"#,
+            r#"{"v":1,"cmd":"../evil"}"#,
+            r#"{"v":1,"cmd":"start_host","ring_timeout_ms":999}"#,
+            r#"{"v":1,"cmd":"start_host","ring_timeout_ms":120001}"#,
+            r#"{"v":1,"cmd":"send_hid_key","unicode_scalar":55296}"#,
+            r#"{"v":1,"cmd":"send_hid_key","unicode_scalar":1114112}"#,
         ] {
             let err = parse_and_validate_command(bad).unwrap_err();
             assert!(!err.ok);
@@ -252,5 +323,25 @@ mod tests {
         }
         let ok = parse_and_validate_command(r#"{"v":1,"cmd":"snapshot","future_field":42}"#).unwrap();
         assert_eq!(ok.cmd, "snapshot");
+        let ok_ring =
+            parse_and_validate_command(r#"{"v":1,"cmd":"start_host","ring_timeout_ms":1000}"#)
+                .unwrap();
+        assert_eq!(ok_ring.ring_timeout_ms, Some(1000));
+        let ok_unicode =
+            parse_and_validate_command(r#"{"v":1,"cmd":"send_hid_key","unicode_scalar":65}"#)
+                .unwrap();
+        assert_eq!(ok_unicode.unicode_scalar, Some(65));
+    }
+
+    #[test]
+    fn command_envelope_debug_redacts_secrets_and_payloads() {
+        let env = parse_and_validate_command(
+            r#"{"v":1,"cmd":"send_clipboard","text":"TOP_SECRET_CLIP_CANARY","payload_b64":"U0VDUkVUX0I2NA=="}"#,
+        )
+        .unwrap();
+        let dbg = format!("{env:?}");
+        assert!(!dbg.contains("TOP_SECRET_CLIP_CANARY"));
+        assert!(!dbg.contains("U0VDUkVUX0I2NA=="));
+        assert!(dbg.contains("<redacted len="));
     }
 }

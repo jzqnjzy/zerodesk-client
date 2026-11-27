@@ -6,6 +6,7 @@ use crate::session::clipboard::{validate_png_ihdr, CLIP_HARD_MAX_BYTES};
 use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
+    fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -25,9 +26,6 @@ pub fn validate_clipboard_png_bytes(bytes: &[u8]) -> Result<(u32, u32), OsError>
 }
 
 /// One-shot anti-echo suppression guard supporting `A -> B -> A` re-copy.
-/// When remote clipboard content `H` is written locally, `arm(H)` records it ONCE.
-/// The next local observation matching `H` is suppressed AND immediately clears the guard,
-/// so a subsequent user copy of `A` after `B` transmits normally!
 #[derive(Debug, Default)]
 pub struct OneShotAntiEcho {
     suppressed_sha256: Option<[u8; 32]>,
@@ -57,20 +55,60 @@ impl OneShotAntiEcho {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OutboundClipboardItem {
     pub text: String,
     pub sha256: [u8; 32],
 }
 
+impl fmt::Debug for OutboundClipboardItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundClipboardItem")
+            .field("len", &self.text.len())
+            .field(
+                "sha256_prefix",
+                &format!("{:02x}{:02x}..", self.sha256[0], self.sha256[1]),
+            )
+            .finish()
+    }
+}
+
+/// Controlled read-only consumer handle for queued outbound clipboard changes.
+/// Enforces the live `allow_clipboard` flag on every dequeue and never exposes raw mutex internals.
+#[derive(Clone)]
+pub struct ClipboardOutboundHandle {
+    queue: Arc<Mutex<VecDeque<OutboundClipboardItem>>>,
+}
+
+impl ClipboardOutboundHandle {
+    pub fn pop_front(&self, allow_clipboard: &AtomicBool) -> Option<OutboundClipboardItem> {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if !allow_clipboard.load(Ordering::Acquire) {
+            q.clear();
+            return None;
+        }
+        q.pop_front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Single-threaded clipboard poller owning the sole `OsClipboardBackend` instance.
 /// Uses SHA-256 primary dedup + optional OS `change_count` pre-filter + one-shot anti-echo
-/// (`A -> B -> A`) + live `allow_clipboard` policy gate that purges pending outbound items when disabled.
+/// (`A -> B -> A`) + initial/policy-reenable baseline resync (never leaks pre-existing clipboard
+/// contents when connecting or re-enabling policy!).
 pub struct ClipboardPoller {
     backend: Box<dyn OsClipboardBackend>,
     allow_clipboard: Arc<AtomicBool>,
     last_change_count: Option<i64>,
     last_seen_sha256: Option<[u8; 32]>,
+    needs_resync: bool,
     anti_echo: OneShotAntiEcho,
     outbound_queue: Arc<Mutex<VecDeque<OutboundClipboardItem>>>,
     max_queue_len: usize,
@@ -83,47 +121,77 @@ impl ClipboardPoller {
             allow_clipboard,
             last_change_count: None,
             last_seen_sha256: None,
+            needs_resync: true,
             anti_echo: OneShotAntiEcho::new(),
             outbound_queue: Arc::new(Mutex::new(VecDeque::new())),
             max_queue_len: 16,
         }
     }
 
-    pub fn outbound_queue_handle(&self) -> Arc<Mutex<VecDeque<OutboundClipboardItem>>> {
-        Arc::clone(&self.outbound_queue)
+    pub fn outbound_handle(&self) -> ClipboardOutboundHandle {
+        ClipboardOutboundHandle {
+            queue: Arc::clone(&self.outbound_queue),
+        }
     }
 
-    /// Applies remote clipboard text locally and arms one-shot anti-echo suppression.
-    pub fn apply_remote_text(&mut self, text: &str) -> Result<(), OsError> {
-        if !self.allow_clipboard.load(Ordering::Acquire) {
-            self.clear_outbound_queue();
-            return Ok(());
+    /// Applies remote clipboard text locally and arms one-shot anti-echo suppression ONLY on success.
+    /// Returns `Ok(true)` if applied, `Ok(false)` if blocked by policy.
+    pub fn apply_remote_text(&mut self, text: &str) -> Result<bool, OsError> {
+        if text.is_empty() || text.len() > CLIP_HARD_MAX_BYTES as usize {
+            return Err(OsError::InvalidData(format!(
+                "remote clipboard text len {} outside 1..={CLIP_HARD_MAX_BYTES}",
+                text.len()
+            )));
         }
+        if !self.allow_clipboard.load(Ordering::Acquire) {
+            self.needs_resync = true;
+            self.clear_outbound_queue();
+            return Ok(false);
+        }
+        // Write FIRST, arm anti-echo ONLY if write_text succeeds!
+        self.backend.write_text(text)?;
         let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
         self.anti_echo.arm(hash);
-        self.backend.write_text(text)?;
-        // Sync pre-filter state without suppressing subsequent distinct user copies.
         self.last_seen_sha256 = Some(hash);
-        Ok(())
+        self.needs_resync = false;
+        Ok(true)
     }
 
-    /// Runs a single poll tick on the owning thread.
+    /// Runs a single poll tick on the owning thread without duplicating into `outbound_queue`.
     /// Returns `Ok(Some(item))` if a new user-initiated clipboard change should be sent to the peer.
     pub fn poll_once(&mut self) -> Result<Option<OutboundClipboardItem>, OsError> {
         if !self.allow_clipboard.load(Ordering::Acquire) {
+            self.needs_resync = true;
+            self.anti_echo.clear();
             self.clear_outbound_queue();
             return Ok(None);
         }
 
-        // Cheap OS change_count pre-filter (e.g. macOS NSPasteboard changeCount).
-        if let Some(cc) = self.backend.read_change_count() {
-            if self.last_change_count == Some(cc) {
-                return Ok(None);
+        let current_cc = self.backend.read_change_count();
+        if !self.needs_resync {
+            if let Some(cc) = current_cc {
+                if self.last_change_count == Some(cc) {
+                    return Ok(None);
+                }
             }
+        }
+
+        // Do NOT commit `last_change_count` if `read_text()` errors, so transient errors retry.
+        let text_opt = self.backend.read_text()?;
+        if let Some(cc) = current_cc {
             self.last_change_count = Some(cc);
         }
 
-        let Some(text) = self.backend.read_text()? else {
+        if self.needs_resync {
+            self.needs_resync = false;
+            self.last_seen_sha256 = text_opt
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| Sha256::digest(t.as_bytes()).into());
+            return Ok(None);
+        }
+
+        let Some(text) = text_opt else {
             return Ok(None);
         };
         if text.is_empty() || text.len() > CLIP_HARD_MAX_BYTES as usize {
@@ -144,15 +212,21 @@ impl ClipboardPoller {
         }
         self.last_seen_sha256 = Some(hash);
 
-        let item = OutboundClipboardItem { text, sha256: hash };
-        {
-            let mut q = self.outbound_queue.lock().unwrap_or_else(|e| e.into_inner());
-            while q.len() >= self.max_queue_len {
-                q.pop_front();
-            }
-            q.push_back(item.clone());
+        Ok(Some(OutboundClipboardItem { text, sha256: hash }))
+    }
+
+    /// Polls once and enqueues any new outbound item into the bounded `ClipboardOutboundHandle`
+    /// queue (single consumption contract with no duplicate return).
+    pub fn poll_into_queue(&mut self) -> Result<bool, OsError> {
+        let Some(item) = self.poll_once()? else {
+            return Ok(false);
+        };
+        let mut q = self.outbound_queue.lock().unwrap_or_else(|e| e.into_inner());
+        while q.len() >= self.max_queue_len {
+            q.pop_front();
         }
-        Ok(Some(item))
+        q.push_back(item);
+        Ok(true)
     }
 
     pub fn clear_outbound_queue(&self) {
@@ -269,37 +343,54 @@ mod tests {
     use crate::os::dryrun::MemoryClipboardBackend;
 
     #[test]
-    fn clipboard_poller_one_shot_anti_echo_a_b_a_and_policy_purge() {
+    fn clipboard_poller_resyncs_baseline_one_shot_aba_redacts_debug_and_policy_purges() {
         let mem = MemoryClipboardBackend::new();
+        mem.set_local_text("PRE_EXISTING_SECRET_MUST_NOT_SEND");
         let allow = Arc::new(AtomicBool::new(true));
         let mut poller = ClipboardPoller::new(Box::new(mem.clone()), Arc::clone(&allow));
-        let q = poller.outbound_queue_handle();
+        let handle = poller.outbound_handle();
 
-        // 1. Remote writes "A" -> armed one-shot anti-echo -> poll suppresses echo
-        poller.apply_remote_text("A").unwrap();
+        // 0. Initial baseline resync MUST NOT transmit pre-existing clipboard contents!
         assert!(poller.poll_once().unwrap().is_none());
 
-        // 2. Local user copies "B" -> transmitted!
+        // 1. Remote writes "A" -> armed one-shot anti-echo -> poll suppresses echo
+        assert!(poller.apply_remote_text("A").unwrap());
+        assert!(poller.poll_once().unwrap().is_none());
+
+        // Empty remote text fails closed
+        assert!(poller.apply_remote_text("").is_err());
+
+        // 2. Local user copies "B" -> transmitted via poll_into_queue!
         mem.set_local_text("B");
-        let item_b = poller.poll_once().unwrap().expect("B should transmit");
+        assert!(poller.poll_into_queue().unwrap());
+        let item_b = handle.pop_front(&allow).expect("B should dequeue");
         assert_eq!(item_b.text, "B");
+        let dbg_str = format!("{item_b:?}");
+        assert!(!dbg_str.contains("\"B\""));
+        assert!(dbg_str.contains("len: 1"));
 
         // 3. Local user copies "A" again (A -> B -> A) -> MUST transmit (one-shot was cleared!)
         mem.set_local_text("A");
-        let item_a2 = poller.poll_once().unwrap().expect("A->B->A must transmit");
-        assert_eq!(item_a2.text, "A");
-        assert_eq!(q.lock().unwrap().len(), 2);
+        assert!(poller.poll_into_queue().unwrap());
+        assert_eq!(handle.len(), 1);
 
-        // 4. Policy disables clipboard -> poll immediately purges outbound queue
+        // 4. Policy disables clipboard -> poll immediately purges outbound queue & sets needs_resync
         allow.store(false, Ordering::Release);
-        mem.set_local_text("C");
+        mem.set_local_text("SECRET_WHILE_DISABLED");
         assert!(poller.poll_once().unwrap().is_none());
-        assert!(q.lock().unwrap().is_empty());
+        assert!(handle.is_empty());
+
+        // 5. Policy re-enabled -> first poll resyncs baseline WITHOUT leaking SECRET_WHILE_DISABLED!
+        allow.store(true, Ordering::Release);
+        assert!(poller.poll_once().unwrap().is_none());
+        // Next user copy AFTER re-enable transmits normally
+        mem.set_local_text("AFTER_REENABLE");
+        let after = poller.poll_once().unwrap().expect("after reenable sends");
+        assert_eq!(after.text, "AFTER_REENABLE");
     }
 
     #[test]
     fn clipboard_png_header_validation_without_decoding_pixels() {
-        // Valid minimal 1x1 PNG header (8-byte sig + IHDR chunk)
         let mut png = Vec::new();
         png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
         png.extend_from_slice(&13u32.to_be_bytes());
@@ -307,10 +398,8 @@ mod tests {
         png.extend_from_slice(&640u32.to_be_bytes());
         png.extend_from_slice(&480u32.to_be_bytes());
         png.extend_from_slice(&[8, 6, 0, 0, 0]);
-        png.extend_from_slice(&[0u8; 4]); // CRC placeholder
+        png.extend_from_slice(&[0u8; 4]);
         assert_eq!(validate_clipboard_png_bytes(&png).unwrap(), (640, 480));
-
-        // Bad magic rejected
         assert!(validate_clipboard_png_bytes(b"NOT_A_PNG_HEADER_1234567890").is_err());
     }
 }

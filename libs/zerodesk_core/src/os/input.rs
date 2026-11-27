@@ -9,6 +9,23 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// All 8 USB HID modifier usages (Left/Right Ctrl, Shift, Alt, Meta), released unconditionally
+/// during emergency key release as defense-in-depth.
+#[cfg(all(target_os = "macos", feature = "real-input"))]
+const ALL_MODIFIER_HID_USAGES: [u16; 8] = [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7];
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn IsSecureEventInputEnabled() -> u8;
+}
+
 /// Pure ANSI positional USB HID Usage Page `0x07` -> macOS virtual keycode (`CGKeyCode`) allowlist.
 /// Unknown usages return `None` and are NEVER injected.
 pub fn hid_usage_to_macos_keycode(usage: u16) -> Option<u16> {
@@ -142,11 +159,7 @@ pub fn real_input_compiled_in() -> bool {
 pub fn is_accessibility_trusted() -> bool {
     #[cfg(target_os = "macos")]
     {
-        #[link(name = "ApplicationServices", kind = "framework")]
-        extern "C" {
-            fn AXIsProcessTrusted() -> bool;
-        }
-        unsafe { AXIsProcessTrusted() }
+        unsafe { AXIsProcessTrusted() != 0 }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -158,11 +171,7 @@ pub fn is_accessibility_trusted() -> bool {
 pub fn is_secure_event_input_enabled() -> bool {
     #[cfg(target_os = "macos")]
     {
-        #[link(name = "Carbon", kind = "framework")]
-        extern "C" {
-            fn IsSecureEventInputEnabled() -> bool;
-        }
-        unsafe { IsSecureEventInputEnabled() }
+        unsafe { IsSecureEventInputEnabled() != 0 }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -172,10 +181,13 @@ pub fn is_secure_event_input_enabled() -> bool {
 
 /// Tiny lock-minimal pressed-key/button state shared between an OS HID sink and its independent
 /// stateless `EmergencyKeyReleaser`.
+/// `interlocked` latches `true` upon emergency release so subsequent sends fail closed until
+/// explicitly resumed.
 #[derive(Debug, Default)]
 pub struct PressedHidState {
     pub keys: BTreeSet<u16>,
     pub buttons: u8,
+    pub interlocked: bool,
 }
 
 impl PressedHidState {
@@ -189,11 +201,12 @@ mod macos_real_input {
     use super::*;
     use crate::{
         os::OsPermission,
-        session::hid::{
-            KeyEvent, MouseEvent, MouseKind, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT,
-        },
+        session::hid::{KeyEvent, MouseEvent, MouseKind, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT},
     };
-    use std::ffi::c_void;
+    use std::{
+        ffi::c_void,
+        time::{Duration, Instant},
+    };
 
     const K_CG_HID_EVENT_TAP: u32 = 0;
     const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
@@ -212,6 +225,8 @@ mod macos_real_input {
     const K_CG_EVENT_FLAG_MASK_CONTROL: u64 = 0x0004_0000;
     const K_CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
     const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+    const WHEEL_CLAMP: i32 = 1024;
+    const AX_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -236,12 +251,14 @@ mod macos_real_input {
             mouse_cursor_position: CGPoint,
             mouse_button: u32,
         ) -> *mut c_void;
-        fn CGEventCreateScrollWheelEvent(
+        // Fixed-arity non-variadic scroll wheel constructor (safe C ABI across arm64/x86_64).
+        fn CGEventCreateScrollWheelEvent2(
             source: *const c_void,
             units: u32,
             wheel_count: u32,
             wheel1: i32,
             wheel2: i32,
+            wheel3: i32,
         ) -> *mut c_void;
         fn CGEventSetFlags(event: *mut c_void, flags: u64);
         fn CGEventPost(tap: u32, event: *mut c_void);
@@ -297,8 +314,9 @@ mod macos_real_input {
         }
     }
 
-    /// Stateless emergency releaser: takes snapshot of pressed keys under tiny lock, drops lock,
-    /// and posts `keyUp`/`mouseUp` directly to `CGEventPost` without borrowing `MacOsHidSink`.
+    /// Stateless emergency releaser: sets `interlocked = true`, snapshots & clears pressed state
+    /// under a tiny lock, drops lock, posts `keyUp`/`mouseUp` + all 8 modifier `keyUp`s directly
+    /// to `CGEventPost` without borrowing `MacOsHidSink`.
     pub struct MacOsEmergencyKeyReleaser {
         pressed: Arc<Mutex<PressedHidState>>,
     }
@@ -307,6 +325,7 @@ mod macos_real_input {
         fn release_all_keys(&self) -> ReleaseReport {
             let (keys, buttons) = {
                 let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                g.interlocked = true;
                 let keys: Vec<u16> = g.keys.iter().copied().collect();
                 let buttons = g.buttons;
                 g.keys.clear();
@@ -315,12 +334,22 @@ mod macos_real_input {
             };
             let mut released_keys = 0usize;
             let mut residual_keys = 0usize;
+            let mut already_released = BTreeSet::new();
             for usage in keys {
                 if let Some(kc) = hid_usage_to_macos_keycode(usage) {
                     if post_key_event(kc, false, 0) {
                         released_keys += 1;
+                        already_released.insert(usage);
                     } else {
                         residual_keys += 1;
+                    }
+                }
+            }
+            // Defense-in-depth: unconditionally post keyUp for all 8 modifiers.
+            for mod_usage in ALL_MODIFIER_HID_USAGES {
+                if !already_released.contains(&mod_usage) {
+                    if let Some(kc) = hid_usage_to_macos_keycode(mod_usage) {
+                        let _ = post_key_event(kc, false, 0);
                     }
                 }
             }
@@ -352,19 +381,31 @@ mod macos_real_input {
     pub struct MacOsHidSink {
         pressed: Arc<Mutex<PressedHidState>>,
         cursor_pt: CGPoint,
+        last_ax_check: Instant,
     }
 
     impl MacOsHidSink {
         /// Triple-gated constructor: requires `cfg(macos)`, `feature = "real-input"`,
-        /// runtime `RealInputPermit`, AND `AXIsProcessTrusted()`.
-        pub fn new(_permit: RealInputPermit) -> Result<Self, OsError> {
+        /// runtime `Arc<RealInputPermit>`, AND `AXIsProcessTrusted()`.
+        pub fn new(_permit: Arc<RealInputPermit>) -> Result<Self, OsError> {
             if !is_accessibility_trusted() {
                 return Err(OsError::PermissionDenied(OsPermission::Accessibility));
             }
             Ok(Self {
                 pressed: PressedHidState::new_shared(),
                 cursor_pt: CGPoint { x: 0.0, y: 0.0 },
+                last_ax_check: Instant::now(),
             })
+        }
+
+        fn ensure_ax_trusted(&mut self) -> Result<(), OsError> {
+            if self.last_ax_check.elapsed() >= AX_RECHECK_INTERVAL {
+                if !is_accessibility_trusted() {
+                    return Err(OsError::PermissionDenied(OsPermission::Accessibility));
+                }
+                self.last_ax_check = Instant::now();
+            }
+            Ok(())
         }
 
         fn display_point_bounds() -> (f64, f64) {
@@ -379,84 +420,143 @@ mod macos_real_input {
 
     impl OsHidSink for MacOsHidSink {
         fn send_key(&mut self, ev: &KeyEvent) -> Result<(), OsError> {
-            let usage = (ev.usb_hid_usage & 0xFFFF) as u16;
+            self.ensure_ax_trusted()?;
+            let Ok(usage) = u16::try_from(ev.usb_hid_usage) else {
+                return Err(OsError::InvalidData(format!(
+                    "USB HID usage {:#x} exceeds u16 range",
+                    ev.usb_hid_usage
+                )));
+            };
             let Some(kc) = hid_usage_to_macos_keycode(usage) else {
                 // Unknown HID usage: never inject.
                 return Ok(());
             };
             {
-                let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
-                if ev.down {
-                    g.keys.insert(usage);
-                } else {
-                    g.keys.remove(&usage);
+                let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                if g.interlocked {
+                    return Err(OsError::Interlocked);
                 }
             }
+            // Post FIRST; only update `pressed` on success so failed key-up stays tracked for EmergencyKeyReleaser!
             if !post_key_event(kc, ev.down, ev.modifiers) {
-                return Err(OsError::CaptureFailed("CGEventCreateKeyboardEvent failed".into()));
+                return Err(OsError::CaptureFailed(
+                    "CGEventCreateKeyboardEvent failed".into(),
+                ));
+            }
+            let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+            if g.interlocked {
+                // Emergency release raced while we were posting; post keyUp defensively if we pressed down.
+                if ev.down {
+                    drop(g);
+                    let _ = post_key_event(kc, false, 0);
+                }
+                return Err(OsError::Interlocked);
+            }
+            if ev.down {
+                g.keys.insert(usage);
+            } else {
+                g.keys.remove(&usage);
             }
             Ok(())
         }
 
         fn send_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsError> {
+            self.ensure_ax_trusted()?;
+            {
+                let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                if g.interlocked {
+                    return Err(OsError::Interlocked);
+                }
+            }
             let (pw, ph) = Self::display_point_bounds();
+            let buttons = ev.buttons & 0x07;
             match ev.kind {
                 MouseKind::MoveAbs => {
-                    // Scale 0..=65535 normalized coords into macOS logical display points
-                    // (handles Retina HiDPI without multiplying by backing scale factor).
                     let x = ((ev.x_or_dx.max(0) as f64) / 65535.0).clamp(0.0, 1.0) * (pw - 1.0);
                     let y = ((ev.y_or_dy.max(0) as f64) / 65535.0).clamp(0.0, 1.0) * (ph - 1.0);
                     self.cursor_pt = CGPoint { x, y };
-                    post_mouse_event(K_CG_EVENT_MOUSE_MOVED, self.cursor_pt, K_CG_MOUSE_BUTTON_LEFT);
+                    if !post_mouse_event(
+                        K_CG_EVENT_MOUSE_MOVED,
+                        self.cursor_pt,
+                        K_CG_MOUSE_BUTTON_LEFT,
+                    ) {
+                        return Err(OsError::CaptureFailed("CGEventCreateMouseEvent failed".into()));
+                    }
                 }
                 MouseKind::MoveRel => {
-                    self.cursor_pt.x = (self.cursor_pt.x + ev.x_or_dx as f64).clamp(0.0, pw - 1.0);
-                    self.cursor_pt.y = (self.cursor_pt.y + ev.y_or_dy as f64).clamp(0.0, ph - 1.0);
-                    post_mouse_event(K_CG_EVENT_MOUSE_MOVED, self.cursor_pt, K_CG_MOUSE_BUTTON_LEFT);
+                    self.cursor_pt.x =
+                        (self.cursor_pt.x + ev.x_or_dx as f64).clamp(0.0, pw - 1.0);
+                    self.cursor_pt.y =
+                        (self.cursor_pt.y + ev.y_or_dy as f64).clamp(0.0, ph - 1.0);
+                    if !post_mouse_event(
+                        K_CG_EVENT_MOUSE_MOVED,
+                        self.cursor_pt,
+                        K_CG_MOUSE_BUTTON_LEFT,
+                    ) {
+                        return Err(OsError::CaptureFailed("CGEventCreateMouseEvent failed".into()));
+                    }
                 }
                 MouseKind::Down => {
-                    {
-                        let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
-                        g.buttons |= ev.buttons;
-                    }
                     for (mask, down_ev, btn) in [
                         (1u8 << 0, K_CG_EVENT_LEFT_MOUSE_DOWN, K_CG_MOUSE_BUTTON_LEFT),
-                        (1u8 << 1, K_CG_EVENT_RIGHT_MOUSE_DOWN, K_CG_MOUSE_BUTTON_RIGHT),
-                        (1u8 << 2, K_CG_EVENT_OTHER_MOUSE_DOWN, K_CG_MOUSE_BUTTON_CENTER),
+                        (
+                            1u8 << 1,
+                            K_CG_EVENT_RIGHT_MOUSE_DOWN,
+                            K_CG_MOUSE_BUTTON_RIGHT,
+                        ),
+                        (
+                            1u8 << 2,
+                            K_CG_EVENT_OTHER_MOUSE_DOWN,
+                            K_CG_MOUSE_BUTTON_CENTER,
+                        ),
                     ] {
-                        if (ev.buttons & mask) != 0 {
-                            post_mouse_event(down_ev, self.cursor_pt, btn);
+                        if (buttons & mask) != 0 {
+                            if !post_mouse_event(down_ev, self.cursor_pt, btn) {
+                                return Err(OsError::CaptureFailed(
+                                    "CGEventCreateMouseEvent(down) failed".into(),
+                                ));
+                            }
+                            let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                            g.buttons |= mask;
                         }
                     }
                 }
                 MouseKind::Up => {
-                    {
-                        let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
-                        g.buttons &= !ev.buttons;
-                    }
                     for (mask, up_ev, btn) in [
                         (1u8 << 0, K_CG_EVENT_LEFT_MOUSE_UP, K_CG_MOUSE_BUTTON_LEFT),
                         (1u8 << 1, K_CG_EVENT_RIGHT_MOUSE_UP, K_CG_MOUSE_BUTTON_RIGHT),
-                        (1u8 << 2, K_CG_EVENT_OTHER_MOUSE_UP, K_CG_MOUSE_BUTTON_CENTER),
+                        (
+                            1u8 << 2,
+                            K_CG_EVENT_OTHER_MOUSE_UP,
+                            K_CG_MOUSE_BUTTON_CENTER,
+                        ),
                     ] {
-                        if (ev.buttons & mask) != 0 {
-                            post_mouse_event(up_ev, self.cursor_pt, btn);
+                        if (buttons & mask) != 0 {
+                            if !post_mouse_event(up_ev, self.cursor_pt, btn) {
+                                return Err(OsError::CaptureFailed(
+                                    "CGEventCreateMouseEvent(up) failed".into(),
+                                ));
+                            }
+                            let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
+                            g.buttons &= !mask;
                         }
                     }
                 }
-                MouseKind::Wheel => unsafe {
-                    let scroll = CGEventCreateScrollWheelEvent(
-                        std::ptr::null(),
-                        1,
-                        2,
-                        ev.wheel_dy as i32,
-                        ev.wheel_dx as i32,
-                    );
-                    if !scroll.is_null() {
+                MouseKind::Wheel => {
+                    let wy = (ev.wheel_dy as i32).clamp(-WHEEL_CLAMP, WHEEL_CLAMP);
+                    let wx = (ev.wheel_dx as i32).clamp(-WHEEL_CLAMP, WHEEL_CLAMP);
+                    unsafe {
+                        let scroll =
+                            CGEventCreateScrollWheelEvent2(std::ptr::null(), 1, 2, wy, wx, 0);
+                        if scroll.is_null() {
+                            return Err(OsError::CaptureFailed(
+                                "CGEventCreateScrollWheelEvent2 failed".into(),
+                            ));
+                        }
                         CGEventPost(K_CG_HID_EVENT_TAP, scroll);
                         CFRelease(scroll as *const c_void);
                     }
-                },
+                }
             }
             Ok(())
         }
@@ -471,7 +571,7 @@ mod macos_real_input {
 
 /// Attempts to create the platform's real OS HID sink. Triple-gated on macOS; returns
 /// `UnsupportedPlatform` when `real-input` feature is off or on unsupported platforms.
-pub fn create_real_os_hid_sink(permit: RealInputPermit) -> Result<Box<dyn OsHidSink>, OsError> {
+pub fn create_real_os_hid_sink(permit: Arc<RealInputPermit>) -> Result<Box<dyn OsHidSink>, OsError> {
     #[cfg(all(target_os = "macos", feature = "real-input"))]
     {
         Ok(Box::new(macos_real_input::MacOsHidSink::new(permit)?))
@@ -504,7 +604,6 @@ mod tests {
             hid_usage_to_macos_keycode(0xE1),
             hid_usage_to_macos_keycode(0xE5)
         );
-        // Unknown / forbidden usages return None
         assert_eq!(hid_usage_to_macos_keycode(0x00), None);
         assert_eq!(hid_usage_to_macos_keycode(0xFF), None);
         assert_eq!(hid_usage_to_macos_keycode(0x9999), None);

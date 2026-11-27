@@ -65,6 +65,7 @@ pub fn validate_cg_bitmap_info(
 ) -> Result<PixelFormat, OsError> {
     const K_CG_BITMAP_ALPHA_INFO_MASK: u32 = 0x1F;
     const K_CG_BITMAP_BYTE_ORDER_MASK: u32 = 0x7000;
+    const K_CG_BITMAP_BYTE_ORDER_DEFAULT: u32 = 0;
     const K_CG_BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
     const K_CG_BITMAP_BYTE_ORDER_32_BIG: u32 = 4 << 12;
     const K_CG_IMAGE_ALPHA_PREMULTIPLIED_FIRST: u32 = 2;
@@ -89,7 +90,7 @@ pub fn validate_cg_bitmap_info(
             | K_CG_IMAGE_ALPHA_FIRST,
         ) => Ok(PixelFormat::Bgra8),
         (
-            K_CG_BITMAP_BYTE_ORDER_32_BIG | 0,
+            K_CG_BITMAP_BYTE_ORDER_32_BIG | K_CG_BITMAP_BYTE_ORDER_DEFAULT,
             K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST
             | K_CG_IMAGE_ALPHA_NONE_SKIP_LAST
             | K_CG_IMAGE_ALPHA_LAST,

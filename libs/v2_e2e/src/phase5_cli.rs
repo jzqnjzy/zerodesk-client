@@ -12,7 +12,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use v2_client::{ClusterConfig, ControlPlaneClient, CreateTenantReq};
@@ -27,6 +30,36 @@ use v2_e2e::{
     scan_json_for_secret_canaries, write_file_atomic_0600, BridgePersistedConfig, TransportMode,
     V2BridgeRuntime, V2BridgeRuntimeOptions,
 };
+
+struct CAbiHandleGuard(Option<u64>);
+
+impl CAbiHandleGuard {
+    fn new(handle: u64) -> Self {
+        Self(Some(handle))
+    }
+
+    fn handle(&self) -> u64 {
+        self.0.unwrap_or(0)
+    }
+
+    fn destroy_now(&mut self) {
+        if let Some(h) = self.0.take() {
+            let _ = zerodesk_v2_destroy(h);
+        }
+    }
+}
+
+impl Drop for CAbiHandleGuard {
+    fn drop(&mut self) {
+        self.destroy_now();
+    }
+}
+
+fn drain_residual_events(rt: &V2BridgeRuntime, captured: &mut Vec<String>) {
+    while let Some(raw) = rt.poll_event_json() {
+        captured.push(raw);
+    }
+}
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
@@ -45,7 +78,7 @@ struct Phase5E2eReport {
     audio_opus_dtx_verified: bool,
     hid_release_normal_disconnect_ms: Option<u64>,
     hid_release_watchdog_timeout_verified: bool,
-    hid_release_sigterm_cancel_ms: Option<u64>,
+    hid_release_stop_host_ms: Option<u64>,
     clipboard_bidir_aba_verified: bool,
     file_transfer_verified: bool,
     policy_refresh_and_deny_verified: bool,
@@ -284,10 +317,13 @@ pub async fn cmd_phase5_e2e(args: &[String]) -> ExitCode {
             && report.start_host_idempotent_verified
             && report.incoming_stale_rejected_and_accept_verified
             && report.video_mailbox_c_abi_verified
+            && report.slow_ui_dropped_frames >= 1
             && report.audio_opus_dtx_verified
-            && report.hid_release_normal_disconnect_ms.is_some_and(|ms| ms <= 500)
+            && report
+                .hid_release_normal_disconnect_ms
+                .is_some_and(|ms| ms <= 500)
             && report.hid_release_watchdog_timeout_verified
-            && report.hid_release_sigterm_cancel_ms.is_some_and(|ms| ms <= 500)
+            && report.hid_release_stop_host_ms.is_some_and(|ms| ms <= 500)
             && report.clipboard_bidir_aba_verified
             && report.file_transfer_verified
             && report.policy_refresh_and_deny_verified
@@ -500,7 +536,7 @@ async fn run_phase5_suite(
         return Err(format!("controller dial failed: {ctrl_stream}"));
     }
 
-    // 4. Live VP9 video through FrameMailbox + C-ABI two-phase copy + slow-UI dropped_ui_frames
+    // 4. Live VP9 video through FrameMailbox + C-ABI two-phase copy + slow-UI dropped_ui_frames (E7)
     let _vfr = wait_for_event(
         &ctrl_rt,
         Duration::from_secs(10),
@@ -512,9 +548,11 @@ async fn run_phase5_suite(
     // Pause reading briefly so slow-UI dropped_ui_frames accumulates deterministically.
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    // Exercise real C-ABI wrappers on the live Controller runtime!
+    // Exercise real C-ABI wrappers on the live Controller runtime behind an RAII drop guard!
     assert_eq!(zerodesk_v2_abi_version(), ZERODESK_V2_ABI_VERSION);
-    let ctrl_handle = register_runtime(Arc::clone(&ctrl_rt));
+    let mut ctrl_handle_guard = CAbiHandleGuard::new(register_runtime(Arc::clone(&ctrl_rt)));
+    let ctrl_handle = ctrl_handle_guard.handle();
+
     let mut snap_buf = ZeroDeskOwnedBuffer::empty();
     let snap_rc = unsafe { zerodesk_v2_snapshot_json(ctrl_handle, &mut snap_buf) };
     if snap_rc != ZERODESK_OK {
@@ -541,92 +579,233 @@ async fn run_phase5_suite(
     {
         return Err("C-ABI buffer-too-small contract failed".into());
     }
-    let mut pixels = vec![0u8; finfo.byte_len];
-    let mut copied_info = ZeroDeskFrameInfo::default();
+
+    // Take Frame #1 and compute SHA-256 hash.
+    let mut pixels1 = vec![0u8; finfo.byte_len];
+    let mut copied_info1 = ZeroDeskFrameInfo::default();
     if unsafe {
         zerodesk_v2_take_latest_frame(
             ctrl_handle,
-            pixels.as_mut_ptr(),
-            pixels.len(),
-            &mut copied_info,
+            pixels1.as_mut_ptr(),
+            pixels1.len(),
+            &mut copied_info1,
         )
     } != ZERODESK_OK
     {
-        return Err("C-ABI take_latest_frame failed".into());
+        return Err("C-ABI take_latest_frame #1 failed".into());
     }
-    let non_zero_pixels = pixels.iter().any(|&b| b != 0);
-    report.slow_ui_dropped_frames = copied_info.dropped_ui_frames;
-    report.video_mailbox_c_abi_verified = non_zero_pixels && copied_info.width >= 32;
+    let frame1_hash: [u8; 32] = Sha256::digest(&pixels1).into();
 
-    // 5. Live Opus audio + DTX check via QoeTelemetry
-    let qoe_ev = wait_for_event(
+    // Wait for a newer frame_seq and take Frame #2 to verify dynamic animated VP9 decoding!
+    let _vfr2 = wait_for_event(
         &ctrl_rt,
         Duration::from_secs(5),
         &mut all_captured_json,
         |ev| {
+            ev["kind"] == "VideoFrameReady"
+                && ev["payload"]["frame_seq"].as_u64().unwrap_or(0) > copied_info1.seq
+        },
+    )
+    .ok_or_else(|| "no second distinct VideoFrameReady received on controller".to_string())?;
+    let mut finfo2 = ZeroDeskFrameInfo::default();
+    if unsafe { zerodesk_v2_frame_info(ctrl_handle, &mut finfo2) } != ZERODESK_OK {
+        return Err("C-ABI frame_info #2 failed".into());
+    }
+    let mut pixels2 = vec![0u8; finfo2.byte_len];
+    let mut copied_info2 = ZeroDeskFrameInfo::default();
+    if unsafe {
+        zerodesk_v2_take_latest_frame(
+            ctrl_handle,
+            pixels2.as_mut_ptr(),
+            pixels2.len(),
+            &mut copied_info2,
+        )
+    } != ZERODESK_OK
+    {
+        return Err("C-ABI take_latest_frame #2 failed".into());
+    }
+    let frame2_hash: [u8; 32] = Sha256::digest(&pixels2).into();
+
+    let non_zero_pixels = pixels1.iter().any(|&b| b != 0) && pixels2.iter().any(|&b| b != 0);
+    let distinct_frames = copied_info2.seq > copied_info1.seq && frame1_hash != frame2_hash;
+    report.slow_ui_dropped_frames = copied_info2.dropped_ui_frames;
+    report.video_mailbox_c_abi_verified =
+        non_zero_pixels && distinct_frames && copied_info2.width >= 32;
+
+    // 5. Live Opus audio + DTX check via QoeTelemetry (E5: BOTH decoded > 0 AND dtx > 0!)
+    let qoe_ev = wait_for_event(
+        &ctrl_rt,
+        Duration::from_secs(8),
+        &mut all_captured_json,
+        |ev| {
             ev["kind"] == "QoeTelemetry"
                 && ev["payload"]["audio_frames_decoded"].as_u64().unwrap_or(0) > 0
+                && ev["payload"]["audio_dtx_frames"].as_u64().unwrap_or(0) > 0
         },
     );
     report.audio_opus_dtx_verified = qoe_ev.is_some();
 
-    // 6. Bidirectional Clipboard (A -> B -> A anti-echo) + File Transfer
+    // 6. Bidirectional Clipboard (A -> B -> A anti-echo) (E1: exact counts + sha256_hex + zero echo!)
+    let sha_a = hex::encode(Sha256::digest(canary_clip_a.as_bytes()));
+    let sha_b = hex::encode(Sha256::digest(canary_clip_b.as_bytes()));
+    let mut host_clip_hashes: Vec<String> = Vec::new();
+    let mut ctrl_clip_hashes: Vec<String> = Vec::new();
+
     let clip_cmd_a = serde_json::json!({
         "v": 1,
         "cmd": "send_clipboard",
         "text": canary_clip_a,
     });
-    let _ = ctrl_rt.exec_json(&clip_cmd_a.to_string());
-    let host_got_a = wait_for_event(
+    let clip_a1_reply: serde_json::Value =
+        serde_json::from_str(&ctrl_rt.exec_json(&clip_cmd_a.to_string()))
+            .map_err(|e| e.to_string())?;
+    if clip_a1_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("send_clipboard A #1 failed: {clip_a1_reply}"));
+    }
+    let host_got_a1 = wait_for_event(
         &host_rt,
         Duration::from_secs(5),
         &mut all_captured_json,
         |ev| ev["kind"] == "ClipboardReceived",
+    )
+    .ok_or_else(|| "host never received clipboard A #1".to_string())?;
+    if let Some(h) = host_got_a1["payload"]["sha256_hex"].as_str() {
+        host_clip_hashes.push(h.to_string());
+    }
+
+    // Verify Host does NOT echo A back to Controller (allow clipboard poller ticks to run).
+    let echo_check = wait_for_event(
+        &ctrl_rt,
+        Duration::from_millis(300),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "ClipboardReceived",
     );
+    if let Some(ev) = echo_check {
+        return Err(format!("unexpected clipboard echo back to controller after A #1: {ev}"));
+    }
+
+    // Host -> Controller: B
     let clip_cmd_b = serde_json::json!({
         "v": 1,
         "cmd": "send_clipboard",
         "text": canary_clip_b,
     });
-    let _ = host_rt.exec_json(&clip_cmd_b.to_string());
+    let clip_b_reply: serde_json::Value =
+        serde_json::from_str(&host_rt.exec_json(&clip_cmd_b.to_string()))
+            .map_err(|e| e.to_string())?;
+    if clip_b_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("send_clipboard B failed: {clip_b_reply}"));
+    }
     let ctrl_got_b = wait_for_event(
         &ctrl_rt,
         Duration::from_secs(5),
         &mut all_captured_json,
         |ev| ev["kind"] == "ClipboardReceived",
-    );
-    // Re-send A (A -> B -> A)
-    let _ = ctrl_rt.exec_json(&clip_cmd_a.to_string());
+    )
+    .ok_or_else(|| "controller never received clipboard B".to_string())?;
+    if let Some(h) = ctrl_got_b["payload"]["sha256_hex"].as_str() {
+        ctrl_clip_hashes.push(h.to_string());
+    }
+
+    // Controller -> Host: re-send A (A -> B -> A)
+    let clip_a2_reply: serde_json::Value =
+        serde_json::from_str(&ctrl_rt.exec_json(&clip_cmd_a.to_string()))
+            .map_err(|e| e.to_string())?;
+    if clip_a2_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("send_clipboard A #2 failed: {clip_a2_reply}"));
+    }
     let host_got_a2 = wait_for_event(
         &host_rt,
         Duration::from_secs(5),
         &mut all_captured_json,
         |ev| ev["kind"] == "ClipboardReceived",
-    );
-    report.clipboard_bidir_aba_verified =
-        host_got_a.is_some() && ctrl_got_b.is_some() && host_got_a2.is_some();
+    )
+    .ok_or_else(|| "host never received clipboard A #2".to_string())?;
+    if let Some(h) = host_got_a2["payload"]["sha256_hex"].as_str() {
+        host_clip_hashes.push(h.to_string());
+    }
 
-    // File Transfer via binary path API
+    // Drain 300ms to confirm ZERO extra echo events on either peer.
+    if let Some(extra_ctrl) = wait_for_event(
+        &ctrl_rt,
+        Duration::from_millis(300),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "ClipboardReceived",
+    ) {
+        if let Some(h) = extra_ctrl["payload"]["sha256_hex"].as_str() {
+            ctrl_clip_hashes.push(h.to_string());
+        }
+    }
+    if let Some(extra_host) = wait_for_event(
+        &host_rt,
+        Duration::from_millis(300),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "ClipboardReceived",
+    ) {
+        if let Some(h) = extra_host["payload"]["sha256_hex"].as_str() {
+            host_clip_hashes.push(h.to_string());
+        }
+    }
+    if ctrl_clip_hashes.iter().any(|h| h == &sha_a) {
+        return Err(format!(
+            "clipboard anti-echo violated: controller received sha256(A) ({ctrl_clip_hashes:?})"
+        ));
+    }
+    report.clipboard_bidir_aba_verified = host_clip_hashes.len() == 2
+        && host_clip_hashes.iter().all(|h| h == &sha_a)
+        && ctrl_clip_hashes.len() == 1
+        && ctrl_clip_hashes[0] == sha_b;
+
+    // File Transfer via binary path API + verify downloaded bytes & SHA-256 on disk (E7)
     let sample_file = work_dir.join("phase5_sample.bin");
     let sample_data: Vec<u8> = (0..8192usize).map(|i| ((i * 29 + 7) & 0xFF) as u8).collect();
     let sample_sha = hex::encode(Sha256::digest(&sample_data));
     write_file_atomic_0600(&sample_file, &sample_data).map_err(|e| e.to_string())?;
-    let _ = ctrl_rt.send_file_path(&sample_file.display().to_string());
+    let ft_send_reply: serde_json::Value =
+        serde_json::from_str(&ctrl_rt.send_file_path(&sample_file.display().to_string()))
+            .map_err(|e| e.to_string())?;
+    if ft_send_reply["accepted"].as_bool() != Some(true) {
+        return Err(format!("send_file_path rejected: {ft_send_reply}"));
+    }
     let ft_ev = wait_for_event(
         &host_rt,
         Duration::from_secs(10),
         &mut all_captured_json,
         |ev| ev["kind"] == "FileTransferComplete",
-    );
-    report.file_transfer_verified = ft_ev
-        .as_ref()
-        .is_some_and(|ev| ev["payload"]["sha256_hex"].as_str() == Some(sample_sha.as_str()));
+    )
+    .ok_or_else(|| "host never received FileTransferComplete".to_string())?;
+    let saved_path_str = ft_ev["payload"]["saved_path"]
+        .as_str()
+        .ok_or_else(|| format!("FileTransferComplete missing saved_path: {ft_ev}"))?;
+    let saved_bytes = fs::read(saved_path_str)
+        .map_err(|e| format!("read downloaded file '{saved_path_str}' failed: {e}"))?;
+    let disk_sha = hex::encode(Sha256::digest(&saved_bytes));
+    report.file_transfer_verified = ft_ev["payload"]["sha256_hex"].as_str() == Some(sample_sha.as_str())
+        && saved_bytes.len() == sample_data.len()
+        && disk_sha == sample_sha;
 
-    // 7a. HID injection + normal disconnect key release <= 500ms
-    let _ = ctrl_rt.exec_json(r#"{"v":1,"cmd":"send_hid_key","usb_hid_usage":4,"down":true}"#);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 7a. HID injection + normal disconnect key release <= 500ms (E2: verify key held BEFORE disconnect!)
+    let hid1_reply: serde_json::Value = serde_json::from_str(
+        &ctrl_rt.exec_json(r#"{"v":1,"cmd":"send_hid_key","usb_hid_usage":4,"down":true}"#),
+    )
+    .map_err(|e| e.to_string())?;
+    if hid1_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("send_hid_key (normal disconnect) failed: {hid1_reply}"));
+    }
+    let hold_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < hold_deadline && host_rt.dryrun_hid_journal().is_all_released() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if host_rt.dryrun_hid_journal().is_all_released() {
+        return Err("HID key-down (usage=4) was never observed held on host before disconnect".into());
+    }
     let disc_start = Instant::now();
-    let _ = ctrl_rt.exec_json(r#"{"v":1,"cmd":"disconnect"}"#);
+    let disc_reply: serde_json::Value =
+        serde_json::from_str(&ctrl_rt.exec_json(r#"{"v":1,"cmd":"disconnect"}"#))
+            .map_err(|e| e.to_string())?;
+    if disc_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("controller disconnect failed: {disc_reply}"));
+    }
     let release_deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < release_deadline && !host_rt.dryrun_hid_journal().is_all_released() {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -635,28 +814,51 @@ async fn run_phase5_suite(
         report.hid_release_normal_disconnect_ms = Some(disc_start.elapsed().as_millis() as u64);
     }
 
-    // Wait for controller tasks to drain to 0
-    let _ = zerodesk_v2_destroy(ctrl_handle);
+    // Drain ctrl_rt residual events & snapshot, destroy C-ABI handle, verify tasks == 0.
+    drain_residual_events(&ctrl_rt, &mut all_captured_json);
+    all_captured_json.push(ctrl_rt.snapshot_json());
+    ctrl_handle_guard.destroy_now();
     let tasks_zero_1 = wait_active_tasks_zero(&ctrl_rt, Duration::from_secs(3));
 
-    // 7b. Deterministic UDP -> Dual TLS-443 fallback + Watchdog timeout key release!
+    // Wait for Host to return to Listening before next dial.
+    let _host_end1 = wait_for_event(
+        &host_rt,
+        Duration::from_secs(5),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "SessionEnded",
+    );
+
+    // 7b. Deterministic UDP -> Dual TLS-443 fallback + genuine silent-peer Watchdog timeout (E3)!
+    let blackhole = Arc::new(AtomicBool::new(false));
     let ctrl_fb_rt = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
         drop_udp_override: true,
+        silent_peer_blackhole: Some(Arc::clone(&blackhole)),
+        download_dir: Some(work_dir.join("ctrl_fb_downloads")),
         ..V2BridgeRuntimeOptions::default()
     })
     .map_err(|e| e.to_string())?;
     save_and_load_config_0600(&ctrl_fb_rt, &work_dir.join("ctrl_fb_cfg.json"), &ctrl_cfg)?;
-    let _ = ctrl_fb_rt.exec_json(&dial_cmd.to_string());
-    if let Some(inc2) = wait_for_event(
+    let fb_dial_reply: serde_json::Value =
+        serde_json::from_str(&ctrl_fb_rt.exec_json(&dial_cmd.to_string()))
+            .map_err(|e| e.to_string())?;
+    if fb_dial_reply["accepted"].as_bool() != Some(true) {
+        return Err(format!("ctrl_fb_rt dial not accepted: {fb_dial_reply}"));
+    }
+    let inc2 = wait_for_event(
         &host_rt,
         Duration::from_secs(15),
         &mut all_captured_json,
         |ev| ev["kind"] == "IncomingCall",
-    ) {
-        if let Some(id2) = inc2["payload"]["incoming_id"].as_str() {
-            let acc2 = serde_json::json!({ "v": 1, "cmd": "accept_incoming", "incoming_id": id2 });
-            let _ = host_rt.exec_json(&acc2.to_string());
-        }
+    )
+    .ok_or_else(|| "host never received IncomingCall for TLS-443 fallback session".to_string())?;
+    let id2 = inc2["payload"]["incoming_id"]
+        .as_str()
+        .ok_or_else(|| "missing incoming_id #2".to_string())?;
+    let acc2 = serde_json::json!({ "v": 1, "cmd": "accept_incoming", "incoming_id": id2 });
+    let acc2_reply: serde_json::Value =
+        serde_json::from_str(&host_rt.exec_json(&acc2.to_string())).map_err(|e| e.to_string())?;
+    if acc2_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("accept_incoming #2 failed: {acc2_reply}"));
     }
     let fb_ev = wait_for_event(
         &ctrl_fb_rt,
@@ -666,37 +868,126 @@ async fn run_phase5_suite(
             ev["kind"] == "TransportModeChanged"
                 && ev["payload"]["active_transport_mode"] == "dual_tls443"
         },
-    );
-    report.udp_to_tls443_fallback_verified = fb_ev.is_some();
+    )
+    .ok_or_else(|| "UDP->Dual TLS-443 fallback TransportModeChanged never arrived".to_string())?;
+    report.udp_to_tls443_fallback_verified =
+        fb_ev["payload"]["active_transport_mode"].as_str() == Some("dual_tls443");
 
-    // Hold a key and abruptly destroy controller without sending disconnect -> Host watchdog fires!
-    let _ = ctrl_fb_rt.exec_json(r#"{"v":1,"cmd":"send_hid_key","usb_hid_usage":5,"down":true}"#);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    ctrl_fb_rt.destroy();
+    // Hold a real key over the live TLS-443 session, verify held on host, then blackhole controller
+    // (silence keepalive + suppress SESSION_CLOSE) so Host watchdog genuinely fires WatchdogTriggered!
+    let hid2_reply: serde_json::Value = serde_json::from_str(
+        &ctrl_fb_rt.exec_json(r#"{"v":1,"cmd":"send_hid_key","usb_hid_usage":5,"down":true}"#),
+    )
+    .map_err(|e| e.to_string())?;
+    if hid2_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("send_hid_key (watchdog) failed: {hid2_reply}"));
+    }
+    let hold2_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < hold2_deadline && host_rt.dryrun_hid_journal().is_all_released() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if host_rt.dryrun_hid_journal().is_all_released() {
+        return Err("HID key-down (usage=5) was never observed held on host before watchdog silence".into());
+    }
+    blackhole.store(true, Ordering::Release);
+
     let wd_ev = wait_for_event(
         &host_rt,
-        Duration::from_secs(6),
+        Duration::from_secs(8),
         &mut all_captured_json,
-        |ev| ev["kind"] == "WatchdogTriggered" || ev["kind"] == "SessionEnded",
+        |ev| ev["kind"] == "WatchdogTriggered",
     );
     report.hid_release_watchdog_timeout_verified =
         wd_ev.is_some() && host_rt.dryrun_hid_journal().is_all_released();
 
-    // 7c. SIGTERM / cancel host while key is held -> released <= 500ms
-    host_rt.dryrun_hid_journal().record_key_public(&v2_e2e::KeyEvent {
-        down: true,
-        modifiers: 0,
-        usb_hid_usage: 0x06,
-        unicode_scalar: 0,
-        client_ts_ms: 1,
-    });
-    let stop_start = Instant::now();
-    let _ = host_rt.exec_json(r#"{"v":1,"cmd":"stop_host"}"#);
-    if host_rt.dryrun_hid_journal().is_all_released() {
-        report.hid_release_sigterm_cancel_ms = Some(stop_start.elapsed().as_millis() as u64);
+    // Capture snapshot & residual events from ctrl_fb_rt, destroy, and verify tasks == 0!
+    drain_residual_events(&ctrl_fb_rt, &mut all_captured_json);
+    all_captured_json.push(ctrl_fb_rt.snapshot_json());
+    ctrl_fb_rt.destroy();
+    let tasks_zero_fb = wait_active_tasks_zero(&ctrl_fb_rt, Duration::from_secs(3));
+
+    // Wait for Host to return to Listening after watchdog teardown.
+    let _host_end2 = wait_for_event(
+        &host_rt,
+        Duration::from_secs(5),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "SessionEnded",
+    );
+
+    // 7c. Stop-host while key is genuinely held via live HID pipeline -> released <= 500ms (E4)
+    let ctrl_stop_rt = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
+        download_dir: Some(work_dir.join("ctrl_stop_downloads")),
+        ..V2BridgeRuntimeOptions::default()
+    })
+    .map_err(|e| e.to_string())?;
+    save_and_load_config_0600(
+        &ctrl_stop_rt,
+        &work_dir.join("ctrl_stop_cfg.json"),
+        &ctrl_cfg,
+    )?;
+    let stop_dial_reply: serde_json::Value =
+        serde_json::from_str(&ctrl_stop_rt.exec_json(&dial_cmd.to_string()))
+            .map_err(|e| e.to_string())?;
+    if stop_dial_reply["accepted"].as_bool() != Some(true) {
+        return Err(format!("ctrl_stop_rt dial not accepted: {stop_dial_reply}"));
+    }
+    let inc3 = wait_for_event(
+        &host_rt,
+        Duration::from_secs(15),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "IncomingCall",
+    )
+    .ok_or_else(|| "host never received IncomingCall for stop_host HID test".to_string())?;
+    let id3 = inc3["payload"]["incoming_id"]
+        .as_str()
+        .ok_or_else(|| "missing incoming_id #3".to_string())?;
+    let acc3 = serde_json::json!({ "v": 1, "cmd": "accept_incoming", "incoming_id": id3 });
+    let acc3_reply: serde_json::Value =
+        serde_json::from_str(&host_rt.exec_json(&acc3.to_string())).map_err(|e| e.to_string())?;
+    if acc3_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("accept_incoming #3 failed: {acc3_reply}"));
+    }
+    let ctrl_stop_stream = wait_for_event(
+        &ctrl_stop_rt,
+        Duration::from_secs(15),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "CommandResult" && ev["payload"]["cmd"] == "dial",
+    )
+    .ok_or_else(|| "ctrl_stop_rt dial CommandResult timed out".to_string())?;
+    if ctrl_stop_stream["payload"]["ok"].as_bool() != Some(true) {
+        return Err(format!("ctrl_stop_rt dial failed: {ctrl_stop_stream}"));
     }
 
-    // 8. Policy refresh & PolicyDenied verification (provision denied tenant)
+    let hid3_reply: serde_json::Value = serde_json::from_str(
+        &ctrl_stop_rt.exec_json(r#"{"v":1,"cmd":"send_hid_key","usb_hid_usage":6,"down":true}"#),
+    )
+    .map_err(|e| e.to_string())?;
+    if hid3_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("send_hid_key (stop_host) failed: {hid3_reply}"));
+    }
+    let hold3_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < hold3_deadline && host_rt.dryrun_hid_journal().is_all_released() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if host_rt.dryrun_hid_journal().is_all_released() {
+        return Err("HID key-down (usage=6) was never observed held on host before stop_host".into());
+    }
+    let stop_start = Instant::now();
+    let stop_reply: serde_json::Value =
+        serde_json::from_str(&host_rt.exec_json(r#"{"v":1,"cmd":"stop_host"}"#))
+            .map_err(|e| e.to_string())?;
+    if stop_reply["ok"].as_bool() != Some(true) {
+        return Err(format!("stop_host failed: {stop_reply}"));
+    }
+    if host_rt.dryrun_hid_journal().is_all_released() {
+        report.hid_release_stop_host_ms = Some(stop_start.elapsed().as_millis() as u64);
+    }
+    drain_residual_events(&ctrl_stop_rt, &mut all_captured_json);
+    all_captured_json.push(ctrl_stop_rt.snapshot_json());
+    ctrl_stop_rt.destroy();
+    let tasks_zero_stop = wait_active_tasks_zero(&ctrl_stop_rt, Duration::from_secs(3));
+
+    // 8. Policy refresh & live PolicyDenied verification on restricted tenant (E6)
     let deny_tid = hex::encode(random_bytes::<16>());
     let deny_enroll = format!("CANARY_ENROLL_P5_DENY_{}", hex::encode(random_bytes::<8>()));
     let deny_req = CreateTenantReq {
@@ -722,46 +1013,171 @@ async fn run_phase5_suite(
     cp.create_tenant(admin_token, &deny_req)
         .await
         .map_err(|e| format!("create denied tenant: {e}"))?;
-    let deny_dir = work_dir.join("deny_id");
-    ensure_dir_0700(&deny_dir).map_err(|e| e.to_string())?;
-    let deny_rt = V2BridgeRuntime::new().map_err(|e| e.to_string())?;
-    let deny_cfg = build_bridge_config(
+    let deny_host_dir = work_dir.join("deny_host_id");
+    let deny_ctrl_dir = work_dir.join("deny_ctrl_id");
+    ensure_dir_0700(&deny_host_dir).map_err(|e| e.to_string())?;
+    ensure_dir_0700(&deny_ctrl_dir).map_err(|e| e.to_string())?;
+
+    let deny_host_rt = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
+        download_dir: Some(work_dir.join("deny_host_dl")),
+        ..V2BridgeRuntimeOptions::default()
+    })
+    .map_err(|e| e.to_string())?;
+    let deny_ctrl_rt = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
+        download_dir: Some(work_dir.join("deny_ctrl_dl")),
+        ..V2BridgeRuntimeOptions::default()
+    })
+    .map_err(|e| e.to_string())?;
+
+    let deny_host_cfg = build_bridge_config(
         cluster,
         cp_url,
         sig_addr,
         ca_path,
         sig_tls,
         &deny_enroll,
-        &deny_dir,
+        &deny_host_dir,
         3000,
         500,
         TransportMode::Auto,
     );
-    save_and_load_config_0600(&deny_rt, &work_dir.join("deny_cfg.json"), &deny_cfg)?;
-    let _ = deny_rt.exec_json(r#"{"v":1,"cmd":"refresh_policy"}"#);
+    let deny_ctrl_cfg = build_bridge_config(
+        cluster,
+        cp_url,
+        sig_addr,
+        ca_path,
+        sig_tls,
+        &deny_enroll,
+        &deny_ctrl_dir,
+        3000,
+        500,
+        TransportMode::Auto,
+    );
+    save_and_load_config_0600(
+        &deny_host_rt,
+        &work_dir.join("deny_host_cfg.json"),
+        &deny_host_cfg,
+    )?;
+    save_and_load_config_0600(
+        &deny_ctrl_rt,
+        &work_dir.join("deny_ctrl_cfg.json"),
+        &deny_ctrl_cfg,
+    )?;
+
+    // Verify refresh_policy accepts and emits PolicyUpdated (NEVER PolicyDegraded!) with both disabled.
+    let ref_reply: serde_json::Value =
+        serde_json::from_str(&deny_ctrl_rt.exec_json(r#"{"v":1,"cmd":"refresh_policy"}"#))
+            .map_err(|e| e.to_string())?;
+    if ref_reply["accepted"].as_bool() != Some(true) {
+        return Err(format!("refresh_policy not accepted: {ref_reply}"));
+    }
     let pol_ev = wait_for_event(
-        &deny_rt,
+        &deny_ctrl_rt,
         Duration::from_secs(10),
         &mut all_captured_json,
         |ev| ev["kind"] == "PolicyUpdated" || ev["kind"] == "PolicyDegraded",
-    );
-    let pol_denies = pol_ev
-        .as_ref()
-        .is_some_and(|ev| ev["payload"]["policy"]["allow_clipboard"] == false);
-    report.policy_refresh_and_deny_verified = pol_denies;
+    )
+    .ok_or_else(|| "refresh_policy never emitted PolicyUpdated".to_string())?;
+    if pol_ev["kind"] != "PolicyUpdated" {
+        return Err(format!("expected PolicyUpdated (not degraded), got: {pol_ev}"));
+    }
+    let pol_denies_both = pol_ev["payload"]["policy"]["allow_clipboard"] == false
+        && pol_ev["payload"]["policy"]["allow_file_transfer"] == false;
 
+    // Establish a live Streaming session on the restricted tenant and assert forbidden clipboard
+    // AND file transfer commands return error_code == "PolicyDenied"!
+    let dsh: serde_json::Value =
+        serde_json::from_str(&deny_host_rt.exec_json(r#"{"v":1,"cmd":"start_host"}"#))
+            .map_err(|e| e.to_string())?;
+    if dsh["accepted"].as_bool() != Some(true) {
+        return Err(format!("deny_host start_host failed: {dsh}"));
+    }
+    let deny_host_ready = wait_for_event(
+        &deny_host_rt,
+        Duration::from_secs(15),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "CommandResult" && ev["payload"]["cmd"] == "start_host",
+    )
+    .ok_or_else(|| "deny_host bootstrap timed out".to_string())?;
+    let deny_host_id_hex = deny_host_ready["payload"]["device_id_hex"]
+        .as_str()
+        .ok_or_else(|| "missing deny_host device_id_hex".to_string())?;
+
+    let deny_dial = serde_json::json!({
+        "v": 1,
+        "cmd": "dial",
+        "target_device_id_hex": deny_host_id_hex,
+    });
+    let dd_reply: serde_json::Value =
+        serde_json::from_str(&deny_ctrl_rt.exec_json(&deny_dial.to_string()))
+            .map_err(|e| e.to_string())?;
+    if dd_reply["accepted"].as_bool() != Some(true) {
+        return Err(format!("deny_ctrl dial failed: {dd_reply}"));
+    }
+    let deny_inc = wait_for_event(
+        &deny_host_rt,
+        Duration::from_secs(15),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "IncomingCall",
+    )
+    .ok_or_else(|| "deny_host never received IncomingCall".to_string())?;
+    let deny_inc_id = deny_inc["payload"]["incoming_id"]
+        .as_str()
+        .ok_or_else(|| "missing deny incoming_id".to_string())?;
+    let deny_acc = serde_json::json!({
+        "v": 1,
+        "cmd": "accept_incoming",
+        "incoming_id": deny_inc_id,
+    });
+    let _ = deny_host_rt.exec_json(&deny_acc.to_string());
+    let deny_stream = wait_for_event(
+        &deny_ctrl_rt,
+        Duration::from_secs(15),
+        &mut all_captured_json,
+        |ev| ev["kind"] == "CommandResult" && ev["payload"]["cmd"] == "dial",
+    )
+    .ok_or_else(|| "deny_ctrl dial CommandResult timed out".to_string())?;
+    if deny_stream["payload"]["ok"].as_bool() != Some(true) {
+        return Err(format!("deny_ctrl dial failed: {deny_stream}"));
+    }
+
+    let denied_clip_reply: serde_json::Value = serde_json::from_str(
+        &deny_ctrl_rt.exec_json(r#"{"v":1,"cmd":"send_clipboard","text":"forbidden"}"#),
+    )
+    .map_err(|e| e.to_string())?;
+    let denied_file_reply: serde_json::Value =
+        serde_json::from_str(&deny_ctrl_rt.send_file_path(&sample_file.display().to_string()))
+            .map_err(|e| e.to_string())?;
+    report.policy_refresh_and_deny_verified = pol_denies_both
+        && denied_clip_reply["ok"].as_bool() == Some(false)
+        && denied_clip_reply["error_code"].as_str() == Some("PolicyDenied")
+        && denied_file_reply["ok"].as_bool() == Some(false)
+        && denied_file_reply["error_code"].as_str() == Some("PolicyDenied");
+
+    // Drain ALL residual events & snapshots from every runtime before teardown & leak scan (E7).
+    drain_residual_events(&host_rt, &mut all_captured_json);
+    drain_residual_events(&deny_host_rt, &mut all_captured_json);
+    drain_residual_events(&deny_ctrl_rt, &mut all_captured_json);
     all_captured_json.push(host_rt.snapshot_json());
-    all_captured_json.push(ctrl_rt.snapshot_json());
-    all_captured_json.push(deny_rt.snapshot_json());
+    all_captured_json.push(deny_host_rt.snapshot_json());
+    all_captured_json.push(deny_ctrl_rt.snapshot_json());
 
     let tasks_zero_host = wait_active_tasks_zero(&host_rt, Duration::from_secs(3));
-    let tasks_zero_deny = wait_active_tasks_zero(&deny_rt, Duration::from_secs(3));
     host_rt.destroy();
-    deny_rt.destroy();
-    report.zero_active_tasks_verified = tasks_zero_1 && tasks_zero_host && tasks_zero_deny;
+    deny_ctrl_rt.destroy();
+    deny_host_rt.destroy();
+    let tasks_zero_deny_ctrl = wait_active_tasks_zero(&deny_ctrl_rt, Duration::from_secs(3));
+    let tasks_zero_deny_host = wait_active_tasks_zero(&deny_host_rt, Duration::from_secs(3));
+    report.zero_active_tasks_verified = tasks_zero_1
+        && tasks_zero_fb
+        && tasks_zero_stop
+        && tasks_zero_host
+        && tasks_zero_deny_ctrl
+        && tasks_zero_deny_host;
 
-    // 9. Scan ALL captured events & snapshots for canary secrets!
+    // 9. Scan ALL captured events & snapshots for canary secrets (including admin_token!)
     let canaries = [
+        admin_token,
         allowed_enroll.as_str(),
         deny_enroll.as_str(),
         canary_clip_a,

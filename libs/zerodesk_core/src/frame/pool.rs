@@ -97,4 +97,21 @@ impl FramePool {
     pub fn recycle_skipped_in_use(&self) -> u64 {
         self.recycle_skipped_in_use.load(Ordering::Relaxed)
     }
+
+    /// Zeroizes all buffered pixel memory in the pool and empties it.
+    pub fn clear_zeroize(&self) {
+        let mut pool = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        for buf in pool.iter_mut() {
+            let cap = buf.capacity();
+            if cap > 0 {
+                buf.resize(cap, 0);
+                for b in buf.iter_mut() {
+                    // Volatile zeroize so the compiler cannot elide clearing before drop.
+                    unsafe { std::ptr::write_volatile(b, 0) };
+                }
+            }
+            buf.clear();
+        }
+        pool.clear();
+    }
 }

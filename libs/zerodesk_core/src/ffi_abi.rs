@@ -195,7 +195,10 @@ pub extern "C" fn zerodesk_v2_destroy(handle: u64) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn zerodesk_v2_buffer_free(buf: ZeroDeskOwnedBuffer) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        if !buf.ptr.is_null() && buf.cap > 0 {
+        if !buf.ptr.is_null() && buf.cap > 0 && buf.len <= buf.cap {
+            for i in 0..buf.len {
+                std::ptr::write_volatile(buf.ptr.add(i), 0);
+            }
             drop(Vec::from_raw_parts(buf.ptr, buf.len, buf.cap));
         }
     }));
@@ -349,6 +352,9 @@ pub unsafe extern "C" fn zerodesk_v2_send_file(
             Ok(s) => s,
             Err(code) => return code,
         };
+        if path_str.is_empty() || path_str.as_bytes().contains(&0) {
+            return ZERODESK_ERR_INVALID_ARG;
+        }
         let reply = rt.send_file_path(path_str);
         *out_reply_json = ZeroDeskOwnedBuffer::from_string(reply);
         ZERODESK_OK
@@ -366,6 +372,7 @@ pub unsafe extern "C" fn zerodesk_v2_frame_info(
         if out_info.is_null() {
             return ZERODESK_ERR_INVALID_ARG;
         }
+        *out_info = ZeroDeskFrameInfo::default();
         let Some(rt) = lookup_runtime(handle) else {
             return ZERODESK_ERR_INVALID_HANDLE;
         };
@@ -393,6 +400,7 @@ pub unsafe extern "C" fn zerodesk_v2_take_latest_frame(
         if out_info.is_null() {
             return ZERODESK_ERR_INVALID_ARG;
         }
+        *out_info = ZeroDeskFrameInfo::default();
         if out_cap > 0 && out_buf.is_null() {
             return ZERODESK_ERR_INVALID_ARG;
         }

@@ -3,8 +3,8 @@
 
 use super::{
     controller::{
-        load_config_json, save_config_json, BridgePersistedConfig, BridgeSnapshot, BridgeState,
-        PolicySummary, RedactedConfigView, V2BridgeController, VerifiedCallerDisplay,
+        load_config_json, BridgePersistedConfig, BridgeSnapshot, BridgeState, PolicySummary,
+        RedactedConfigView, V2BridgeController, VerifiedCallerDisplay,
     },
     events::BridgeEventHub,
     json_abi::{parse_and_validate_command, RuntimeCommandEnvelope, RuntimeReplyEnvelope},
@@ -33,8 +33,8 @@ use crate::{
         clipboard::{
             check_clipboard_policy_for_sync, decode_clipboard_l4, prepare_outbound_clipboard,
             ChannelFramingErrorCounter, ClipMessage, ClipboardReceiver, ClipboardRecvAction,
-            CLIP_ACK_OK, CLIP_MIME_IMAGE_PNG, CLIP_MIME_TEXT_UTF8, CLIP_MSG_ACK, CLIP_MSG_CHUNK,
-            CLIP_MSG_SYNC,
+            CLIP_ACK_OK, CLIP_HARD_MAX_BYTES, CLIP_MIME_IMAGE_PNG, CLIP_MIME_TEXT_UTF8,
+            CLIP_MSG_ACK, CLIP_MSG_CHUNK, CLIP_MSG_SYNC,
         },
         config::{TransportMode, V2ClientConfig},
         file_transfer::{
@@ -59,12 +59,16 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc as std_mpsc, Arc, Mutex, RwLock,
+        mpsc as std_mpsc, Arc, Condvar, Mutex, RwLock,
     },
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle, ThreadId},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -80,6 +84,10 @@ use v2_transport::{
 pub const SYNC_CMD_TIMEOUT: Duration = Duration::from_millis(500);
 pub const UNIFIED_SHUTDOWN_BUDGET: Duration = Duration::from_secs(3);
 pub const DEFAULT_RING_TIMEOUT: Duration = Duration::from_secs(15);
+const POLICY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const FILE_COMPLETE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const FILE_PROGRESS_THROTTLE_INTERVAL: Duration = Duration::from_millis(200);
+const FILE_ERR_LOCAL_ABORT: u16 = 0x0500;
 const ACTOR_CHANNEL_CAP: usize = 256;
 const SESSION_ACTION_CAP: usize = 128;
 
@@ -96,12 +104,15 @@ pub struct V2BridgeRuntimeOptions {
     pub use_os_capture: bool,
     pub use_os_audio: bool,
     pub use_os_clipboard: bool,
-    pub real_input_permit: Option<RealInputPermit>,
+    pub real_input_permit: Option<Arc<RealInputPermit>>,
     pub dryrun_journal: DryRunHidJournal,
     pub memory_clipboard: MemoryClipboardBackend,
     pub download_dir: Option<PathBuf>,
     pub ring_timeout: Duration,
+    #[cfg(feature = "e2e-fault-injection")]
     pub drop_udp_override: bool,
+    #[cfg(feature = "e2e-fault-injection")]
+    pub silent_peer_blackhole: Option<Arc<AtomicBool>>,
     pub synthetic_width: u32,
     pub synthetic_height: u32,
 }
@@ -117,7 +128,10 @@ impl Default for V2BridgeRuntimeOptions {
             memory_clipboard: MemoryClipboardBackend::new(),
             download_dir: None,
             ring_timeout: DEFAULT_RING_TIMEOUT,
+            #[cfg(feature = "e2e-fault-injection")]
             drop_udp_override: false,
+            #[cfg(feature = "e2e-fault-injection")]
+            silent_peer_blackhole: None,
             synthetic_width: 640,
             synthetic_height: 360,
         }
@@ -164,6 +178,9 @@ enum SessionAction {
         path: PathBuf,
         rel_name: String,
     },
+    CancelFile {
+        transfer_id: u64,
+    },
     SetAudioMute(bool),
     RefreshPolicy {
         cmd_id: u64,
@@ -190,8 +207,8 @@ enum ActorEvent {
     StreamingStarted {
         cmd_id: Option<u64>,
         session_id: [u8; 16],
-        peer_device_id: [u8; 16],
-        tenant_id: [u8; 16],
+        local_cert: Box<SignalingDeviceCert>,
+        peer_cert: Box<SignalingDeviceCert>,
         policy: EffectiveTenantPolicy,
         active_mode: ActiveTransportMode,
         attach_ms: u64,
@@ -204,15 +221,20 @@ enum ActorEvent {
     PolicyUpdated {
         cmd_id: Option<u64>,
         policy: EffectiveTenantPolicy,
+        is_degraded: bool,
     },
     AudioStatus(AudioStatusChanged),
+    HostCapabilityDegraded {
+        capability: String,
+        reason: String,
+    },
     WatchdogTriggered {
         released_keys: usize,
         released_buttons: usize,
     },
     ClipboardReceived {
         mime_kind: u8,
-        bytes: usize,
+        byte_count: usize,
         sha256_hex: String,
     },
     FileProgress {
@@ -239,7 +261,6 @@ enum ActorEvent {
         error_code: Option<String>,
         error: Option<String>,
     },
-    QoeTelemetry(serde_json::Value),
     SessionEnded {
         return_to_listening: bool,
         reason: String,
@@ -251,14 +272,17 @@ enum ActorEvent {
 enum ActorMessage {
     ExecCommand {
         env: Box<RuntimeCommandEnvelope>,
+        queued_at: Instant,
         reply: std_mpsc::SyncSender<RuntimeReplyEnvelope>,
     },
     SendClipboardPng {
         bytes: Vec<u8>,
+        queued_at: Instant,
         reply: std_mpsc::SyncSender<RuntimeReplyEnvelope>,
     },
     SendFilePath {
         path: String,
+        queued_at: Instant,
         reply: std_mpsc::SyncSender<RuntimeReplyEnvelope>,
     },
     InternalEvent {
@@ -274,6 +298,12 @@ enum ActorMessage {
     },
     #[cfg(test)]
     SimulateStaleEvent {
+        session_gen: u64,
+        cmd_id: Option<u64>,
+        ack: std_mpsc::SyncSender<()>,
+    },
+    #[cfg(test)]
+    SimulateStaleSecurityEvent {
         session_gen: u64,
         ack: std_mpsc::SyncSender<()>,
     },
@@ -300,31 +330,50 @@ impl Drop for PendingIncoming {
 struct BridgeUiCallback {
     session_gen: u64,
     actor_tx: mpsc::Sender<ActorMessage>,
+    events: Arc<BridgeEventHub>,
+    dropped_events: Arc<AtomicU64>,
 }
 
 impl V2UiCallback for BridgeUiCallback {
     fn on_frame(&self, _frame: Arc<crate::session::video::I420Frame>) {}
     fn on_state(&self, _state: V2SessionState) {}
     fn on_qoe(&self, snapshot: crate::session::runtime::QoeSnapshot) {
+        // High-frequency QoE telemetry bypasses the actor control channel completely.
         if let Ok(val) = serde_json::to_value(snapshot) {
-            let _ = self.actor_tx.try_send(ActorMessage::InternalEvent {
-                session_gen: self.session_gen,
-                event: ActorEvent::QoeTelemetry(val),
-            });
+            self.events.set_telemetry("QoeTelemetry", val);
         }
     }
     fn on_capabilities(&self, _caps: VerifiedTenantPolicy) {}
     fn on_incoming_call(&self, call: IncomingCall, reply: oneshot::Sender<CallDecision>) {
-        let _ = self.actor_tx.try_send(ActorMessage::InternalEvent {
+        if let Err(err) = self.actor_tx.try_send(ActorMessage::InternalEvent {
             session_gen: self.session_gen,
             event: ActorEvent::IncomingCall { call, reply },
-        });
+        }) {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+            if let ActorMessage::InternalEvent {
+                event: ActorEvent::IncomingCall { reply, .. },
+                ..
+            } = match err {
+                mpsc::error::TrySendError::Full(m) | mpsc::error::TrySendError::Closed(m) => m,
+            } {
+                let _ = reply.send(CallDecision::Reject {
+                    error_code: 0x0503,
+                    reason: "actor_control_channel_busy".into(),
+                });
+            }
+        }
     }
     fn on_security_event(&self, event: SecurityEvent) {
-        let _ = self.actor_tx.try_send(ActorMessage::InternalEvent {
-            session_gen: self.session_gen,
-            event: ActorEvent::SecurityEvent(event),
-        });
+        if self
+            .actor_tx
+            .try_send(ActorMessage::InternalEvent {
+                session_gen: self.session_gen,
+                event: ActorEvent::SecurityEvent(event),
+            })
+            .is_err()
+        {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -341,10 +390,13 @@ pub struct V2BridgeRuntime {
     events: Arc<BridgeEventHub>,
     active_tasks: Arc<AtomicUsize>,
     spawned_tasks_total: Arc<AtomicU64>,
+    dropped_events: Arc<AtomicU64>,
     emergency_releaser: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>>,
     dryrun_journal: DryRunHidJournal,
     memory_clipboard: MemoryClipboardBackend,
+    actor_thread_id: ThreadId,
     thread_handle: Mutex<Option<JoinHandle<()>>>,
+    shutdown_done: Arc<(Mutex<bool>, Condvar)>,
     destroyed: AtomicBool,
 }
 
@@ -361,6 +413,7 @@ impl V2BridgeRuntime {
         let shutdown_token = CancellationToken::new();
         let active_tasks = Arc::new(AtomicUsize::new(0));
         let spawned_tasks_total = Arc::new(AtomicU64::new(0));
+        let dropped_events = Arc::new(AtomicU64::new(0));
         let emergency_releaser: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>> =
             Arc::new(Mutex::new(None));
         let dryrun_journal = options.dryrun_journal.clone();
@@ -376,6 +429,7 @@ impl V2BridgeRuntime {
         let events_bg = Arc::clone(&events);
         let active_bg = Arc::clone(&active_tasks);
         let total_bg = Arc::clone(&spawned_tasks_total);
+        let dropped_bg = Arc::clone(&dropped_events);
         let releaser_bg = Arc::clone(&emergency_releaser);
 
         let handle = thread::Builder::new()
@@ -394,38 +448,71 @@ impl V2BridgeRuntime {
                         return;
                     }
                 };
-                rt.block_on(async move {
-                    let mut actor = BridgeActor {
-                        controller,
-                        options,
-                        actor_tx: actor_tx_bg,
-                        snapshot_cache: snapshot_bg,
-                        mailbox: mailbox_bg,
-                        events: events_bg,
-                        active_tasks: active_bg,
-                        spawned_tasks_total: total_bg,
-                        emergency_releaser: releaser_bg,
-                        session_gen: 0,
-                        next_cmd_id: 1,
-                        next_incoming_seq: 1,
-                        role: ActiveRole::None,
-                        loaded_config: None,
-                        effective_policy: None,
-                        session_cancel: None,
-                        session_handles: Vec::new(),
-                        pending_incoming: None,
-                        active_session_tx: None,
-                    };
-                    actor.run(actor_rx, shutdown_bg).await;
-                });
-                // Bounded runtime shutdown so lingering blocking tasks can never hang teardown.
-                rt.shutdown_timeout(Duration::from_millis(500));
+                let shutdown_panic = shutdown_bg.clone();
+                let snapshot_panic = Arc::clone(&snapshot_bg);
+                let events_panic = Arc::clone(&events_bg);
+                let releaser_panic = Arc::clone(&releaser_bg);
+
+                let run_res = catch_unwind(AssertUnwindSafe(move || {
+                    rt.block_on(async move {
+                        let mut actor = BridgeActor {
+                            controller,
+                            options,
+                            actor_tx: actor_tx_bg,
+                            snapshot_cache: snapshot_bg,
+                            mailbox: mailbox_bg,
+                            events: events_bg,
+                            active_tasks: active_bg,
+                            spawned_tasks_total: total_bg,
+                            dropped_events: dropped_bg,
+                            emergency_releaser: releaser_bg,
+                            session_gen: 0,
+                            next_cmd_id: 1,
+                            next_incoming_seq: 1,
+                            role: ActiveRole::None,
+                            loaded_config: None,
+                            effective_policy: None,
+                            session_cancel: None,
+                            session_handles: Vec::new(),
+                            pending_incoming: None,
+                            active_session_tx: None,
+                            shutting_down: false,
+                        };
+                        actor.run(actor_rx, shutdown_bg).await;
+                    });
+                    // Bounded runtime shutdown so lingering blocking tasks can never hang teardown.
+                    rt.shutdown_timeout(Duration::from_millis(500));
+                }));
+                if run_res.is_err() {
+                    shutdown_panic.cancel();
+                    if let Some(releaser) = releaser_panic
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        let _ = releaser.release_all_keys();
+                    }
+                    {
+                        let mut snap = snapshot_panic
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        snap.state = BridgeState::Faulted;
+                        snap.fault_reason = Some("bridge actor panicked".into());
+                    }
+                    events_panic.push_critical(
+                        "SessionTaskCrashed",
+                        serde_json::json!({ "task": "bridge_actor" }),
+                    );
+                    events_panic.close();
+                }
             })
             .map_err(|e| format!("spawn zerodesk-v2-rt thread: {e}"))?;
 
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| "timed out starting zerodesk-v2-rt thread".to_string())??;
+
+        let actor_thread_id = handle.thread().id();
 
         Ok(Self {
             actor_tx,
@@ -435,10 +522,13 @@ impl V2BridgeRuntime {
             events,
             active_tasks,
             spawned_tasks_total,
+            dropped_events,
             emergency_releaser,
             dryrun_journal,
             memory_clipboard,
+            actor_thread_id,
             thread_handle: Mutex::new(Some(handle)),
+            shutdown_done: Arc::new((Mutex::new(false), Condvar::new())),
             destroyed: AtomicBool::new(false),
         })
     }
@@ -463,6 +553,10 @@ impl V2BridgeRuntime {
         self.spawned_tasks_total.load(Ordering::Relaxed)
     }
 
+    pub fn dropped_event_count(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
     /// Reads the latest redacted snapshot under a short non-async lock (ZERO `.await`, ZERO I/O).
     pub fn snapshot(&self) -> BridgeSnapshot {
         self.snapshot_cache
@@ -479,14 +573,17 @@ impl V2BridgeRuntime {
     }
 
     fn send_to_actor(&self, mut msg: ActorMessage, timeout: Duration) -> Result<(), ()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         loop {
+            if self.destroyed.load(Ordering::Acquire) {
+                return Err(());
+            }
             match self.actor_tx.try_send(msg) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Closed(_)) => return Err(()),
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     msg = returned;
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|dl| Instant::now() >= dl) {
                         return Err(());
                     }
                     thread::sleep(Duration::from_millis(1));
@@ -520,6 +617,7 @@ impl V2BridgeRuntime {
             .send_to_actor(
                 ActorMessage::ExecCommand {
                     env: Box::new(env),
+                    queued_at: Instant::now(),
                     reply: tx,
                 },
                 SYNC_CMD_TIMEOUT,
@@ -553,6 +651,7 @@ impl V2BridgeRuntime {
             .send_to_actor(
                 ActorMessage::SendClipboardPng {
                     bytes: png_bytes.to_vec(),
+                    queued_at: Instant::now(),
                     reply: tx,
                 },
                 SYNC_CMD_TIMEOUT,
@@ -584,6 +683,7 @@ impl V2BridgeRuntime {
             .send_to_actor(
                 ActorMessage::SendFilePath {
                     path: path.to_string(),
+                    queued_at: Instant::now(),
                     reply: tx,
                 },
                 SYNC_CMD_TIMEOUT,
@@ -624,17 +724,58 @@ impl V2BridgeRuntime {
 
     /// Unified, idempotent, bounded (<= 3s) shutdown safe from ANY thread.
     /// Synchronously invokes the independent `EmergencyKeyReleaser` without depending on Tokio!
+    /// Concurrent callers wait on `shutdown_done` until shutdown completes (except same-thread calls,
+    /// which check thread ID first so they never self-deadlock).
     pub fn destroy(&self) {
-        if self.destroyed.swap(true, Ordering::AcqRel) {
+        let is_actor_thread = thread::current().id() == self.actor_thread_id;
+        if is_actor_thread {
+            self.destroyed.store(true, Ordering::Release);
+            if let Some(releaser) = self
+                .emergency_releaser
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                let _ = releaser.release_all_keys();
+            }
+            self.shutdown_token.cancel();
+            self.events.close();
+            self.mailbox.clear();
+            self.memory_clipboard.clear();
             return;
         }
-        // 1. Trigger independent emergency key release synchronously (works even if Tokio died).
-        if let Some(releaser) = self
+
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            // Another caller owns teardown; wait boundedly until it finishes.
+            let (lock, cvar) = &*self.shutdown_done;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let deadline = Instant::now().checked_add(UNIFIED_SHUTDOWN_BUDGET);
+            while !*done {
+                let rem = match deadline {
+                    Some(dl) => match dl.checked_duration_since(Instant::now()) {
+                        Some(r) if !r.is_zero() => r,
+                        _ => break,
+                    },
+                    None => UNIFIED_SHUTDOWN_BUDGET,
+                };
+                let (guard, wait_res) = cvar
+                    .wait_timeout(done, rem)
+                    .unwrap_or_else(|e| e.into_inner());
+                done = guard;
+                if wait_res.timed_out() {
+                    break;
+                }
+            }
+            return;
+        }
+
+        // 1. Trigger independent emergency key release synchronously (cloned outside lock).
+        let releaser_opt = self
             .emergency_releaser
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+            .clone();
+        if let Some(releaser) = releaser_opt {
             let _ = releaser.release_all_keys();
         }
         // 2. Cancel all runtime tasks and wake blocked pollers.
@@ -644,26 +785,31 @@ impl V2BridgeRuntime {
         let _ = self.actor_tx.try_send(ActorMessage::Shutdown { ack: ack_tx });
         let _ = ack_rx.recv_timeout(UNIFIED_SHUTDOWN_BUDGET);
 
-        // 3. Join the dedicated OS thread (never panic if called from same thread).
+        // 3. Join the dedicated OS thread.
         let handle = self
             .thread_handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(h) = handle {
-            if h.thread().id() != thread::current().id() {
-                let _ = h.join();
-            }
+            let _ = h.join();
         }
-        // 4. Final defensive emergency key release pass after actor thread exited.
-        if let Some(releaser) = self
+        // 4. Final defensive emergency key release pass after actor thread exited (outside lock).
+        let final_releaser = self
             .emergency_releaser
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .take();
+        if let Some(releaser) = final_releaser {
             let _ = releaser.release_all_keys();
         }
+        // 5. Clear & zeroize buffered pixels and in-memory clipboard secrets at shutdown end.
+        self.mailbox.clear();
+        self.memory_clipboard.clear();
+
+        let (lock, cvar) = &*self.shutdown_done;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cvar.notify_all();
     }
 
     #[cfg(test)]
@@ -687,10 +833,23 @@ impl V2BridgeRuntime {
     }
 
     #[cfg(test)]
-    fn simulate_stale_event(&self, stale_gen: u64) {
+    fn simulate_stale_event(&self, stale_gen: u64, cmd_id: Option<u64>) {
         let (ack_tx, ack_rx) = std_mpsc::sync_channel(1);
         self.actor_tx
             .blocking_send(ActorMessage::SimulateStaleEvent {
+                session_gen: stale_gen,
+                cmd_id,
+                ack: ack_tx,
+            })
+            .unwrap();
+        let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+    }
+
+    #[cfg(test)]
+    fn simulate_stale_security_event(&self, stale_gen: u64) {
+        let (ack_tx, ack_rx) = std_mpsc::sync_channel(1);
+        self.actor_tx
+            .blocking_send(ActorMessage::SimulateStaleSecurityEvent {
                 session_gen: stale_gen,
                 ack: ack_tx,
             })
@@ -714,6 +873,7 @@ struct BridgeActor {
     events: Arc<BridgeEventHub>,
     active_tasks: Arc<AtomicUsize>,
     spawned_tasks_total: Arc<AtomicU64>,
+    dropped_events: Arc<AtomicU64>,
     emergency_releaser: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>>,
     session_gen: u64,
     next_cmd_id: u64,
@@ -725,6 +885,135 @@ struct BridgeActor {
     session_handles: Vec<tokio::task::JoinHandle<()>>,
     pending_incoming: Option<PendingIncoming>,
     active_session_tx: Option<mpsc::Sender<SessionAction>>,
+    shutting_down: bool,
+}
+
+fn validate_download_dir(path: &Path) -> Result<PathBuf, RuntimeReplyEnvelope> {
+    if !path.is_absolute() {
+        return Err(RuntimeReplyEnvelope::err(
+            "InvalidArgument",
+            "download_dir must be an absolute path",
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(RuntimeReplyEnvelope::err(
+                    "InvalidArgument",
+                    "download_dir must be a real directory (not a symlink or file)",
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Walk up to the nearest existing ancestor and ensure it is not a symlink.
+            let mut cur = path.parent();
+            while let Some(p) = cur {
+                match std::fs::symlink_metadata(p) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() || !meta.is_dir() {
+                            return Err(RuntimeReplyEnvelope::err(
+                                "InvalidArgument",
+                                "download_dir parent must be a real directory (not a symlink)",
+                            ));
+                        }
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        cur = p.parent();
+                    }
+                    Err(err) => {
+                        return Err(RuntimeReplyEnvelope::err(
+                            "InvalidArgument",
+                            format!("inspect download_dir parent failed: {err}"),
+                        ));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return Err(RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                format!("inspect download_dir failed: {e}"),
+            ));
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn should_accept_policy_update(
+    current: Option<&EffectiveTenantPolicy>,
+    candidate: &EffectiveTenantPolicy,
+    now_unix: u64,
+) -> Result<(), String> {
+    if let Some(cur) = current {
+        if !cur.degraded && cur.exp_unix > now_unix {
+            if candidate.degraded {
+                return Err(
+                    "refusing to overwrite unexpired verified policy with degraded policy".into(),
+                );
+            }
+            if candidate.version < cur.version {
+                return Err(format!(
+                    "refusing policy version downgrade ({} < {})",
+                    candidate.version, cur.version
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn security_event_to_json(se: &SecurityEvent) -> serde_json::Value {
+    match se {
+        SecurityEvent::CertVerified { peer_device_id } => serde_json::json!({
+            "event": "CertVerified",
+            "peer_device_id_hex": hex::encode(peer_device_id),
+        }),
+        SecurityEvent::CertRejected { reason } => serde_json::json!({
+            "event": "CertRejected",
+            "reason": reason,
+        }),
+        SecurityEvent::TenantMismatch { expected, actual } => serde_json::json!({
+            "event": "TenantMismatch",
+            "expected_tenant_hex": hex::encode(expected),
+            "actual_tenant_hex": hex::encode(actual),
+        }),
+        SecurityEvent::ReplaySessionRejected { session_id } => serde_json::json!({
+            "event": "ReplaySessionRejected",
+            "session_id_hex": hex::encode(session_id),
+        }),
+        SecurityEvent::InvalidHidFraming { reason } => serde_json::json!({
+            "event": "InvalidHidFraming",
+            "reason": reason,
+        }),
+        SecurityEvent::InputFaulted {
+            residual_buttons,
+            residual_keys,
+        } => serde_json::json!({
+            "event": "InputFaulted",
+            "residual_buttons": residual_buttons,
+            "residual_key_count": residual_keys.len(),
+        }),
+        SecurityEvent::WatchdogTriggered => serde_json::json!({
+            "event": "WatchdogTriggered",
+        }),
+        SecurityEvent::LeaseRenewalFailed {
+            consecutive,
+            reason,
+        } => serde_json::json!({
+            "event": "LeaseRenewalFailed",
+            "consecutive": consecutive,
+            "reason": reason,
+        }),
+        SecurityEvent::SignalingDisconnected { reason } => serde_json::json!({
+            "event": "SignalingDisconnected",
+            "reason": reason,
+        }),
+        SecurityEvent::PolicyDegraded { reason } => serde_json::json!({
+            "event": "PolicyDegraded",
+            "reason": reason,
+        }),
+    }
 }
 
 impl BridgeActor {
@@ -748,34 +1037,85 @@ impl BridgeActor {
         }
     }
 
+    fn clear_pending_incoming(&mut self, reason: &str) {
+        if let Some(mut p) = self.pending_incoming.take() {
+            p.timer_cancel.cancel();
+            if let Some(tx) = p.reply_tx.take() {
+                let _ = tx.send(CallDecision::Reject {
+                    error_code: 0x0409,
+                    reason: reason.to_string(),
+                });
+            }
+            self.events.push_critical(
+                "IncomingEnded",
+                serde_json::json!({
+                    "incoming_id": p.incoming_id,
+                    "session_id_hex": p.session_id_hex,
+                    "reason": reason,
+                }),
+            );
+        }
+    }
+
     async fn unified_shutdown_session(&mut self, return_to_listening: bool) {
-        self.pending_incoming = None;
+        self.clear_pending_incoming("session_shutdown");
         self.active_session_tx = None;
 
         if let Some(tok) = self.session_cancel.take() {
             tok.cancel();
         }
-        // Synchronously release any held HID keys before waiting for async joins.
-        if let Some(releaser) = self
+        // Synchronously release any held HID keys before waiting for async joins (cloned outside lock).
+        let releaser_opt = self
             .emergency_releaser
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+            .clone();
+        if let Some(releaser) = releaser_opt {
             let _ = releaser.release_all_keys();
         }
 
         let handles = std::mem::take(&mut self.session_handles);
         let deadline = tokio::time::Instant::now() + UNIFIED_SHUTDOWN_BUDGET;
-        for h in handles {
+        for mut h in handles {
             let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
             if rem.is_zero() {
                 h.abort();
-                let _ = h.await;
-            } else if tokio::time::timeout(rem, h).await.is_err() {
-                // Bounded budget expired; handle dropped/aborted.
+                if let Err(e) = h.await {
+                    if e.is_panic() {
+                        self.events.push_critical(
+                            "SessionTaskCrashed",
+                            serde_json::json!({ "reason": "task panicked during shutdown" }),
+                        );
+                    }
+                }
+            } else {
+                match tokio::time::timeout(rem, &mut h).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if e.is_panic() {
+                            self.events.push_critical(
+                                "SessionTaskCrashed",
+                                serde_json::json!({ "reason": "task panicked" }),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        h.abort();
+                        if let Err(e) = h.await {
+                            if e.is_panic() {
+                                self.events.push_critical(
+                                    "SessionTaskCrashed",
+                                    serde_json::json!({ "reason": "task panicked after abort" }),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
+        // Zeroize any buffered frame pixels from the ended session.
+        self.mailbox.clear();
+
         if !return_to_listening {
             self.role = ActiveRole::None;
         }
@@ -797,24 +1137,68 @@ impl BridgeActor {
         loop {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
+                    self.shutting_down = true;
                     self.unified_shutdown_session(false).await;
                     break;
                 }
                 msg = rx.recv() => {
                     let Some(msg) = msg else {
+                        self.shutting_down = true;
                         self.unified_shutdown_session(false).await;
                         break;
                     };
                     match msg {
-                        ActorMessage::ExecCommand { env, reply } => {
+                        ActorMessage::ExecCommand { env, queued_at, reply } => {
+                            if self.shutting_down || shutdown_token.is_cancelled() {
+                                let _ = reply.send(RuntimeReplyEnvelope::err(
+                                    "Destroyed",
+                                    "bridge runtime is shutting down",
+                                ));
+                                continue;
+                            }
+                            if queued_at.elapsed() > SYNC_CMD_TIMEOUT {
+                                let _ = reply.send(RuntimeReplyEnvelope::err(
+                                    "Timeout",
+                                    "command expired in actor queue before execution",
+                                ));
+                                continue;
+                            }
                             let resp = self.handle_command(*env).await;
                             let _ = reply.send(resp);
                         }
-                        ActorMessage::SendClipboardPng { bytes, reply } => {
+                        ActorMessage::SendClipboardPng { bytes, queued_at, reply } => {
+                            if self.shutting_down || shutdown_token.is_cancelled() {
+                                let _ = reply.send(RuntimeReplyEnvelope::err(
+                                    "Destroyed",
+                                    "bridge runtime is shutting down",
+                                ));
+                                continue;
+                            }
+                            if queued_at.elapsed() > SYNC_CMD_TIMEOUT {
+                                let _ = reply.send(RuntimeReplyEnvelope::err(
+                                    "Timeout",
+                                    "send_clipboard_png expired in actor queue",
+                                ));
+                                continue;
+                            }
                             let resp = self.handle_send_clipboard_binary(CLIP_MIME_IMAGE_PNG, bytes);
                             let _ = reply.send(resp);
                         }
-                        ActorMessage::SendFilePath { path, reply } => {
+                        ActorMessage::SendFilePath { path, queued_at, reply } => {
+                            if self.shutting_down || shutdown_token.is_cancelled() {
+                                let _ = reply.send(RuntimeReplyEnvelope::err(
+                                    "Destroyed",
+                                    "bridge runtime is shutting down",
+                                ));
+                                continue;
+                            }
+                            if queued_at.elapsed() > SYNC_CMD_TIMEOUT {
+                                let _ = reply.send(RuntimeReplyEnvelope::err(
+                                    "Timeout",
+                                    "send_file_path expired in actor queue",
+                                ));
+                                continue;
+                            }
                             let resp = self.handle_send_file_path(&path);
                             let _ = reply.send(resp);
                         }
@@ -825,7 +1209,7 @@ impl BridgeActor {
                         ActorMessage::InjectTestIncoming { session_id, caller_cert, reply_tx, ack } => {
                             // Prepare controller into Listening if not already, for isolated unit tests.
                             if self.controller.state() == BridgeState::Idle {
-                                let mut cfg = BridgePersistedConfig {
+                                let cfg = BridgePersistedConfig {
                                     v: 1,
                                     control_plane_endpoint: "http://127.0.0.1:8080".into(),
                                     signaling_addr: "127.0.0.1:9001".into(),
@@ -845,7 +1229,6 @@ impl BridgeActor {
                                     transport_mode: TransportMode::Auto,
                                     udp_probe_timeout_ms: 1500,
                                 };
-                                cfg.v = 1;
                                 self.loaded_config = Some(cfg);
                             }
                             self.session_gen = self.session_gen.saturating_add(1);
@@ -874,18 +1257,37 @@ impl BridgeActor {
                             let _ = ack.send(incoming_id);
                         }
                         #[cfg(test)]
-                        ActorMessage::SimulateStaleEvent { session_gen, ack } => {
-                            self.apply_event(
-                                session_gen,
+                        ActorMessage::SimulateStaleEvent { session_gen, cmd_id, ack } => {
+                            let ev = if let Some(cid) = cmd_id {
+                                ActorEvent::CommandResult {
+                                    cmd_id: cid,
+                                    ok: true,
+                                    data: None,
+                                    error_code: None,
+                                    error: None,
+                                }
+                            } else {
                                 ActorEvent::AudioStatus(AudioStatusChanged {
                                     available: false,
                                     reason: Some("stale_gen_marker".into()),
+                                })
+                            };
+                            self.apply_event(session_gen, ev).await;
+                            let _ = ack.send(());
+                        }
+                        #[cfg(test)]
+                        ActorMessage::SimulateStaleSecurityEvent { session_gen, ack } => {
+                            self.apply_event(
+                                session_gen,
+                                ActorEvent::SecurityEvent(SecurityEvent::ReplaySessionRejected {
+                                    session_id: [0xEE; 16],
                                 }),
                             )
                             .await;
                             let _ = ack.send(());
                         }
                         ActorMessage::Shutdown { ack } => {
+                            self.shutting_down = true;
                             self.unified_shutdown_session(false).await;
                             let _ = ack.send(());
                             break;
@@ -905,6 +1307,15 @@ impl BridgeActor {
                         "load_config requires 'path'",
                     );
                 };
+                if !self.controller.allows_config_mutation() {
+                    return RuntimeReplyEnvelope::err(
+                        "IllegalStateTransition",
+                        format!(
+                            "load_config forbidden in state {:?}",
+                            self.controller.state()
+                        ),
+                    );
+                }
                 match load_config_json(Path::new(path)) {
                     Ok(cfg) => {
                         let cmd = serde_json::json!({
@@ -947,7 +1358,17 @@ impl BridgeActor {
                         "save_config requires 'config'",
                     );
                 };
-                if let Err(e) = save_config_json(Path::new(path), &cfg) {
+                // Validate controller state AND config BEFORE writing anything to disk!
+                if !self.controller.allows_config_mutation() {
+                    return RuntimeReplyEnvelope::err(
+                        "IllegalStateTransition",
+                        format!(
+                            "save_config forbidden in state {:?}",
+                            self.controller.state()
+                        ),
+                    );
+                }
+                if let Err(e) = cfg.validate() {
                     return RuntimeReplyEnvelope::err("ConfigError", e.to_string());
                 }
                 let cmd = serde_json::json!({
@@ -1008,6 +1429,14 @@ impl BridgeActor {
                         "set_audio_mute requires boolean 'muted'",
                     );
                 };
+                if let Some(tx) = &self.active_session_tx {
+                    if tx.try_send(SessionAction::SetAudioMute(muted)).is_err() {
+                        return RuntimeReplyEnvelope::err(
+                            "Busy",
+                            "session action queue full or closed",
+                        );
+                    }
+                }
                 let cmd = serde_json::json!({
                     "v": 1,
                     "cmd": "set_audio_mute",
@@ -1015,12 +1444,16 @@ impl BridgeActor {
                 });
                 let resp_raw = self.controller.execute_command_json(&cmd.to_string());
                 let parsed: serde_json::Value = serde_json::from_str(&resp_raw).unwrap_or_default();
-                if let Some(tx) = &self.active_session_tx {
-                    let _ = tx.try_send(SessionAction::SetAudioMute(muted));
-                }
                 self.drain_controller_events_to_hub();
                 self.sync_snapshot();
-                RuntimeReplyEnvelope::ok(parsed["data"].clone())
+                if parsed["ok"].as_bool() == Some(true) {
+                    RuntimeReplyEnvelope::ok(parsed["data"].clone())
+                } else {
+                    RuntimeReplyEnvelope::err(
+                        parsed["error_code"].as_str().unwrap_or("IllegalStateTransition"),
+                        parsed["error"].as_str().unwrap_or("set_audio_mute failed"),
+                    )
+                }
             }
             "start_host" => self.handle_start_host(env),
             "stop_host" => self.handle_stop_host().await,
@@ -1049,6 +1482,9 @@ impl BridgeActor {
                         "cancel_file requires 'transfer_id'",
                     );
                 };
+                if let Some(tx) = &self.active_session_tx {
+                    let _ = tx.try_send(SessionAction::CancelFile { transfer_id: tid });
+                }
                 let cmd = serde_json::json!({
                     "v": 1,
                     "cmd": "cancel_file",
@@ -1073,10 +1509,7 @@ impl BridgeActor {
         }
     }
 
-    fn build_client_config(
-        &self,
-        drop_udp_cmd: Option<bool>,
-    ) -> Result<V2ClientConfig, RuntimeReplyEnvelope> {
+    fn build_client_config(&self) -> Result<V2ClientConfig, RuntimeReplyEnvelope> {
         let Some(cfg) = &self.loaded_config else {
             return Err(RuntimeReplyEnvelope::err(
                 "MissingConfig",
@@ -1117,7 +1550,8 @@ impl BridgeActor {
             bw_cap_kbps: cfg.bw_cap_kbps,
             transport_mode: cfg.transport_mode,
             udp_probe_timeout_ms: cfg.udp_probe_timeout_ms,
-            drop_udp_for_test: drop_udp_cmd.unwrap_or(false) || self.options.drop_udp_override,
+            #[cfg(feature = "e2e-fault-injection")]
+            drop_udp_for_test: self.options.drop_udp_override,
         };
         v2_cfg
             .validate()
@@ -1151,8 +1585,17 @@ impl BridgeActor {
             );
         }
 
-        let client_cfg = match self.build_client_config(env.drop_udp) {
+        let client_cfg = match self.build_client_config() {
             Ok(c) => c,
+            Err(e) => return e,
+        };
+        let raw_dl = env
+            .download_dir
+            .map(PathBuf::from)
+            .or_else(|| self.options.download_dir.clone())
+            .unwrap_or_else(|| client_cfg.identity_dir.join("downloads"));
+        let download_dir = match validate_download_dir(&raw_dl) {
+            Ok(d) => d,
             Err(e) => return e,
         };
 
@@ -1177,6 +1620,8 @@ impl BridgeActor {
         self.sync_snapshot();
 
         let actor_tx = self.actor_tx.clone();
+        let events = Arc::clone(&self.events);
+        let dropped_events = Arc::clone(&self.dropped_events);
         let active_tasks = Arc::clone(&self.active_tasks);
         let total_tasks = Arc::clone(&self.spawned_tasks_total);
         let releaser_slot = Arc::clone(&self.emergency_releaser);
@@ -1185,14 +1630,9 @@ impl BridgeActor {
         let use_os_clipboard = self.options.use_os_clipboard;
         let dryrun_journal = self.options.dryrun_journal.clone();
         let mem_clip = self.options.memory_clipboard.clone();
-        let download_dir = env
-            .download_dir
-            .map(PathBuf::from)
-            .or_else(|| self.options.download_dir.clone())
-            .unwrap_or_else(|| client_cfg.identity_dir.join("downloads"));
         let synth_w = self.options.synthetic_width;
         let synth_h = self.options.synthetic_height;
-        let real_input_requested = self.options.real_input_permit.is_some();
+        let real_input_permit = self.options.real_input_permit.clone();
 
         let h = tokio::spawn(async move {
             let _guard = TaskCountGuard::enter(&active_tasks, &total_tasks);
@@ -1202,12 +1642,14 @@ impl BridgeActor {
                 client_cfg,
                 cancel,
                 actor_tx,
+                events,
+                dropped_events,
                 releaser_slot,
                 HostTaskAdapters {
                     use_os_capture,
                     use_os_audio,
                     use_os_clipboard,
-                    real_input_requested,
+                    real_input_permit,
                     dryrun_journal,
                     mem_clip,
                     download_dir,
@@ -1283,8 +1725,17 @@ impl BridgeActor {
                 );
             }
         };
-        let client_cfg = match self.build_client_config(env.drop_udp) {
+        let client_cfg = match self.build_client_config() {
             Ok(c) => c,
+            Err(e) => return e,
+        };
+        let raw_dl = env
+            .download_dir
+            .map(PathBuf::from)
+            .or_else(|| self.options.download_dir.clone())
+            .unwrap_or_else(|| client_cfg.identity_dir.join("downloads"));
+        let download_dir = match validate_download_dir(&raw_dl) {
+            Ok(d) => d,
             Err(e) => return e,
         };
 
@@ -1314,16 +1765,14 @@ impl BridgeActor {
         let actor_tx = self.actor_tx.clone();
         let mailbox = Arc::clone(&self.mailbox);
         let events = Arc::clone(&self.events);
+        let dropped_events = Arc::clone(&self.dropped_events);
         let active_tasks = Arc::clone(&self.active_tasks);
         let total_tasks = Arc::clone(&self.spawned_tasks_total);
         let use_os_audio = self.options.use_os_audio;
         let use_os_clipboard = self.options.use_os_clipboard;
         let mem_clip = self.options.memory_clipboard.clone();
-        let download_dir = env
-            .download_dir
-            .map(PathBuf::from)
-            .or_else(|| self.options.download_dir.clone())
-            .unwrap_or_else(|| client_cfg.identity_dir.join("downloads"));
+        #[cfg(feature = "e2e-fault-injection")]
+        let silent_blackhole = self.options.silent_peer_blackhole.clone();
 
         let h = tokio::spawn(async move {
             let _guard = TaskCountGuard::enter(&active_tasks, &total_tasks);
@@ -1336,10 +1785,13 @@ impl BridgeActor {
                 actor_tx,
                 mailbox,
                 events,
+                dropped_events,
                 use_os_audio,
                 use_os_clipboard,
                 mem_clip,
                 download_dir,
+                #[cfg(feature = "e2e-fault-injection")]
+                silent_blackhole,
             )
             .await;
         });
@@ -1402,7 +1854,9 @@ impl BridgeActor {
                 ),
             );
         }
-        let mut pending = self.pending_incoming.take().expect("checked Some above");
+        let Some(mut pending) = self.pending_incoming.take() else {
+            return RuntimeReplyEnvelope::err("StaleIncoming", "no pending incoming call");
+        };
         pending.timer_cancel.cancel();
 
         let cmd_name = if accept {
@@ -1439,6 +1893,18 @@ impl BridgeActor {
     }
 
     fn handle_send_hid_key(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        if self.controller.state() != BridgeState::Streaming {
+            return RuntimeReplyEnvelope::err(
+                "IllegalStateTransition",
+                "send_hid_key requires active Streaming session",
+            );
+        }
+        if self.effective_policy.is_none() {
+            return RuntimeReplyEnvelope::err(
+                "PolicyDenied",
+                "verified tenant policy unavailable",
+            );
+        }
         let Some(tx) = &self.active_session_tx else {
             return RuntimeReplyEnvelope::err(
                 "IllegalStateTransition",
@@ -1454,11 +1920,18 @@ impl BridgeActor {
         let Some(down) = env.down else {
             return RuntimeReplyEnvelope::err("InvalidArgument", "send_hid_key requires 'down'");
         };
+        let scalar = env.unicode_scalar.unwrap_or(0);
+        if scalar != 0 && char::from_u32(scalar).is_none() {
+            return RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                "unicode_scalar is not a valid Unicode scalar",
+            );
+        }
         let ev = KeyEvent {
             down,
             modifiers: env.modifiers.unwrap_or(0),
-            usb_hid_usage: usage as u32,
-            unicode_scalar: env.unicode_scalar.unwrap_or(0),
+            usb_hid_usage: u32::from(usage),
+            unicode_scalar: scalar,
             client_ts_ms: now_epoch_ms(),
         };
         if tx.try_send(SessionAction::SendHid(HidPayload::Key(ev))).is_err() {
@@ -1468,6 +1941,18 @@ impl BridgeActor {
     }
 
     fn handle_send_hid_mouse(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        if self.controller.state() != BridgeState::Streaming {
+            return RuntimeReplyEnvelope::err(
+                "IllegalStateTransition",
+                "send_hid_mouse requires active Streaming session",
+            );
+        }
+        if self.effective_policy.is_none() {
+            return RuntimeReplyEnvelope::err(
+                "PolicyDenied",
+                "verified tenant policy unavailable",
+            );
+        }
         let Some(tx) = &self.active_session_tx else {
             return RuntimeReplyEnvelope::err(
                 "IllegalStateTransition",
@@ -1493,13 +1978,26 @@ impl BridgeActor {
                 );
             }
         };
+        let buttons = env.buttons.unwrap_or(0);
+        if buttons & !0x07 != 0 {
+            return RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                "mouse buttons bitmask must fit within 0x07",
+            );
+        }
         let (x_or_dx, y_or_dy) = match kind {
-            MouseKind::MoveRel => (env.dx.unwrap_or(0) as i32, env.dy.unwrap_or(0) as i32),
-            _ => (env.x.unwrap_or(0) as i32, env.y.unwrap_or(0) as i32),
+            MouseKind::MoveRel => (
+                i32::from(env.dx.unwrap_or(0)),
+                i32::from(env.dy.unwrap_or(0)),
+            ),
+            _ => (
+                i32::from(env.x.unwrap_or(0)),
+                i32::from(env.y.unwrap_or(0)),
+            ),
         };
         let ev = MouseEvent {
             kind,
-            buttons: env.buttons.unwrap_or(0),
+            buttons,
             x_or_dx,
             y_or_dy,
             wheel_dx: env.wheel_x.unwrap_or(0),
@@ -1516,10 +2014,68 @@ impl BridgeActor {
     }
 
     fn handle_send_clipboard_cmd(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        if self.controller.state() != BridgeState::Streaming {
+            return RuntimeReplyEnvelope::err(
+                "IllegalStateTransition",
+                "clipboard requires Streaming state",
+            );
+        }
+        let Some(pol) = &self.effective_policy else {
+            return RuntimeReplyEnvelope::err(
+                "PolicyDenied",
+                "verified tenant policy unavailable",
+            );
+        };
+        let max_allowed = pol
+            .max_clipboard_bytes()
+            .min(u64::from(CLIP_HARD_MAX_BYTES)) as usize;
         let mime_kind = env.mime_kind.unwrap_or(CLIP_MIME_TEXT_UTF8);
         let bytes = if let Some(text) = env.text {
+            if !pol.allow_clipboard() {
+                self.events.push_critical(
+                    "PolicyDenied",
+                    serde_json::json!({ "channel": "clipboard", "reason": "clipboard_disabled" }),
+                );
+                return RuntimeReplyEnvelope::err(
+                    "PolicyDenied",
+                    "clipboard disabled by tenant policy",
+                );
+            }
+            if text.len() > max_allowed {
+                self.events.push_critical(
+                    "PolicyDenied",
+                    serde_json::json!({ "channel": "clipboard", "reason": "size_limit_exceeded" }),
+                );
+                return RuntimeReplyEnvelope::err(
+                    "PolicyDenied",
+                    format!("clipboard text size {}B exceeds policy cap {max_allowed}B", text.len()),
+                );
+            }
             text.into_bytes()
         } else if let Some(b64) = env.payload_b64 {
+            if !pol.allow_clipboard() {
+                self.events.push_critical(
+                    "PolicyDenied",
+                    serde_json::json!({ "channel": "clipboard", "reason": "clipboard_disabled" }),
+                );
+                return RuntimeReplyEnvelope::err(
+                    "PolicyDenied",
+                    "clipboard disabled by tenant policy",
+                );
+            }
+            let est_decoded = (b64.len() / 4).saturating_mul(3);
+            if est_decoded > max_allowed {
+                self.events.push_critical(
+                    "PolicyDenied",
+                    serde_json::json!({ "channel": "clipboard", "reason": "size_limit_exceeded" }),
+                );
+                return RuntimeReplyEnvelope::err(
+                    "PolicyDenied",
+                    format!(
+                        "clipboard base64 estimated size {est_decoded}B exceeds policy cap {max_allowed}B"
+                    ),
+                );
+            }
             match B64.decode(&b64) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1599,7 +2155,11 @@ impl BridgeActor {
             );
         }
         let path = PathBuf::from(path_str);
-        let meta = match std::fs::metadata(&path) {
+        let file = match open_regular_file_nofollow(&path) {
+            Ok(f) => f,
+            Err((code, msg)) => return RuntimeReplyEnvelope::err(&code, msg),
+        };
+        let meta = match file.metadata() {
             Ok(m) if m.is_file() => m,
             Ok(_) => {
                 return RuntimeReplyEnvelope::err(
@@ -1608,7 +2168,7 @@ impl BridgeActor {
                 );
             }
             Err(e) => {
-                return RuntimeReplyEnvelope::err("IoError", format!("stat file failed: {e}"));
+                return RuntimeReplyEnvelope::err("IoError", format!("fstat file failed: {e}"));
             }
         };
         let rel_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -1666,23 +2226,25 @@ impl BridgeActor {
             }
         }
         // Fallback: refresh directly via Control Plane using loaded config even while Ready/Listening.
-        let client_cfg = match self.build_client_config(None) {
+        let client_cfg = match self.build_client_config() {
             Ok(c) => c,
             Err(e) => return e,
         };
         let actor_tx = self.actor_tx.clone();
         let active_tasks = Arc::clone(&self.active_tasks);
         let total_tasks = Arc::clone(&self.spawned_tasks_total);
+        let cancel = self.session_cancel.clone().unwrap_or_default();
         let h = tokio::spawn(async move {
             let _guard = TaskCountGuard::enter(&active_tasks, &total_tasks);
-            match refresh_policy_from_cp(&client_cfg).await {
-                Ok(policy) => {
+            match refresh_policy_from_cp(&client_cfg, &cancel).await {
+                Ok((policy, is_degraded)) => {
                     let _ = actor_tx
                         .send(ActorMessage::InternalEvent {
                             session_gen: gen,
                             event: ActorEvent::PolicyUpdated {
                                 cmd_id: Some(cmd_id),
                                 policy,
+                                is_degraded,
                             },
                         })
                         .await;
@@ -1708,8 +2270,53 @@ impl BridgeActor {
     }
 
     async fn apply_event(&mut self, ev_gen: u64, event: ActorEvent) {
-        // Drop any event from a stale session generation!
+        // Handle events from a superseded session generation:
+        // - NEVER drop `SecurityEvent` (always audit with structured redacted fields).
+        // - Explicitly reject stale `IncomingCall` replies.
+        // - Emit `CommandResult { ok: false, error_code: "StaleGeneration" }` for any event carrying a `cmd_id`.
         if ev_gen != self.session_gen {
+            match event {
+                ActorEvent::SecurityEvent(se) => {
+                    self.events.push_critical(
+                        "SecurityEvent",
+                        serde_json::json!({
+                            "session_gen": ev_gen,
+                            "stale_generation": true,
+                            "detail": security_event_to_json(&se),
+                        }),
+                    );
+                }
+                ActorEvent::IncomingCall { reply, .. } => {
+                    let _ = reply.send(CallDecision::Reject {
+                        error_code: 0x0409,
+                        reason: "stale_generation".into(),
+                    });
+                }
+                ActorEvent::HostBootstrapped { cmd_id, .. }
+                | ActorEvent::HostBootstrapFailed { cmd_id, .. }
+                | ActorEvent::DialFailed { cmd_id, .. }
+                | ActorEvent::CommandResult { cmd_id, .. }
+                | ActorEvent::StreamingStarted {
+                    cmd_id: Some(cmd_id),
+                    ..
+                }
+                | ActorEvent::PolicyUpdated {
+                    cmd_id: Some(cmd_id),
+                    ..
+                } => {
+                    self.events.push_critical(
+                        "CommandResult",
+                        serde_json::json!({
+                            "cmd_id": cmd_id,
+                            "ok": false,
+                            "session_gen": ev_gen,
+                            "error_code": "StaleGeneration",
+                            "error": "event arrived for superseded session generation",
+                        }),
+                    );
+                }
+                _ => {}
+            }
             return;
         }
         match event {
@@ -1755,26 +2362,23 @@ impl BridgeActor {
                 );
             }
             ActorEvent::IncomingCall { call, reply } => {
+                // If an older pending incoming exists, reject it and cancel its timer first.
+                self.clear_pending_incoming("superseded");
+
+                // Use the REAL CA-verified caller DeviceCert from DesktopHostDaemon (zero forged certs).
+                if let Err(e) = self
+                    .controller
+                    .on_incoming_verified_call(call.session_id, &call.caller_cert)
+                {
+                    let _ = reply.send(CallDecision::Reject {
+                        error_code: 0x0409,
+                        reason: e,
+                    });
+                    return;
+                }
                 let incoming_id = format!("inc-{ev_gen}-{}", self.next_incoming_seq);
                 self.next_incoming_seq = self.next_incoming_seq.saturating_add(1);
                 let sid_hex = hex::encode(call.session_id);
-                let synth_cert = SignalingDeviceCert {
-                    version: 1,
-                    cert_id: [0u8; 16],
-                    device_id: call.controller_device_id,
-                    tenant_id: call.tenant_id,
-                    p256_pub_der: Vec::new(),
-                    key_epoch: 1,
-                    policy_hash: [0u8; 32],
-                    cap_bits: call.controller_cap_bits,
-                    iat_unix: 0,
-                    exp_unix: u64::MAX,
-                    ca_key_id: 0,
-                    ca_sig: Vec::new(),
-                };
-                let _ = self
-                    .controller
-                    .on_incoming_verified_call(call.session_id, &synth_cert);
                 self.drain_controller_events_to_hub();
                 self.sync_snapshot();
 
@@ -1804,7 +2408,7 @@ impl BridgeActor {
                 });
                 self.session_handles.push(timer_handle);
 
-                let caller = VerifiedCallerDisplay::from_verified_cert(&synth_cert);
+                let caller = VerifiedCallerDisplay::from_verified_cert(&call.caller_cert);
                 self.pending_incoming = Some(PendingIncoming {
                     incoming_id: incoming_id.clone(),
                     session_id_hex: sid_hex.clone(),
@@ -1827,12 +2431,22 @@ impl BridgeActor {
                     .as_ref()
                     .is_some_and(|p| p.incoming_id == incoming_id)
                 {
-                    let mut p = self.pending_incoming.take().expect("checked");
-                    if let Some(tx) = p.reply_tx.take() {
-                        let _ = tx.send(CallDecision::Reject {
-                            error_code: 0x0408,
-                            reason: "ring_timeout".into(),
-                        });
+                    if let Some(mut p) = self.pending_incoming.take() {
+                        p.timer_cancel.cancel();
+                        if let Some(tx) = p.reply_tx.take() {
+                            let _ = tx.send(CallDecision::Reject {
+                                error_code: 0x0408,
+                                reason: "ring_timeout".into(),
+                            });
+                        }
+                        self.events.push_critical(
+                            "IncomingEnded",
+                            serde_json::json!({
+                                "incoming_id": p.incoming_id,
+                                "session_id_hex": p.session_id_hex,
+                                "reason": "ring_timeout",
+                            }),
+                        );
                     }
                     let _ = self
                         .controller
@@ -1844,35 +2458,44 @@ impl BridgeActor {
             ActorEvent::StreamingStarted {
                 cmd_id,
                 session_id,
-                peer_device_id,
-                tenant_id,
+                local_cert,
+                peer_cert,
                 policy,
                 active_mode,
                 attach_ms,
                 action_tx,
             } => {
+                // Check BOTH controller state transitions fail-closed!
+                let boot_res = self.controller.on_bootstrap_complete(
+                    &local_cert,
+                    policy.clone(),
+                    self.role == ActiveRole::Host,
+                );
+                let stream_res = boot_res.and_then(|()| {
+                    self.controller
+                        .on_streaming_started(session_id, &peer_cert, active_mode)
+                });
+                if let Err(err) = stream_res {
+                    let return_to_listening = self.role == ActiveRole::Host;
+                    self.unified_shutdown_session(return_to_listening).await;
+                    if let Some(cid) = cmd_id {
+                        self.events.push_critical(
+                            "CommandResult",
+                            serde_json::json!({
+                                "cmd_id": cid,
+                                "cmd": "dial",
+                                "ok": false,
+                                "session_gen": ev_gen,
+                                "error_code": "IllegalStateTransition",
+                                "error": err,
+                            }),
+                        );
+                    }
+                    return;
+                }
+                self.mailbox.reset_for_session(ev_gen);
                 self.effective_policy = Some(policy.clone());
                 self.active_session_tx = Some(action_tx);
-                let peer_cert = SignalingDeviceCert {
-                    version: 1,
-                    cert_id: [0u8; 16],
-                    device_id: peer_device_id,
-                    tenant_id,
-                    p256_pub_der: Vec::new(),
-                    key_epoch: 1,
-                    policy_hash: policy.policy_hash,
-                    cap_bits: DEFAULT_V2_CAP_BITS,
-                    iat_unix: 0,
-                    exp_unix: policy.exp_unix,
-                    ca_key_id: 0,
-                    ca_sig: Vec::new(),
-                };
-                let _ = self
-                    .controller
-                    .on_bootstrap_complete(&peer_cert, policy.clone(), self.role == ActiveRole::Host);
-                let _ = self
-                    .controller
-                    .on_streaming_started(session_id, &peer_cert, active_mode);
                 self.drain_controller_events_to_hub();
                 self.sync_snapshot();
                 self.emit_policy_event(&policy);
@@ -1915,39 +2538,63 @@ impl BridgeActor {
                     }),
                 );
             }
-            ActorEvent::PolicyUpdated { cmd_id, policy } => {
-                self.effective_policy = Some(policy.clone());
-                let dummy_cert = SignalingDeviceCert {
-                    version: 1,
-                    cert_id: [0u8; 16],
-                    device_id: [0u8; 16],
-                    tenant_id: policy.tenant_id,
-                    p256_pub_der: Vec::new(),
-                    key_epoch: 1,
-                    policy_hash: policy.policy_hash,
-                    cap_bits: DEFAULT_V2_CAP_BITS,
-                    iat_unix: 0,
-                    exp_unix: policy.exp_unix,
-                    ca_key_id: 0,
-                    ca_sig: Vec::new(),
-                };
-                if self.controller.state() != BridgeState::Idle {
-                    let _ = self.controller.on_bootstrap_complete(
-                        &dummy_cert,
-                        policy.clone(),
-                        self.role == ActiveRole::Host,
+            ActorEvent::PolicyUpdated {
+                cmd_id,
+                policy,
+                is_degraded,
+            } => {
+                let now = now_unix_secs();
+                if let Err(reason) =
+                    should_accept_policy_update(self.effective_policy.as_ref(), &policy, now)
+                {
+                    self.events.push_critical(
+                        "PolicyDegraded",
+                        serde_json::json!({
+                            "reason": reason,
+                            "kept_existing_policy": true,
+                        }),
                     );
+                    if let Some(cid) = cmd_id {
+                        self.events.push_critical(
+                            "CommandResult",
+                            serde_json::json!({
+                                "cmd_id": cid,
+                                "cmd": "refresh_policy",
+                                "ok": false,
+                                "error_code": "PolicyDegraded",
+                                "error": reason,
+                            }),
+                        );
+                    }
+                    return;
+                }
+                self.effective_policy = Some(policy.clone());
+                if self.controller.state() != BridgeState::Idle {
+                    let _ = self.controller.on_policy_updated(policy.clone());
                     self.drain_controller_events_to_hub();
                     self.sync_snapshot();
                 }
-                self.emit_policy_event(&policy);
+                if is_degraded || policy.degraded {
+                    self.events.push_critical(
+                        "PolicyDegraded",
+                        serde_json::json!({
+                            "reason": policy.degraded_reason,
+                            "policy": PolicySummary::from(&policy),
+                        }),
+                    );
+                } else {
+                    self.events.push_critical(
+                        "PolicyUpdated",
+                        serde_json::json!({ "policy": PolicySummary::from(&policy) }),
+                    );
+                }
                 if let Some(cid) = cmd_id {
                     self.events.push_critical(
                         "CommandResult",
                         serde_json::json!({
                             "cmd_id": cid,
                             "cmd": "refresh_policy",
-                            "ok": true,
+                            "ok": !(is_degraded || policy.degraded),
                             "policy": PolicySummary::from(&policy),
                         }),
                     );
@@ -1959,6 +2606,15 @@ impl BridgeActor {
                     serde_json::json!({
                         "available": st.available,
                         "reason": st.reason,
+                    }),
+                );
+            }
+            ActorEvent::HostCapabilityDegraded { capability, reason } => {
+                self.events.push_critical(
+                    "HostCapabilityDegraded",
+                    serde_json::json!({
+                        "capability": capability,
+                        "reason": reason,
                     }),
                 );
             }
@@ -1976,7 +2632,7 @@ impl BridgeActor {
             }
             ActorEvent::ClipboardReceived {
                 mime_kind,
-                bytes,
+                byte_count,
                 sha256_hex,
             } => {
                 // Redacted: NEVER include raw clipboard text or bytes!
@@ -1984,7 +2640,7 @@ impl BridgeActor {
                     "ClipboardReceived",
                     serde_json::json!({
                         "mime_kind": mime_kind,
-                        "bytes": bytes,
+                        "bytes": byte_count,
                         "sha256_hex": sha256_hex,
                     }),
                 );
@@ -2053,15 +2709,13 @@ impl BridgeActor {
                     }),
                 );
             }
-            ActorEvent::QoeTelemetry(val) => {
-                self.events.set_telemetry("QoeTelemetry", val);
-            }
             ActorEvent::SessionEnded {
                 return_to_listening,
                 reason,
             } => {
                 self.active_session_tx = None;
-                self.pending_incoming = None;
+                self.clear_pending_incoming(&reason);
+                self.mailbox.clear();
                 if !return_to_listening {
                     self.role = ActiveRole::None;
                 }
@@ -2085,7 +2739,10 @@ impl BridgeActor {
             ActorEvent::SecurityEvent(se) => {
                 self.events.push_critical(
                     "SecurityEvent",
-                    serde_json::json!({ "detail": format!("{se:?}") }),
+                    serde_json::json!({
+                        "session_gen": ev_gen,
+                        "detail": security_event_to_json(&se),
+                    }),
                 );
             }
         }
@@ -2110,57 +2767,648 @@ impl BridgeActor {
     }
 }
 
-async fn refresh_policy_from_cp(cfg: &V2ClientConfig) -> Result<EffectiveTenantPolicy, String> {
-    let cp = ControlPlaneClient::new(&cfg.control_plane_endpoint, cfg.ca_der_path.as_deref())
-        .map_err(|e| e.to_string())?;
-    let ca_spki_der = cp
-        .get_ca_pubkey()
-        .await
-        .map_err(|e| e.to_string())?
-        .spki_der()
-        .map_err(|e| e.to_string())?;
-    let mut identity =
-        PersistentV2Identity::load_or_create(&cfg.identity_dir).map_err(|e| e.to_string())?;
-    let (cert, inline_blob) = identity
-        .ensure_registered_with_policy(
-            &cp,
+async fn refresh_policy_from_cp(
+    cfg: &V2ClientConfig,
+    cancel: &CancellationToken,
+) -> Result<(EffectiveTenantPolicy, bool), String> {
+    let fut = async {
+        let cp = ControlPlaneClient::new(&cfg.control_plane_endpoint, cfg.ca_der_path.as_deref())
+            .map_err(|e| e.to_string())?;
+        let ca_spki_der = cp
+            .get_ca_pubkey()
+            .await
+            .map_err(|e| e.to_string())?
+            .spki_der()
+            .map_err(|e| e.to_string())?;
+        let mut identity =
+            PersistentV2Identity::load_or_create(&cfg.identity_dir).map_err(|e| e.to_string())?;
+        let (cert, _inline_blob) = identity
+            .ensure_registered_with_policy(
+                &cp,
+                &ca_spki_der,
+                cfg.enrollment_token.as_deref(),
+                DEFAULT_V2_CAP_BITS,
+                &cfg.home_region,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let now = now_unix_secs();
+        let fetched = cp
+            .fetch_tenant_policy(&cert.device_id, identity.keystore(), now)
+            .await
+            .map_err(|e| format!("fetch_tenant_policy failed: {e}"))?;
+        let last_ver = identity.last_policy_version();
+        let outcome = verify_tenant_policy_blob(
+            Some(&fetched),
             &ca_spki_der,
-            cfg.enrollment_token.as_deref(),
-            DEFAULT_V2_CAP_BITS,
-            &cfg.home_region,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let now = now_unix_secs();
-    let fetched = cp
-        .fetch_tenant_policy(&cert.device_id, identity.keystore(), now)
-        .await
-        .ok();
-    let blob = fetched.or(inline_blob);
-    let last_ver = identity.last_policy_version();
-    let outcome = verify_tenant_policy_blob(
-        blob.as_ref(),
-        &ca_spki_der,
-        &cert.tenant_id,
-        &cert.policy_hash,
-        last_ver,
-        now,
-    );
-    let policy = match outcome {
-        PolicyVerifyOutcome::Verified(p) => {
-            let _ = identity.advance_policy_version(p.version);
-            p
+            &cert.tenant_id,
+            &cert.policy_hash,
+            last_ver,
+            now,
+        );
+        match outcome {
+            PolicyVerifyOutcome::Verified(p) => {
+                let _ = identity.advance_policy_version(p.version);
+                Ok((p, false))
+            }
+            PolicyVerifyOutcome::Degraded { policy, .. } => Ok((policy, true)),
         }
-        PolicyVerifyOutcome::Degraded { policy, .. } => policy,
     };
-    Ok(policy)
+    tokio::select! {
+        _ = cancel.cancelled() => Err("policy refresh cancelled".into()),
+        res = tokio::time::timeout(POLICY_REFRESH_TIMEOUT, fut) => match res {
+            Ok(inner) => inner,
+            Err(_) => Err("policy refresh timed out after 5s".into()),
+        },
+    }
+}
+
+/// Opens `path` with `O_NOFOLLOW | O_NONBLOCK` on Unix and verifies `fstat` is a regular file.
+fn open_regular_file_nofollow(path: &Path) -> Result<File, (String, String)> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts
+        .open(path)
+        .map_err(|e| ("IoError".to_string(), format!("open file failed: {e}")))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| ("IoError".to_string(), format!("fstat file failed: {e}")))?;
+    if !meta.is_file() {
+        return Err((
+            "InvalidArgument".to_string(),
+            "send_file path must be a regular file".to_string(),
+        ));
+    }
+    Ok(file)
+}
+
+/// Computes SHA-256 over an already-opened `File` using a bounded 64 KiB streaming buffer
+/// (ZERO full-file allocation in RAM, ZERO TOCTOU) and rewinds the descriptor back to byte 0.
+fn compute_file_sha256_streaming(mut file: File) -> Result<(File, u64, [u8; 32]), (String, String)> {
+    let meta = file
+        .metadata()
+        .map_err(|e| ("IoError".to_string(), format!("fstat file failed: {e}")))?;
+    if !meta.is_file() {
+        return Err((
+            "InvalidArgument".to_string(),
+            "send_file path must be a regular file".to_string(),
+        ));
+    }
+    let total = meta.len();
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut hashed: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| ("IoError".to_string(), format!("read file for sha256 failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        hashed = hashed.saturating_add(n as u64);
+        if hashed > total {
+            return Err((
+                "IoError".to_string(),
+                "file grew concurrently while hashing".to_string(),
+            ));
+        }
+    }
+    if hashed != total {
+        return Err((
+            "IoError".to_string(),
+            "file size changed concurrently while hashing".to_string(),
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| ("IoError".to_string(), format!("rewind file failed: {e}")))?;
+    let sha256: [u8; 32] = hasher.finalize().into();
+    Ok((file, total, sha256))
+}
+
+struct OutboundTransferState {
+    transfer_id: u64,
+    cmd_id: u64,
+    rel_name: String,
+    file: File,
+    total_bytes: u64,
+    sha256: [u8; 32],
+    offset: u64,
+    complete_sent_at: Option<Instant>,
+    last_progress_at: Instant,
+    last_progress_pct: u8,
+}
+
+struct OutboundFileManager {
+    active: HashMap<u64, OutboundTransferState>,
+    unknown_peer_msgs_dropped: u64,
+}
+
+impl OutboundFileManager {
+    fn new() -> Self {
+        Self {
+            active: HashMap::new(),
+            unknown_peer_msgs_dropped: 0,
+        }
+    }
+
+    fn has_active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_transfer(
+        &mut self,
+        sess: &mut UdpE2eeSession,
+        transfer_id: u64,
+        cmd_id: u64,
+        path: PathBuf,
+        rel_name: String,
+        policy: &EffectiveTenantPolicy,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) {
+        let open_res = tokio::task::spawn_blocking(move || {
+            let file = open_regular_file_nofollow(&path)?;
+            compute_file_sha256_streaming(file)
+        })
+        .await;
+        let (file, total, sha256) = match open_res {
+            Ok(Ok(tuple)) => tuple,
+            Ok(Err((code, msg))) => {
+                emit_file_cmd_result(gen, cmd_id, actor_tx, Err((code, msg))).await;
+                return;
+            }
+            Err(e) => {
+                emit_file_cmd_result(
+                    gen,
+                    cmd_id,
+                    actor_tx,
+                    Err(("IoError".into(), format!("file prepare task failed: {e}"))),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(e) = check_file_policy(policy, total) {
+            let abort = FileAbort {
+                transfer_id,
+                error_code: FILE_ERR_POLICY_DENIED,
+            };
+            let _ = sess
+                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
+                .await;
+            emit_file_cmd_result(gen, cmd_id, actor_tx, Err(("PolicyDenied".into(), e.to_string())))
+                .await;
+            return;
+        }
+
+        let offer = FileOffer {
+            transfer_id,
+            file_size: total,
+            chunk_size: FILE_RECOMMENDED_CHUNK_SIZE,
+            sha256,
+            rel_name: rel_name.clone(),
+        };
+        let offer_wire = match offer.encode() {
+            Ok(w) => w,
+            Err(e) => {
+                emit_file_cmd_result(
+                    gen,
+                    cmd_id,
+                    actor_tx,
+                    Err(("InvalidArgument".into(), e.to_string())),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(e) = sess
+            .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_OFFER, 0, false, &offer_wire)
+            .await
+        {
+            emit_file_cmd_result(
+                gen,
+                cmd_id,
+                actor_tx,
+                Err(("TransportError".into(), e.to_string())),
+            )
+            .await;
+            return;
+        }
+
+        self.active.insert(
+            transfer_id,
+            OutboundTransferState {
+                transfer_id,
+                cmd_id,
+                rel_name,
+                file,
+                total_bytes: total,
+                sha256,
+                offset: 0,
+                complete_sent_at: None,
+                last_progress_at: Instant::now(),
+                last_progress_pct: 0,
+            },
+        );
+    }
+
+    /// Pumps at most one chunk across active outbound transfers and enforces `CompleteAck` timeout.
+    async fn pump_one_step(
+        &mut self,
+        sess: &mut UdpE2eeSession,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) {
+        // 1. Check CompleteAck timeouts first.
+        let timed_out_ids: Vec<u64> = self
+            .active
+            .iter()
+            .filter_map(|(&tid, st)| {
+                st.complete_sent_at
+                    .filter(|t| t.elapsed() >= FILE_COMPLETE_ACK_TIMEOUT)
+                    .map(|_| tid)
+            })
+            .collect();
+        for tid in timed_out_ids {
+            if let Some(st) = self.active.remove(&tid) {
+                let abort = FileAbort {
+                    transfer_id: tid,
+                    error_code: FILE_ERR_LOCAL_ABORT,
+                };
+                let _ = sess
+                    .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
+                    .await;
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::FileAborted {
+                            transfer_id: tid,
+                            error_code: FILE_ERR_LOCAL_ABORT,
+                            reason: "complete_ack timeout".into(),
+                        },
+                    })
+                    .await;
+                emit_file_cmd_result(
+                    gen,
+                    st.cmd_id,
+                    actor_tx,
+                    Err(("Timeout".into(), "peer did not acknowledge file completion".into())),
+                )
+                .await;
+            }
+        }
+
+        // 2. Pick the first active transfer still sending chunks or needing FILE_MSG_COMPLETE.
+        let next_tid = self
+            .active
+            .iter()
+            .find(|(_, st)| st.complete_sent_at.is_none())
+            .map(|(&tid, _)| tid);
+        let Some(tid) = next_tid else {
+            return;
+        };
+        let Some(st) = self.active.get_mut(&tid) else {
+            return;
+        };
+
+        if st.offset < st.total_bytes {
+            let remaining = (st.total_bytes - st.offset) as usize;
+            let to_read = remaining.min(FILE_RECOMMENDED_CHUNK_SIZE as usize);
+            let mut chunk_buf = vec![0u8; to_read];
+            let read_res = st.file.read(&mut chunk_buf);
+            match read_res {
+                Ok(0) => {
+                    // Unexpected EOF -> abort cleanly.
+                    let st = self.active.remove(&tid);
+                    if let Some(st) = st {
+                        let abort = FileAbort {
+                            transfer_id: tid,
+                            error_code: FILE_ERR_LOCAL_ABORT,
+                        };
+                        let _ = sess
+                            .send_l4_raw(
+                                CHAN_FILE_TRANSFER,
+                                FILE_MSG_ABORT,
+                                0,
+                                false,
+                                &abort.encode(),
+                            )
+                            .await;
+                        emit_file_cmd_result(
+                            gen,
+                            st.cmd_id,
+                            actor_tx,
+                            Err(("IoError".into(), "unexpected EOF while streaming file".into())),
+                        )
+                        .await;
+                    }
+                }
+                Ok(n) => {
+                    chunk_buf.truncate(n);
+                    let ch = FileChunk {
+                        transfer_id: tid,
+                        offset: st.offset,
+                        data: chunk_buf,
+                    };
+                    let send_res = match ch.encode() {
+                        Ok(wire) => sess
+                            .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_CHUNK, 0, false, &wire)
+                            .await
+                            .map_err(|e| ("TransportError".to_string(), e.to_string())),
+                        Err(e) => Err(("InvalidArgument".to_string(), e.to_string())),
+                    };
+                    if let Err(err) = send_res {
+                        if let Some(st) = self.active.remove(&tid) {
+                            let abort = FileAbort {
+                                transfer_id: tid,
+                                error_code: FILE_ERR_LOCAL_ABORT,
+                            };
+                            let _ = sess
+                                .send_l4_raw(
+                                    CHAN_FILE_TRANSFER,
+                                    FILE_MSG_ABORT,
+                                    0,
+                                    false,
+                                    &abort.encode(),
+                                )
+                                .await;
+                            emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(err)).await;
+                        }
+                        return;
+                    }
+                    st.offset = st.offset.saturating_add(n as u64);
+                    let pct = if st.total_bytes == 0 {
+                        100
+                    } else {
+                        ((st.offset.saturating_mul(100)) / st.total_bytes).min(100) as u8
+                    };
+                    let should_emit = st.offset == st.total_bytes
+                        || pct >= st.last_progress_pct.saturating_add(5)
+                        || st.last_progress_at.elapsed() >= FILE_PROGRESS_THROTTLE_INTERVAL;
+                    if should_emit {
+                        st.last_progress_pct = pct;
+                        st.last_progress_at = Instant::now();
+                        let _ = actor_tx.try_send(ActorMessage::InternalEvent {
+                            session_gen: gen,
+                            event: ActorEvent::FileProgress {
+                                transfer_id: tid,
+                                bytes_transferred: st.offset,
+                                total_bytes: st.total_bytes,
+                            },
+                        });
+                    }
+                }
+                Err(e) => {
+                    if let Some(st) = self.active.remove(&tid) {
+                        let abort = FileAbort {
+                            transfer_id: tid,
+                            error_code: FILE_ERR_LOCAL_ABORT,
+                        };
+                        let _ = sess
+                            .send_l4_raw(
+                                CHAN_FILE_TRANSFER,
+                                FILE_MSG_ABORT,
+                                0,
+                                false,
+                                &abort.encode(),
+                            )
+                            .await;
+                        emit_file_cmd_result(
+                            gen,
+                            st.cmd_id,
+                            actor_tx,
+                            Err(("IoError".into(), format!("read chunk failed: {e}"))),
+                        )
+                        .await;
+                    }
+                }
+            }
+        } else {
+            let complete = FileComplete {
+                transfer_id: tid,
+                sha256: st.sha256,
+            };
+            if let Err(e) = sess
+                .send_l4_raw(
+                    CHAN_FILE_TRANSFER,
+                    FILE_MSG_COMPLETE,
+                    0,
+                    false,
+                    &complete.encode(),
+                )
+                .await
+            {
+                if let Some(st) = self.active.remove(&tid) {
+                    let abort = FileAbort {
+                        transfer_id: tid,
+                        error_code: FILE_ERR_LOCAL_ABORT,
+                    };
+                    let _ = sess
+                        .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
+                        .await;
+                    emit_file_cmd_result(
+                        gen,
+                        st.cmd_id,
+                        actor_tx,
+                        Err(("TransportError".into(), e.to_string())),
+                    )
+                    .await;
+                }
+            } else {
+                st.complete_sent_at = Some(Instant::now());
+            }
+        }
+    }
+
+    async fn handle_complete_ack(
+        &mut self,
+        transfer_id: u64,
+        status: u8,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) {
+        let Some(st) = self.active.remove(&transfer_id) else {
+            self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
+            return;
+        };
+        if status == FILE_COMPLETE_ACK_OK {
+            let sha_hex = hex::encode(st.sha256);
+            let _ = actor_tx
+                .send(ActorMessage::InternalEvent {
+                    session_gen: gen,
+                    event: ActorEvent::FileComplete {
+                        transfer_id: st.transfer_id,
+                        rel_name: st.rel_name.clone(),
+                        bytes: st.total_bytes,
+                        sha256_hex: sha_hex.clone(),
+                        saved_path: None,
+                    },
+                })
+                .await;
+            emit_file_cmd_result(
+                gen,
+                st.cmd_id,
+                actor_tx,
+                Ok(serde_json::json!({
+                    "transfer_id": st.transfer_id,
+                    "rel_name": st.rel_name,
+                    "bytes": st.total_bytes,
+                    "sha256_hex": sha_hex,
+                })),
+            )
+            .await;
+        } else {
+            let reason = format!("remote complete_ack status={status}");
+            let _ = actor_tx
+                .send(ActorMessage::InternalEvent {
+                    session_gen: gen,
+                    event: ActorEvent::FileAborted {
+                        transfer_id: st.transfer_id,
+                        error_code: u16::from(status),
+                        reason: reason.clone(),
+                    },
+                })
+                .await;
+            emit_file_cmd_result(
+                gen,
+                st.cmd_id,
+                actor_tx,
+                Err(("FileAborted".into(), reason)),
+            )
+            .await;
+        }
+    }
+
+    async fn handle_remote_abort(
+        &mut self,
+        transfer_id: u64,
+        error_code: u16,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) {
+        let Some(st) = self.active.remove(&transfer_id) else {
+            self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
+            return;
+        };
+        let reason = format!("remote abort {error_code:#06x}");
+        let _ = actor_tx
+            .send(ActorMessage::InternalEvent {
+                session_gen: gen,
+                event: ActorEvent::FileAborted {
+                    transfer_id: st.transfer_id,
+                    error_code,
+                    reason: reason.clone(),
+                },
+            })
+            .await;
+        emit_file_cmd_result(
+            gen,
+            st.cmd_id,
+            actor_tx,
+            Err(("FileAborted".into(), reason)),
+        )
+        .await;
+    }
+
+    async fn cancel_transfer(
+        &mut self,
+        sess: &mut UdpE2eeSession,
+        transfer_id: u64,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) {
+        if let Some(st) = self.active.remove(&transfer_id) {
+            let abort = FileAbort {
+                transfer_id,
+                error_code: FILE_ERR_LOCAL_ABORT,
+            };
+            let _ = sess
+                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
+                .await;
+            let _ = actor_tx
+                .send(ActorMessage::InternalEvent {
+                    session_gen: gen,
+                    event: ActorEvent::FileAborted {
+                        transfer_id,
+                        error_code: FILE_ERR_LOCAL_ABORT,
+                        reason: "cancelled locally".into(),
+                    },
+                })
+                .await;
+            emit_file_cmd_result(
+                gen,
+                st.cmd_id,
+                actor_tx,
+                Err(("Cancelled".into(), "file transfer cancelled".into())),
+            )
+            .await;
+        }
+    }
+
+    async fn abort_all_on_teardown(
+        &mut self,
+        sess: &mut UdpE2eeSession,
+        gen: u64,
+        actor_tx: &mpsc::Sender<ActorMessage>,
+    ) {
+        let remaining: Vec<OutboundTransferState> =
+            self.active.drain().map(|(_, st)| st).collect();
+        for st in remaining {
+            let abort = FileAbort {
+                transfer_id: st.transfer_id,
+                error_code: FILE_ERR_LOCAL_ABORT,
+            };
+            let _ = sess
+                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
+                .await;
+            emit_file_cmd_result(
+                gen,
+                st.cmd_id,
+                actor_tx,
+                Err(("Aborted".into(), "session closed during file transfer".into())),
+            )
+            .await;
+        }
+    }
+}
+
+/// RAII guard ensuring `release_all_keys()` runs and `releaser_slot` is cleared on ANY exit path
+/// (normal teardown, early encoder init error, cancellation, or panic unwind).
+struct ReleaserDropGuard {
+    releaser: Arc<dyn EmergencyKeyReleaser>,
+    slot: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>>,
+}
+
+impl ReleaserDropGuard {
+    fn arm(
+        releaser: Arc<dyn EmergencyKeyReleaser>,
+        slot: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>>,
+    ) -> Self {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&releaser));
+        Self { releaser, slot }
+    }
+}
+
+impl Drop for ReleaserDropGuard {
+    fn drop(&mut self) {
+        let _ = self.releaser.release_all_keys();
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 struct HostTaskAdapters {
     use_os_capture: bool,
     use_os_audio: bool,
     use_os_clipboard: bool,
-    real_input_requested: bool,
+    real_input_permit: Option<Arc<RealInputPermit>>,
     dryrun_journal: DryRunHidJournal,
     mem_clip: MemoryClipboardBackend,
     download_dir: PathBuf,
@@ -2168,18 +3416,23 @@ struct HostTaskAdapters {
     synth_h: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_host_lifecycle_task(
     gen: u64,
     cmd_id: u64,
     cfg: V2ClientConfig,
     cancel: CancellationToken,
     actor_tx: mpsc::Sender<ActorMessage>,
+    events: Arc<BridgeEventHub>,
+    dropped_events: Arc<AtomicU64>,
     releaser_slot: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>>,
     adapters: HostTaskAdapters,
 ) {
     let cb = Arc::new(BridgeUiCallback {
         session_gen: gen,
         actor_tx: actor_tx.clone(),
+        events,
+        dropped_events,
     });
     let dispatcher = UiCallbackDispatcher::spawn(cb);
 
@@ -2215,7 +3468,7 @@ async fn run_host_lifecycle_task(
         }
     };
     let policy = daemon.effective_policy().clone();
-    let _ = actor_tx
+    if actor_tx
         .send(ActorMessage::InternalEvent {
             session_gen: gen,
             event: ActorEvent::HostBootstrapped {
@@ -2224,7 +3477,12 @@ async fn run_host_lifecycle_task(
                 policy,
             },
         })
-        .await;
+        .await
+        .is_err()
+    {
+        daemon.disconnect_signaling().await;
+        return;
+    }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_c = Arc::clone(&stop_flag);
@@ -2235,7 +3493,7 @@ async fn run_host_lifecycle_task(
     });
 
     while !cancel.is_cancelled() {
-        let accepted = tokio::select! {
+        let mut accepted = tokio::select! {
             _ = cancel.cancelled() => break,
             res = daemon.accept_next_session(Arc::clone(&stop_flag), None) => match res {
                 Ok(sess) => sess,
@@ -2248,21 +3506,28 @@ async fn run_host_lifecycle_task(
         };
 
         let (action_tx, action_rx) = mpsc::channel::<SessionAction>(SESSION_ACTION_CAP);
-        let _ = actor_tx
+        // P0-1: Check StreamingStarted delivery — never enter a headless zombie session loop if actor closed!
+        if actor_tx
             .send(ActorMessage::InternalEvent {
                 session_gen: gen,
                 event: ActorEvent::StreamingStarted {
                     cmd_id: None,
                     session_id: accepted.session_id,
-                    peer_device_id: accepted.peer_device_id,
-                    tenant_id: accepted.tenant_id,
+                    local_cert: Box::new(accepted.local_cert.clone()),
+                    peer_cert: Box::new(accepted.peer_cert.clone()),
                     policy: accepted.effective_policy.clone(),
                     active_mode: accepted.active_transport_mode,
                     attach_ms: accepted.transport_attach_ms,
                     action_tx,
                 },
             })
-            .await;
+            .await
+            .is_err()
+        {
+            let _ = send_redundant_session_close_3x(&mut accepted.e2ee_session, 0).await;
+            let _ = accepted.lease_renewal.shutdown().await;
+            break;
+        }
 
         let end_reason = run_active_host_session(
             gen,
@@ -2308,24 +3573,50 @@ async fn run_active_host_session(
     let mut audio_gate = AudioChannelGate::from_policy(&effective_policy);
     let mut audio_muted = false;
 
-    // 1. HID sink (DryRun by default; triple-gated RealInput only when explicitly opted in).
-    let mut hid_sink: Box<dyn OsHidSink> = if adapters.real_input_requested {
-        match RealInputPermit::from_explicit_opt_in(true).and_then(create_real_os_hid_sink) {
+    // Re-arm the shared dry-run HID journal for this brand-new session after any prior session's release.
+    adapters.dryrun_journal.resume_for_new_session();
+
+    // 1. HID sink (DryRun by default; triple-gated RealInput only when Arc<RealInputPermit> provided).
+    let mut hid_sink: Box<dyn OsHidSink> = if let Some(permit) = adapters.real_input_permit.clone()
+    {
+        match create_real_os_hid_sink(permit) {
             Ok(real) => real,
-            Err(_) => Box::new(DryRunHidSink::new()),
+            Err(e) => {
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::HostCapabilityDegraded {
+                            capability: "real_input".into(),
+                            reason: e.to_string(),
+                        },
+                    })
+                    .await;
+                Box::new(DryRunHidSink::with_journal(adapters.dryrun_journal.clone()))
+            }
         }
     } else {
-        Box::new(DryRunSinkWithJournal {
-            journal: adapters.dryrun_journal.clone(),
-        })
+        Box::new(DryRunHidSink::with_journal(adapters.dryrun_journal.clone()))
     };
     let releaser = hid_sink.emergency_releaser();
-    *releaser_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&releaser));
+    let _releaser_guard = ReleaserDropGuard::arm(Arc::clone(&releaser), releaser_slot);
 
-    // 2. Capture source (Synthetic by default, OS capture if requested with graceful fallback).
+    // 2. Capture source (Synthetic by default, OS capture if requested with explicit degradation event).
     let mut capture: Box<dyn OsScreenCapture> = if adapters.use_os_capture {
-        create_os_screen_capture()
-            .unwrap_or_else(|_| Box::new(SyntheticScreenSource::new(adapters.synth_w, adapters.synth_h)))
+        match create_os_screen_capture() {
+            Ok(cap) => cap,
+            Err(e) => {
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::HostCapabilityDegraded {
+                            capability: "os_capture".into(),
+                            reason: e.to_string(),
+                        },
+                    })
+                    .await;
+                Box::new(SyntheticScreenSource::new(adapters.synth_w, adapters.synth_h))
+            }
+        }
     } else {
         Box::new(SyntheticScreenSource::new(adapters.synth_w, adapters.synth_h))
     };
@@ -2336,7 +3627,7 @@ async fn run_active_host_session(
     let encoder = match V2VideoEncoder::new(cfg.codec, enc_w, enc_h, 2.0, Some(cfg.fps as usize)) {
         Ok(e) => e,
         Err(e) => {
-            let _ = releaser.release_all_keys();
+            // `_releaser_guard` automatically releases keys and clears `releaser_slot` on return.
             let _ = accepted.lease_renewal.shutdown().await;
             return format!("encoder init failed: {e}");
         }
@@ -2376,60 +3667,107 @@ async fn run_active_host_session(
     let mut clip_err_counter = ChannelFramingErrorCounter::new();
     let mut next_clip_id: u64 = 1;
 
-    // 5. File transfer receiver.
+    // 5. File transfer receiver + incremental non-blocking outbound manager.
     let _ = std::fs::create_dir_all(&adapters.download_dir);
     let mut file_receiver =
         FileTransferReceiver::new(effective_policy.clone(), adapters.download_dir.clone());
     let mut file_err_counter = ChannelFramingErrorCounter::new();
+    let mut outbound_files = OutboundFileManager::new();
     let mut next_transfer_id: u64 = 1;
 
-    let frame_period = Duration::from_millis((1000 / cfg.fps.max(1)) as u64).max(Duration::from_millis(16));
+    // 6. Non-blocking policy refresh result channel.
+    let (pol_tx, mut pol_rx) =
+        mpsc::channel::<(u64, Result<(EffectiveTenantPolicy, bool), String>)>(4);
+
+    let frame_period =
+        Duration::from_millis((1000 / cfg.fps.max(1)) as u64).max(Duration::from_millis(16));
     let mut video_tick = tokio::time::interval(frame_period);
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut audio_tick = tokio::time::interval(Duration::from_millis(20));
     audio_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clip_tick = tokio::time::interval(Duration::from_millis(100));
     clip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut file_tick = tokio::time::interval(Duration::from_millis(2));
+    file_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let watchdog_timeout = Duration::from_millis(cfg.watchdog_timeout_ms);
     let mut last_peer_activity = Instant::now();
     let mut lease_expired_rx = accepted.lease_renewal.subscribe_expired();
     let mut pts_ms: i64 = 0;
-    let end_reason: String;
 
-    loop {
-        if cancel.is_cancelled() {
-            end_reason = "local_cancel".into();
-            break;
-        }
-        if last_peer_activity.elapsed() >= watchdog_timeout {
-            let rep = releaser.release_all_keys();
-            let _ = actor_tx
-                .send(ActorMessage::InternalEvent {
-                    session_gen: gen,
-                    event: ActorEvent::WatchdogTriggered {
-                        released_keys: rep.released_keys,
-                        released_buttons: rep.released_buttons,
-                    },
-                })
-                .await;
-            end_reason = "watchdog_timeout".into();
-            break;
-        }
-
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                end_reason = "local_cancel".into();
-                break;
+    // P0-2: Check pre-latched lease expiry BEFORE entering the select loop!
+    let end_reason: String = if lease_expired_rx.borrow().is_some() {
+        "lease_expired".into()
+    } else {
+        loop {
+            if cancel.is_cancelled() {
+                break "local_cancel".into();
             }
-            _ = lease_expired_rx.changed() => {
-                if lease_expired_rx.borrow().is_some() {
-                    end_reason = "lease_expired".into();
-                    break;
+            if last_peer_activity.elapsed() >= watchdog_timeout {
+                let rep = releaser.release_all_keys();
+                let _ = actor_tx
+                    .send(ActorMessage::InternalEvent {
+                        session_gen: gen,
+                        event: ActorEvent::WatchdogTriggered {
+                            released_keys: rep.released_keys,
+                            released_buttons: rep.released_buttons,
+                        },
+                    })
+                    .await;
+                break "watchdog_timeout".into();
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break "local_cancel".into();
                 }
-            }
-            act = action_rx.recv() => {
-                if let Some(action) = act {
+                // P0-2: Treat both Err(_) (sender dropped) and Some(_) as fail-closed lease_expired!
+                res = lease_expired_rx.changed() => {
+                    if res.is_err() || lease_expired_rx.borrow().is_some() {
+                        break "lease_expired".into();
+                    }
+                }
+                // Non-blocking policy refresh completion
+                Some((cmd_id, res)) = pol_rx.recv() => {
+                    match res {
+                        Ok((new_pol, is_degraded)) => {
+                            let now = now_unix_secs();
+                            if should_accept_policy_update(Some(&effective_policy), &new_pol, now).is_ok() {
+                                effective_policy = new_pol.clone();
+                                allow_clip_flag.store(effective_policy.allow_clipboard(), Ordering::Release);
+                                audio_gate = AudioChannelGate::from_policy(&effective_policy);
+                                audio_gate.set_muted(audio_muted);
+                                clip_receiver.update_policy(effective_policy.clone());
+                                file_receiver.update_policy(effective_policy.clone());
+                            }
+                            let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                session_gen: gen,
+                                event: ActorEvent::PolicyUpdated {
+                                    cmd_id: Some(cmd_id),
+                                    policy: new_pol,
+                                    is_degraded,
+                                },
+                            }).await;
+                        }
+                        Err(e) => {
+                            let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                session_gen: gen,
+                                event: ActorEvent::CommandResult {
+                                    cmd_id,
+                                    ok: false,
+                                    data: None,
+                                    error_code: Some("PolicyRefreshFailed".into()),
+                                    error: Some(e),
+                                },
+                            }).await;
+                        }
+                    }
+                }
+                // P0-1: Break immediately when action_rx closes (None)!
+                act = action_rx.recv() => {
+                    let Some(action) = act else {
+                        break "action_channel_closed".into();
+                    };
                     match action {
                         SessionAction::SetAudioMute(m) => {
                             audio_muted = m;
@@ -2453,218 +3791,222 @@ async fn run_active_host_session(
                         SessionAction::SendFile { cmd_id, path, rel_name } => {
                             let tid = next_transfer_id;
                             next_transfer_id += 1;
-                            let res = send_file_over_session(host_sess.session_mut(), tid, &path, &rel_name, &effective_policy, gen, &actor_tx).await;
-                            emit_file_cmd_result(gen, cmd_id, &actor_tx, res).await;
+                            outbound_files.start_transfer(
+                                host_sess.session_mut(),
+                                tid,
+                                cmd_id,
+                                path,
+                                rel_name,
+                                &effective_policy,
+                                gen,
+                                &actor_tx,
+                            ).await;
+                        }
+                        SessionAction::CancelFile { transfer_id } => {
+                            outbound_files.cancel_transfer(host_sess.session_mut(), transfer_id, gen, &actor_tx).await;
                         }
                         SessionAction::RefreshPolicy { cmd_id } => {
-                            match refresh_policy_from_cp(cfg).await {
-                                Ok(new_pol) => {
-                                    effective_policy = new_pol.clone();
-                                    allow_clip_flag.store(effective_policy.allow_clipboard(), Ordering::Release);
-                                    audio_gate = AudioChannelGate::from_policy(&effective_policy);
-                                    audio_gate.set_muted(audio_muted);
-                                    clip_receiver.update_policy(effective_policy.clone());
-                                    file_receiver.update_policy(effective_policy.clone());
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::PolicyUpdated { cmd_id: Some(cmd_id), policy: new_pol },
-                                    }).await;
-                                }
-                                Err(e) => {
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::CommandResult {
-                                            cmd_id,
-                                            ok: false,
-                                            data: None,
-                                            error_code: Some("PolicyRefreshFailed".into()),
-                                            error: Some(e),
-                                        },
-                                    }).await;
-                                }
-                            }
+                            let cfg_c = cfg.clone();
+                            let cancel_c = cancel.clone();
+                            let pol_tx_c = pol_tx.clone();
+                            tokio::spawn(async move {
+                                let res = refresh_policy_from_cp(&cfg_c, &cancel_c).await;
+                                let _ = pol_tx_c.send((cmd_id, res)).await;
+                            });
                         }
                         SessionAction::SendHid(_) => {}
                     }
                 }
-            }
-            _ = video_tick.tick() => {
-                if let Ok(raw) = capture.capture_frame() {
-                    let i420_res = if adapters.use_os_capture {
-                        convert_captured_stride_to_i420(&raw)
-                    } else {
-                        raw_captured_to_i420(&raw)
-                    };
-                    if let Ok(i420) = i420_res {
-                        pts_ms += frame_period.as_millis() as i64;
-                        let _ = host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await;
+                _ = file_tick.tick(), if outbound_files.has_active() => {
+                    outbound_files.pump_one_step(host_sess.session_mut(), gen, &actor_tx).await;
+                }
+                _ = video_tick.tick() => {
+                    if let Ok(raw) = capture.capture_frame() {
+                        let i420_res = if adapters.use_os_capture {
+                            convert_captured_stride_to_i420(&raw)
+                        } else {
+                            raw_captured_to_i420(&raw)
+                        };
+                        if let Ok(i420) = i420_res {
+                            pts_ms += frame_period.as_millis() as i64;
+                            let _ = host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await;
+                        }
                     }
                 }
-            }
-            _ = audio_tick.tick() => {
-                if !audio_muted && audio_gate.check_allowed().unwrap_or(false) {
-                    if let Some(enc) = audio_enc.as_mut() {
-                        let pcm_opt: Option<Vec<f32>> = if adapters.use_os_audio {
-                            let mut pcm = vec![0.0f32; AUDIO_FRAME_SAMPLES_PER_CH * 2];
-                            if os_audio_cap.read_frame(&mut pcm).unwrap_or(false) {
-                                Some(pcm)
+                _ = audio_tick.tick() => {
+                    if !audio_muted && audio_gate.check_allowed().unwrap_or(false) {
+                        if let Some(enc) = audio_enc.as_mut() {
+                            let pcm_opt: Option<Vec<f32>> = if adapters.use_os_audio {
+                                let mut pcm = vec![0.0f32; AUDIO_FRAME_SAMPLES_PER_CH * 2];
+                                if os_audio_cap.read_frame(&mut pcm).unwrap_or(false) {
+                                    Some(pcm)
+                                } else {
+                                    None
+                                }
+                            } else if let Some(src) = synth_audio.as_mut() {
+                                if let Some(frame) = src.next_frame() {
+                                    Some(frame)
+                                } else {
+                                    synth_audio = SyntheticMultiToneSource::new(2, 15, 25, 15).ok();
+                                    synth_audio.as_mut().and_then(|s| s.next_frame())
+                                }
                             } else {
                                 None
-                            }
-                        } else if let Some(src) = synth_audio.as_mut() {
-                            if let Some(frame) = src.next_frame() {
-                                Some(frame)
-                            } else {
-                                synth_audio = SyntheticMultiToneSource::new(2, 15, 25, 15).ok();
-                                synth_audio.as_mut().and_then(|s| s.next_frame())
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(pcm) = pcm_opt {
-                            if let Ok(encoded) = enc.encode_frame(&pcm) {
-                                let ts = audio_ts_u32;
-                                audio_ts_u32 = audio_ts_u32.wrapping_add(AUDIO_FRAME_SAMPLES_PER_CH as u32);
-                                let _ = host_sess.session_mut().send_audio(&AudioPacket {
-                                    ts,
-                                    dtx: encoded.dtx,
-                                    payload: bytes::Bytes::from(encoded.payload),
-                                }).await;
+                            };
+                            if let Some(pcm) = pcm_opt {
+                                if let Ok(encoded) = enc.encode_frame(&pcm) {
+                                    let ts = audio_ts_u32;
+                                    audio_ts_u32 = audio_ts_u32.wrapping_add(AUDIO_FRAME_SAMPLES_PER_CH as u32);
+                                    let _ = host_sess.session_mut().send_audio(&AudioPacket {
+                                        ts,
+                                        dtx: encoded.dtx,
+                                        payload: bytes::Bytes::from(encoded.payload),
+                                    }).await;
+                                }
                             }
                         }
                     }
                 }
-            }
-            _ = clip_tick.tick() => {
-                if let Ok(Some(item)) = clip_poller.poll_once() {
-                    let bytes = item.text.into_bytes();
-                    let cid = next_clip_id;
-                    next_clip_id += 1;
-                    let paused = host_sess.session().is_bulk_paused();
-                    if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, CLIP_MIME_TEXT_UTF8, &bytes, cid, cid, paused) {
-                        if let Ok(sync_bytes) = xfer.sync.encode() {
-                            let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
-                        }
-                        for ch in &xfer.chunks {
-                            if let Ok(enc) = ch.encode() {
-                                let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
+                _ = clip_tick.tick() => {
+                    if let Ok(Some(item)) = clip_poller.poll_once() {
+                        let bytes = item.text.into_bytes();
+                        let cid = next_clip_id;
+                        next_clip_id += 1;
+                        let paused = host_sess.session().is_bulk_paused();
+                        if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, CLIP_MIME_TEXT_UTF8, &bytes, cid, cid, paused) {
+                            if let Ok(sync_bytes) = xfer.sync.encode() {
+                                let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
+                            }
+                            for ch in &xfer.chunks {
+                                if let Ok(enc) = ch.encode() {
+                                    let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
+                                }
                             }
                         }
                     }
                 }
-            }
-            recv_res = host_sess.session_mut().recv_v124_event(Duration::from_millis(25)) => {
-                match recv_res {
-                    Ok(ev) => {
-                        last_peer_activity = Instant::now();
-                        match ev {
-                            V2RecvEvent::Transport(TransportEvent::Hid(frame)) => {
-                                if let Ok(payload) = decode_hid_frame(&frame) {
-                                    match payload {
-                                        HidPayload::Key(k) => { let _ = hid_sink.send_key(&k); }
-                                        HidPayload::Mouse(m) => { let _ = hid_sink.send_mouse(&m); }
-                                        HidPayload::EchoAck(_) => {}
-                                    }
-                                }
-                            }
-                            V2RecvEvent::Transport(TransportEvent::Control(ctrl)) => {
-                                if let Some(code) = parse_session_close(&ctrl) {
-                                    end_reason = format!("peer_closed({code:#06x})");
-                                    break;
-                                }
-                            }
-                            V2RecvEvent::ClipboardRaw(raw) => {
-                                match clip_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut clip_err_counter) {
-                                    ClipboardRecvAction::SendAck(ack) => {
-                                        if let Ok(enc) = ack.encode() {
-                                            let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
+                recv_res = host_sess.session_mut().recv_v124_event(Duration::from_millis(25)) => {
+                    match recv_res {
+                        Ok(ev) => {
+                            last_peer_activity = Instant::now();
+                            match ev {
+                                V2RecvEvent::Transport(TransportEvent::Hid(frame)) => {
+                                    if let Ok(payload) = decode_hid_frame(&frame) {
+                                        match payload {
+                                            HidPayload::Key(k) => { let _ = hid_sink.send_key(&k); }
+                                            HidPayload::Mouse(m) => { let _ = hid_sink.send_mouse(&m); }
+                                            HidPayload::EchoAck(_) => {}
                                         }
                                     }
-                                    ClipboardRecvAction::DeliverAndAck { delivered, ack } => {
-                                        if let Ok(enc) = ack.encode() {
-                                            let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
-                                        }
-                                        if delivered.mime_kind == CLIP_MIME_TEXT_UTF8 {
-                                            if let Ok(s) = std::str::from_utf8(&delivered.payload) {
-                                                let _ = clip_poller.apply_remote_text(s);
+                                }
+                                V2RecvEvent::Transport(TransportEvent::Control(ctrl)) => {
+                                    if let Some(code) = parse_session_close(&ctrl) {
+                                        break format!("peer_closed({code:#06x})");
+                                    }
+                                }
+                                V2RecvEvent::ClipboardRaw(raw) => {
+                                    match clip_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut clip_err_counter) {
+                                        ClipboardRecvAction::SendAck(ack) => {
+                                            if let Ok(enc) = ack.encode() {
+                                                let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
                                             }
                                         }
-                                        let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                            session_gen: gen,
-                                            event: ActorEvent::ClipboardReceived {
-                                                mime_kind: delivered.mime_kind,
-                                                bytes: delivered.payload.len(),
-                                                sha256_hex: hex::encode(delivered.sha256),
-                                            },
-                                        }).await;
+                                        ClipboardRecvAction::DeliverAndAck { delivered, ack } => {
+                                            if let Ok(enc) = ack.encode() {
+                                                let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
+                                            }
+                                            if delivered.mime_kind == CLIP_MIME_TEXT_UTF8 {
+                                                if let Ok(s) = std::str::from_utf8(&delivered.payload) {
+                                                    let _ = clip_poller.apply_remote_text(s);
+                                                }
+                                            }
+                                            let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                                session_gen: gen,
+                                                event: ActorEvent::ClipboardReceived {
+                                                    mime_kind: delivered.mime_kind,
+                                                    byte_count: delivered.payload.len(),
+                                                    sha256_hex: hex::encode(delivered.sha256),
+                                                },
+                                            }).await;
+                                        }
+                                        ClipboardRecvAction::SessionFatal(reason) => {
+                                            break format!("clipboard_fatal: {reason}");
+                                        }
+                                        ClipboardRecvAction::None => {}
                                     }
-                                    ClipboardRecvAction::SessionFatal(reason) => {
-                                        end_reason = format!("clipboard_fatal: {reason}");
-                                        break;
-                                    }
-                                    ClipboardRecvAction::None => {}
                                 }
-                            }
-                            V2RecvEvent::FileTransferRaw(raw) => {
-                                match file_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut file_err_counter) {
-                                    FileRecvAction::SendAccept(acc) => {
-                                        if let Ok(enc) = acc.encode() {
-                                            let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &enc).await;
+                                V2RecvEvent::FileTransferRaw(raw) => {
+                                    match decode_file_l4(&raw.header, &raw.body) {
+                                        Ok(FileMessage::CompleteAck(cack)) => {
+                                            outbound_files.handle_complete_ack(cack.transfer_id, cack.status, gen, &actor_tx).await;
+                                        }
+                                        Ok(FileMessage::Abort(ab)) => {
+                                            outbound_files.handle_remote_abort(ab.transfer_id, ab.error_code, gen, &actor_tx).await;
+                                        }
+                                        _ => {
+                                            match file_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut file_err_counter) {
+                                                FileRecvAction::SendAccept(acc) => {
+                                                    if let Ok(enc) = acc.encode() {
+                                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &enc).await;
+                                                    }
+                                                }
+                                                FileRecvAction::SendAck(ack) => {
+                                                    if let Ok(enc) = ack.encode() {
+                                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &enc).await;
+                                                    }
+                                                }
+                                                FileRecvAction::SendCompleteAck { ack, saved_path, audit } => {
+                                                    if let Ok(enc) = ack.encode() {
+                                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_COMPLETE_ACK, 0, false, &enc).await;
+                                                    }
+                                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                                        session_gen: gen,
+                                                        event: ActorEvent::FileComplete {
+                                                            transfer_id: audit.transfer_id,
+                                                            rel_name: audit.rel_name,
+                                                            bytes: audit.file_size,
+                                                            sha256_hex: audit.sha256_hex,
+                                                            saved_path: saved_path.map(|p| p.display().to_string()),
+                                                        },
+                                                    }).await;
+                                                }
+                                                FileRecvAction::SendAbort(ab) => {
+                                                    let enc = ab.encode();
+                                                    let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &enc).await;
+                                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                                        session_gen: gen,
+                                                        event: ActorEvent::FileAborted {
+                                                            transfer_id: ab.transfer_id,
+                                                            error_code: ab.error_code,
+                                                            reason: format!("error_code={:#06x}", ab.error_code),
+                                                        },
+                                                    }).await;
+                                                }
+                                                FileRecvAction::SessionFatal(reason) => {
+                                                    break format!("file_fatal: {reason}");
+                                                }
+                                                FileRecvAction::None => {}
+                                            }
                                         }
                                     }
-                                    FileRecvAction::SendAck(ack) => {
-                                        if let Ok(enc) = ack.encode() {
-                                            let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &enc).await;
-                                        }
-                                    }
-                                    FileRecvAction::SendCompleteAck { ack, saved_path, audit } => {
-                                        if let Ok(enc) = ack.encode() {
-                                            let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_COMPLETE_ACK, 0, false, &enc).await;
-                                        }
-                                        let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                            session_gen: gen,
-                                            event: ActorEvent::FileComplete {
-                                                transfer_id: audit.transfer_id,
-                                                rel_name: audit.rel_name,
-                                                bytes: audit.file_size,
-                                                sha256_hex: audit.sha256_hex,
-                                                saved_path: saved_path.map(|p| p.display().to_string()),
-                                            },
-                                        }).await;
-                                    }
-                                    FileRecvAction::SendAbort(ab) => {
-                                        let enc = ab.encode();
-                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &enc).await;
-                                        let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                            session_gen: gen,
-                                            event: ActorEvent::FileAborted {
-                                                transfer_id: ab.transfer_id,
-                                                error_code: ab.error_code,
-                                                reason: format!("error_code={:#06x}", ab.error_code),
-                                            },
-                                        }).await;
-                                    }
-                                    FileRecvAction::SessionFatal(reason) => {
-                                        end_reason = format!("file_fatal: {reason}");
-                                        break;
-                                    }
-                                    FileRecvAction::None => {}
                                 }
+                                V2RecvEvent::Transport(_) | V2RecvEvent::AudioRaw(_) => {}
                             }
-                            V2RecvEvent::Transport(_) | V2RecvEvent::AudioRaw(_) => {}
                         }
-                    }
-                    Err(v2_client::ClientError::Timeout(_)) => {}
-                    Err(e) => {
-                        end_reason = format!("transport_error: {e}");
-                        break;
+                        Err(v2_client::ClientError::Timeout(_)) => {}
+                        Err(e) => {
+                            break format!("transport_error: {e}");
+                        }
                     }
                 }
             }
         }
-    }
+    };
 
-    // Mandatory synchronous release_all BEFORE teardown completes!
+    // Abort any in-flight outbound file transfers, release all keys, send close, shut down lease.
+    outbound_files
+        .abort_all_on_teardown(host_sess.session_mut(), gen, &actor_tx)
+        .await;
     let _ = releaser.release_all_keys();
     let _ = send_redundant_session_close_3x(host_sess.session_mut(), 0).await;
     let _ = accepted.lease_renewal.shutdown().await;
@@ -2681,14 +4023,18 @@ async fn run_controller_lifecycle_task(
     actor_tx: mpsc::Sender<ActorMessage>,
     mailbox: Arc<FrameMailbox>,
     events: Arc<BridgeEventHub>,
+    dropped_events: Arc<AtomicU64>,
     use_os_audio: bool,
     use_os_clipboard: bool,
     mem_clip: MemoryClipboardBackend,
     download_dir: PathBuf,
+    #[cfg(feature = "e2e-fault-injection")] silent_blackhole: Option<Arc<AtomicBool>>,
 ) {
     let cb = Arc::new(BridgeUiCallback {
         session_gen: gen,
         actor_tx: actor_tx.clone(),
+        events: Arc::clone(&events),
+        dropped_events,
     });
     let dispatcher = UiCallbackDispatcher::spawn(cb);
 
@@ -2708,7 +4054,7 @@ async fn run_controller_lifecycle_task(
         }
     };
 
-    let connected = tokio::select! {
+    let mut connected = tokio::select! {
         _ = cancel.cancelled() => return,
         res = client.dial(target_device_id, None, Duration::from_secs(20)) => match res {
             Ok(c) => c,
@@ -2727,21 +4073,31 @@ async fn run_controller_lifecycle_task(
     let allow_clip_flag = Arc::new(AtomicBool::new(effective_policy.allow_clipboard()));
     let mut audio_muted = false;
 
-    let _ = actor_tx
+    // P0-1: Check StreamingStarted delivery — never start a headless zombie controller loop!
+    if actor_tx
         .send(ActorMessage::InternalEvent {
             session_gen: gen,
             event: ActorEvent::StreamingStarted {
                 cmd_id: Some(cmd_id),
                 session_id: connected.session_id,
-                peer_device_id: connected.target_device_id,
-                tenant_id: connected.tenant_id,
+                local_cert: Box::new(connected.local_cert.clone()),
+                peer_cert: Box::new(connected.peer_cert.clone()),
                 policy: effective_policy.clone(),
                 active_mode: connected.active_transport_mode,
                 attach_ms: connected.transport_attach_ms,
                 action_tx,
             },
         })
-        .await;
+        .await
+        .is_err()
+    {
+        let _ = connected
+            .e2ee_session
+            .send_control(CTRL_MSG_SESSION_CLOSE, &0u16.to_be_bytes())
+            .await;
+        let _ = connected.lease_renewal.shutdown().await;
+        return;
+    }
 
     let mut decoder = match V2VideoDecoder::new(cfg.codec) {
         Ok(d) => d,
@@ -2795,7 +4151,11 @@ async fn run_controller_lifecycle_task(
     let _ = std::fs::create_dir_all(&download_dir);
     let mut file_receiver = FileTransferReceiver::new(effective_policy.clone(), download_dir);
     let mut file_err_counter = ChannelFramingErrorCounter::new();
+    let mut outbound_files = OutboundFileManager::new();
     let mut next_transfer_id: u64 = 1;
+
+    let (pol_tx, mut pol_rx) =
+        mpsc::channel::<(u64, Result<(EffectiveTenantPolicy, bool), String>)>(4);
 
     let mut ka_tick = tokio::time::interval(connected.keepalive_interval);
     ka_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2803,70 +4163,63 @@ async fn run_controller_lifecycle_task(
     clip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut qoe_tick = tokio::time::interval(Duration::from_millis(500));
     qoe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut file_tick = tokio::time::interval(Duration::from_millis(2));
+    file_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut lease_expired_rx = connected.lease_renewal.subscribe_expired();
-    let end_reason: String;
     let mut video_frames_decoded: u64 = 0;
 
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                end_reason = "local_cancel".into();
-                break;
-            }
-            _ = lease_expired_rx.changed() => {
-                if lease_expired_rx.borrow().is_some() {
-                    end_reason = "lease_expired".into();
-                    break;
+    let is_blackholed = || -> bool {
+        #[cfg(feature = "e2e-fault-injection")]
+        {
+            silent_blackhole
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Acquire))
+        }
+        #[cfg(not(feature = "e2e-fault-injection"))]
+        {
+            false
+        }
+    };
+
+    // P0-2: Check pre-latched lease expiry BEFORE entering the select loop!
+    let end_reason: String = if lease_expired_rx.borrow().is_some() {
+        "lease_expired".into()
+    } else {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break "local_cancel".into();
                 }
-            }
-            _ = ka_tick.tick() => {
-                let _ = ctrl_sess.ping_keepalive(Duration::from_millis(500)).await;
-            }
-            _ = qoe_tick.tick() => {
-                let _ = actor_tx.try_send(ActorMessage::InternalEvent {
-                    session_gen: gen,
-                    event: ActorEvent::QoeTelemetry(serde_json::json!({
+                // P0-2: Treat both Err(_) (sender dropped) and Some(_) as fail-closed lease_expired!
+                res = lease_expired_rx.changed() => {
+                    if res.is_err() || lease_expired_rx.borrow().is_some() {
+                        break "lease_expired".into();
+                    }
+                }
+                _ = ka_tick.tick() => {
+                    if !is_blackholed() {
+                        let _ = ctrl_sess.ping_keepalive(Duration::from_millis(500)).await;
+                    }
+                }
+                _ = qoe_tick.tick() => {
+                    // Direct single-slot overwrite telemetry (never enters actor control channel).
+                    events.set_telemetry("QoeTelemetry", serde_json::json!({
                         "video_frames_decoded": video_frames_decoded,
                         "dropped_ui_frames": mailbox.dropped_ui_frames(),
                         "audio_frames_decoded": audio_frames_decoded,
                         "audio_dtx_frames": audio_dtx_frames,
                         "active_transport_mode": ctrl_sess.active_transport_mode().label(),
-                    })),
-                });
-            }
-            _ = clip_tick.tick() => {
-                if let Ok(Some(item)) = clip_poller.poll_once() {
-                    let bytes = item.text.into_bytes();
-                    let cid = next_clip_id;
-                    next_clip_id += 1;
-                    let paused = ctrl_sess.is_bulk_paused();
-                    if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, CLIP_MIME_TEXT_UTF8, &bytes, cid, cid, paused) {
-                        if let Ok(sync_bytes) = xfer.sync.encode() {
-                            let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
-                        }
-                        for ch in &xfer.chunks {
-                            if let Ok(enc) = ch.encode() {
-                                let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
-                            }
-                        }
-                    }
+                    }));
                 }
-            }
-            act = action_rx.recv() => {
-                if let Some(action) = act {
-                    match action {
-                        SessionAction::SetAudioMute(m) => { audio_muted = m; }
-                        SessionAction::SendHid(payload) => {
-                            if let Ok(frame) = encode_hid_frame(&payload) {
-                                let _ = ctrl_sess.send_hid(&frame).await;
-                            }
-                        }
-                        SessionAction::SendClipboard { mime_kind, bytes } => {
+                _ = clip_tick.tick() => {
+                    if !is_blackholed() {
+                        if let Ok(Some(item)) = clip_poller.poll_once() {
+                            let bytes = item.text.into_bytes();
                             let cid = next_clip_id;
                             next_clip_id += 1;
                             let paused = ctrl_sess.is_bulk_paused();
-                            if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, mime_kind, &bytes, cid, cid, paused) {
+                            if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, CLIP_MIME_TEXT_UTF8, &bytes, cid, cid, paused) {
                                 if let Ok(sync_bytes) = xfer.sync.encode() {
                                     let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
                                 }
@@ -2877,206 +4230,243 @@ async fn run_controller_lifecycle_task(
                                 }
                             }
                         }
-                        SessionAction::SendFile { cmd_id, path, rel_name } => {
-                            let tid = next_transfer_id;
-                            next_transfer_id += 1;
-                            let res = send_file_over_session(&mut ctrl_sess, tid, &path, &rel_name, &effective_policy, gen, &actor_tx).await;
-                            emit_file_cmd_result(gen, cmd_id, &actor_tx, res).await;
-                        }
-                        SessionAction::RefreshPolicy { cmd_id } => {
-                            match refresh_policy_from_cp(&cfg).await {
-                                Ok(new_pol) => {
-                                    effective_policy = new_pol.clone();
-                                    allow_clip_flag.store(effective_policy.allow_clipboard(), Ordering::Release);
-                                    clip_receiver.update_policy(effective_policy.clone());
-                                    file_receiver.update_policy(effective_policy.clone());
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::PolicyUpdated { cmd_id: Some(cmd_id), policy: new_pol },
-                                    }).await;
-                                }
-                                Err(e) => {
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::CommandResult {
-                                            cmd_id,
-                                            ok: false,
-                                            data: None,
-                                            error_code: Some("PolicyRefreshFailed".into()),
-                                            error: Some(e),
-                                        },
-                                    }).await;
-                                }
+                    }
+                }
+                Some((cmd_id, res)) = pol_rx.recv() => {
+                    match res {
+                        Ok((new_pol, is_degraded)) => {
+                            let now = now_unix_secs();
+                            if should_accept_policy_update(Some(&effective_policy), &new_pol, now).is_ok() {
+                                effective_policy = new_pol.clone();
+                                allow_clip_flag.store(effective_policy.allow_clipboard(), Ordering::Release);
+                                clip_receiver.update_policy(effective_policy.clone());
+                                file_receiver.update_policy(effective_policy.clone());
                             }
+                            let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                session_gen: gen,
+                                event: ActorEvent::PolicyUpdated {
+                                    cmd_id: Some(cmd_id),
+                                    policy: new_pol,
+                                    is_degraded,
+                                },
+                            }).await;
+                        }
+                        Err(e) => {
+                            let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                session_gen: gen,
+                                event: ActorEvent::CommandResult {
+                                    cmd_id,
+                                    ok: false,
+                                    data: None,
+                                    error_code: Some("PolicyRefreshFailed".into()),
+                                    error: Some(e),
+                                },
+                            }).await;
                         }
                     }
                 }
-            }
-            recv_res = ctrl_sess.recv_v124_event(Duration::from_millis(25)) => {
-                match recv_res {
-                    Ok(V2RecvEvent::Transport(TransportEvent::VideoFrame(vf))) => {
-                        if let Ok(i420) = decoder.decode_raw(&vf.data) {
-                            video_frames_decoded += 1;
-                            if mailbox.publish_i420(&i420, PixelFormat::Bgra8, now_epoch_ms()).is_ok() {
-                                events.notify_frame_published();
-                            }
-                        }
-                    }
-                    Ok(V2RecvEvent::AudioRaw(raw)) => {
-                        if !audio_muted && effective_policy.allow_audio() {
-                            if let Ok(wire) = OpusWireFrame::decode(&raw.body) {
-                                if wire.dtx {
-                                    audio_dtx_frames += 1;
-                                }
-                                let _ = audio_jitter.push(wire);
-                                if let Some(dec) = audio_dec.as_mut() {
-                                    let action = audio_jitter.pop_playout();
-                                    if let Ok(pcm) = dec.execute_playout(action) {
-                                        audio_frames_decoded += 1;
-                                        let _ = os_audio_out.write_frame(&pcm);
-                                    }
+                // P0-1: Break immediately when action_rx closes (None)!
+                act = action_rx.recv() => {
+                    let Some(action) = act else {
+                        break "action_channel_closed".into();
+                    };
+                    match action {
+                        SessionAction::SetAudioMute(m) => { audio_muted = m; }
+                        SessionAction::SendHid(payload) => {
+                            if !is_blackholed() {
+                                if let Ok(frame) = encode_hid_frame(&payload) {
+                                    let _ = ctrl_sess.send_hid(&frame).await;
                                 }
                             }
                         }
-                    }
-                    Ok(V2RecvEvent::ClipboardRaw(raw)) => {
-                        if let Ok(ClipMessage::Ack(ack)) = decode_clipboard_l4(&raw.header, &raw.body) {
-                            if ack.status != CLIP_ACK_OK {
-                                let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                    session_gen: gen,
-                                    event: ActorEvent::SecurityEvent(SecurityEvent::PolicyDegraded {
-                                        reason: format!("remote clipboard ack status={}", ack.status),
-                                    }),
-                                }).await;
-                            }
-                        } else {
-                            match clip_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut clip_err_counter) {
-                                ClipboardRecvAction::SendAck(ack) => {
-                                    if let Ok(enc) = ack.encode() {
-                                        let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
+                        SessionAction::SendClipboard { mime_kind, bytes } => {
+                            if !is_blackholed() {
+                                let cid = next_clip_id;
+                                next_clip_id += 1;
+                                let paused = ctrl_sess.is_bulk_paused();
+                                if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, mime_kind, &bytes, cid, cid, paused) {
+                                    if let Ok(sync_bytes) = xfer.sync.encode() {
+                                        let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
                                     }
-                                }
-                                ClipboardRecvAction::DeliverAndAck { delivered, ack } => {
-                                    if let Ok(enc) = ack.encode() {
-                                        let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
-                                    }
-                                    if delivered.mime_kind == CLIP_MIME_TEXT_UTF8 {
-                                        if let Ok(s) = std::str::from_utf8(&delivered.payload) {
-                                            let _ = clip_poller.apply_remote_text(s);
+                                    for ch in &xfer.chunks {
+                                        if let Ok(enc) = ch.encode() {
+                                            let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
                                         }
                                     }
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::ClipboardReceived {
-                                            mime_kind: delivered.mime_kind,
-                                            bytes: delivered.payload.len(),
-                                            sha256_hex: hex::encode(delivered.sha256),
-                                        },
-                                    }).await;
                                 }
-                                ClipboardRecvAction::SessionFatal(reason) => {
-                                    end_reason = format!("clipboard_fatal: {reason}");
-                                    break;
-                                }
-                                ClipboardRecvAction::None => {}
                             }
                         }
+                        SessionAction::SendFile { cmd_id, path, rel_name } => {
+                            let tid = next_transfer_id;
+                            next_transfer_id += 1;
+                            outbound_files.start_transfer(
+                                &mut ctrl_sess,
+                                tid,
+                                cmd_id,
+                                path,
+                                rel_name,
+                                &effective_policy,
+                                gen,
+                                &actor_tx,
+                            ).await;
+                        }
+                        SessionAction::CancelFile { transfer_id } => {
+                            outbound_files.cancel_transfer(&mut ctrl_sess, transfer_id, gen, &actor_tx).await;
+                        }
+                        SessionAction::RefreshPolicy { cmd_id } => {
+                            let cfg_c = cfg.clone();
+                            let cancel_c = cancel.clone();
+                            let pol_tx_c = pol_tx.clone();
+                            tokio::spawn(async move {
+                                let res = refresh_policy_from_cp(&cfg_c, &cancel_c).await;
+                                let _ = pol_tx_c.send((cmd_id, res)).await;
+                            });
+                        }
                     }
-                    Ok(V2RecvEvent::FileTransferRaw(raw)) => {
-                        match decode_file_l4(&raw.header, &raw.body) {
-                            Ok(FileMessage::CompleteAck(cack)) => {
-                                if cack.status == FILE_COMPLETE_ACK_OK {
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::FileComplete {
-                                            transfer_id: cack.transfer_id,
-                                            rel_name: String::new(),
-                                            bytes: 0,
-                                            sha256_hex: String::new(),
-                                            saved_path: None,
-                                        },
-                                    }).await;
-                                } else {
-                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::FileAborted {
-                                            transfer_id: cack.transfer_id,
-                                            error_code: cack.status as u16,
-                                            reason: format!("remote complete_ack status={}", cack.status),
-                                        },
-                                    }).await;
+                }
+                _ = file_tick.tick(), if outbound_files.has_active() => {
+                    outbound_files.pump_one_step(&mut ctrl_sess, gen, &actor_tx).await;
+                }
+                recv_res = ctrl_sess.recv_v124_event(Duration::from_millis(25)) => {
+                    match recv_res {
+                        Ok(V2RecvEvent::Transport(TransportEvent::VideoFrame(vf))) => {
+                            if let Ok(i420) = decoder.decode_raw(&vf.data) {
+                                video_frames_decoded += 1;
+                                if mailbox.publish_i420(&i420, PixelFormat::Bgra8, now_epoch_ms()).is_ok() {
+                                    events.notify_frame_published();
                                 }
                             }
-                            Ok(FileMessage::Abort(ab)) => {
-                                let _ = actor_tx.send(ActorMessage::InternalEvent {
-                                    session_gen: gen,
-                                    event: ActorEvent::FileAborted {
-                                        transfer_id: ab.transfer_id,
-                                        error_code: ab.error_code,
-                                        reason: format!("remote abort {:#06x}", ab.error_code),
-                                    },
-                                }).await;
-                            }
-                            _ => {
-                                match file_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut file_err_counter) {
-                                    FileRecvAction::SendAccept(acc) => {
-                                        if let Ok(enc) = acc.encode() {
-                                            let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &enc).await;
+                        }
+                        Ok(V2RecvEvent::AudioRaw(raw)) => {
+                            if !audio_muted && effective_policy.allow_audio() {
+                                if let Ok(wire) = OpusWireFrame::decode(&raw.body) {
+                                    if wire.dtx {
+                                        audio_dtx_frames += 1;
+                                    }
+                                    let _ = audio_jitter.push(wire);
+                                    if let Some(dec) = audio_dec.as_mut() {
+                                        let action = audio_jitter.pop_playout();
+                                        if let Ok(pcm) = dec.execute_playout(action) {
+                                            audio_frames_decoded += 1;
+                                            let _ = os_audio_out.write_frame(&pcm);
                                         }
                                     }
-                                    FileRecvAction::SendAck(ack) => {
+                                }
+                            }
+                        }
+                        Ok(V2RecvEvent::ClipboardRaw(raw)) => {
+                            if let Ok(ClipMessage::Ack(ack)) = decode_clipboard_l4(&raw.header, &raw.body) {
+                                if ack.status != CLIP_ACK_OK {
+                                    let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::SecurityEvent(SecurityEvent::PolicyDegraded {
+                                            reason: format!("remote clipboard ack status={}", ack.status),
+                                        }),
+                                    }).await;
+                                }
+                            } else {
+                                match clip_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut clip_err_counter) {
+                                    ClipboardRecvAction::SendAck(ack) => {
                                         if let Ok(enc) = ack.encode() {
-                                            let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &enc).await;
+                                            let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
                                         }
                                     }
-                                    FileRecvAction::SendCompleteAck { ack, saved_path, audit } => {
+                                    ClipboardRecvAction::DeliverAndAck { delivered, ack } => {
                                         if let Ok(enc) = ack.encode() {
-                                            let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_COMPLETE_ACK, 0, false, &enc).await;
+                                            let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_ACK, 0, false, &enc).await;
+                                        }
+                                        if delivered.mime_kind == CLIP_MIME_TEXT_UTF8 {
+                                            if let Ok(s) = std::str::from_utf8(&delivered.payload) {
+                                                let _ = clip_poller.apply_remote_text(s);
+                                            }
                                         }
                                         let _ = actor_tx.send(ActorMessage::InternalEvent {
                                             session_gen: gen,
-                                            event: ActorEvent::FileComplete {
-                                                transfer_id: audit.transfer_id,
-                                                rel_name: audit.rel_name,
-                                                bytes: audit.file_size,
-                                                sha256_hex: audit.sha256_hex,
-                                                saved_path: saved_path.map(|p| p.display().to_string()),
+                                            event: ActorEvent::ClipboardReceived {
+                                                mime_kind: delivered.mime_kind,
+                                                byte_count: delivered.payload.len(),
+                                                sha256_hex: hex::encode(delivered.sha256),
                                             },
                                         }).await;
                                     }
-                                    FileRecvAction::SendAbort(ab) => {
-                                        let enc = ab.encode();
-                                        let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &enc).await;
+                                    ClipboardRecvAction::SessionFatal(reason) => {
+                                        break format!("clipboard_fatal: {reason}");
                                     }
-                                    FileRecvAction::SessionFatal(reason) => {
-                                        end_reason = format!("file_fatal: {reason}");
-                                        break;
-                                    }
-                                    FileRecvAction::None => {}
+                                    ClipboardRecvAction::None => {}
                                 }
                             }
                         }
-                    }
-                    Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
-                        if let Some(code) = parse_session_close(&ctrl) {
-                            end_reason = format!("peer_closed({code:#06x})");
-                            break;
+                        Ok(V2RecvEvent::FileTransferRaw(raw)) => {
+                            match decode_file_l4(&raw.header, &raw.body) {
+                                Ok(FileMessage::CompleteAck(cack)) => {
+                                    outbound_files.handle_complete_ack(cack.transfer_id, cack.status, gen, &actor_tx).await;
+                                }
+                                Ok(FileMessage::Abort(ab)) => {
+                                    outbound_files.handle_remote_abort(ab.transfer_id, ab.error_code, gen, &actor_tx).await;
+                                }
+                                _ => {
+                                    match file_receiver.on_l4_frame(&raw.header, &raw.body, Instant::now(), &mut file_err_counter) {
+                                        FileRecvAction::SendAccept(acc) => {
+                                            if let Ok(enc) = acc.encode() {
+                                                let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACCEPT, 0, false, &enc).await;
+                                            }
+                                        }
+                                        FileRecvAction::SendAck(ack) => {
+                                            if let Ok(enc) = ack.encode() {
+                                                let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ACK, 0, false, &enc).await;
+                                            }
+                                        }
+                                        FileRecvAction::SendCompleteAck { ack, saved_path, audit } => {
+                                            if let Ok(enc) = ack.encode() {
+                                                let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_COMPLETE_ACK, 0, false, &enc).await;
+                                            }
+                                            let _ = actor_tx.send(ActorMessage::InternalEvent {
+                                                session_gen: gen,
+                                                event: ActorEvent::FileComplete {
+                                                    transfer_id: audit.transfer_id,
+                                                    rel_name: audit.rel_name,
+                                                    bytes: audit.file_size,
+                                                    sha256_hex: audit.sha256_hex,
+                                                    saved_path: saved_path.map(|p| p.display().to_string()),
+                                                },
+                                            }).await;
+                                        }
+                                        FileRecvAction::SendAbort(ab) => {
+                                            let enc = ab.encode();
+                                            let _ = ctrl_sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &enc).await;
+                                        }
+                                        FileRecvAction::SessionFatal(reason) => {
+                                            break format!("file_fatal: {reason}");
+                                        }
+                                        FileRecvAction::None => {}
+                                    }
+                                }
+                            }
                         }
-                    }
-                    Ok(V2RecvEvent::Transport(_)) => {}
-                    Err(v2_client::ClientError::Timeout(_)) => {}
-                    Err(e) => {
-                        end_reason = format!("transport_error: {e}");
-                        break;
+                        Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
+                            if let Some(code) = parse_session_close(&ctrl) {
+                                break format!("peer_closed({code:#06x})");
+                            }
+                        }
+                        Ok(V2RecvEvent::Transport(_)) => {}
+                        Err(v2_client::ClientError::Timeout(_)) => {}
+                        Err(e) => {
+                            break format!("transport_error: {e}");
+                        }
                     }
                 }
             }
         }
-    }
+    };
 
-    let _ = ctrl_sess
-        .send_control(CTRL_MSG_SESSION_CLOSE, &0u16.to_be_bytes())
+    outbound_files
+        .abort_all_on_teardown(&mut ctrl_sess, gen, &actor_tx)
         .await;
+    if !is_blackholed() {
+        let _ = ctrl_sess
+            .send_control(CTRL_MSG_SESSION_CLOSE, &0u16.to_be_bytes())
+            .await;
+    }
     let _ = connected.lease_renewal.shutdown().await;
     let _ = actor_tx
         .send(ActorMessage::InternalEvent {
@@ -3087,92 +4477,6 @@ async fn run_controller_lifecycle_task(
             },
         })
         .await;
-}
-
-async fn send_file_over_session(
-    sess: &mut UdpE2eeSession,
-    transfer_id: u64,
-    path: &Path,
-    rel_name: &str,
-    policy: &EffectiveTenantPolicy,
-    gen: u64,
-    actor_tx: &mpsc::Sender<ActorMessage>,
-) -> Result<serde_json::Value, (String, String)> {
-    let data = std::fs::read(path).map_err(|e| ("IoError".into(), e.to_string()))?;
-    let total = data.len() as u64;
-    if let Err(e) = check_file_policy(policy, total) {
-        let abort = FileAbort {
-            transfer_id,
-            error_code: FILE_ERR_POLICY_DENIED,
-        };
-        let _ = sess
-            .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_ABORT, 0, false, &abort.encode())
-            .await;
-        return Err(("PolicyDenied".into(), e.to_string()));
-    }
-    let sha256: [u8; 32] = Sha256::digest(&data).into();
-    let offer = FileOffer {
-        transfer_id,
-        file_size: total,
-        chunk_size: FILE_RECOMMENDED_CHUNK_SIZE,
-        sha256,
-        rel_name: rel_name.to_string(),
-    };
-    let offer_wire = offer
-        .encode()
-        .map_err(|e| ("InvalidArgument".into(), e.to_string()))?;
-    sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_OFFER, 0, false, &offer_wire)
-        .await
-        .map_err(|e| ("TransportError".into(), e.to_string()))?;
-
-    let mut offset = 0usize;
-    let chunk_sz = FILE_RECOMMENDED_CHUNK_SIZE as usize;
-    while offset < data.len() {
-        let end = (offset + chunk_sz).min(data.len());
-        let ch = FileChunk {
-            transfer_id,
-            offset: offset as u64,
-            data: data[offset..end].to_vec(),
-        };
-        let wire = ch
-            .encode()
-            .map_err(|e| ("InvalidArgument".into(), e.to_string()))?;
-        sess.send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_CHUNK, 0, false, &wire)
-            .await
-            .map_err(|e| ("TransportError".into(), e.to_string()))?;
-        offset = end;
-        let _ = actor_tx
-            .send(ActorMessage::InternalEvent {
-                session_gen: gen,
-                event: ActorEvent::FileProgress {
-                    transfer_id,
-                    bytes_transferred: offset as u64,
-                    total_bytes: total,
-                },
-            })
-            .await;
-    }
-
-    let complete = FileComplete {
-        transfer_id,
-        sha256,
-    };
-    sess.send_l4_raw(
-        CHAN_FILE_TRANSFER,
-        FILE_MSG_COMPLETE,
-        0,
-        false,
-        &complete.encode(),
-    )
-    .await
-    .map_err(|e| ("TransportError".into(), e.to_string()))?;
-
-    Ok(serde_json::json!({
-        "transfer_id": transfer_id,
-        "rel_name": rel_name,
-        "bytes": total,
-        "sha256_hex": hex::encode(sha256),
-    }))
 }
 
 async fn emit_file_cmd_result(
@@ -3203,51 +4507,6 @@ async fn emit_file_cmd_result(
             event,
         })
         .await;
-}
-
-struct DryRunSinkWithJournal {
-    journal: DryRunHidJournal,
-}
-
-impl OsHidSink for DryRunSinkWithJournal {
-    fn send_key(&mut self, ev: &KeyEvent) -> Result<(), crate::os::OsError> {
-        let mut sink = DryRunHidSink::new();
-        let _ = sink.send_key(ev);
-        // Forward to shared journal directly via a tiny helper.
-        // We delegate to DryRunHidSink's exact same journal by constructing it from shared journal.
-        // Instead, invoke via journal recording:
-        record_into_shared_journal(&self.journal, HidPayload::Key(*ev));
-        Ok(())
-    }
-
-    fn send_mouse(&mut self, ev: &MouseEvent) -> Result<(), crate::os::OsError> {
-        record_into_shared_journal(&self.journal, HidPayload::Mouse(*ev));
-        Ok(())
-    }
-
-    fn emergency_releaser(&self) -> Arc<dyn EmergencyKeyReleaser> {
-        Arc::new(SharedJournalReleaser {
-            journal: self.journal.clone(),
-        })
-    }
-}
-
-struct SharedJournalReleaser {
-    journal: DryRunHidJournal,
-}
-
-impl EmergencyKeyReleaser for SharedJournalReleaser {
-    fn release_all_keys(&self) -> crate::os::ReleaseReport {
-        self.journal.emergency_release_all()
-    }
-}
-
-fn record_into_shared_journal(journal: &DryRunHidJournal, payload: HidPayload) {
-    match payload {
-        HidPayload::Key(k) => journal.record_key_public(&k),
-        HidPayload::Mouse(m) => journal.record_mouse_public(&m),
-        HidPayload::EchoAck(_) => {}
-    }
 }
 
 #[cfg(test)]
@@ -3302,7 +4561,33 @@ mod tests {
     }
 
     #[test]
-    fn runtime_incoming_stale_id_rejected_and_drop_equals_reject() {
+    fn runtime_concurrent_destroy_and_exec_json_race_is_safe() {
+        let rt = Arc::new(V2BridgeRuntime::new().unwrap());
+        let rt_d1 = Arc::clone(&rt);
+        let rt_d2 = Arc::clone(&rt);
+        let rt_cmd = Arc::clone(&rt);
+
+        let h1 = thread::spawn(move || rt_d1.destroy());
+        let h2 = thread::spawn(move || rt_d2.destroy());
+        let h3 = thread::spawn(move || {
+            for _ in 0..20 {
+                let _ = rt_cmd.exec_json(r#"{"v":1,"cmd":"stop_host"}"#);
+            }
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+        h3.join().unwrap();
+
+        // Subsequent exec_json MUST fail closed with Destroyed.
+        let reply: serde_json::Value =
+            serde_json::from_str(&rt.exec_json(r#"{"v":1,"cmd":"stop_host"}"#)).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error_code"], "Destroyed");
+        assert_eq!(rt.active_task_count(), 0);
+    }
+
+    #[test]
+    fn runtime_incoming_stale_id_rejected_and_stale_gen_audits_security_and_cmd_results() {
         let rt = V2BridgeRuntime::new().unwrap();
         let (inc_id, dec_rx) = rt.inject_test_incoming([0xAA; 16], sample_cert());
 
@@ -3314,8 +4599,31 @@ mod tests {
         assert_eq!(bad["ok"], false);
         assert_eq!(bad["error_code"], "StaleIncoming");
 
-        // Stale session_gen event is dropped
-        rt.simulate_stale_event(0);
+        // Stale session_gen event without cmd_id is dropped; with cmd_id emits StaleGeneration!
+        rt.simulate_stale_event(0, None);
+        rt.simulate_stale_event(0, Some(777));
+        // Stale SecurityEvent is NEVER dropped and uses structured redacted fields!
+        rt.simulate_stale_security_event(0);
+
+        let mut saw_stale_cmd_err = false;
+        let mut saw_stale_sec = false;
+        while let Some(raw) = rt.poll_event_json() {
+            let ev: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if ev["kind"] == "CommandResult"
+                && ev["payload"]["cmd_id"] == 777
+                && ev["payload"]["error_code"] == "StaleGeneration"
+            {
+                saw_stale_cmd_err = true;
+            }
+            if ev["kind"] == "SecurityEvent"
+                && ev["payload"]["stale_generation"] == true
+                && ev["payload"]["detail"]["event"] == "ReplaySessionRejected"
+            {
+                saw_stale_sec = true;
+            }
+        }
+        assert!(saw_stale_cmd_err, "stale cmd_id must emit StaleGeneration");
+        assert!(saw_stale_sec, "stale SecurityEvent must never be dropped");
 
         // Valid incoming_id succeeds and delivers CallDecision::Accept
         let ok: serde_json::Value = serde_json::from_str(&rt.exec_json(&format!(
@@ -3333,10 +4641,41 @@ mod tests {
         assert_eq!(second["ok"], false);
         assert_eq!(second["error_code"], "StaleIncoming");
 
-        // Verify dropping pending incoming on destroy triggers RecvError (rejection)
+        // Verify dropping pending incoming on destroy triggers RecvError or explicit Reject
         let (_inc2, dec_rx2) = rt.inject_test_incoming([0xBB; 16], sample_cert());
         rt.destroy();
-        assert!(dec_rx2.blocking_recv().is_err());
+        assert!(!matches!(dec_rx2.blocking_recv(), Ok(CallDecision::Accept)));
+    }
+
+    #[test]
+    fn policy_refresh_refuses_downgrade_or_degraded_overwrite_of_unexpired_valid_policy() {
+        let valid_v2 = EffectiveTenantPolicy {
+            version: 2,
+            exp_unix: 10_000,
+            degraded: false,
+            degraded_reason: None,
+            ..EffectiveTenantPolicy::degraded([1u8; 16], [0u8; 32], "base")
+        };
+        let degraded = EffectiveTenantPolicy::degraded([1u8; 16], [0u8; 32], "cp down");
+        assert!(should_accept_policy_update(Some(&valid_v2), &degraded, 5_000).is_err());
+
+        let valid_v1 = EffectiveTenantPolicy {
+            version: 1,
+            exp_unix: 10_000,
+            degraded: false,
+            degraded_reason: None,
+            ..valid_v2.clone()
+        };
+        assert!(should_accept_policy_update(Some(&valid_v2), &valid_v1, 5_000).is_err());
+
+        let valid_v3 = EffectiveTenantPolicy {
+            version: 3,
+            exp_unix: 12_000,
+            degraded: false,
+            degraded_reason: None,
+            ..valid_v2.clone()
+        };
+        assert!(should_accept_policy_update(Some(&valid_v2), &valid_v3, 5_000).is_ok());
     }
 
     #[test]
@@ -3378,12 +4717,11 @@ mod tests {
     }
 
     #[test]
-    fn task_panic_triggers_emergency_key_release_within_500ms() {
+    fn task_panic_triggers_emergency_key_release_and_clears_releaser_slot() {
         let journal = DryRunHidJournal::new();
-        let mut sink = DryRunSinkWithJournal {
-            journal: journal.clone(),
-        };
+        let mut sink = DryRunHidSink::with_journal(journal.clone());
         let releaser = sink.emergency_releaser();
+        let slot: Arc<Mutex<Option<Arc<dyn EmergencyKeyReleaser>>>> = Arc::new(Mutex::new(None));
         sink.send_key(&KeyEvent {
             down: true,
             modifiers: 0,
@@ -3395,15 +4733,35 @@ mod tests {
         assert_eq!(journal.pressed_keys(), vec![0x04]);
 
         let start = Instant::now();
+        let slot_bg = Arc::clone(&slot);
         let handle = thread::spawn(move || {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _guard = ReleaserDropGuard::arm(releaser, slot_bg);
                 panic!("simulated worker panic while key held");
             }));
-            releaser.release_all_keys()
         });
-        let report = handle.join().unwrap();
+        handle.join().unwrap();
         assert!(start.elapsed() <= Duration::from_millis(500));
-        assert_eq!(report.released_keys, 1);
         assert!(journal.is_all_released());
+        assert!(slot.lock().unwrap().is_none(), "ReleaserDropGuard must clear slot on panic");
+    }
+
+    #[test]
+    fn validate_download_dir_rejects_relative_and_symlink() {
+        assert!(validate_download_dir(Path::new("relative/dir")).is_err());
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("zd-dl-test-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(validate_download_dir(&base).is_ok());
+        #[cfg(unix)]
+        {
+            let link = base.join("sym_dl");
+            std::os::unix::fs::symlink(&base, &link).unwrap();
+            assert!(validate_download_dir(&link).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

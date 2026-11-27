@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 v2_client = { path = "../v2_client", features = ["test-utils"] }
 v2_identity = { path = "../v2_identity" }
 v2_transport = { path = "../v2_transport" }
-zerodesk_core = { path = "../zerodesk_core" }
+zerodesk_core = { path = "../zerodesk_core", features = ["e2e-fault-injection"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
