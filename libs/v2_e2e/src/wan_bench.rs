@@ -2025,6 +2025,15 @@ mod tests {
         assert_eq!(custom.max_wire_mbps, 8.0);
         assert_eq!(custom.ca_der, Some(PathBuf::from("/tmp/ca.der")));
 
+        let h264_args =
+            parse_wan_bench_args(&argv(&["bin", "wan-bench", "--config", "c.json", "--codec", "h264"]))
+                .unwrap();
+        assert_eq!(h264_args.codec, VideoCodec::H264);
+        let hevc_args =
+            parse_wan_bench_args(&argv(&["bin", "wan-bench", "--config", "c.json", "--codec", "hevc"]))
+                .unwrap();
+        assert_eq!(hevc_args.codec, VideoCodec::Hevc);
+
         for bad in [
             argv(&["bin", "wan-bench"]),
             argv(&["bin", "wan-bench", "--config", "c.json", "--rounds", "2"]),
@@ -2052,7 +2061,7 @@ mod tests {
                 "--config",
                 "c.json",
                 "--codec",
-                "h264",
+                "mpeg2",
             ]),
         ] {
             assert!(

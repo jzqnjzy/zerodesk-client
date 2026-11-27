@@ -11,6 +11,7 @@ let macosSystemLinkerSettings: [LinkerSetting] = [
     .linkedFramework("Carbon"),
     .linkedFramework("AppKit"),
     .linkedFramework("ScreenCaptureKit"),
+    .linkedFramework("VideoToolbox"),
     .linkedFramework("CoreMedia"),
     .linkedFramework("CoreVideo"),
     .linkedFramework("Foundation"),

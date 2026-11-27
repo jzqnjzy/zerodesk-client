@@ -1,23 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
+use super::{
+    manager::DEFAULT_V2_CAP_BITS,
+    vt_codec::{self, VtDecoder, VtEncoder},
+};
 use scrap::{
     aom::{aom_img_fmt, AomDecoder, AomEncoder, AomEncoderConfig},
     codec::{EncoderApi, EncoderCfg},
     EncodeYuvFormat, GoogleImage, Pixfmt, VpxDecoder, VpxDecoderConfig, VpxEncoder,
     VpxEncoderConfig, VpxVideoCodecId, STRIDE_ALIGN,
 };
-use std::fmt;
-use v2_transport::{AssembledVideoFrame, VideoFrameMeta, VIDEO_REASSEMBLER_MAX_AGE_MS};
+use std::{fmt, str::FromStr};
+use v2_transport::{
+    AssembledVideoFrame, VideoFrameMeta, CAP_CODEC_AV1, CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW,
+    CAP_CODEC_VP9, VIDEO_REASSEMBLER_MAX_AGE_MS,
+};
 
 pub const CODEC_ID_AV1: u8 = 1;
 pub const CODEC_ID_VP9: u8 = 2;
+pub const CODEC_ID_H264: u8 = 3;
+pub const CODEC_ID_HEVC: u8 = 4;
 pub const MAX_FRAME_DIM: usize = 8192;
+pub const MAX_CONSECUTIVE_DECODE_FAILURES: u32 = 30;
+pub const DEFAULT_H264_1080P_BITRATE_BPS: u32 = 8_000_000;
+pub const DEFAULT_HEVC_1080P_BITRATE_BPS: u32 = 6_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoCodec {
     Vp9,
     Av1,
+    H264,
+    Hevc,
 }
 
 impl VideoCodec {
@@ -25,6 +39,8 @@ impl VideoCodec {
         match self {
             Self::Av1 => CODEC_ID_AV1,
             Self::Vp9 => CODEC_ID_VP9,
+            Self::H264 => CODEC_ID_H264,
+            Self::Hevc => CODEC_ID_HEVC,
         }
     }
 
@@ -32,6 +48,8 @@ impl VideoCodec {
         match id {
             CODEC_ID_AV1 => Ok(Self::Av1),
             CODEC_ID_VP9 => Ok(Self::Vp9),
+            CODEC_ID_H264 => Ok(Self::H264),
+            CODEC_ID_HEVC => Ok(Self::Hevc),
             other => Err(VideoError::UnsupportedCodecId(other)),
         }
     }
@@ -40,16 +58,97 @@ impl VideoCodec {
         match self {
             Self::Vp9 => "vp9",
             Self::Av1 => "av1",
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
         }
     }
 
     pub fn parse_name(s: &str) -> Result<Self, VideoError> {
-        match s.to_ascii_lowercase().as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
             "vp9" => Ok(Self::Vp9),
             "av1" => Ok(Self::Av1),
-            _ => Err(VideoError::InvalidInput(format!("unsupported codec '{s}' (expected vp9 or av1)"))),
+            "h264" => Ok(Self::H264),
+            "hevc" => Ok(Self::Hevc),
+            _ => Err(VideoError::InvalidInput(format!(
+                "unsupported codec '{s}' (expected vp9, av1, h264, or hevc)"
+            ))),
         }
     }
+
+    pub fn cap_bit(self) -> u64 {
+        match self {
+            Self::Av1 => CAP_CODEC_AV1,
+            Self::Vp9 => CAP_CODEC_VP9,
+            Self::H264 => CAP_CODEC_H264,
+            Self::Hevc => CAP_CODEC_HEVC_OS_HW,
+        }
+    }
+
+    pub fn is_hw_vt(self) -> bool {
+        matches!(self, Self::H264 | Self::Hevc)
+    }
+}
+
+impl fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for VideoCodec {
+    type Err = VideoError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_name(s)
+    }
+}
+
+/// Returns the local V2 capability bitmask, OR'ing `DEFAULT_V2_CAP_BITS` with any OS-hardware
+/// H.264/HEVC capabilities verified by `zd_vt_probe_capabilities()` (cached once per process).
+pub fn local_v2_cap_bits() -> u64 {
+    DEFAULT_V2_CAP_BITS | vt_codec::probed_vt_cap_bits()
+}
+
+/// Deterministic helper for testing HW-disabled fallback without mutating process environment.
+pub fn local_v2_cap_bits_with_vt_disable(disable_hw: bool) -> u64 {
+    DEFAULT_V2_CAP_BITS | vt_codec::probed_vt_cap_bits_with_disable(disable_hw)
+}
+
+/// Negotiates a common video codec from local and peer capability bitmasks.
+/// - When `preferred` is `None`, selects in strict priority order: `Hevc > H264 > Vp9 > Av1`.
+/// - When `preferred` is `Some(c)`, verifies `c.cap_bit()` is present in `local_caps & peer_caps`;
+///   if absent, fails closed with `VideoError::NoCommonCodec` (never silently switches).
+pub fn negotiate_video_codec(
+    local_caps: u64,
+    peer_caps: u64,
+    preferred: Option<VideoCodec>,
+) -> Result<VideoCodec, VideoError> {
+    let common = local_caps & peer_caps;
+    if let Some(pref) = preferred {
+        if (common & pref.cap_bit()) != 0 {
+            return Ok(pref);
+        }
+        return Err(VideoError::NoCommonCodec {
+            local_caps,
+            peer_caps,
+            preferred: Some(pref),
+        });
+    }
+    for candidate in [
+        VideoCodec::Hevc,
+        VideoCodec::H264,
+        VideoCodec::Vp9,
+        VideoCodec::Av1,
+    ] {
+        if (common & candidate.cap_bit()) != 0 {
+            return Ok(candidate);
+        }
+    }
+    Err(VideoError::NoCommonCodec {
+        local_caps,
+        peer_caps,
+        preferred: None,
+    })
 }
 
 #[derive(Debug)]
@@ -57,6 +156,14 @@ pub enum VideoError {
     InvalidInput(String),
     UnsupportedCodecId(u8),
     CodecMismatch { expected: u8, actual: u8 },
+    HardwareUnavailable(String),
+    NeedIdr(String),
+    CodecFailed { codec: VideoCodec, reason: String },
+    NoCommonCodec {
+        local_caps: u64,
+        peer_caps: u64,
+        preferred: Option<VideoCodec>,
+    },
     Encoder(String),
     Decoder(String),
     NoOutputFrame,
@@ -70,6 +177,19 @@ impl fmt::Display for VideoError {
             Self::CodecMismatch { expected, actual } => {
                 write!(f, "codec_id mismatch: expected {expected}, got {actual}")
             }
+            Self::HardwareUnavailable(msg) => write!(f, "hardware video codec unavailable: {msg}"),
+            Self::NeedIdr(msg) => write!(f, "video decoder requires IDR: {msg}"),
+            Self::CodecFailed { codec, reason } => {
+                write!(f, "video codec {} failed closed: {reason}", codec.name())
+            }
+            Self::NoCommonCodec {
+                local_caps,
+                peer_caps,
+                preferred,
+            } => write!(
+                f,
+                "no common video codec (local={local_caps:#x}, peer={peer_caps:#x}, preferred={preferred:?})"
+            ),
             Self::Encoder(msg) => write!(f, "video encoder error: {msg}"),
             Self::Decoder(msg) => write!(f, "video decoder error: {msg}"),
             Self::NoOutputFrame => write!(f, "codec produced no output frame"),
@@ -78,6 +198,29 @@ impl fmt::Display for VideoError {
 }
 
 impl std::error::Error for VideoError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BgraFrame {
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DecodedVideoFrame {
+    I420(I420Frame),
+    Bgra(BgraFrame),
+}
+
+impl DecodedVideoFrame {
+    pub fn into_i420(self) -> Result<I420Frame, VideoError> {
+        match self {
+            Self::I420(f) => Ok(f),
+            Self::Bgra(b) => vt_codec::bgra_to_i420_bt709(&b),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct I420Frame {
@@ -493,6 +636,175 @@ pub fn compute_y_ssim(reference: &I420Frame, decoded: &I420Frame) -> Result<f64,
     Ok(ssim_sum / ((bx_cnt * by_cnt) as f64))
 }
 
+/// Synthesizes a deterministic BT.709 video-range (`Y ∈ [16..235]`, `UV ∈ [16..240]`) remote
+/// desktop scene combining crisp desktop text/UI panels, a smooth multi-frequency synthetic photo
+/// panel, a moving floating window & cursor, and 12-bit binary frame-index tiles.
+pub fn generate_desktop_scene_i420(width: usize, height: usize, frame_idx: u32) -> I420Frame {
+    let width = width.clamp(2, MAX_FRAME_DIM) & !1;
+    let height = height.clamp(2, MAX_FRAME_DIM) & !1;
+    let f = frame_idx as usize;
+    let mut y = vec![230u8; width * height];
+    let uv_w = width / 2;
+    let uv_h = height / 2;
+    let mut u = vec![128u8; uv_w * uv_h];
+    let mut v = vec![128u8; uv_w * uv_h];
+
+    // 1. Desktop background & top menu bar (light neutral workspace).
+    let top_bar_h = (height / 24).max(16).min(height);
+    for row in 0..top_bar_h {
+        let off = row * width;
+        for col in 0..width {
+            y[off + col] = 44;
+        }
+    }
+
+    // 2. Left sidebar + crisp synthetic desktop text lines (high-contrast glyph blocks).
+    let split_x = (width * 55) / 100;
+    let sidebar_w = (width / 7).min(split_x);
+    for row in top_bar_h..height {
+        let off = row * width;
+        for col in 0..sidebar_w {
+            y[off + col] = 212;
+        }
+    }
+    let scroll_y = (f * 2) % 36;
+    for row in (top_bar_h + 48)..height.saturating_sub(48) {
+        let off = row * width;
+        let line_y = (row + scroll_y) % 24;
+        if (6..16).contains(&line_y) {
+            let line_idx = (row + scroll_y) / 24;
+            let text_end = sidebar_w + 32 + ((line_idx * 97 + 211) % (split_x.saturating_sub(sidebar_w + 64).max(1)));
+            for col in (sidebar_w + 24)..text_end.min(split_x.saturating_sub(16)) {
+                let cell = (col - sidebar_w) % 10;
+                if cell < 6 && !(col / 10 + line_idx).is_multiple_of(7) {
+                    // Anti-aliased-like stroke edges for realistic desktop font rendering.
+                    let edge = line_y == 6 || line_y == 15 || cell == 0 || cell == 5;
+                    y[off + col] = if edge { 88 } else { 28 };
+                }
+            }
+        }
+    }
+
+    // 3. Right-hand synthetic photographic panel (smooth multi-frequency gradient + subtle motion).
+    let photo_x0 = split_x + 12;
+    let photo_x1 = width.saturating_sub(16);
+    let photo_y0 = top_bar_h + 24;
+    let photo_y1 = height.saturating_sub(48);
+    if photo_x1 > photo_x0 + 8 && photo_y1 > photo_y0 + 8 {
+        let pw = photo_x1 - photo_x0;
+        let ph = photo_y1 - photo_y0;
+        for row in photo_y0..photo_y1 {
+            let off = row * width;
+            let ry = row - photo_y0;
+            let wy = ((ry + f) * 180) / ph.max(1);
+            for col in photo_x0..photo_x1 {
+                let rx = col - photo_x0;
+                let wx = ((rx + f * 2) * 180) / pw.max(1);
+                let wave = ((wx + wy) % 180) as i32;
+                let tri = if wave < 90 { wave } else { 180 - wave };
+                let luma = (32 + (tri * 2).min(196)) as u8;
+                y[off + col] = luma;
+            }
+        }
+        for row in (photo_y0 / 2)..(photo_y1 / 2) {
+            let off = row * uv_w;
+            let ry = row.saturating_sub(photo_y0 / 2);
+            for col in (photo_x0 / 2)..(photo_x1 / 2) {
+                let rx = col.saturating_sub(photo_x0 / 2);
+                u[off + col] = (84 + ((rx + f) * 88 / (pw / 2).max(1)) % 88) as u8;
+                v[off + col] = (84 + ((ry + f) * 88 / (ph / 2).max(1)) % 88) as u8;
+            }
+        }
+    }
+
+    // 4. Moving floating UI card + cursor (exercises inter-frame motion vectors cleanly).
+    let card_w = (width / 6).max(32).min(width);
+    let card_h = (height / 5).max(32).min(height);
+    let max_cx = width.saturating_sub(card_w);
+    let max_cy = height.saturating_sub(card_h);
+    let card_x = if max_cx == 0 { 0 } else { (f * 6) % max_cx };
+    let card_y = if max_cy == 0 {
+        0
+    } else {
+        (top_bar_h + 64 + (f * 2) % (height / 3).max(1)).min(max_cy)
+    };
+    let border = 3usize.min(card_w / 2).min(card_h / 2);
+    for row in card_y..(card_y + card_h) {
+        let off = row * width;
+        let is_b = row < card_y + border || row >= card_y + card_h - border;
+        let is_hdr = row < card_y + 18.min(card_h);
+        for col in card_x..(card_x + card_w) {
+            let is_bx = col < card_x + border || col >= card_x + card_w - border;
+            y[off + col] = if is_b || is_bx {
+                30
+            } else if is_hdr {
+                72
+            } else {
+                224
+            };
+        }
+    }
+    for row in (card_y / 2)..((card_y + card_h) / 2).min(uv_h) {
+        let off = row * uv_w;
+        for col in (card_x / 2)..((card_x + card_w) / 2).min(uv_w) {
+            u[off + col] = 152;
+            v[off + col] = 108;
+        }
+    }
+
+    // 5. Top-left 12-bit binary frame index indicator tiles (16x16 px) inside top bar / header.
+    let tile = 16usize;
+    if width >= tile * 14 && height >= top_bar_h + tile + 8 {
+        let ty0 = top_bar_h + 6;
+        for bit in 0..12usize {
+            let set = ((frame_idx >> bit) & 1) != 0;
+            let val = if set { 228u8 } else { 24u8 };
+            let tx0 = tile + bit * (tile + 4);
+            for row in ty0..(ty0 + tile) {
+                let off = row * width;
+                for col in tx0..(tx0 + tile) {
+                    y[off + col] = val;
+                }
+            }
+        }
+    }
+
+    I420Frame {
+        width,
+        height,
+        y,
+        u,
+        v,
+    }
+}
+
+/// Decodes the 12-bit binary frame-index indicator tiles written by `generate_desktop_scene_i420`.
+pub fn read_desktop_scene_frame_idx(frame: &I420Frame) -> Option<u32> {
+    let tile = 16usize;
+    let top_bar_h = (frame.height / 24).max(16).min(frame.height);
+    if frame.width < tile * 14 || frame.height < top_bar_h + tile + 8 {
+        return None;
+    }
+    let ty0 = top_bar_h + 6;
+    let mut out = 0u32;
+    for bit in 0..12usize {
+        let tx0 = tile + bit * (tile + 4);
+        let mut sum = 0u64;
+        let mut cnt = 0u64;
+        for row in (ty0 + 4)..(ty0 + tile - 4) {
+            let off = row * frame.width;
+            for col in (tx0 + 4)..(tx0 + tile - 4) {
+                sum += frame.y[off + col] as u64;
+                cnt += 1;
+            }
+        }
+        if cnt > 0 && (sum / cnt) >= 126 {
+            out |= 1u32 << bit;
+        }
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedV2Frame {
     pub meta: VideoFrameMeta,
@@ -502,14 +814,41 @@ pub struct EncodedV2Frame {
 enum InnerEncoder {
     Vp9(VpxEncoder),
     Av1(AomEncoder),
+    Vt(VtEncoder),
 }
 
-/// Real `scrap` VP9 (`libvpx`) / AV1 (`libaom`) encoder producing raw elementary bitstreams
-/// directly mapped to `v2_transport::VideoFrameMeta` (zero RustDesk protobuf on the wire).
+fn default_vt_bitrate_bps(codec: VideoCodec, width: u32, height: u32, quality: f32) -> u32 {
+    let base_1080p = match codec {
+        VideoCodec::Hevc => DEFAULT_HEVC_1080P_BITRATE_BPS as f64,
+        _ => DEFAULT_H264_1080P_BITRATE_BPS as f64,
+    };
+    let area_ratio = ((width as f64) * (height as f64)) / (1920.0 * 1080.0);
+    let q_scale = (quality.clamp(0.5, 4.0) as f64) / 2.0;
+    let bps = (base_1080p * area_ratio.max(0.05) * q_scale).round();
+    (bps as u64).clamp(500_000, 50_000_000) as u32
+}
+
+fn vt_i420_format(width: u32, height: u32) -> EncodeYuvFormat {
+    let w = width as usize;
+    let h = height as usize;
+    let uv_w = w / 2;
+    let y_len = w * h;
+    let u_len = uv_w * (h / 2);
+    EncodeYuvFormat {
+        pixfmt: Pixfmt::I420,
+        w,
+        h,
+        stride: vec![w, uv_w, uv_w],
+        u: y_len,
+        v: y_len + u_len,
+    }
+}
+
+/// Video encoder supporting VP9 (`libvpx`), AV1 (`libaom`), and OS-hardware VideoToolbox
+/// H.264/HEVC producing raw elementary bitstreams mapped to `v2_transport::VideoFrameMeta`.
 ///
 /// Per `protocol-spec/spec/04-inner-channels.md` §3.3, `ltr_slot` is always `0` (and
-/// `CAP_VIDEO_LTR` must remain `0`) until Phase 3 implements true encoder
-/// `mark_ltr` / `force_ref_ltr` reference pinning.
+/// `CAP_VIDEO_LTR` must remain `0`) until true encoder `mark_ltr` / `force_ref_ltr` is wired.
 pub struct V2VideoEncoder {
     codec: VideoCodec,
     inner: InnerEncoder,
@@ -564,11 +903,50 @@ impl V2VideoEncoder {
                 let fmt = enc.yuvfmt();
                 (InnerEncoder::Av1(enc), fmt)
             }
+            VideoCodec::H264 | VideoCodec::Hevc => {
+                let bitrate_bps = default_vt_bitrate_bps(codec, width, height, quality);
+                let max_kf = keyframe_interval.unwrap_or(60).clamp(1, 600) as u32;
+                let enc = VtEncoder::new(codec, width, height, 30, bitrate_bps, max_kf)?;
+                (InnerEncoder::Vt(enc), vt_i420_format(width, height))
+            }
         };
         Ok(Self {
             codec,
             inner,
             yuvfmt,
+            next_frame_id: 1,
+            prev_frame_id: None,
+        })
+    }
+
+    /// Creates a VideoToolbox H.264/HEVC encoder with explicit FPS, bitrate, and keyframe interval.
+    pub fn new_with_vt_config(
+        codec: VideoCodec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u32,
+        max_keyframe_interval: u32,
+    ) -> Result<Self, VideoError> {
+        if !codec.is_hw_vt() {
+            return Err(VideoError::InvalidInput(format!(
+                "new_with_vt_config requires H264 or Hevc, got {}",
+                codec.name()
+            )));
+        }
+        let w = width as usize;
+        let h = height as usize;
+        if w == 0 || h == 0 || (w & 1) != 0 || (h & 1) != 0 || w > MAX_FRAME_DIM || h > MAX_FRAME_DIM
+        {
+            return Err(VideoError::InvalidInput(format!(
+                "encoder dimensions must be positive, even, and <= {MAX_FRAME_DIM}, got {width}x{height}"
+            )));
+        }
+        let enc = VtEncoder::new(codec, width, height, fps, bitrate_bps, max_keyframe_interval)?;
+        Ok(Self {
+            codec,
+            inner: InnerEncoder::Vt(enc),
+            yuvfmt: vt_i420_format(width, height),
             next_frame_id: 1,
             prev_frame_id: None,
         })
@@ -586,8 +964,28 @@ impl V2VideoEncoder {
         self.next_frame_id
     }
 
+    pub fn vt_rebuild_count(&self) -> u64 {
+        match &self.inner {
+            InnerEncoder::Vt(enc) => enc.total_rebuilds(),
+            _ => 0,
+        }
+    }
+
+    pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), VideoError> {
+        match &mut self.inner {
+            InnerEncoder::Vt(enc) => enc.set_bitrate(bitrate_bps),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn force_next_idr(&mut self) {
+        if let InnerEncoder::Vt(enc) = &mut self.inner {
+            enc.force_next_idr();
+        }
+    }
+
     /// Ensures `next_frame_id` is at least `min_next` so `frame_id` stays strictly monotonic
-    /// across encoder replacements (e.g. mid-session codec switches).
+    /// across encoder replacements.
     pub fn advance_next_frame_id_at_least(&mut self, min_next: u32) {
         let floor = min_next.max(1);
         if floor > self.next_frame_id {
@@ -595,10 +993,51 @@ impl V2VideoEncoder {
         }
     }
 
+    fn finish_encoded_frame(&mut self, raw_data: Vec<u8>, is_key: bool) -> EncodedV2Frame {
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
+
+        let ref_frame_id = if is_key {
+            frame_id
+        } else {
+            self.prev_frame_id.unwrap_or(frame_id)
+        };
+        self.prev_frame_id = Some(frame_id);
+
+        let meta = VideoFrameMeta {
+            display_idx: 0,
+            codec_id: self.codec.codec_id(),
+            frame_id,
+            ref_frame_id,
+            ltr_slot: 0,
+            is_idr: is_key,
+            is_ref: true,
+            max_age_ms: VIDEO_REASSEMBLER_MAX_AGE_MS,
+        };
+
+        EncodedV2Frame {
+            meta,
+            data: raw_data,
+        }
+    }
+
     pub fn encode_i420(&mut self, frame: &I420Frame, pts_ms: i64) -> Result<EncodedV2Frame, VideoError> {
-        let aligned = frame.pack_for_encoder(&self.yuvfmt)?;
+        self.encode_i420_with_idr(frame, pts_ms, false)
+    }
+
+    pub fn encode_i420_with_idr(
+        &mut self,
+        frame: &I420Frame,
+        pts_ms: i64,
+        force_idr: bool,
+    ) -> Result<EncodedV2Frame, VideoError> {
         let (raw_data, is_key) = match &mut self.inner {
+            InnerEncoder::Vt(enc) => {
+                let pts_us = pts_ms.saturating_mul(1000);
+                enc.encode_i420(frame, pts_us, force_idr)?
+            }
             InnerEncoder::Vp9(enc) => {
+                let aligned = frame.pack_for_encoder(&self.yuvfmt)?;
                 let mut out: Option<(Vec<u8>, bool)> = None;
                 for pkt in enc
                     .encode(pts_ms, &aligned, STRIDE_ALIGN)
@@ -625,6 +1064,7 @@ impl V2VideoEncoder {
                 out.ok_or(VideoError::NoOutputFrame)?
             }
             InnerEncoder::Av1(enc) => {
+                let aligned = frame.pack_for_encoder(&self.yuvfmt)?;
                 let mut out: Option<(Vec<u8>, bool)> = None;
                 for pkt in enc
                     .encode(pts_ms, &aligned, STRIDE_ALIGN)
@@ -642,33 +1082,43 @@ impl V2VideoEncoder {
             }
         };
 
-        let frame_id = self.next_frame_id;
-        self.next_frame_id = self.next_frame_id.wrapping_add(1).max(1);
+        Ok(self.finish_encoded_frame(raw_data, is_key))
+    }
 
-        // True dual-slot LTR requires encoder mark_ltr/force_ref_ltr (Phase 3); emit ltr_slot = 0
-        // and truthful immediate-predecessor inter-frame dependency per spec §3.3.
-        let ref_frame_id = if is_key {
-            frame_id
-        } else {
-            self.prev_frame_id.unwrap_or(frame_id)
-        };
-        self.prev_frame_id = Some(frame_id);
+    pub fn encode_bgra(
+        &mut self,
+        bgra: &[u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        pts_ms: i64,
+        force_idr: bool,
+    ) -> Result<EncodedV2Frame, VideoError> {
+        match &mut self.inner {
+            InnerEncoder::Vt(enc) => {
+                let pts_us = pts_ms.saturating_mul(1000);
+                let (raw_data, is_key) =
+                    enc.encode_bgra(bgra, width, height, stride, pts_us, force_idr)?;
+                Ok(self.finish_encoded_frame(raw_data, is_key))
+            }
+            _ => {
+                let frame = BgraFrame {
+                    width,
+                    height,
+                    stride,
+                    data: bgra.to_vec(),
+                };
+                let i420 = vt_codec::bgra_to_i420_bt709(&frame)?;
+                self.encode_i420_with_idr(&i420, pts_ms, force_idr)
+            }
+        }
+    }
 
-        let meta = VideoFrameMeta {
-            display_idx: 0,
-            codec_id: self.codec.codec_id(),
-            frame_id,
-            ref_frame_id,
-            ltr_slot: 0,
-            is_idr: is_key,
-            is_ref: true,
-            max_age_ms: VIDEO_REASSEMBLER_MAX_AGE_MS,
-        };
-
-        Ok(EncodedV2Frame {
-            meta,
-            data: raw_data,
-        })
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn invalidate_vt_session_for_test(&mut self) {
+        if let InnerEncoder::Vt(enc) = &mut self.inner {
+            enc.invalidate_session_for_test();
+        }
     }
 }
 
@@ -713,13 +1163,15 @@ fn extract_aom_i420(img: &scrap::aom::Image) -> Result<I420Frame, VideoError> {
 enum InnerDecoder {
     Vp9(VpxDecoder),
     Av1(AomDecoder),
+    Vt(VtDecoder),
 }
 
-/// Real `scrap` VP9 (`libvpx`) / AV1 (`libaom`) decoder returning decoded I420 planes directly
-/// from raw V2 elementary bitstreams.
+/// Real video decoder supporting VP9 (`libvpx`), AV1 (`libaom`), and OS-hardware VideoToolbox
+/// H.264/HEVC (with direct 32BGRA output to avoid redundant BGRA->I420->BGRA roundtrips).
 pub struct V2VideoDecoder {
     codec: VideoCodec,
     inner: InnerDecoder,
+    consecutive_failures: u32,
 }
 
 impl V2VideoDecoder {
@@ -734,19 +1186,67 @@ impl V2VideoDecoder {
             VideoCodec::Av1 => {
                 InnerDecoder::Av1(AomDecoder::new().map_err(|e| VideoError::Decoder(e.to_string()))?)
             }
+            VideoCodec::H264 | VideoCodec::Hevc => InnerDecoder::Vt(VtDecoder::new(codec)?),
         };
-        Ok(Self { codec, inner })
+        Ok(Self {
+            codec,
+            inner,
+            consecutive_failures: 0,
+        })
     }
 
     pub fn codec(&self) -> VideoCodec {
         self.codec
     }
 
-    pub fn decode_raw(&mut self, data: &[u8]) -> Result<I420Frame, VideoError> {
-        if data.is_empty() {
-            return Err(VideoError::InvalidInput("empty compressed video frame".into()));
+    pub fn consecutive_decode_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    pub fn vt_rebuild_count(&self) -> u64 {
+        match &self.inner {
+            InnerDecoder::Vt(dec) => dec.total_rebuilds(),
+            _ => 0,
         }
-        match &mut self.inner {
+    }
+
+    fn track_decode_outcome<T>(&mut self, res: Result<T, VideoError>) -> Result<T, VideoError> {
+        match res {
+            Ok(val) => {
+                self.consecutive_failures = 0;
+                Ok(val)
+            }
+            Err(err @ VideoError::CodecFailed { .. }) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                Err(err)
+            }
+            Err(err) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                if self.consecutive_failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                    Err(VideoError::CodecFailed {
+                        codec: self.codec,
+                        reason: format!(
+                            "{} consecutive decode failures (last: {err})",
+                            self.consecutive_failures
+                        ),
+                    })
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Decodes a raw frame returning the decoder's native pixel representation (`Bgra` for
+    /// VideoToolbox H.264/HEVC with zero color-space roundtrip, `I420` for VP9/AV1).
+    pub fn decode_raw_frame(&mut self, data: &[u8]) -> Result<DecodedVideoFrame, VideoError> {
+        if data.is_empty() {
+            return self.track_decode_outcome(Err(VideoError::InvalidInput(
+                "empty compressed video frame".into(),
+            )));
+        }
+        let res = match &mut self.inner {
+            InnerDecoder::Vt(dec) => dec.decode_annexb_bgra(data).map(DecodedVideoFrame::Bgra),
             InnerDecoder::Vp9(dec) => {
                 let mut decoded: Option<I420Frame> = None;
                 for img in dec
@@ -754,9 +1254,9 @@ impl V2VideoDecoder {
                     .map_err(|e| VideoError::Decoder(e.to_string()))?
                 {
                     if decoded.is_some() {
-                        return Err(VideoError::Decoder(
+                        return self.track_decode_outcome(Err(VideoError::Decoder(
                             "VP9 decoder unexpectedly emitted multiple frames for one packet".into(),
-                        ));
+                        )));
                     }
                     decoded = Some(extract_vpx_i420(&img)?);
                 }
@@ -766,14 +1266,16 @@ impl V2VideoDecoder {
                         .map_err(|e| VideoError::Decoder(e.to_string()))?
                     {
                         if decoded.is_some() {
-                            return Err(VideoError::Decoder(
+                            return self.track_decode_outcome(Err(VideoError::Decoder(
                                 "VP9 decoder flush unexpectedly emitted multiple frames".into(),
-                            ));
+                            )));
                         }
                         decoded = Some(extract_vpx_i420(&img)?);
                     }
                 }
-                decoded.ok_or(VideoError::NoOutputFrame)
+                decoded
+                    .map(DecodedVideoFrame::I420)
+                    .ok_or(VideoError::NoOutputFrame)
             }
             InnerDecoder::Av1(dec) => {
                 let mut decoded: Option<I420Frame> = None;
@@ -782,9 +1284,9 @@ impl V2VideoDecoder {
                     .map_err(|e| VideoError::Decoder(e.to_string()))?
                 {
                     if decoded.is_some() {
-                        return Err(VideoError::Decoder(
+                        return self.track_decode_outcome(Err(VideoError::Decoder(
                             "AV1 decoder unexpectedly emitted multiple frames for one packet".into(),
-                        ));
+                        )));
                     }
                     decoded = Some(extract_aom_i420(&img)?);
                 }
@@ -794,19 +1296,89 @@ impl V2VideoDecoder {
                         .map_err(|e| VideoError::Decoder(e.to_string()))?
                     {
                         if decoded.is_some() {
-                            return Err(VideoError::Decoder(
+                            return self.track_decode_outcome(Err(VideoError::Decoder(
                                 "AV1 decoder flush unexpectedly emitted multiple frames".into(),
-                            ));
+                            )));
                         }
                         decoded = Some(extract_aom_i420(&img)?);
                     }
                 }
-                decoded.ok_or(VideoError::NoOutputFrame)
+                decoded
+                    .map(DecodedVideoFrame::I420)
+                    .ok_or(VideoError::NoOutputFrame)
+            }
+        };
+        self.track_decode_outcome(res)
+    }
+
+    /// Zero-extra-copy decode into a caller-provided BGRA buffer (reusing pooled memory with
+    /// zero per-frame 8 MiB heap allocations or double copies).
+    pub fn decode_raw_bgra_into(
+        &mut self,
+        data: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> Result<(usize, usize, usize), VideoError> {
+        if data.is_empty() {
+            return self.track_decode_outcome(Err(VideoError::InvalidInput(
+                "empty compressed video frame".into(),
+            )));
+        }
+        let res = match &mut self.inner {
+            InnerDecoder::Vt(dec) => dec.decode_annexb_bgra_into(data, dst),
+            _ => {
+                let bgra = self.decode_raw_bgra(data)?;
+                dst.clear();
+                dst.extend_from_slice(&bgra.data);
+                return Ok((bgra.width, bgra.height, bgra.stride));
+            }
+        };
+        self.track_decode_outcome(res)
+    }
+
+    pub fn decode_raw_bgra(&mut self, data: &[u8]) -> Result<BgraFrame, VideoError> {
+        match self.decode_raw_frame(data)? {
+            DecodedVideoFrame::Bgra(bgra) => Ok(bgra),
+            DecodedVideoFrame::I420(i420) => {
+                let stride = i420.width * 4;
+                let mut out = vec![0u8; stride * i420.height];
+                let uv_w = i420.width / 2;
+                let rc = unsafe {
+                    scrap::I420ToARGB(
+                        i420.y.as_ptr(),
+                        i420.width as i32,
+                        i420.u.as_ptr(),
+                        uv_w as i32,
+                        i420.v.as_ptr(),
+                        uv_w as i32,
+                        out.as_mut_ptr(),
+                        stride as i32,
+                        i420.width as i32,
+                        i420.height as i32,
+                    )
+                };
+                if rc != 0 {
+                    return Err(VideoError::Decoder(format!(
+                        "libyuv I420ToARGB failed with rc={rc}"
+                    )));
+                }
+                Ok(BgraFrame {
+                    width: i420.width,
+                    height: i420.height,
+                    stride,
+                    data: out,
+                })
             }
         }
     }
 
-    pub fn decode_assembled(&mut self, frame: &AssembledVideoFrame) -> Result<I420Frame, VideoError> {
+    pub fn decode_raw(&mut self, data: &[u8]) -> Result<I420Frame, VideoError> {
+        self.decode_raw_frame(data)?.into_i420()
+    }
+
+    pub fn decode_assembled_frame(
+        &mut self,
+        frame: &AssembledVideoFrame,
+    ) -> Result<DecodedVideoFrame, VideoError> {
         let expected = self.codec.codec_id();
         if frame.codec_id != expected {
             return Err(VideoError::CodecMismatch {
@@ -814,7 +1386,11 @@ impl V2VideoDecoder {
                 actual: frame.codec_id,
             });
         }
-        self.decode_raw(&frame.data)
+        self.decode_raw_frame(&frame.data)
+    }
+
+    pub fn decode_assembled(&mut self, frame: &AssembledVideoFrame) -> Result<I420Frame, VideoError> {
+        self.decode_assembled_frame(frame)?.into_i420()
     }
 
     pub fn decode_and_measure(
@@ -847,8 +1423,18 @@ impl V2VideoDecoder {
                     flushed.push(extract_aom_i420(&img)?);
                 }
             }
+            InnerDecoder::Vt(_) => {
+                // Synchronous VT decoding emits every decoded frame immediately with 0 pending queue.
+            }
         }
         Ok(flushed)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn invalidate_vt_session_for_test(&mut self) {
+        if let InnerDecoder::Vt(dec) = &mut self.inner {
+            dec.invalidate_session_for_test();
+        }
     }
 }
 

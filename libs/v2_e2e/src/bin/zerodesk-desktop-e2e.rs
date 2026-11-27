@@ -61,10 +61,12 @@ use v2_client::{
     ControlPlaneClient, CreateTenantReq, SignalingClient, UdpAccessLink, UdpE2eeSession,
 };
 use v2_e2e::{
-    compute_y_psnr, compute_y_ssim, decode_hid_frame, encode_hid_frame, generate_animated_i420,
-    DesktopControllerSession, DesktopHostSession, HidEchoAck, HidPayload, KeyEvent, MouseEvent,
-    MouseKind, SessionError, V2VideoDecoder, V2VideoEncoder, VideoCodec, MOD_ALT, MOD_CTRL,
-    MOD_META, MOD_SHIFT,
+    bgra_to_i420_bt709, compute_y_psnr, compute_y_ssim, decode_hid_frame, encode_hid_frame,
+    generate_animated_i420, generate_desktop_scene_i420, local_v2_cap_bits, parse_annexb_checked,
+    probed_vt_cap_bits, read_desktop_scene_frame_idx, DesktopControllerSession,
+    DesktopHostSession, HidEchoAck, HidPayload, KeyEvent, MouseEvent, MouseKind, SessionError,
+    V2VideoDecoder, V2VideoEncoder, VideoCodec, DEFAULT_H264_1080P_BITRATE_BPS,
+    DEFAULT_HEVC_1080P_BITRATE_BPS, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT,
 };
 use v2_identity::{
     verify_p256_low_s, DeviceCert, DeviceKeyStore, SoftwareDeviceKeyStore, TenantPolicyBlob,
@@ -261,6 +263,298 @@ fn run_codec_selftest_one(
         total_decode_ms: dec_dur.as_secs_f64() * 1000.0,
         pass,
     })
+}
+
+#[derive(Debug, Serialize)]
+struct Vt1080pCodecMetrics {
+    codec: String,
+    width: usize,
+    height: usize,
+    bitrate_bps: u32,
+    frames: usize,
+    encode_p50_ms: f64,
+    encode_p99_ms: f64,
+    encode_fps: f64,
+    decode_p50_ms: f64,
+    decode_p99_ms: f64,
+    decode_fps: f64,
+    min_psnr_db: f64,
+    avg_psnr_db: f64,
+    min_ssim: f64,
+    avg_ssim: f64,
+    avg_frame_bytes: f64,
+    actual_bitrate_mbps: f64,
+    idr_count: usize,
+    idr_has_param_sets_ok: bool,
+    monotonic_order_ok: bool,
+    cold_start_idr_standalone_ok: bool,
+    pass: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Vt1080pBenchReport {
+    pass: bool,
+    probed_vt_cap_bits: String,
+    local_v2_cap_bits: String,
+    h264: Vt1080pCodecMetrics,
+    hevc: Vt1080pCodecMetrics,
+    error: Option<String>,
+}
+
+fn run_vt_1080p_one(codec: VideoCodec, bitrate_bps: u32, frames: usize) -> Vt1080pCodecMetrics {
+    const W: usize = 1920;
+    const H: usize = 1080;
+    const FPS: u32 = 60;
+    let empty_err = |msg: String| Vt1080pCodecMetrics {
+        codec: codec.name().to_string(),
+        width: W,
+        height: H,
+        bitrate_bps,
+        frames: 0,
+        encode_p50_ms: 0.0,
+        encode_p99_ms: 0.0,
+        encode_fps: 0.0,
+        decode_p50_ms: 0.0,
+        decode_p99_ms: 0.0,
+        decode_fps: 0.0,
+        min_psnr_db: 0.0,
+        avg_psnr_db: 0.0,
+        min_ssim: 0.0,
+        avg_ssim: 0.0,
+        avg_frame_bytes: 0.0,
+        actual_bitrate_mbps: 0.0,
+        idr_count: 0,
+        idr_has_param_sets_ok: false,
+        monotonic_order_ok: false,
+        cold_start_idr_standalone_ok: false,
+        pass: false,
+        error: Some(msg),
+    };
+
+    let frames = frames.max(2);
+    let mut encoder = match V2VideoEncoder::new_with_vt_config(
+        codec,
+        W as u32,
+        H as u32,
+        FPS,
+        bitrate_bps,
+        FPS * 2,
+    ) {
+        Ok(e) => e,
+        Err(e) => return empty_err(format!("encoder init failed: {e}")),
+    };
+    let mut decoder = match V2VideoDecoder::new(codec) {
+        Ok(d) => d,
+        Err(e) => return empty_err(format!("decoder init failed: {e}")),
+    };
+
+    // Pre-generate desktop-text + synthetic-photo frames outside timed encode/decode window.
+    let source_frames: Vec<_> = (0..frames)
+        .map(|idx| generate_desktop_scene_i420(W, H, idx as u32))
+        .collect();
+
+    // Warm up hardware pipelines (2 frames) so one-time kernel/Metal/VT setup is excluded from steady-state.
+    let warmup_frame = &source_frames[0];
+    for w_idx in 0..2i64 {
+        if let Ok(enc_w) = encoder.encode_i420_with_idr(warmup_frame, w_idx * 16, w_idx == 0) {
+            let _ = decoder.decode_raw_bgra(&enc_w.data);
+        }
+    }
+    let mut encoder = match V2VideoEncoder::new_with_vt_config(
+        codec,
+        W as u32,
+        H as u32,
+        FPS,
+        bitrate_bps,
+        FPS * 2,
+    ) {
+        Ok(e) => e,
+        Err(e) => return empty_err(format!("encoder re-init failed: {e}")),
+    };
+    let mut decoder = match V2VideoDecoder::new(codec) {
+        Ok(d) => d,
+        Err(e) => return empty_err(format!("decoder re-init failed: {e}")),
+    };
+
+    let mut enc_samples_us = Vec::with_capacity(frames);
+    let mut dec_samples_us = Vec::with_capacity(frames);
+    let mut encoded_frames = Vec::with_capacity(frames);
+    let mut total_bytes = 0usize;
+    let mut idr_count = 0usize;
+    let mut idr_has_param_sets_ok = true;
+
+    let enc_wall_start = Instant::now();
+    for (idx, src) in source_frames.iter().enumerate() {
+        let t0 = Instant::now();
+        let encoded = match encoder.encode_i420_with_idr(src, (idx as i64) * 16, idx == 0) {
+            Ok(f) => f,
+            Err(e) => return empty_err(format!("encode frame {idx} failed: {e}")),
+        };
+        enc_samples_us.push(t0.elapsed().as_micros() as u64);
+        total_bytes += encoded.data.len();
+        if encoded.meta.is_idr {
+            idr_count += 1;
+            match parse_annexb_checked(codec, &encoded.data) {
+                Ok(summary) => {
+                    let ps_ok = match codec {
+                        VideoCodec::H264 => {
+                            summary.has_idr && summary.sps_count > 0 && summary.pps_count > 0
+                        }
+                        VideoCodec::Hevc => {
+                            summary.has_idr
+                                && summary.vps_count > 0
+                                && summary.sps_count > 0
+                                && summary.pps_count > 0
+                        }
+                        _ => false,
+                    };
+                    if !ps_ok {
+                        idr_has_param_sets_ok = false;
+                    }
+                }
+                Err(_) => idr_has_param_sets_ok = false,
+            }
+        }
+        encoded_frames.push(encoded);
+    }
+    let enc_wall_secs = enc_wall_start.elapsed().as_secs_f64().max(1e-9);
+
+    // Cold-start standalone IDR decode verification on a brand-new decoder.
+    let cold_start_idr_standalone_ok = if let Some(first) = encoded_frames.first() {
+        first.meta.is_idr
+            && V2VideoDecoder::new(codec)
+                .and_then(|mut fresh| fresh.decode_raw_bgra(&first.data))
+                .is_ok_and(|bgra| bgra.width == W && bgra.height == H)
+    } else {
+        false
+    };
+
+    let mut min_psnr = f64::MAX;
+    let mut sum_psnr = 0.0f64;
+    let mut min_ssim = f64::MAX;
+    let mut sum_ssim = 0.0f64;
+    let mut monotonic_order_ok = true;
+    let mut bgra_buf = vec![0u8; W * H * 4];
+    let mut dec_total_dur = Duration::ZERO;
+
+    for (idx, (src, enc)) in source_frames.iter().zip(encoded_frames.iter()).enumerate() {
+        let t1 = Instant::now();
+        let (dw, dh, dstride) = match decoder.decode_raw_bgra_into(&enc.data, &mut bgra_buf) {
+            Ok(dims) => dims,
+            Err(e) => return empty_err(format!("decode frame {idx} failed: {e}")),
+        };
+        let dt = t1.elapsed();
+        dec_total_dur += dt;
+        dec_samples_us.push(dt.as_micros() as u64);
+
+        let bgra_view = v2_e2e::BgraFrame {
+            width: dw,
+            height: dh,
+            stride: dstride,
+            data: std::mem::take(&mut bgra_buf),
+        };
+        let dec_i420 = match bgra_to_i420_bt709(&bgra_view) {
+            Ok(f) => f,
+            Err(e) => return empty_err(format!("bgra_to_i420_bt709 frame {idx} failed: {e}")),
+        };
+        bgra_buf = bgra_view.data;
+
+        if read_desktop_scene_frame_idx(&dec_i420) != Some(idx as u32) {
+            monotonic_order_ok = false;
+        }
+        let psnr = match compute_y_psnr(src, &dec_i420) {
+            Ok(v) => v,
+            Err(e) => return empty_err(format!("PSNR frame {idx} failed: {e}")),
+        };
+        let ssim = match compute_y_ssim(src, &dec_i420) {
+            Ok(v) => v,
+            Err(e) => return empty_err(format!("SSIM frame {idx} failed: {e}")),
+        };
+        if psnr < min_psnr {
+            min_psnr = psnr;
+        }
+        if ssim < min_ssim {
+            min_ssim = ssim;
+        }
+        sum_psnr += psnr;
+        sum_ssim += ssim;
+    }
+    let dec_wall_secs = dec_total_dur.as_secs_f64().max(1e-9);
+
+    let count_f = frames as f64;
+    let encode_p50_ms = percentile_ms(&enc_samples_us, 0.50);
+    let encode_p99_ms = percentile_ms(&enc_samples_us, 0.99);
+    let encode_fps = count_f / enc_wall_secs;
+    let decode_p50_ms = percentile_ms(&dec_samples_us, 0.50);
+    let decode_p99_ms = percentile_ms(&dec_samples_us, 0.99);
+    let decode_fps = count_f / dec_wall_secs;
+    let avg_psnr_db = sum_psnr / count_f;
+    let avg_ssim = sum_ssim / count_f;
+    let avg_frame_bytes = (total_bytes as f64) / count_f;
+    let actual_bitrate_mbps = (avg_frame_bytes * 8.0 * (FPS as f64)) / 1_000_000.0;
+
+    let pass = encode_p50_ms <= 6.0
+        && encode_p99_ms <= 12.0
+        && encode_fps >= 120.0
+        && decode_p50_ms <= 4.0
+        && decode_p99_ms <= 8.0
+        && avg_psnr_db >= 40.0
+        && avg_ssim >= 0.98
+        && idr_count >= 1
+        && idr_has_param_sets_ok
+        && monotonic_order_ok
+        && cold_start_idr_standalone_ok;
+
+    Vt1080pCodecMetrics {
+        codec: codec.name().to_string(),
+        width: W,
+        height: H,
+        bitrate_bps,
+        frames,
+        encode_p50_ms,
+        encode_p99_ms,
+        encode_fps,
+        decode_p50_ms,
+        decode_p99_ms,
+        decode_fps,
+        min_psnr_db: min_psnr,
+        avg_psnr_db,
+        min_ssim,
+        avg_ssim,
+        avg_frame_bytes,
+        actual_bitrate_mbps,
+        idr_count,
+        idr_has_param_sets_ok,
+        monotonic_order_ok,
+        cold_start_idr_standalone_ok,
+        pass,
+        error: if pass {
+            None
+        } else {
+            Some("one or more 1080p VT latency/FPS/quality/invariant gates failed".into())
+        },
+    }
+}
+
+fn cmd_vt_1080p_bench(frames: usize) -> Vt1080pBenchReport {
+    let vt_caps = probed_vt_cap_bits();
+    let local_caps = local_v2_cap_bits();
+    let h264 = run_vt_1080p_one(VideoCodec::H264, DEFAULT_H264_1080P_BITRATE_BPS, frames);
+    let hevc = run_vt_1080p_one(VideoCodec::Hevc, DEFAULT_HEVC_1080P_BITRATE_BPS, frames);
+    let pass = h264.pass && hevc.pass;
+    Vt1080pBenchReport {
+        pass,
+        probed_vt_cap_bits: format!("{vt_caps:#018x}"),
+        local_v2_cap_bits: format!("{local_caps:#018x}"),
+        h264,
+        hevc,
+        error: if pass {
+            None
+        } else {
+            Some("1080p VideoToolbox benchmark failed one or more gates".into())
+        },
+    }
 }
 
 fn cmd_codec_selftest(vp9_frames: usize, av1_frames: usize) -> CodecSelftestReport {
@@ -1204,6 +1498,8 @@ async fn cmd_e2e(
     let secondary_codec = match primary_codec {
         VideoCodec::Vp9 => VideoCodec::Av1,
         VideoCodec::Av1 => VideoCodec::Vp9,
+        VideoCodec::H264 => VideoCodec::Hevc,
+        VideoCodec::Hevc => VideoCodec::H264,
     };
 
     let init_enc = V2VideoEncoder::new(
@@ -1246,7 +1542,7 @@ async fn cmd_e2e(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e wan-bench --config <cluster.json> [--ca-der <ca.der>] [--frames 120] [--codec vp9|av1] [--bg-mbps 8] [--rounds 3] [--probes-per-round 200] [--max-wire-mbps 8]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--allow-idle-exit] [--audit-key-identity] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1] [--leave-stuck] [--hold-after-stuck-ms 0] [--no-visual-marker] [--audit-key-identity]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]\n  zerodesk-desktop-e2e v2-hostd --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>]\n  zerodesk-desktop-e2e v2-ctl --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>]\n  zerodesk-desktop-e2e signaling-e2e --config <cluster.json> [--ca-der <path>] [--codec vp9] [--frames 30]\n  zerodesk-desktop-e2e phase4b-e2e --config <cluster.json> [--ca-der <path>] [--signaling-tls] [--codec vp9] [--frames 30] [--scenario all|a|b|c]\n  zerodesk-desktop-e2e phase5-e2e --config <cluster.json> [--ca-cert <path>] [--signaling-tls]\n  zerodesk-desktop-e2e phase6-e2e --config <cluster.json> [--host-bin <zerodesk-desktop>] [--ca-cert <path>] [--signaling-tls]"
+        "Usage:\n  zerodesk-desktop-e2e codec-selftest [--frames 30] [--av1-frames 10] [--vt-1080p] [--vt-frames 180]\n  zerodesk-desktop-e2e vt-bench [--frames 180]\n  zerodesk-desktop-e2e e2e --config <cluster.json> [--ca-der <ca.der>] [--frames 300] [--codec vp9|av1|h264|hevc] [--bg-mbps 20] [--av1-burst 10]\n  zerodesk-desktop-e2e wan-bench --config <cluster.json> [--ca-der <ca.der>] [--frames 120] [--codec vp9|av1|h264|hevc] [--bg-mbps 8] [--rounds 3] [--probes-per-round 200] [--max-wire-mbps 8]\n  zerodesk-desktop-e2e host --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--source synthetic|screen] [--codec vp9|av1|h264|hevc] [--fps 30] [--watchdog-ms 800] [--idle-exit-ms 2500] [--allow-idle-exit] [--audit-key-identity] [--enable-os-input]\n  zerodesk-desktop-e2e controller --config <cluster.json> [--ca-der <ca.der>] --rendezvous <path> --audit-out <jsonl> [--frames 60] [--codec vp9|av1|h264|hevc] [--leave-stuck] [--hold-after-stuck-ms 0] [--no-visual-marker] [--audit-key-identity]\n  zerodesk-desktop-e2e dual-e2e --config <cluster.json> [--ca-der <ca.der>] [--codec vp9|av1|h264|hevc] [--frames 60]\n  zerodesk-desktop-e2e capture-probe --source screen|synthetic [--frames 30] [--timeout-ms 5000]\n  zerodesk-desktop-e2e v2-hostd --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --audit-out <jsonl> [--codec vp9|av1|h264|hevc] [--fps 30] [--watchdog-ms 1200] [--idle-exit-ms 10000] [--ready-file <path>] [--enrollment-token <tok>]\n  zerodesk-desktop-e2e v2-ctl --config <cluster.json> [--ca-der <path>] --identity-dir <dir> --target-device-id <hex> --tenant-id <hex> --enrollment-token <tok> --audit-out <jsonl> [--codec vp9|av1|h264|hevc] [--frames 30] [--leave-stuck] [--hold-after-stuck-ms <ms>]\n  zerodesk-desktop-e2e signaling-e2e --config <cluster.json> [--ca-der <path>] [--codec vp9|av1|h264|hevc] [--frames 30]\n  zerodesk-desktop-e2e phase4b-e2e --config <cluster.json> [--ca-der <path>] [--signaling-tls] [--codec vp9|av1|h264|hevc] [--frames 30] [--scenario all|a|b|c]\n  zerodesk-desktop-e2e phase5-e2e --config <cluster.json> [--ca-cert <path>] [--signaling-tls]\n  zerodesk-desktop-e2e phase6-e2e --config <cluster.json> [--host-bin <zerodesk-desktop>] [--ca-cert <path>] [--signaling-tls]"
     );
 }
 
@@ -1269,6 +1565,8 @@ async fn main() -> ExitCode {
         "codec-selftest" => {
             let mut vp9_frames = 30usize;
             let mut av1_frames = 10usize;
+            let mut vt_1080p = false;
+            let mut vt_frames = 180usize;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1290,6 +1588,16 @@ async fn main() -> ExitCode {
                             return ExitCode::from(2);
                         }
                     },
+                    "--vt-1080p" => vt_1080p = true,
+                    "--vt-frames" => match parse_flag_value(&args, &mut i, "--vt-frames")
+                        .and_then(|v| v.parse::<usize>().map_err(|e| e.to_string()))
+                    {
+                        Ok(n) => vt_frames = n,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return ExitCode::from(2);
+                        }
+                    },
                     other => {
                         eprintln!("unknown argument '{other}'");
                         print_usage();
@@ -1298,7 +1606,51 @@ async fn main() -> ExitCode {
                 }
                 i += 1;
             }
-            let report = cmd_codec_selftest(vp9_frames, av1_frames);
+            if vt_1080p {
+                let report = cmd_vt_1080p_bench(vt_frames);
+                if let Ok(json) = serde_json::to_string_pretty(&report) {
+                    println!("{json}");
+                }
+                if report.pass {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            } else {
+                let report = cmd_codec_selftest(vp9_frames, av1_frames);
+                if let Ok(json) = serde_json::to_string_pretty(&report) {
+                    println!("{json}");
+                }
+                if report.pass {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "vt-bench" => {
+            let mut vt_frames = 180usize;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--frames" => match parse_flag_value(&args, &mut i, "--frames")
+                        .and_then(|v| v.parse::<usize>().map_err(|e| e.to_string()))
+                    {
+                        Ok(n) => vt_frames = n,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return ExitCode::from(2);
+                        }
+                    },
+                    other => {
+                        eprintln!("unknown argument '{other}'");
+                        print_usage();
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            let report = cmd_vt_1080p_bench(vt_frames);
             if let Ok(json) = serde_json::to_string_pretty(&report) {
                 println!("{json}");
             }

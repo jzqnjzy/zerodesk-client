@@ -10,7 +10,7 @@ use super::{
         DEGRADED_BASELINE_BW_KBPS,
     },
     runtime::{CloseReason, LeaseRenewalConfig, LeaseRenewalLeg, LeaseRenewalTask, QoeSnapshot},
-    video::I420Frame,
+    video::{local_v2_cap_bits, I420Frame},
 };
 use rand_core::{OsRng, RngCore};
 use std::{
@@ -35,10 +35,14 @@ use v2_client::{
 use v2_identity::{DelegationCache, DeviceKeyStore, SoftwareDeviceKeyStore};
 use v2_transport::{
     PrologueInput, QuotaExhaustPolicy, VerifiedTenantPolicy, CAP_ACCESS_LEG_SEQ_V11,
-    CAP_AUDIO_OPUS_DTX, CAP_CLIPBOARD, CAP_CODEC_AV1, CAP_CODEC_VP9, CAP_FILE_TRANSFER,
-    CAP_SURVIVAL_MODE, CAP_TRANSPORT_TCP443_DUAL, CIPHER_AESGCM, L3_MTU_DEFAULT, PATTERN_IK,
-    TRANSPORT_MODE_RELAY_UDP, VER_MAJOR, VER_MAJOR_MINOR, VER_MINOR,
+    CAP_AUDIO_OPUS_DTX, CAP_CLIPBOARD, CAP_CODEC_AV1, CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW,
+    CAP_CODEC_VP9, CAP_FILE_TRANSFER, CAP_SURVIVAL_MODE, CAP_TRANSPORT_TCP443_DUAL,
+    CIPHER_AESGCM, L3_MTU_DEFAULT, PATTERN_IK, TRANSPORT_MODE_RELAY_UDP, VER_MAJOR,
+    VER_MAJOR_MINOR, VER_MINOR,
 };
+
+const ANY_VIDEO_CODEC_CAP_MASK: u64 =
+    CAP_CODEC_AV1 | CAP_CODEC_VP9 | CAP_CODEC_H264 | CAP_CODEC_HEVC_OS_HW;
 
 pub const DEFAULT_V2_CAP_BITS: u64 = CAP_CODEC_AV1
     | CAP_CODEC_VP9
@@ -747,13 +751,14 @@ impl DesktopHostDaemon {
         cp.healthz().await?;
         let ca_spki_der = cp.get_ca_pubkey().await?.spki_der()?;
 
+        let cap_bits = local_v2_cap_bits();
         let mut identity = PersistentV2Identity::load_or_create(&config.identity_dir)?;
         let (_cert, inline_blob) = identity
             .ensure_registered_with_policy(
                 &cp,
                 &ca_spki_der,
                 config.enrollment_token.as_deref(),
-                DEFAULT_V2_CAP_BITS,
+                cap_bits,
                 &config.home_region,
             )
             .await?;
@@ -762,7 +767,7 @@ impl DesktopHostDaemon {
             &mut identity,
             &ca_spki_der,
             config.enrollment_token.as_deref(),
-            DEFAULT_V2_CAP_BITS,
+            cap_bits,
             &config.home_region,
             inline_blob,
             &callbacks,
@@ -774,7 +779,7 @@ impl DesktopHostDaemon {
             device_cert: cert,
             delegation: deleg,
             presence: PresenceState::Online,
-            cap_bits: DEFAULT_V2_CAP_BITS,
+            cap_bits,
             home_region: config.home_region.clone(),
             ver_major: u32::from(VER_MAJOR),
             ver_minor: u32::from(VER_MINOR),
@@ -801,7 +806,7 @@ impl DesktopHostDaemon {
             ca_spki_der,
             effective_policy,
             policy_resolved_at: Instant::now(),
-            cap_bits: DEFAULT_V2_CAP_BITS,
+            cap_bits,
             callbacks,
             seen_sessions: SeenSessionCache::new(SEEN_SESSION_CACHE_CAP),
             delegation_cache: DelegationCache::new(),
@@ -1146,7 +1151,7 @@ impl DesktopHostDaemon {
         let edge_a_hash = edge_a_cfg.edge_cert_hash()?;
 
         let negotiated_cap_bits = offer.controller_cap_bits & self.cap_bits;
-        if (negotiated_cap_bits & (CAP_CODEC_VP9 | CAP_CODEC_AV1)) == 0 {
+        if (negotiated_cap_bits & ANY_VIDEO_CODEC_CAP_MASK) == 0 {
             self.send_reject(offer.session_id, 0x0102).await;
             return Err(ManagerError::Rejected {
                 error_code: 0x0102,
@@ -1423,13 +1428,14 @@ impl DesktopControllerClient {
         cp.healthz().await?;
         let ca_spki_der = cp.get_ca_pubkey().await?.spki_der()?;
 
+        let cap_bits = local_v2_cap_bits();
         let mut identity = PersistentV2Identity::load_or_create(&config.identity_dir)?;
         let (_cert, inline_blob) = identity
             .ensure_registered_with_policy(
                 &cp,
                 &ca_spki_der,
                 config.enrollment_token.as_deref(),
-                DEFAULT_V2_CAP_BITS,
+                cap_bits,
                 &config.home_region,
             )
             .await?;
@@ -1438,7 +1444,7 @@ impl DesktopControllerClient {
             &mut identity,
             &ca_spki_der,
             config.enrollment_token.as_deref(),
-            DEFAULT_V2_CAP_BITS,
+            cap_bits,
             &config.home_region,
             inline_blob,
             &callbacks,
@@ -1450,7 +1456,7 @@ impl DesktopControllerClient {
             device_cert: cert,
             delegation: deleg,
             presence: PresenceState::Online,
-            cap_bits: DEFAULT_V2_CAP_BITS,
+            cap_bits,
             home_region: config.home_region.clone(),
             ver_major: u32::from(VER_MAJOR),
             ver_minor: u32::from(VER_MINOR),
@@ -1477,7 +1483,7 @@ impl DesktopControllerClient {
             ca_spki_der,
             effective_policy,
             policy_resolved_at: Instant::now(),
-            cap_bits: DEFAULT_V2_CAP_BITS,
+            cap_bits,
             callbacks,
             delegation_cache: DelegationCache::new(),
             udp_neg_cache: UdpNegativeCache::new(),
@@ -1778,7 +1784,7 @@ impl DesktopControllerClient {
 
         let negotiated_cap_bits = accept.negotiated_cap_bits;
         if (negotiated_cap_bits & !self.cap_bits) != 0
-            || (negotiated_cap_bits & (CAP_CODEC_VP9 | CAP_CODEC_AV1)) == 0
+            || (negotiated_cap_bits & ANY_VIDEO_CODEC_CAP_MASK) == 0
         {
             return Err(ManagerError::Protocol(format!(
                 "invalid negotiated_cap_bits={negotiated_cap_bits:#x}"

@@ -112,6 +112,28 @@ fn compile_macos_sck() {
     }
 }
 
+fn compile_macos_vt() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=native/macos_vt.h");
+        println!("cargo:rerun-if-changed=native/macos_vt.c");
+
+        cc::Build::new()
+            .file("native/macos_vt.c")
+            .include("native")
+            .flag("-std=c11")
+            .flag("-mmacosx-version-min=13.0")
+            .flag("-Wall")
+            .flag("-Wextra")
+            .flag("-Werror")
+            .compile("zerodesk_macos_vt");
+
+        println!("cargo:rustc-link-lib=framework=VideoToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ZERODESK_LIBOPUS_PREFIX");
@@ -120,6 +142,7 @@ fn main() {
 
     link_macos_frameworks();
     compile_macos_sck();
+    compile_macos_vt();
 
     let static_codecs = env::var("ZERODESK_STATIC_CODECS").as_deref() == Ok("1");
     if static_codecs {

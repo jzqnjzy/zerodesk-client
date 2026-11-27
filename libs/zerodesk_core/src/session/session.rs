@@ -150,6 +150,12 @@ impl DesktopHostSession {
         self.encoder_codec
     }
 
+    pub fn force_next_idr(&self) {
+        if let Ok(mut guard) = self.encoder.lock() {
+            guard.force_next_idr();
+        }
+    }
+
     /// Replaces the active encoder while keeping `frame_id` strictly monotonic across codec switches.
     pub fn replace_encoder(&mut self, mut encoder: V2VideoEncoder) {
         if let Ok(prev) = self.encoder.lock() {

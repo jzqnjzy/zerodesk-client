@@ -15,6 +15,7 @@ pub mod runtime;
 #[allow(clippy::module_inception)]
 pub mod session;
 pub mod video;
+pub mod vt_codec;
 
 pub use audio::{
     audio_ts_delta, audio_ts_gt, measure_audio_quality, AudioChannelGate, AudioError,
@@ -123,7 +124,15 @@ pub use session::{
     CTRL_MSG_SESSION_CLOSE, PENDING_VIDEO_QUEUE_CAP,
 };
 pub use video::{
-    compute_y_psnr, compute_y_ssim, generate_animated_i420, EncodedV2Frame, FrameQualityMetrics,
-    I420Frame, V2VideoDecoder, V2VideoEncoder, VideoCodec, VideoError, CODEC_ID_AV1, CODEC_ID_VP9,
-    MAX_FRAME_DIM,
+    compute_y_psnr, compute_y_ssim, generate_animated_i420, generate_desktop_scene_i420,
+    local_v2_cap_bits, local_v2_cap_bits_with_vt_disable, negotiate_video_codec,
+    read_desktop_scene_frame_idx, BgraFrame, DecodedVideoFrame, EncodedV2Frame,
+    FrameQualityMetrics, I420Frame, V2VideoDecoder, V2VideoEncoder, VideoCodec, VideoError,
+    CODEC_ID_AV1, CODEC_ID_H264, CODEC_ID_HEVC, CODEC_ID_VP9, DEFAULT_H264_1080P_BITRATE_BPS,
+    DEFAULT_HEVC_1080P_BITRATE_BPS, MAX_CONSECUTIVE_DECODE_FAILURES, MAX_FRAME_DIM,
+};
+pub use vt_codec::{
+    bgra_to_i420_bt709, parse_annexb_checked, probe_vt_cap_bits_uncached, probed_vt_cap_bits,
+    probed_vt_cap_bits_with_disable, AnnexbParseSummary, VT_DISABLE_ENV_VAR,
+    VT_MAX_REBUILDS_IN_WINDOW, VT_REBUILD_WINDOW,
 };

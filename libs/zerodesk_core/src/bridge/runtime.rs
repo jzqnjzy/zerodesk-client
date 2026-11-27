@@ -51,12 +51,18 @@ use crate::{
         identity::PersistentV2Identity,
         manager::{
             CallDecision, DesktopControllerClient, DesktopHostDaemon, IncomingCall, SecurityEvent,
-            UiCallbackDispatcher, V2SessionState, V2UiCallback, DEFAULT_V2_CAP_BITS,
+            UiCallbackDispatcher, V2SessionState, V2UiCallback,
         },
         policy::{verify_tenant_policy_blob, EffectiveTenantPolicy, PolicyVerifyOutcome},
         runtime::send_redundant_session_close_3x,
-        session::{parse_session_close, DesktopHostSession, CTRL_MSG_SESSION_CLOSE},
-        video::{V2VideoDecoder, V2VideoEncoder, VideoCodec},
+        session::{
+            parse_request_idr, parse_session_close, DesktopHostSession, SessionError,
+            CTRL_MSG_REQUEST_IDR, CTRL_MSG_SESSION_CLOSE,
+        },
+        video::{
+            local_v2_cap_bits, DecodedVideoFrame, V2VideoDecoder, V2VideoEncoder, VideoCodec,
+            VideoError,
+        },
     },
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -82,6 +88,7 @@ use v2_client::{
 };
 use v2_transport::{
     AudioPacket, TransportEvent, VerifiedTenantPolicy, CHAN_CLIPBOARD, CHAN_FILE_TRANSFER,
+    IDR_MIN_INTERVAL_MS,
 };
 
 pub const SYNC_CMD_TIMEOUT: Duration = Duration::from_millis(500);
@@ -1572,9 +1579,11 @@ impl BridgeActor {
                 "config missing 'edge_b'",
             ));
         };
-        let codec = match cfg.codec.to_ascii_lowercase().as_str() {
-            "av1" => VideoCodec::Av1,
-            _ => VideoCodec::Vp9,
+        let codec = if cfg.codec.trim().is_empty() {
+            VideoCodec::Vp9
+        } else {
+            VideoCodec::parse_name(&cfg.codec)
+                .map_err(|e| RuntimeReplyEnvelope::err("InvalidConfig", e.to_string()))?
         };
         let v2_cfg = V2ClientConfig {
             control_plane_endpoint: cfg.control_plane_endpoint.clone(),
@@ -2891,7 +2900,7 @@ async fn refresh_policy_from_cp(
                 &cp,
                 &ca_spki_der,
                 cfg.enrollment_token.as_deref(),
-                DEFAULT_V2_CAP_BITS,
+                local_v2_cap_bits(),
                 &cfg.home_region,
             )
             .await
@@ -4626,7 +4635,11 @@ async fn run_active_host_session(
                         };
                         if let Ok(i420) = i420_res {
                             pts_ms += frame_period.as_millis() as i64;
-                            let _ = host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await;
+                            if let Err(SessionError::Video(e @ VideoError::CodecFailed { .. })) =
+                                host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await
+                            {
+                                break format!("video_codec_failed: {e}");
+                            }
                         }
                     }
                 }
@@ -4699,6 +4712,9 @@ async fn run_active_host_session(
                                 V2RecvEvent::Transport(TransportEvent::Control(ctrl)) => {
                                     if let Some(code) = parse_session_close(&ctrl) {
                                         break format!("peer_closed({code:#06x})");
+                                    }
+                                    if parse_request_idr(&ctrl).is_some() {
+                                        host_sess.force_next_idr();
                                     }
                                 }
                                 V2RecvEvent::ClipboardRaw(raw) => {
@@ -4929,6 +4945,7 @@ async fn run_controller_lifecycle_task(
 
     let mut lease_expired_rx = connected.lease_renewal.subscribe_expired();
     let mut video_frames_decoded: u64 = 0;
+    let mut last_idr_req_at: Option<Instant> = None;
 
     let is_blackholed = || -> bool {
         #[cfg(feature = "e2e-fault-injection")]
@@ -5135,19 +5152,58 @@ async fn run_controller_lifecycle_task(
                 recv_res = ctrl_sess.recv_v124_event(Duration::from_millis(25)) => {
                     match recv_res {
                         Ok(V2RecvEvent::Transport(TransportEvent::VideoFrame(vf))) => {
-                            if let Ok(i420) = decoder.decode_raw(&vf.data) {
-                                video_frames_decoded += 1;
-                                if mailbox
-                                    .publish_i420_for_session(
-                                        gen,
-                                        &i420,
-                                        PixelFormat::Bgra8,
-                                        now_epoch_ms(),
-                                    )
-                                    .is_ok()
-                                {
-                                    events.notify_frame_published();
+                            match decoder.decode_raw_frame(&vf.data) {
+                                Ok(DecodedVideoFrame::Bgra(bgra)) => {
+                                    video_frames_decoded += 1;
+                                    if mailbox
+                                        .publish_raw_for_session(
+                                            gen,
+                                            bgra.width as u32,
+                                            bgra.height as u32,
+                                            bgra.stride as u32,
+                                            PixelFormat::Bgra8,
+                                            now_epoch_ms(),
+                                            bgra.data,
+                                        )
+                                        .is_ok()
+                                    {
+                                        events.notify_frame_published();
+                                    }
                                 }
+                                Ok(DecodedVideoFrame::I420(i420)) => {
+                                    video_frames_decoded += 1;
+                                    if mailbox
+                                        .publish_i420_for_session(
+                                            gen,
+                                            &i420,
+                                            PixelFormat::Bgra8,
+                                            now_epoch_ms(),
+                                        )
+                                        .is_ok()
+                                    {
+                                        events.notify_frame_published();
+                                    }
+                                }
+                                Err(VideoError::NeedIdr(_)) => {
+                                    if !is_blackholed()
+                                        && last_idr_req_at.is_none_or(|t| {
+                                            t.elapsed() >= Duration::from_millis(IDR_MIN_INTERVAL_MS)
+                                        })
+                                        && ctrl_sess
+                                            .send_control(
+                                                CTRL_MSG_REQUEST_IDR,
+                                                &vf.frame_id.to_be_bytes(),
+                                            )
+                                            .await
+                                            .is_ok()
+                                    {
+                                        last_idr_req_at = Some(Instant::now());
+                                    }
+                                }
+                                Err(e @ VideoError::CodecFailed { .. }) => {
+                                    break format!("video_codec_failed: {e}");
+                                }
+                                Err(_) => {}
                             }
                         }
                         Ok(V2RecvEvent::AudioRaw(raw)) => {
@@ -5296,7 +5352,7 @@ async fn emit_file_cmd_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::json_abi::scan_json_for_secret_canaries;
+    use crate::{bridge::json_abi::scan_json_for_secret_canaries, session::DEFAULT_V2_CAP_BITS};
 
     fn sample_cert() -> SignalingDeviceCert {
         SignalingDeviceCert {
