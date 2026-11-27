@@ -32,7 +32,7 @@ use v2_e2e::{
     AuditRecord, ChannelFramingErrorCounter, ClipMessage, ClipSync, ClipboardReceiver,
     ClipboardRecvAction, CloseReason, DecodedVideoDelivery, DesktopControllerClient,
     DesktopControllerSession, DesktopHostDaemon, DesktopHostSession, DryRunSink, FileChunk,
-    FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver, HidEchoAck,
+    FileComplete, FileMessage, FileOffer, FileRecvAction, FileSenderWindow, FileTransferReceiver, HidEchoAck,
     HidInputExecutor, HidPayload, InputError, JitterPlayoutAction, KeyEvent, MouseEvent, MouseKind,
     NoopUiCallback, OpusWireFrame, SafeHidKey, SessionError, SharedVisualMarker,
     SyntheticAnimatedSource, SyntheticMultiToneSource, TransportMode, UiCallbackDispatcher,
@@ -639,6 +639,8 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
     let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(args.fps.max(1)));
     let idle_exit = Duration::from_millis(args.idle_exit_ms);
     let session_start = Instant::now();
+    let mut peer_ready = false;
+    let mut audio_started = false;
     let mut last_peer_activity = Instant::now();
     let mut next_frame_at = Instant::now();
     let mut next_hid_seq = 0u32;
@@ -674,6 +676,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
             .clamp(Duration::from_millis(1), Duration::from_millis(10));
         match host.session_mut().recv_v124_event(recv_wait).await {
             Ok(V2RecvEvent::Transport(TransportEvent::Hid(frame))) => {
+                peer_ready = true;
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 match decode_hid_frame(&frame) {
@@ -718,6 +721,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                 }
             }
             Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
+                peer_ready = true;
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 if let Some(code) = parse_session_close(&ctrl) {
@@ -733,6 +737,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                 }
             }
             Ok(V2RecvEvent::AudioRaw(raw)) => {
+                peer_ready = true;
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 if !audio_gate.policy_allows_audio() {
@@ -744,6 +749,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                 }
             }
             Ok(V2RecvEvent::ClipboardRaw(raw)) => {
+                peer_ready = true;
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 match clip_rx.on_l4_frame(
@@ -832,6 +838,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                 }
             }
             Ok(V2RecvEvent::FileTransferRaw(raw)) => {
+                peer_ready = true;
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
                 match file_rx.on_l4_frame(
@@ -906,6 +913,7 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
                 }
             }
             Ok(V2RecvEvent::Transport(_)) => {
+                peer_ready = true;
                 last_peer_activity = Instant::now();
                 executor.touch_activity();
             }
@@ -920,31 +928,37 @@ async fn run_v2_hostd(args: &HostDaemonArgs) -> Result<HostDaemonSummary, String
         if let Some((ref mut src, ref mut enc, ref mut ts_u32, ref mut next_audio_at)) =
             audio_tx_state
         {
-            if Instant::now() >= *next_audio_at {
-                *next_audio_at = Instant::now() + Duration::from_millis(20);
-                if let Some(pcm) = src.next_frame() {
-                    if let Ok(encoded) = enc.encode_frame(&pcm) {
-                        let wire = OpusWireFrame {
-                            ts_u32: *ts_u32,
-                            dtx: encoded.dtx,
-                            payload: encoded.payload,
-                        };
-                        if let Ok(bytes) = wire.encode() {
-                            if host
-                                .session_mut()
-                                .send_l4_raw(CHAN_AUDIO, 0x01, 0, false, &bytes)
-                                .await
-                                .is_ok()
-                            {
-                                audio_frames_sent = audio_frames_sent.saturating_add(1);
-                                if encoded.dtx {
-                                    audio_dtx_frames_sent =
-                                        audio_dtx_frames_sent.saturating_add(1);
+            if peer_ready || session_start.elapsed() >= Duration::from_secs(2) {
+                if !audio_started {
+                    audio_started = true;
+                    *next_audio_at = Instant::now();
+                }
+                if Instant::now() >= *next_audio_at {
+                    *next_audio_at = Instant::now() + Duration::from_millis(20);
+                    if let Some(pcm) = src.next_frame() {
+                        if let Ok(encoded) = enc.encode_frame(&pcm) {
+                            let wire = OpusWireFrame {
+                                ts_u32: *ts_u32,
+                                dtx: encoded.dtx,
+                                payload: encoded.payload,
+                            };
+                            if let Ok(bytes) = wire.encode() {
+                                if host
+                                    .session_mut()
+                                    .send_l4_raw(CHAN_AUDIO, 0x01, 0, false, &bytes)
+                                    .await
+                                    .is_ok()
+                                {
+                                    audio_frames_sent = audio_frames_sent.saturating_add(1);
+                                    if encoded.dtx {
+                                        audio_dtx_frames_sent =
+                                            audio_dtx_frames_sent.saturating_add(1);
+                                    }
                                 }
                             }
                         }
+                        *ts_u32 = ts_u32.wrapping_add(AUDIO_FRAME_SAMPLES_PER_CH as u32);
                     }
-                    *ts_u32 = ts_u32.wrapping_add(AUDIO_FRAME_SAMPLES_PER_CH as u32);
                 }
             }
         }
@@ -1469,17 +1483,18 @@ async fn push_file_transfer_p4b(
         Instant::now(),
     )
     .map_err(|e| format!("prepare FileOffer: {e}"))?;
-    session
-        .send_l4_raw(
-            CHAN_FILE_TRANSFER,
-            FILE_MSG_OFFER,
-            0,
-            false,
-            &offer.encode().map_err(|e| e.to_string())?,
-        )
+    let offer_bytes = offer.encode().map_err(|e| e.to_string())?;
+    let mut offer_sent = match session
+        .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_OFFER, 0, false, &offer_bytes)
         .await
-        .map_err(|e| e.to_string())?;
-    *last_tx = Instant::now();
+    {
+        Ok(_) => {
+            *last_tx = Instant::now();
+            true
+        }
+        Err(v2_client::ClientError::P3Backpressure { .. }) => false,
+        Err(e) => return Err(e.to_string()),
+    };
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut audio_opt = audio_tracker;
@@ -1487,6 +1502,19 @@ async fn push_file_transfer_p4b(
     loop {
         maybe_send_keepalive(session, keepalive_interval, last_tx).await?;
         let bulk_paused = session.is_bulk_paused();
+        if !offer_sent && !bulk_paused {
+            match session
+                .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_OFFER, 0, false, &offer_bytes)
+                .await
+            {
+                Ok(_) => {
+                    offer_sent = true;
+                    *last_tx = Instant::now();
+                }
+                Err(v2_client::ClientError::P3Backpressure { .. }) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         while let Some((offset, len)) = win.next_chunk_range(bulk_paused) {
             let start = offset as usize;
             let end = start + len;
@@ -1496,16 +1524,24 @@ async fn push_file_transfer_p4b(
                 data: data[start..end].to_vec(),
             };
             let chunk_bytes = chunk.encode().map_err(|e| e.to_string())?;
-            session
+            match session
                 .send_l4_raw(CHAN_FILE_TRANSFER, FILE_MSG_CHUNK, 0, false, &chunk_bytes)
                 .await
-                .map_err(|e| e.to_string())?;
-            win.mark_chunk_sent(offset, len, Instant::now());
-            *last_tx = Instant::now();
+            {
+                Ok(_) => {
+                    win.mark_chunk_sent(offset, len, Instant::now());
+                    *last_tx = Instant::now();
+                }
+                Err(v2_client::ClientError::P3Backpressure { .. }) => break,
+                Err(e) => return Err(e.to_string()),
+            }
         }
-        if !complete_sent && win.ready_for_complete() {
-            let comp = win.build_complete(Instant::now());
-            session
+        if !complete_sent && !bulk_paused && win.ready_for_complete() {
+            let comp = FileComplete {
+                transfer_id,
+                sha256,
+            };
+            match session
                 .send_l4_raw(
                     CHAN_FILE_TRANSFER,
                     FILE_MSG_COMPLETE,
@@ -1514,9 +1550,15 @@ async fn push_file_transfer_p4b(
                     &comp.encode(),
                 )
                 .await
-                .map_err(|e| e.to_string())?;
-            complete_sent = true;
-            *last_tx = Instant::now();
+            {
+                Ok(_) => {
+                    let _ = win.build_complete(Instant::now());
+                    complete_sent = true;
+                    *last_tx = Instant::now();
+                }
+                Err(v2_client::ClientError::P3Backpressure { .. }) => {}
+                Err(e) => return Err(e.to_string()),
+            }
         }
 
         let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
@@ -1934,6 +1976,7 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                 // to verify Edge L2 allowed_mask AND remote Host defense-in-depth!
                 let expect_clip_deny = clipboard_local_policy_denied;
                 let expect_file_deny = file_local_policy_denied;
+                let edge_drops_p3 = expect_clip_deny && expect_file_deny;
 
                 if expect_clip_deny {
                     let clip_payload = b"denied-probe-text";
@@ -1946,14 +1989,25 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                         sha256: Sha256::digest(clip_payload).into(),
                     };
                     let clip_sync_bytes = clip_sync.encode().map_err(|e| e.to_string())?;
-                    session
-                        .send_negative_policy_probe(
-                            CHAN_CLIPBOARD,
-                            CLIP_MSG_SYNC,
-                            &clip_sync_bytes,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    if edge_drops_p3 {
+                        session
+                            .send_negative_policy_probe(
+                                CHAN_CLIPBOARD,
+                                CLIP_MSG_SYNC,
+                                &clip_sync_bytes,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        session
+                            .send_l4_bypass_local_policy(
+                                CHAN_CLIPBOARD,
+                                CLIP_MSG_SYNC,
+                                &clip_sync_bytes,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
 
                 if expect_file_deny {
@@ -1965,14 +2019,25 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                         rel_name: "denied.txt".into(),
                     };
                     let offer_bytes = file_offer.encode().map_err(|e| e.to_string())?;
-                    session
-                        .send_negative_policy_probe(
-                            CHAN_FILE_TRANSFER,
-                            FILE_MSG_OFFER,
-                            &offer_bytes,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    if edge_drops_p3 {
+                        session
+                            .send_negative_policy_probe(
+                                CHAN_FILE_TRANSFER,
+                                FILE_MSG_OFFER,
+                                &offer_bytes,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        session
+                            .send_l4_bypass_local_policy(
+                                CHAN_FILE_TRANSFER,
+                                FILE_MSG_OFFER,
+                                &offer_bytes,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
 
                 if audio_local_policy_denied {
@@ -2248,10 +2313,6 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                             Err(e) => return Err(e.to_string()),
                         }
                     }
-                    tr.drain()?;
-                    audio_frames_received = tr.frames_received;
-                    audio_dtx_frames_received = tr.dtx_frames_received;
-                    audio_snr_db = tr.compute_active_snr_db();
                 }
             }
 
@@ -2259,6 +2320,16 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
         }
         .await;
 
+        let mut res = res;
+        if let Some(ref mut tr) = audio_tracker {
+            let drain_res = tr.drain();
+            audio_frames_received = tr.frames_received;
+            audio_dtx_frames_received = tr.dtx_frames_received;
+            audio_snr_db = tr.compute_active_snr_db();
+            if res.is_ok() {
+                res = drain_res;
+            }
+        }
         let p3_drop = session.p3_dropped();
         let _ = send_redundant_session_close_3x(&mut session, 0x0000).await;
         (res, p3_drop)

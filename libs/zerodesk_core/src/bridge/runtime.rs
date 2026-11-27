@@ -62,7 +62,7 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     panic::{catch_unwind, AssertUnwindSafe},
@@ -89,7 +89,10 @@ pub const UNIFIED_SHUTDOWN_BUDGET: Duration = Duration::from_secs(3);
 pub const DEFAULT_RING_TIMEOUT: Duration = Duration::from_secs(15);
 const POLICY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const FILE_COMPLETE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const FILE_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_PROGRESS_THROTTLE_INTERVAL: Duration = Duration::from_millis(200);
+const PENDING_CLIP_FRAMES_CAP: usize = 256;
+const PENDING_FILE_CTRL_CAP: usize = 128;
 const FILE_ERR_LOCAL_ABORT: u16 = 0x0500;
 const ACTOR_CHANNEL_CAP: usize = 256;
 const SESSION_ACTION_CAP: usize = 128;
@@ -2991,12 +2994,22 @@ fn compute_file_sha256_streaming(mut file: File) -> Result<(File, u64, [u8; 32])
     Ok((file, total, sha256))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileSendError {
+    Backpressure,
+    Transport(String),
+}
+
 trait FileL4Sender {
     fn send_file_l4<'a>(
         &'a mut self,
         msg_type: u8,
         body: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>>;
+
+    fn is_bulk_paused(&self) -> bool {
+        false
+    }
 }
 
 impl FileL4Sender for UdpE2eeSession {
@@ -3004,13 +3017,24 @@ impl FileL4Sender for UdpE2eeSession {
         &'a mut self,
         msg_type: u8,
         body: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>>
+    {
         Box::pin(async move {
-            self.send_l4_raw(CHAN_FILE_TRANSFER, msg_type, 0, false, body)
+            match self
+                .send_l4_raw(CHAN_FILE_TRANSFER, msg_type, 0, false, body)
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            {
+                Ok(_) => Ok(()),
+                Err(v2_client::ClientError::P3Backpressure { .. }) => {
+                    Err(FileSendError::Backpressure)
+                }
+                Err(e) => Err(FileSendError::Transport(e.to_string())),
+            }
         })
+    }
+
+    fn is_bulk_paused(&self) -> bool {
+        UdpE2eeSession::is_bulk_paused(self)
     }
 }
 
@@ -3021,9 +3045,11 @@ struct OutboundTransferState {
     file: File,
     total_bytes: u64,
     sha256: [u8; 32],
+    pending_offer: Option<Vec<u8>>,
     accepted: bool,
     window_end_offset: u64,
     offset: u64,
+    acked_offset: u64,
     complete_sent_at: Option<Instant>,
     last_activity_at: Instant,
     last_progress_at: Instant,
@@ -3032,6 +3058,7 @@ struct OutboundTransferState {
 
 struct OutboundFileManager {
     active: HashMap<u64, OutboundTransferState>,
+    pending_ctrl_frames: VecDeque<(u8, Vec<u8>)>,
     unknown_peer_msgs_dropped: u64,
 }
 
@@ -3039,12 +3066,19 @@ impl OutboundFileManager {
     fn new() -> Self {
         Self {
             active: HashMap::new(),
+            pending_ctrl_frames: VecDeque::new(),
             unknown_peer_msgs_dropped: 0,
         }
     }
 
     fn has_active(&self) -> bool {
-        !self.active.is_empty()
+        !self.active.is_empty() || !self.pending_ctrl_frames.is_empty()
+    }
+
+    fn enqueue_ctrl_retry(&mut self, msg_type: u8, body: &[u8]) {
+        if self.pending_ctrl_frames.len() < PENDING_FILE_CTRL_CAP {
+            self.pending_ctrl_frames.push_back((msg_type, body.to_vec()));
+        }
     }
 
     /// Processes an inbound `FILE_MSG_ACCEPT` from the peer. Returns `true` if it matched an
@@ -3057,15 +3091,19 @@ impl OutboundFileManager {
         if st.accepted || acc.resume_offset != 0 {
             return true;
         }
+        let resume = acc.resume_offset.min(st.total_bytes);
         let clamped_win = acc.initial_window_end_offset.min(st.total_bytes);
         st.accepted = true;
+        st.offset = resume;
+        st.acked_offset = resume;
         st.window_end_offset = clamped_win;
         st.last_activity_at = Instant::now();
         true
     }
 
-    /// Processes an inbound `FILE_MSG_ACK` from the peer, advancing the send credit window.
-    /// Returns `true` if it matched an active outbound transfer (consumed), or `false` if unknown.
+    /// Processes an inbound `FILE_MSG_ACK` from the peer, monotonically advancing `acked_offset`
+    /// and the send credit window. Returns `true` if it matched an active outbound transfer
+    /// (consumed), or `false` if unknown.
     fn handle_ack(&mut self, ack: &FileAck) -> bool {
         let Some(st) = self.active.get_mut(&ack.transfer_id) else {
             self.unknown_peer_msgs_dropped = self.unknown_peer_msgs_dropped.saturating_add(1);
@@ -3074,11 +3112,25 @@ impl OutboundFileManager {
         if !st.accepted {
             return true;
         }
+        if ack.next_expected_offset > st.offset
+            || ack.next_expected_offset > st.total_bytes
+            || ack.window_end_offset < ack.next_expected_offset
+        {
+            return true;
+        }
+        let mut progressed = false;
+        if ack.next_expected_offset > st.acked_offset {
+            st.acked_offset = ack.next_expected_offset;
+            progressed = true;
+        }
         let new_win = ack.window_end_offset.min(st.total_bytes);
         if new_win > st.window_end_offset {
             st.window_end_offset = new_win;
+            progressed = true;
         }
-        st.last_activity_at = Instant::now();
+        if progressed {
+            st.last_activity_at = Instant::now();
+        }
         true
     }
 
@@ -3159,10 +3211,15 @@ impl OutboundFileManager {
                 return;
             }
         };
-        if let Err(e) = sess.send_file_l4(FILE_MSG_OFFER, &offer_wire).await {
-            emit_file_cmd_result(gen, cmd_id, actor_tx, Err(("TransportError".into(), e))).await;
-            return;
-        }
+        let pending_offer = match sess.send_file_l4(FILE_MSG_OFFER, &offer_wire).await {
+            Ok(()) => None,
+            Err(FileSendError::Backpressure) => Some(offer_wire),
+            Err(FileSendError::Transport(e)) => {
+                emit_file_cmd_result(gen, cmd_id, actor_tx, Err(("TransportError".into(), e)))
+                    .await;
+                return;
+            }
+        };
 
         let now = Instant::now();
         self.active.insert(
@@ -3174,9 +3231,11 @@ impl OutboundFileManager {
                 file,
                 total_bytes: total,
                 sha256,
+                pending_offer,
                 accepted: false,
                 window_end_offset: 0,
                 offset: 0,
+                acked_offset: 0,
                 complete_sent_at: None,
                 last_activity_at: now,
                 last_progress_at: now,
@@ -3194,7 +3253,20 @@ impl OutboundFileManager {
         gen: u64,
         actor_tx: &mpsc::Sender<ActorMessage>,
     ) {
-        // 0. Re-check live policy on every step: if file transfer was disabled mid-flight, abort all.
+        // 0. Drain any receiver control replies deferred by L4 p3 backpressure first.
+        while let Some((msg_type, body)) = self.pending_ctrl_frames.front() {
+            match sess.send_file_l4(*msg_type, body).await {
+                Ok(()) => {
+                    self.pending_ctrl_frames.pop_front();
+                }
+                Err(FileSendError::Backpressure) => return,
+                Err(FileSendError::Transport(_)) => {
+                    self.pending_ctrl_frames.pop_front();
+                }
+            }
+        }
+
+        // 1. Re-check live policy on every step: if file transfer was disabled mid-flight, abort all.
         if !policy.allow_file_transfer() {
             let revoked: Vec<OutboundTransferState> =
                 self.active.drain().map(|(_, st)| st).collect();
@@ -3228,7 +3300,7 @@ impl OutboundFileManager {
             return;
         }
 
-        // 1. Check CompleteAck / Accept / window stall timeouts.
+        // 2. Check CompleteAck (15s) and no-progress (30s) timeouts.
         let timed_out_ids: Vec<u64> = self
             .active
             .iter()
@@ -3236,8 +3308,8 @@ impl OutboundFileManager {
                 let complete_to = st
                     .complete_sent_at
                     .is_some_and(|t| t.elapsed() >= FILE_COMPLETE_ACK_TIMEOUT);
-                let stall_to = st.last_activity_at.elapsed() >= FILE_COMPLETE_ACK_TIMEOUT;
-                if complete_to || stall_to {
+                let no_progress_to = st.last_activity_at.elapsed() >= FILE_NO_PROGRESS_TIMEOUT;
+                if complete_to || no_progress_to {
                     Some(tid)
                 } else {
                     None
@@ -3271,14 +3343,53 @@ impl OutboundFileManager {
             }
         }
 
-        // 2. Pick the first accepted transfer that has window credit or is ready for FILE_MSG_COMPLETE.
+        // 3. Respect L2 BwHint bulk pause / Survival Mode before sending offers, chunks, or COMPLETE.
+        if sess.is_bulk_paused() {
+            return;
+        }
+
+        // 4. Retry any FILE_MSG_OFFER deferred by P3 backpressure.
+        let pending_offer_tid = self
+            .active
+            .iter()
+            .find(|(_, st)| st.pending_offer.is_some())
+            .map(|(&tid, _)| tid);
+        if let Some(tid) = pending_offer_tid {
+            if let Some(st) = self.active.get_mut(&tid) {
+                if let Some(offer_wire) = st.pending_offer.as_ref() {
+                    match sess.send_file_l4(FILE_MSG_OFFER, offer_wire).await {
+                        Ok(()) => {
+                            st.pending_offer = None;
+                            st.last_activity_at = Instant::now();
+                        }
+                        Err(FileSendError::Backpressure) => return,
+                        Err(FileSendError::Transport(e)) => {
+                            if let Some(st) = self.active.remove(&tid) {
+                                emit_file_cmd_result(
+                                    gen,
+                                    st.cmd_id,
+                                    actor_tx,
+                                    Err(("TransportError".into(), e)),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // 5. Pick the first accepted transfer that has window credit OR is fully ACKed and ready
+        //    for FILE_MSG_COMPLETE (strictly requiring `acked_offset == total_bytes`).
         let next_tid = self
             .active
             .iter()
             .find(|(_, st)| {
                 st.accepted
                     && st.complete_sent_at.is_none()
-                    && (st.offset == st.total_bytes || st.offset < st.window_end_offset)
+                    && ((st.offset < st.total_bytes && st.offset < st.window_end_offset)
+                        || (st.offset == st.total_bytes && st.acked_offset == st.total_bytes))
             })
             .map(|(&tid, _)| tid);
         let Some(tid) = next_tid else {
@@ -3324,23 +3435,49 @@ impl OutboundFileManager {
                         offset: st.offset,
                         data: chunk_buf,
                     };
-                    let send_res = match ch.encode() {
-                        Ok(wire) => sess
-                            .send_file_l4(FILE_MSG_CHUNK, &wire)
-                            .await
-                            .map_err(|e| ("TransportError".to_string(), e)),
-                        Err(e) => Err(("InvalidArgument".to_string(), e.to_string())),
-                    };
-                    if let Err(err) = send_res {
-                        if let Some(st) = self.active.remove(&tid) {
-                            let abort = FileAbort {
-                                transfer_id: tid,
-                                error_code: FILE_ERR_LOCAL_ABORT,
-                            };
-                            let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
-                            emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(err)).await;
+                    let wire = match ch.encode() {
+                        Ok(w) => w,
+                        Err(e) => {
+                            if let Some(st) = self.active.remove(&tid) {
+                                let abort = FileAbort {
+                                    transfer_id: tid,
+                                    error_code: FILE_ERR_LOCAL_ABORT,
+                                };
+                                let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
+                                emit_file_cmd_result(
+                                    gen,
+                                    st.cmd_id,
+                                    actor_tx,
+                                    Err(("InvalidArgument".into(), e.to_string())),
+                                )
+                                .await;
+                            }
+                            return;
                         }
-                        return;
+                    };
+                    match sess.send_file_l4(FILE_MSG_CHUNK, &wire).await {
+                        Ok(()) => {}
+                        Err(FileSendError::Backpressure) => {
+                            let _ = st.file.seek(SeekFrom::Start(st.offset));
+                            return;
+                        }
+                        Err(FileSendError::Transport(e)) => {
+                            if let Some(st) = self.active.remove(&tid) {
+                                let abort = FileAbort {
+                                    transfer_id: tid,
+                                    error_code: FILE_ERR_LOCAL_ABORT,
+                                };
+                                let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
+                                emit_file_cmd_result(
+                                    gen,
+                                    st.cmd_id,
+                                    actor_tx,
+                                    Err(("TransportError".into(), e)),
+                                )
+                                .await;
+                            }
+                            return;
+                        }
                     }
                     st.offset = st.offset.saturating_add(n as u64);
                     st.last_activity_at = Instant::now();
@@ -3382,28 +3519,37 @@ impl OutboundFileManager {
                     }
                 }
             }
-        } else {
+        } else if st.acked_offset == st.total_bytes {
             let complete = FileComplete {
                 transfer_id: tid,
                 sha256: st.sha256,
             };
-            if let Err(e) = sess
+            match sess
                 .send_file_l4(FILE_MSG_COMPLETE, &complete.encode())
                 .await
             {
-                if let Some(st) = self.active.remove(&tid) {
-                    let abort = FileAbort {
-                        transfer_id: tid,
-                        error_code: FILE_ERR_LOCAL_ABORT,
-                    };
-                    let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
-                    emit_file_cmd_result(gen, st.cmd_id, actor_tx, Err(("TransportError".into(), e)))
-                        .await;
+                Ok(()) => {
+                    let now = Instant::now();
+                    st.complete_sent_at = Some(now);
+                    st.last_activity_at = now;
                 }
-            } else {
-                let now = Instant::now();
-                st.complete_sent_at = Some(now);
-                st.last_activity_at = now;
+                Err(FileSendError::Backpressure) => {}
+                Err(FileSendError::Transport(e)) => {
+                    if let Some(st) = self.active.remove(&tid) {
+                        let abort = FileAbort {
+                            transfer_id: tid,
+                            error_code: FILE_ERR_LOCAL_ABORT,
+                        };
+                        let _ = sess.send_file_l4(FILE_MSG_ABORT, &abort.encode()).await;
+                        emit_file_cmd_result(
+                            gen,
+                            st.cmd_id,
+                            actor_tx,
+                            Err(("TransportError".into(), e)),
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }
@@ -3609,12 +3755,22 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
     match file_receiver.on_l4_frame(l4_hdr, body, Instant::now(), file_err_counter) {
         FileRecvAction::SendAccept(acc) => {
             if let Ok(enc) = acc.encode() {
-                let _ = sess.send_file_l4(FILE_MSG_ACCEPT, &enc).await;
+                if matches!(
+                    sess.send_file_l4(FILE_MSG_ACCEPT, &enc).await,
+                    Err(FileSendError::Backpressure)
+                ) {
+                    outbound_files.enqueue_ctrl_retry(FILE_MSG_ACCEPT, &enc);
+                }
             }
         }
         FileRecvAction::SendAck(ack) => {
             if let Ok(enc) = ack.encode() {
-                let _ = sess.send_file_l4(FILE_MSG_ACK, &enc).await;
+                if matches!(
+                    sess.send_file_l4(FILE_MSG_ACK, &enc).await,
+                    Err(FileSendError::Backpressure)
+                ) {
+                    outbound_files.enqueue_ctrl_retry(FILE_MSG_ACK, &enc);
+                }
             }
         }
         FileRecvAction::SendCompleteAck {
@@ -3623,7 +3779,12 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
             audit,
         } => {
             if let Ok(enc) = ack.encode() {
-                let _ = sess.send_file_l4(FILE_MSG_COMPLETE_ACK, &enc).await;
+                if matches!(
+                    sess.send_file_l4(FILE_MSG_COMPLETE_ACK, &enc).await,
+                    Err(FileSendError::Backpressure)
+                ) {
+                    outbound_files.enqueue_ctrl_retry(FILE_MSG_COMPLETE_ACK, &enc);
+                }
             }
             let _ = actor_tx
                 .send(ActorMessage::InternalEvent {
@@ -3640,7 +3801,12 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
         }
         FileRecvAction::SendAbort(ab) => {
             let enc = ab.encode();
-            let _ = sess.send_file_l4(FILE_MSG_ABORT, &enc).await;
+            if matches!(
+                sess.send_file_l4(FILE_MSG_ABORT, &enc).await,
+                Err(FileSendError::Backpressure)
+            ) {
+                outbound_files.enqueue_ctrl_retry(FILE_MSG_ABORT, &enc);
+            }
             let _ = actor_tx
                 .send(ActorMessage::InternalEvent {
                     session_gen: gen,
@@ -3658,6 +3824,48 @@ async fn route_inbound_file_l4<S: FileL4Sender>(
         FileRecvAction::None => {}
     }
     None
+}
+
+async fn send_or_queue_clip_frame(
+    sess: &mut UdpE2eeSession,
+    pending: &mut VecDeque<(u8, Vec<u8>)>,
+    msg_type: u8,
+    body: &[u8],
+) {
+    if !pending.is_empty() {
+        if pending.len() < PENDING_CLIP_FRAMES_CAP {
+            pending.push_back((msg_type, body.to_vec()));
+        }
+        return;
+    }
+    if matches!(
+        sess.send_l4_raw(CHAN_CLIPBOARD, msg_type, 0, false, body)
+            .await,
+        Err(v2_client::ClientError::P3Backpressure { .. })
+    ) && pending.len() < PENDING_CLIP_FRAMES_CAP
+    {
+        pending.push_back((msg_type, body.to_vec()));
+    }
+}
+
+async fn drain_pending_clip_frames(
+    sess: &mut UdpE2eeSession,
+    pending: &mut VecDeque<(u8, Vec<u8>)>,
+) {
+    while let Some((msg_type, body)) = pending.front() {
+        match sess
+            .send_l4_raw(CHAN_CLIPBOARD, *msg_type, 0, false, body)
+            .await
+        {
+            Ok(_) => {
+                pending.pop_front();
+            }
+            Err(v2_client::ClientError::P3Backpressure { .. }) => break,
+            Err(_) => {
+                pending.pop_front();
+            }
+        }
+    }
 }
 
 /// RAII guard ensuring `release_all_keys()` runs and `releaser_slot` is cleared on ANY exit path
@@ -4020,6 +4228,7 @@ async fn run_active_host_session(
         FileTransferReceiver::new(effective_policy.clone(), adapters.download_dir.clone());
     let mut file_err_counter = ChannelFramingErrorCounter::new();
     let mut outbound_files = OutboundFileManager::new();
+    let mut pending_clip_frames: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
     let mut next_transfer_id: u64 = 1;
 
     // 6. Non-blocking policy refresh result channel.
@@ -4064,7 +4273,18 @@ async fn run_active_host_session(
                 break "watchdog_timeout".into();
             }
 
+            let arq_deadline = host_sess.session().next_arq_deadline();
             tokio::select! {
+                _ = async {
+                    match arq_deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if let Err(e) = host_sess.session_mut().poll_arq().await {
+                        break format!("transport_error: {e}");
+                    }
+                }
                 _ = cancel.cancelled() => {
                     break "local_cancel".into();
                 }
@@ -4146,11 +4366,11 @@ async fn run_active_host_session(
                             let paused = host_sess.session().is_bulk_paused();
                             if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, mime_kind, &bytes, cid, cid, paused) {
                                 if let Ok(sync_bytes) = xfer.sync.encode() {
-                                    let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
+                                    send_or_queue_clip_frame(host_sess.session_mut(), &mut pending_clip_frames, CLIP_MSG_SYNC, &sync_bytes).await;
                                 }
                                 for ch in &xfer.chunks {
                                     if let Ok(enc) = ch.encode() {
-                                        let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
+                                        send_or_queue_clip_frame(host_sess.session_mut(), &mut pending_clip_frames, CLIP_MSG_CHUNK, &enc).await;
                                     }
                                 }
                             }
@@ -4184,10 +4404,16 @@ async fn run_active_host_session(
                         SessionAction::SendHid(_) => {}
                     }
                 }
-                _ = file_tick.tick(), if outbound_files.has_active() => {
-                    outbound_files
-                        .pump_one_step(host_sess.session_mut(), &effective_policy, gen, &actor_tx)
-                        .await;
+                _ = file_tick.tick(), if outbound_files.has_active() || !pending_clip_frames.is_empty() => {
+                    if !pending_clip_frames.is_empty() {
+                        drain_pending_clip_frames(host_sess.session_mut(), &mut pending_clip_frames)
+                            .await;
+                    }
+                    if outbound_files.has_active() {
+                        outbound_files
+                            .pump_one_step(host_sess.session_mut(), &effective_policy, gen, &actor_tx)
+                            .await;
+                    }
                 }
                 _ = video_tick.tick() => {
                     if let Ok(raw) = capture.capture_frame() {
@@ -4244,11 +4470,11 @@ async fn run_active_host_session(
                         let paused = host_sess.session().is_bulk_paused();
                         if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, CLIP_MIME_TEXT_UTF8, &bytes, cid, cid, paused) {
                             if let Ok(sync_bytes) = xfer.sync.encode() {
-                                let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
+                                send_or_queue_clip_frame(host_sess.session_mut(), &mut pending_clip_frames, CLIP_MSG_SYNC, &sync_bytes).await;
                             }
                             for ch in &xfer.chunks {
                                 if let Ok(enc) = ch.encode() {
-                                    let _ = host_sess.session_mut().send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
+                                    send_or_queue_clip_frame(host_sess.session_mut(), &mut pending_clip_frames, CLIP_MSG_CHUNK, &enc).await;
                                 }
                             }
                         }
@@ -4484,6 +4710,7 @@ async fn run_controller_lifecycle_task(
     let mut file_receiver = FileTransferReceiver::new(effective_policy.clone(), download_dir);
     let mut file_err_counter = ChannelFramingErrorCounter::new();
     let mut outbound_files = OutboundFileManager::new();
+    let mut pending_clip_frames: VecDeque<(u8, Vec<u8>)> = VecDeque::new();
     let mut next_transfer_id: u64 = 1;
 
     let (pol_tx, mut pol_rx) =
@@ -4519,7 +4746,24 @@ async fn run_controller_lifecycle_task(
         "lease_expired".into()
     } else {
         loop {
+            let arq_deadline = if is_blackholed() {
+                None
+            } else {
+                ctrl_sess.next_arq_deadline()
+            };
             tokio::select! {
+                _ = async {
+                    match arq_deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if !is_blackholed() {
+                        if let Err(e) = ctrl_sess.poll_arq().await {
+                            break format!("transport_error: {e}");
+                        }
+                    }
+                }
                 _ = cancel.cancelled() => {
                     break "local_cancel".into();
                 }
@@ -4553,11 +4797,11 @@ async fn run_controller_lifecycle_task(
                             let paused = ctrl_sess.is_bulk_paused();
                             if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, CLIP_MIME_TEXT_UTF8, &bytes, cid, cid, paused) {
                                 if let Ok(sync_bytes) = xfer.sync.encode() {
-                                    let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
+                                    send_or_queue_clip_frame(&mut ctrl_sess, &mut pending_clip_frames, CLIP_MSG_SYNC, &sync_bytes).await;
                                 }
                                 for ch in &xfer.chunks {
                                     if let Ok(enc) = ch.encode() {
-                                        let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
+                                        send_or_queue_clip_frame(&mut ctrl_sess, &mut pending_clip_frames, CLIP_MSG_CHUNK, &enc).await;
                                     }
                                 }
                             }
@@ -4638,11 +4882,11 @@ async fn run_controller_lifecycle_task(
                                 let paused = ctrl_sess.is_bulk_paused();
                                 if let Ok(xfer) = prepare_outbound_clipboard(&effective_policy, mime_kind, &bytes, cid, cid, paused) {
                                     if let Ok(sync_bytes) = xfer.sync.encode() {
-                                        let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_SYNC, 0, false, &sync_bytes).await;
+                                        send_or_queue_clip_frame(&mut ctrl_sess, &mut pending_clip_frames, CLIP_MSG_SYNC, &sync_bytes).await;
                                     }
                                     for ch in &xfer.chunks {
                                         if let Ok(enc) = ch.encode() {
-                                            let _ = ctrl_sess.send_l4_raw(CHAN_CLIPBOARD, CLIP_MSG_CHUNK, 0, false, &enc).await;
+                                            send_or_queue_clip_frame(&mut ctrl_sess, &mut pending_clip_frames, CLIP_MSG_CHUNK, &enc).await;
                                         }
                                     }
                                 }
@@ -4676,10 +4920,15 @@ async fn run_controller_lifecycle_task(
                         }
                     }
                 }
-                _ = file_tick.tick(), if outbound_files.has_active() => {
-                    outbound_files
-                        .pump_one_step(&mut ctrl_sess, &effective_policy, gen, &actor_tx)
-                        .await;
+                _ = file_tick.tick(), if outbound_files.has_active() || !pending_clip_frames.is_empty() => {
+                    if !is_blackholed() && !pending_clip_frames.is_empty() {
+                        drain_pending_clip_frames(&mut ctrl_sess, &mut pending_clip_frames).await;
+                    }
+                    if outbound_files.has_active() {
+                        outbound_files
+                            .pump_one_step(&mut ctrl_sess, &effective_policy, gen, &actor_tx)
+                            .await;
+                    }
                 }
                 recv_res = ctrl_sess.recv_v124_event(Duration::from_millis(25)) => {
                     match recv_res {
@@ -5124,8 +5373,9 @@ mod tests {
             &'a mut self,
             msg_type: u8,
             body: &'a [u8],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>,
+        > {
             let body_owned = body.to_vec();
             Box::pin(async move {
                 self.frames.push((msg_type, body_owned));
@@ -5466,5 +5716,216 @@ mod tests {
         assert_eq!(parsed["data"]["v"].as_u64(), Some(1));
         assert_eq!(parsed["data"]["state"].as_str(), Some("idle"));
         rt.destroy();
+    }
+
+    struct ControllableFileTx {
+        frames: Vec<(u8, Vec<u8>)>,
+        bulk_paused: bool,
+        inject_backpressure_once: bool,
+    }
+
+    impl FileL4Sender for ControllableFileTx {
+        fn send_file_l4<'a>(
+            &'a mut self,
+            msg_type: u8,
+            body: &'a [u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), FileSendError>> + Send + 'a>,
+        > {
+            let body_owned = body.to_vec();
+            Box::pin(async move {
+                if self.inject_backpressure_once {
+                    self.inject_backpressure_once = false;
+                    return Err(FileSendError::Backpressure);
+                }
+                self.frames.push((msg_type, body_owned));
+                Ok(())
+            })
+        }
+
+        fn is_bulk_paused(&self) -> bool {
+            self.bulk_paused
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_file_manager_zero_byte_backpressure_bulk_pause_and_no_progress_timeout() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("zd-ft-ofm-{}-{uniq}", std::process::id()));
+        let dl_dir = base.join("dl");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        let allow_pol = allow_file_policy(16);
+        let (tx_chan, mut rx_chan) = mpsc::channel::<ActorMessage>(64);
+
+        // 1. 0-byte file: FILE_OFFER -> FILE_ACCEPT -> FILE_COMPLETE immediately (zero chunks)
+        let empty_path = base.join("zero.bin");
+        std::fs::write(&empty_path, b"").unwrap();
+        let mut ofm = OutboundFileManager::new();
+        let mut wire = ControllableFileTx {
+            frames: Vec::new(),
+            bulk_paused: false,
+            inject_backpressure_once: false,
+        };
+        ofm.start_transfer(
+            &mut wire,
+            10,
+            201,
+            empty_path,
+            "zero.bin".into(),
+            &allow_pol,
+            1,
+            &tx_chan,
+        )
+        .await;
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_OFFER);
+        wire.frames.clear();
+
+        assert!(ofm.handle_accept(&FileAccept {
+            transfer_id: 10,
+            resume_offset: 0,
+            initial_window_end_offset: 0,
+        }));
+        // Bulk pause MUST block even FILE_COMPLETE for a 0-byte file.
+        wire.bulk_paused = true;
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(wire.frames.is_empty());
+
+        wire.bulk_paused = false;
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_COMPLETE);
+        assert!(
+            ofm.handle_complete_ack(10, FILE_COMPLETE_ACK_OK, 1, &tx_chan)
+                .await
+        );
+        assert!(!ofm.has_active());
+        wire.frames.clear();
+
+        // 2. Non-zero 2048B file: Backpressure rewinds file cursor without corrupting bytes,
+        //    and FILE_COMPLETE is strictly withheld until FILE_ACK(next_expected_offset == 2048).
+        let data_path = base.join("two_chunks.bin");
+        let payload: Vec<u8> = (0..2048usize).map(|i| ((i * 31 + 5) & 0xFF) as u8).collect();
+        std::fs::write(&data_path, &payload).unwrap();
+        ofm.start_transfer(
+            &mut wire,
+            11,
+            202,
+            data_path,
+            "two_chunks.bin".into(),
+            &allow_pol,
+            1,
+            &tx_chan,
+        )
+        .await;
+        wire.frames.clear();
+
+        assert!(ofm.handle_accept(&FileAccept {
+            transfer_id: 11,
+            resume_offset: 0,
+            initial_window_end_offset: 2048,
+        }));
+
+        // Inject Backpressure on chunk 0: must rewind cursor and send exact bytes 0..1024 on retry!
+        wire.inject_backpressure_once = true;
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(wire.frames.is_empty());
+        assert!(ofm.has_active());
+
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert_eq!(wire.frames.len(), 2);
+        let ch0 = FileChunk::decode(&wire.frames[0].1).unwrap();
+        let ch1 = FileChunk::decode(&wire.frames[1].1).unwrap();
+        assert_eq!(ch0.offset, 0);
+        assert_eq!(ch0.data, &payload[..1024]);
+        assert_eq!(ch1.offset, 1024);
+        assert_eq!(ch1.data, &payload[1024..]);
+        wire.frames.clear();
+
+        // All bytes sent, ZERO FILE_ACK received yet -> pump MUST NOT emit FILE_COMPLETE!
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(wire.frames.is_empty());
+
+        // Partial ACK (1024/2048) -> STILL MUST NOT emit FILE_COMPLETE!
+        assert!(ofm.handle_ack(&FileAck {
+            transfer_id: 11,
+            next_expected_offset: 1024,
+            window_end_offset: 2048,
+        }));
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(wire.frames.is_empty());
+
+        // Spoofed ACK past total_bytes is ignored without unlocking FILE_COMPLETE.
+        assert!(ofm.handle_ack(&FileAck {
+            transfer_id: 11,
+            next_expected_offset: 4096,
+            window_end_offset: 4096,
+        }));
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(wire.frames.is_empty());
+
+        // Final ACK (2048/2048) -> unlocks FILE_COMPLETE!
+        assert!(ofm.handle_ack(&FileAck {
+            transfer_id: 11,
+            next_expected_offset: 2048,
+            window_end_offset: 2048,
+        }));
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_COMPLETE);
+        assert!(
+            ofm.handle_complete_ack(11, FILE_COMPLETE_ACK_OK, 1, &tx_chan)
+                .await
+        );
+        wire.frames.clear();
+
+        // 3. No-progress timeout (30s) aborts cleanly and emits Timeout command error.
+        let stall_path = base.join("stall.bin");
+        std::fs::write(&stall_path, b"stall").unwrap();
+        ofm.start_transfer(
+            &mut wire,
+            12,
+            203,
+            stall_path,
+            "stall.bin".into(),
+            &allow_pol,
+            1,
+            &tx_chan,
+        )
+        .await;
+        wire.frames.clear();
+        ofm.active.get_mut(&12).unwrap().last_activity_at =
+            Instant::now() - FILE_NO_PROGRESS_TIMEOUT - Duration::from_secs(1);
+        ofm.pump_one_step(&mut wire, &allow_pol, 1, &tx_chan).await;
+        assert!(!ofm.has_active());
+        assert_eq!(wire.frames.len(), 1);
+        assert_eq!(wire.frames[0].0, FILE_MSG_ABORT);
+
+        let mut saw_timeout = false;
+        while let Ok(msg) = rx_chan.try_recv() {
+            if let ActorMessage::InternalEvent {
+                event:
+                    ActorEvent::CommandResult {
+                        cmd_id: 203,
+                        ok: false,
+                        error_code: Some(code),
+                        ..
+                    },
+                ..
+            } = msg
+            {
+                if code == "Timeout" {
+                    saw_timeout = true;
+                }
+            }
+        }
+        assert!(saw_timeout, "expected Timeout CommandResult for cmd_id=203");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

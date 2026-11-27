@@ -917,7 +917,7 @@ impl FileSenderWindow {
     }
 
     pub fn ready_for_complete(&self) -> bool {
-        self.accepted && !self.complete_sent && self.max_sent_offset == self.file_size
+        self.accepted && !self.complete_sent && self.next_expected_offset == self.file_size
     }
 
     pub fn build_complete(&mut self, now: Instant) -> FileComplete {
@@ -939,6 +939,10 @@ impl FileSenderWindow {
 
     pub fn max_sent_offset(&self) -> u64 {
         self.max_sent_offset
+    }
+
+    pub fn next_expected_offset(&self) -> u64 {
+        self.next_expected_offset
     }
 }
 
@@ -1912,6 +1916,117 @@ mod tests {
         }
         assert_eq!(denied_rx.audit_records.len(), FILE_AUDIT_LOG_CAP);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sender_window_waits_for_final_ack_before_complete_and_allows_zero_byte_file() {
+        let now = Instant::now();
+        let pol = allow_file_policy(16);
+        let payload = vec![0xABu8; 2048];
+        let sha: [u8; 32] = Sha256::digest(&payload).into();
+        let (mut sender, _offer) =
+            FileSenderWindow::new(&pol, 7, "wait_ack.bin", payload.len() as u64, 1024, sha, now)
+                .unwrap();
+        sender
+            .on_accept(
+                &FileAccept {
+                    transfer_id: 7,
+                    resume_offset: 0,
+                    initial_window_end_offset: payload.len() as u64,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Send all bytes without receiving FILE_ACK yet: MUST NOT be ready_for_complete.
+        while let Some((off, len)) = sender.next_chunk_range(false) {
+            sender.mark_chunk_sent(off, len, now);
+        }
+        assert_eq!(sender.max_sent_offset(), payload.len() as u64);
+        assert_eq!(sender.next_expected_offset(), 0);
+        assert!(!sender.ready_for_complete());
+
+        // Partial ACK still blocks FILE_COMPLETE.
+        sender
+            .on_ack(
+                &FileAck {
+                    transfer_id: 7,
+                    next_expected_offset: 1024,
+                    window_end_offset: 2048,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(!sender.ready_for_complete());
+
+        // Final ACK reaching file_size unlocks FILE_COMPLETE.
+        sender
+            .on_ack(
+                &FileAck {
+                    transfer_id: 7,
+                    next_expected_offset: 2048,
+                    window_end_offset: 2048,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(sender.ready_for_complete());
+
+        // 0-byte file: ready_for_complete immediately after FILE_ACCEPT (resume_offset == file_size).
+        let empty_sha: [u8; 32] = Sha256::digest(b"").into();
+        let (mut zero_sender, zero_offer) =
+            FileSenderWindow::new(&pol, 8, "empty.bin", 0, 1024, empty_sha, now).unwrap();
+        let dir = std::env::temp_dir().join(format!("zd_ft_zero_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut rx = FileTransferReceiver::new(pol, dir.clone());
+        let mut err_cnt = ChannelFramingErrorCounter::new();
+        let offer_wire = zero_offer.encode().unwrap();
+        let acc_act = rx.on_l4_frame(
+            &L4Header {
+                msg_type: FILE_MSG_OFFER,
+                flags: 0,
+                body_len: offer_wire.len() as u16,
+                stream_seq: 1,
+            },
+            &offer_wire,
+            now,
+            &mut err_cnt,
+        );
+        let FileRecvAction::SendAccept(acc) = acc_act else {
+            panic!("expected SendAccept for 0-byte file, got {acc_act:?}");
+        };
+        assert_eq!(acc.resume_offset, 0);
+        assert_eq!(acc.initial_window_end_offset, 0);
+
+        zero_sender.on_accept(&acc, now).unwrap();
+        assert!(zero_sender.next_chunk_range(false).is_none());
+        assert!(zero_sender.ready_for_complete());
+
+        let comp_wire = zero_sender.build_complete(now).encode();
+        let done_act = rx.on_l4_frame(
+            &L4Header {
+                msg_type: FILE_MSG_COMPLETE,
+                flags: 0,
+                body_len: comp_wire.len() as u16,
+                stream_seq: 2,
+            },
+            &comp_wire,
+            now,
+            &mut err_cnt,
+        );
+        match done_act {
+            FileRecvAction::SendCompleteAck {
+                ack,
+                saved_path: Some(p),
+                ..
+            } => {
+                assert_eq!(ack.status, FILE_COMPLETE_ACK_OK);
+                assert_eq!(fs::read(&p).unwrap().len(), 0);
+            }
+            other => panic!("expected SendCompleteAck for 0-byte file, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
