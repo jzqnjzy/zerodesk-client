@@ -7,6 +7,10 @@ description = "Clean-room ZeroDesk V2 (v1.2.3) client runtime: Control-Plane HTT
 
 [workspace]
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 base64 = "0.22.1"
 bytes = "1.9"
@@ -28,3 +32,4 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 rcgen = "0.13.2"
+v2_client = { path = ".", features = ["test-utils"] }

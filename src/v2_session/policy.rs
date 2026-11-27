@@ -172,10 +172,10 @@ impl TenantPolicyBody {
         (self.flags & POLICY_FLAG_ALLOW_CLIPBOARD) != 0 && self.max_clipboard_kb > 0
     }
 
-    /// `allow_file_clipboard` is effective ONLY when `allow_clipboard` is also 1 (`spec/06` §3.8.1).
+    /// `allow_file_clipboard` is effective ONLY when `allow_clipboard` is also 1 and
+    /// `max_clipboard_kb > 0` (`spec/06` §3.8.1).
     pub const fn allow_file_clipboard(&self) -> bool {
-        (self.flags & POLICY_FLAG_ALLOW_CLIPBOARD) != 0
-            && (self.flags & POLICY_FLAG_ALLOW_FILE_CLIPBOARD) != 0
+        self.allow_clipboard() && (self.flags & POLICY_FLAG_ALLOW_FILE_CLIPBOARD) != 0
     }
 
     pub const fn allow_tcp_tunnel(&self) -> bool {

@@ -1930,66 +1930,72 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                 clipboard_local_policy_denied = !effective_policy.allow_clipboard();
                 file_local_policy_denied = !effective_policy.allow_file_transfer();
 
-                // Now intentionally send raw channel probes to verify Host-side defense-in-depth!
-                let clip_payload = b"denied-probe-text";
-                let clip_sync = ClipSync {
-                    mime_kind: CLIP_MIME_TEXT_UTF8,
-                    clip_id: 901,
-                    origin_nonce: 0xDEAD_0001,
-                    total_len: clip_payload.len() as u32,
-                    total_chunks: 1,
-                    sha256: Sha256::digest(clip_payload).into(),
-                };
-                let clip_sync_bytes = clip_sync.encode().map_err(|e| e.to_string())?;
-                session
-                    .send_l4_raw(
-                        CHAN_CLIPBOARD,
-                        CLIP_MSG_SYNC,
-                        0,
-                        false,
-                        &clip_sync_bytes,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
+                // Now intentionally send raw channel probes ONLY for locally denied channels
+                // to verify Edge L2 allowed_mask AND remote Host defense-in-depth!
+                let expect_clip_deny = clipboard_local_policy_denied;
+                let expect_file_deny = file_local_policy_denied;
 
-                let file_offer = FileOffer {
-                    transfer_id: 902,
-                    file_size: 16,
-                    chunk_size: FILE_E2E_CHUNK_SIZE,
-                    sha256: Sha256::digest(b"0123456789abcdef").into(),
-                    rel_name: "denied.txt".into(),
-                };
-                session
-                    .send_l4_raw(
-                        CHAN_FILE_TRANSFER,
-                        FILE_MSG_OFFER,
-                        0,
-                        false,
-                        &file_offer.encode().map_err(|e| e.to_string())?,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if expect_clip_deny {
+                    let clip_payload = b"denied-probe-text";
+                    let clip_sync = ClipSync {
+                        mime_kind: CLIP_MIME_TEXT_UTF8,
+                        clip_id: 901,
+                        origin_nonce: 0xDEAD_0001,
+                        total_len: clip_payload.len() as u32,
+                        total_chunks: 1,
+                        sha256: Sha256::digest(clip_payload).into(),
+                    };
+                    let clip_sync_bytes = clip_sync.encode().map_err(|e| e.to_string())?;
+                    session
+                        .send_negative_policy_probe(
+                            CHAN_CLIPBOARD,
+                            CLIP_MSG_SYNC,
+                            &clip_sync_bytes,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
 
-                let audio_probe = OpusWireFrame {
-                    ts_u32: 0,
-                    dtx: true,
-                    payload: Vec::new(),
-                };
-                session
-                    .send_l4_raw(
-                        CHAN_AUDIO,
-                        0x01,
-                        0,
-                        false,
-                        &audio_probe.encode().map_err(|e| e.to_string())?,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if expect_file_deny {
+                    let file_offer = FileOffer {
+                        transfer_id: 902,
+                        file_size: 16,
+                        chunk_size: FILE_E2E_CHUNK_SIZE,
+                        sha256: Sha256::digest(b"0123456789abcdef").into(),
+                        rel_name: "denied.txt".into(),
+                    };
+                    let offer_bytes = file_offer.encode().map_err(|e| e.to_string())?;
+                    session
+                        .send_negative_policy_probe(
+                            CHAN_FILE_TRANSFER,
+                            FILE_MSG_OFFER,
+                            &offer_bytes,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+
+                if audio_local_policy_denied {
+                    let audio_probe = OpusWireFrame {
+                        ts_u32: 0,
+                        dtx: true,
+                        payload: Vec::new(),
+                    };
+                    let audio_bytes = audio_probe.encode().map_err(|e| e.to_string())?;
+                    session
+                        .send_negative_policy_probe(CHAN_AUDIO, 0x01, &audio_bytes)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
                 last_tx = Instant::now();
 
-                let probe_deadline = Instant::now() + Duration::from_secs(5);
+                // Wait up to 1.5s for remote policy replies (note: when BOTH clipboard and file
+                // transfer are denied, Edge L2 allowed_mask=0x07 silently drops p3 before Host,
+                // while partial-deny allows p3 through so Host emits FILE_ABORT 0x0401 live!).
+                let probe_deadline = Instant::now() + Duration::from_millis(1_500);
                 while Instant::now() < probe_deadline
-                    && (clipboard_acks_denied == 0 || file_transfers_aborted_policy == 0)
+                    && ((expect_clip_deny && clipboard_acks_denied == 0)
+                        || (expect_file_deny && file_transfers_aborted_policy == 0))
                 {
                     maybe_send_keepalive(&mut session, keepalive_interval, &mut last_tx).await?;
                     match session.recv_v124_event(Duration::from_millis(50)).await {
@@ -1999,6 +2005,8 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                             {
                                 if ack.status == CLIP_ACK_POLICY_DENIED {
                                     clipboard_acks_denied = clipboard_acks_denied.saturating_add(1);
+                                } else if ack.status == CLIP_ACK_OK {
+                                    clipboard_acks_ok = clipboard_acks_ok.saturating_add(1);
                                 }
                             }
                         }
@@ -2011,6 +2019,9 @@ async fn run_v2_ctl(args: &ControllerClientArgs) -> Result<ControllerClientSumma
                                         file_transfers_aborted_policy.saturating_add(1);
                                 }
                             }
+                        }
+                        Ok(V2RecvEvent::AudioRaw(_)) => {
+                            audio_frames_received = audio_frames_received.saturating_add(1);
                         }
                         Ok(V2RecvEvent::Transport(TransportEvent::Control(ctrl))) => {
                             if let Some(code) = parse_session_close(&ctrl) {

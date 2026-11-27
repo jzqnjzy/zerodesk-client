@@ -346,6 +346,19 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
+const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const POLICY_DEGRADED_REFRESH_DEBOUNCE: Duration = Duration::from_secs(5);
+
+fn clamp_bw_cap_with_policy(base_kbps: u32, policy: &EffectiveTenantPolicy) -> u32 {
+    let pol_cap = policy.max_bw_kbps();
+    let capped = if pol_cap > 0 {
+        base_kbps.min(pol_cap)
+    } else {
+        base_kbps
+    };
+    capped.max(256)
+}
+
 /// 10-minute per-endpoint negative UDP probe cache (`UDP_NEGATIVE_CACHE_TTL = 600s`).
 /// When UDP probing fails on a network/endpoint, subsequent connections within 10 minutes skip
 /// UDP probe delay and connect Dual TLS-443 directly.
@@ -370,8 +383,9 @@ impl UdpNegativeCache {
     }
 
     pub fn mark_udp_blocked(&mut self, endpoint_key: &str, now: Instant) {
-        self.blocked_until
-            .insert(endpoint_key.to_string(), now + UDP_NEGATIVE_CACHE_TTL);
+        if let Some(until) = now.checked_add(UDP_NEGATIVE_CACHE_TTL) {
+            self.blocked_until.insert(endpoint_key.to_string(), until);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -704,6 +718,7 @@ pub struct DesktopHostDaemon {
     identity: PersistentV2Identity,
     ca_spki_der: Vec<u8>,
     effective_policy: EffectiveTenantPolicy,
+    policy_resolved_at: Instant,
     cap_bits: u64,
     callbacks: UiCallbackDispatcher,
     seen_sessions: SeenSessionCache,
@@ -782,6 +797,7 @@ impl DesktopHostDaemon {
             identity,
             ca_spki_der,
             effective_policy,
+            policy_resolved_at: Instant::now(),
             cap_bits: DEFAULT_V2_CAP_BITS,
             callbacks,
             seen_sessions: SeenSessionCache::new(SEEN_SESSION_CACHE_CAP),
@@ -821,10 +837,39 @@ impl DesktopHostDaemon {
         }
     }
 
+    async fn refresh_policy_if_needed(&mut self, force: bool) {
+        let elapsed = self.policy_resolved_at.elapsed();
+        let should_refresh = force
+            || (self.effective_policy.degraded && elapsed >= POLICY_DEGRADED_REFRESH_DEBOUNCE)
+            || elapsed >= POLICY_REFRESH_INTERVAL;
+        if !should_refresh {
+            return;
+        }
+        if let Ok((_cert, pol)) = resolve_verified_tenant_policy(
+            &self.cp,
+            &mut self.identity,
+            &self.ca_spki_der,
+            self.config.enrollment_token.as_deref(),
+            self.cap_bits,
+            &self.config.home_region,
+            None,
+            &self.callbacks,
+        )
+        .await
+        {
+            self.effective_policy = pol;
+            self.policy_resolved_at = Instant::now();
+        }
+    }
+
     async fn ensure_signaling_connected(&mut self) -> Result<(), ManagerError> {
         if self.signaling.is_some() {
             return Ok(());
         }
+        // Clear negative UDP probe cache on signaling reconnect (network may have changed) and
+        // re-verify the CA-signed TenantPolicyBlob cleanly.
+        self.udp_neg_cache.clear();
+        self.refresh_policy_if_needed(true).await;
         let cert = self
             .identity
             .device_cert()
@@ -1171,11 +1216,14 @@ impl DesktopHostDaemon {
             ));
         }
 
-        let effective_bw_cap_kbps = peer_route
-            .bw_cap_kbps
-            .min(host_lease_b.bw_cap_kbps.max(256))
-            .min(self.config.bw_cap_kbps)
-            .max(256);
+        self.refresh_policy_if_needed(false).await;
+        let effective_bw_cap_kbps = clamp_bw_cap_with_policy(
+            peer_route
+                .bw_cap_kbps
+                .min(host_lease_b.bw_cap_kbps.max(256))
+                .min(self.config.bw_cap_kbps),
+            &self.effective_policy,
+        );
         let attach_t0 = Instant::now();
         let (data_plane_b, _probe_rtt_us) = attach_access_data_plane(
             self.config.transport_mode,
@@ -1327,6 +1375,7 @@ pub struct DesktopControllerClient {
     identity: PersistentV2Identity,
     ca_spki_der: Vec<u8>,
     effective_policy: EffectiveTenantPolicy,
+    policy_resolved_at: Instant,
     cap_bits: u64,
     callbacks: UiCallbackDispatcher,
     delegation_cache: DelegationCache,
@@ -1403,6 +1452,7 @@ impl DesktopControllerClient {
             identity,
             ca_spki_der,
             effective_policy,
+            policy_resolved_at: Instant::now(),
             cap_bits: DEFAULT_V2_CAP_BITS,
             callbacks,
             delegation_cache: DelegationCache::new(),
@@ -1435,6 +1485,26 @@ impl DesktopControllerClient {
         connect_timeout: Duration,
     ) -> Result<ConnectedControllerSession, ManagerError> {
         self.callbacks.emit_state(V2SessionState::Connecting);
+        let elapsed = self.policy_resolved_at.elapsed();
+        if (self.effective_policy.degraded && elapsed >= POLICY_DEGRADED_REFRESH_DEBOUNCE)
+            || elapsed >= POLICY_REFRESH_INTERVAL
+        {
+            if let Ok((_cert, pol)) = resolve_verified_tenant_policy(
+                &self.cp,
+                &mut self.identity,
+                &self.ca_spki_der,
+                self.config.enrollment_token.as_deref(),
+                self.cap_bits,
+                &self.config.home_region,
+                None,
+                &self.callbacks,
+            )
+            .await
+            {
+                self.effective_policy = pol;
+                self.policy_resolved_at = Instant::now();
+            }
+        }
         let ctrl_cert = self
             .identity
             .device_cert()
@@ -1512,10 +1582,10 @@ impl DesktopControllerClient {
             ));
         }
 
-        let effective_bw_cap_kbps = lease_a
-            .bw_cap_kbps
-            .min(self.config.bw_cap_kbps)
-            .max(256);
+        let effective_bw_cap_kbps = clamp_bw_cap_with_policy(
+            lease_a.bw_cap_kbps.min(self.config.bw_cap_kbps),
+            &self.effective_policy,
+        );
         let attach_t0 = Instant::now();
         let (data_plane_a, _probe_rtt_us) = attach_access_data_plane(
             self.config.transport_mode,

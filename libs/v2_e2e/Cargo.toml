@@ -30,3 +30,6 @@ v2_transport = { path = "../v2_transport" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+v2_client = { path = "../v2_client", features = ["test-utils"] }

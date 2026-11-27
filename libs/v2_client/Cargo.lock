@@ -908,6 +908,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "v2_client",
  "v2_identity",
  "v2_transport",
  "webpki-roots",

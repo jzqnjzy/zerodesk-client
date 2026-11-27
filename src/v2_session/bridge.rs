@@ -13,7 +13,8 @@ use super::{
         read_file_0600_to_string, write_file_atomic_0600, TransportMode, V2ConfigError,
         DEFAULT_BW_CAP_KBPS, DEFAULT_FPS, DEFAULT_KEEPALIVE_INTERVAL_MS,
         DEFAULT_LEASE_RENEW_INTERVAL_SEC, DEFAULT_UDP_PROBE_TIMEOUT_MS,
-        DEFAULT_WATCHDOG_TIMEOUT_MS,
+        DEFAULT_WATCHDOG_TIMEOUT_MS, MAX_LEASE_RENEW_INTERVAL_SEC, MAX_UDP_PROBE_TIMEOUT_MS,
+        MIN_UDP_PROBE_TIMEOUT_MS,
     },
     file_transfer::{check_file_policy, validate_safe_filename},
     policy::EffectiveTenantPolicy,
@@ -32,6 +33,8 @@ use v2_client::{ActiveTransportMode, EdgeEndpointConfig, SignalingDeviceCert};
 
 pub const BRIDGE_ABI_VERSION: u32 = 1;
 pub const BRIDGE_EVENT_QUEUE_CAP: usize = 256;
+pub const BRIDGE_MAX_CMD_JSON_BYTES: usize = 512 * 1024;
+pub const BRIDGE_MAX_CLIP_B64_BYTES: usize = 360 * 1024;
 
 /// Explicit lifecycle state machine for `V2BridgeController`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,15 +334,69 @@ impl BridgeResponseEnvelope {
     }
 }
 
+impl BridgePersistedConfig {
+    pub fn validate(&self) -> Result<(), V2ConfigError> {
+        if self.v != BRIDGE_ABI_VERSION {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "unsupported config ABI version {} (expected {BRIDGE_ABI_VERSION})",
+                self.v
+            )));
+        }
+        if self.control_plane_endpoint.trim().is_empty() {
+            return Err(V2ConfigError::InvalidValue(
+                "control_plane_endpoint must not be empty".into(),
+            ));
+        }
+        if self.signaling_addr.trim().is_empty() {
+            return Err(V2ConfigError::InvalidValue(
+                "signaling_addr must not be empty".into(),
+            ));
+        }
+        if self.identity_dir.trim().is_empty() {
+            return Err(V2ConfigError::InvalidValue(
+                "identity_dir must not be empty".into(),
+            ));
+        }
+        if self.fps == 0 || self.fps > 120 {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "fps {} outside 1..=120",
+                self.fps
+            )));
+        }
+        if self.watchdog_timeout_ms == 0 || self.keepalive_interval_ms == 0 {
+            return Err(V2ConfigError::InvalidValue(
+                "watchdog_timeout_ms and keepalive_interval_ms must be > 0".into(),
+            ));
+        }
+        if self.keepalive_interval_ms >= self.watchdog_timeout_ms {
+            return Err(V2ConfigError::InvalidValue(
+                "keepalive_interval_ms must be < watchdog_timeout_ms".into(),
+            ));
+        }
+        if self.lease_renew_interval_sec == 0
+            || self.lease_renew_interval_sec > MAX_LEASE_RENEW_INTERVAL_SEC
+        {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "lease_renew_interval_sec {} outside 1..={MAX_LEASE_RENEW_INTERVAL_SEC}",
+                self.lease_renew_interval_sec
+            )));
+        }
+        if !(MIN_UDP_PROBE_TIMEOUT_MS..=MAX_UDP_PROBE_TIMEOUT_MS)
+            .contains(&self.udp_probe_timeout_ms)
+        {
+            return Err(V2ConfigError::InvalidValue(format!(
+                "udp_probe_timeout_ms {} outside {MIN_UDP_PROBE_TIMEOUT_MS}..={MAX_UDP_PROBE_TIMEOUT_MS}",
+                self.udp_probe_timeout_ms
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Atomically saves a `BridgePersistedConfig` JSON file at strict `0600` (`O_NOFOLLOW | O_CREAT | O_EXCL`
 /// temp -> `sync_all` -> `rename` -> parent-dir `fsync`).
 pub fn save_config_json(path: &Path, cfg: &BridgePersistedConfig) -> Result<(), V2ConfigError> {
-    if cfg.v != BRIDGE_ABI_VERSION {
-        return Err(V2ConfigError::InvalidValue(format!(
-            "unsupported config ABI version {} (expected {BRIDGE_ABI_VERSION})",
-            cfg.v
-        )));
-    }
+    cfg.validate()?;
     let bytes = serde_json::to_vec_pretty(cfg)
         .map_err(|e| V2ConfigError::InvalidValue(format!("serialize config JSON: {e}")))?;
     write_file_atomic_0600(path, &bytes)
@@ -350,12 +407,7 @@ pub fn load_config_json(path: &Path) -> Result<BridgePersistedConfig, V2ConfigEr
     let raw = read_file_0600_to_string(path)?;
     let cfg: BridgePersistedConfig = serde_json::from_str(&raw)
         .map_err(|e| V2ConfigError::InvalidValue(format!("parse config JSON: {e}")))?;
-    if cfg.v != BRIDGE_ABI_VERSION {
-        return Err(V2ConfigError::InvalidValue(format!(
-            "unsupported config ABI version {} (expected {BRIDGE_ABI_VERSION})",
-            cfg.v
-        )));
-    }
+    cfg.validate()?;
     Ok(cfg)
 }
 
@@ -369,6 +421,7 @@ struct BridgeInner {
     local_tenant_id_hex: Option<String>,
     active_session_id_hex: Option<String>,
     pending_incoming_session_id_hex: Option<String>,
+    incoming_accepted: bool,
     verified_caller: Option<VerifiedCallerDisplay>,
     policy: Option<EffectiveTenantPolicy>,
     active_file_transfers: BTreeMap<u64, String>,
@@ -392,6 +445,7 @@ impl BridgeInner {
             local_tenant_id_hex: None,
             active_session_id_hex: None,
             pending_incoming_session_id_hex: None,
+            incoming_accepted: false,
             verified_caller: None,
             policy: None,
             active_file_transfers: BTreeMap::new(),
@@ -402,6 +456,13 @@ impl BridgeInner {
             event_seq: 0,
             events: VecDeque::with_capacity(64),
         }
+    }
+
+    fn allows_config_mutation(&self) -> bool {
+        matches!(
+            self.state,
+            BridgeState::Idle | BridgeState::Ready | BridgeState::Listening | BridgeState::Faulted
+        )
     }
 
     fn push_event(&mut self, kind: &str, payload: serde_json::Value) {
@@ -486,42 +547,74 @@ impl V2BridgeController {
     }
 
     /// Awaits the next queued event up to `timeout` without holding any internal mutex across `.await`.
+    /// Registers & enables the `Notify` waiter BEFORE checking the queue to eliminate lost wakeups.
     pub async fn recv_event_timeout(&self, timeout: Duration) -> Option<BridgeEvent> {
+        let notified = self.event_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if let Some(ev) = self.recv_event() {
             return Some(ev);
         }
-        let _ = tokio::time::timeout(timeout, self.event_notify.notified()).await;
+        let _ = tokio::time::timeout(timeout, notified).await;
         self.recv_event()
     }
 
-    /// Runtime hook: called when device bootstrap completes with CA-verified cert & policy.
+    /// Runtime hook: called when device bootstrap/policy refresh completes with CA-verified cert &
+    /// policy. Enforces explicit source-state guards: if already `Streaming`, updates cert & policy
+    /// ONLY without clobbering active session state; rejects invalid states (`Idle`/`Dialing`/
+    /// `Incoming`/`Closing`).
     pub fn on_bootstrap_complete(
         &self,
         local_cert: &SignalingDeviceCert,
         policy: EffectiveTenantPolicy,
         listening: bool,
-    ) {
+    ) -> Result<(), String> {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            g.local_device_id_hex = Some(hex::encode(local_cert.device_id));
-            g.local_tenant_id_hex = Some(hex::encode(local_cert.tenant_id));
-            g.policy = Some(policy.clone());
-            g.state = if listening {
-                BridgeState::Listening
-            } else {
-                BridgeState::Ready
-            };
-            g.fault_reason = None;
-            let st = g.state;
-            g.push_event(
-                "state_changed",
-                serde_json::json!({
-                    "state": st,
-                    "policy_degraded": policy.degraded,
-                }),
-            );
+            match g.state {
+                BridgeState::Streaming => {
+                    g.local_device_id_hex = Some(hex::encode(local_cert.device_id));
+                    g.local_tenant_id_hex = Some(hex::encode(local_cert.tenant_id));
+                    g.policy = Some(policy.clone());
+                    g.push_event(
+                        "policy_refreshed",
+                        serde_json::json!({
+                            "state": BridgeState::Streaming,
+                            "policy_degraded": policy.degraded,
+                        }),
+                    );
+                }
+                BridgeState::Bootstrapping
+                | BridgeState::Ready
+                | BridgeState::Listening
+                | BridgeState::Faulted => {
+                    g.local_device_id_hex = Some(hex::encode(local_cert.device_id));
+                    g.local_tenant_id_hex = Some(hex::encode(local_cert.tenant_id));
+                    g.policy = Some(policy.clone());
+                    g.state = if listening {
+                        BridgeState::Listening
+                    } else {
+                        BridgeState::Ready
+                    };
+                    g.fault_reason = None;
+                    let st = g.state;
+                    g.push_event(
+                        "state_changed",
+                        serde_json::json!({
+                            "state": st,
+                            "policy_degraded": policy.degraded,
+                        }),
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "on_bootstrap_complete forbidden in state {other:?}"
+                    ));
+                }
+            }
         }
         self.event_notify.notify_waiters();
+        Ok(())
     }
 
     /// Runtime hook: called when an incoming call has passed CA `DeviceCert` verification.
@@ -543,6 +636,7 @@ impl V2BridgeController {
             }
             g.state = BridgeState::Incoming;
             g.pending_incoming_session_id_hex = Some(sid_hex.clone());
+            g.incoming_accepted = false;
             g.verified_caller = Some(caller.clone());
             g.push_event(
                 "incoming_call",
@@ -576,6 +670,7 @@ impl V2BridgeController {
             g.state = BridgeState::Streaming;
             g.active_session_id_hex = Some(sid_hex.clone());
             g.pending_incoming_session_id_hex = None;
+            g.incoming_accepted = false;
             g.verified_caller = Some(peer_display.clone());
             g.active_transport_mode = Some(active_mode);
             g.qoe.active_transport_mode = Some(active_mode);
@@ -593,10 +688,15 @@ impl V2BridgeController {
         Ok(())
     }
 
-    /// Runtime hook: transitions from `Closing` back to `Ready` or `Idle` after ordered teardown.
-    pub fn on_closed(&self, return_to_listening: bool) {
+    /// Runtime hook: transitions from an active/closing/faulted state back to `Listening`/`Ready`/
+    /// `Idle` after ordered teardown, always clearing `fault_reason` and `active_file_transfers`.
+    /// Rejects `Idle` and `Bootstrapping`.
+    pub fn on_closed(&self, return_to_listening: bool) -> Result<(), String> {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(g.state, BridgeState::Idle | BridgeState::Bootstrapping) {
+                return Err(format!("on_closed forbidden in state {:?}", g.state));
+            }
             g.state = if return_to_listening {
                 BridgeState::Listening
             } else if g.config.is_some() {
@@ -606,13 +706,16 @@ impl V2BridgeController {
             };
             g.active_session_id_hex = None;
             g.pending_incoming_session_id_hex = None;
+            g.incoming_accepted = false;
             g.verified_caller = None;
             g.active_transport_mode = None;
+            g.fault_reason = None;
             g.active_file_transfers.clear();
             let st = g.state;
             g.push_event("state_changed", serde_json::json!({ "state": st }));
         }
         self.event_notify.notify_waiters();
+        Ok(())
     }
 
     /// Runtime hook: transitions into `Faulted` with structured diagnostic reason.
@@ -631,6 +734,16 @@ impl V2BridgeController {
     /// Unknown JSON fields are ignored on deserialize. Illegal state transitions return structured
     /// `{"v":1,"ok":false,"error_code":"illegal_state_transition",...}` JSON without panicking.
     pub fn execute_command_json(&self, cmd_json: &str) -> String {
+        if cmd_json.len() > BRIDGE_MAX_CMD_JSON_BYTES {
+            return BridgeResponseEnvelope::err(
+                "too_large",
+                format!(
+                    "command JSON size {}B exceeds {BRIDGE_MAX_CMD_JSON_BYTES}B cap",
+                    cmd_json.len()
+                ),
+            )
+            .to_json_string();
+        }
         let env: BridgeCommandEnvelope = match serde_json::from_str(cmd_json) {
             Ok(e) => e,
             Err(e) => {
@@ -678,10 +791,31 @@ impl V2BridgeController {
                         false,
                     );
                 };
+                {
+                    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if !g.allows_config_mutation() {
+                        return (
+                            BridgeResponseEnvelope::err(
+                                "illegal_state_transition",
+                                format!("load_config forbidden in state {:?}", g.state),
+                            ),
+                            false,
+                        );
+                    }
+                }
                 match load_config_json(Path::new(path)) {
                     Ok(cfg) => {
                         let redacted = RedactedConfigView::from(&cfg);
                         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if !g.allows_config_mutation() {
+                            return (
+                                BridgeResponseEnvelope::err(
+                                    "illegal_state_transition",
+                                    format!("load_config forbidden in state {:?}", g.state),
+                                ),
+                                false,
+                            );
+                        }
                         g.transport_mode = cfg.transport_mode;
                         g.config = Some(cfg);
                         if g.state == BridgeState::Idle {
@@ -713,10 +847,31 @@ impl V2BridgeController {
                         false,
                     );
                 };
+                {
+                    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if !g.allows_config_mutation() {
+                        return (
+                            BridgeResponseEnvelope::err(
+                                "illegal_state_transition",
+                                format!("save_config forbidden in state {:?}", g.state),
+                            ),
+                            false,
+                        );
+                    }
+                }
                 match save_config_json(Path::new(path), &cfg) {
                     Ok(()) => {
                         let redacted = RedactedConfigView::from(&cfg);
                         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if !g.allows_config_mutation() {
+                            return (
+                                BridgeResponseEnvelope::err(
+                                    "illegal_state_transition",
+                                    format!("save_config forbidden in state {:?}", g.state),
+                                ),
+                                false,
+                            );
+                        }
                         g.transport_mode = cfg.transport_mode;
                         g.config = Some(cfg);
                         g.push_event(
@@ -781,6 +936,8 @@ impl V2BridgeController {
                     );
                 }
                 g.state = BridgeState::Closing;
+                g.incoming_accepted = false;
+                g.active_file_transfers.clear();
                 g.push_event(
                     "state_changed",
                     serde_json::json!({ "state": BridgeState::Closing, "reason": "stop_host" }),
@@ -852,6 +1009,8 @@ impl V2BridgeController {
                 }
                 let reason = env.reason.unwrap_or_else(|| "user_disconnect".into());
                 g.state = BridgeState::Closing;
+                g.incoming_accepted = false;
+                g.active_file_transfers.clear();
                 g.push_event(
                     "disconnect_requested",
                     serde_json::json!({ "state": BridgeState::Closing, "reason": reason }),
@@ -863,11 +1022,14 @@ impl V2BridgeController {
             }
             "accept_incoming" => {
                 let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if g.state != BridgeState::Incoming {
+                if g.state != BridgeState::Incoming || g.incoming_accepted {
                     return (
                         BridgeResponseEnvelope::err(
                             "illegal_state_transition",
-                            format!("accept_incoming forbidden in state {:?}", g.state),
+                            format!(
+                                "accept_incoming forbidden in state {:?} (accepted={})",
+                                g.state, g.incoming_accepted
+                            ),
                         ),
                         false,
                     );
@@ -883,6 +1045,7 @@ impl V2BridgeController {
                         );
                     }
                 }
+                g.incoming_accepted = true;
                 let sid = g.pending_incoming_session_id_hex.clone().unwrap_or_default();
                 g.push_event(
                     "incoming_call_accepted",
@@ -898,11 +1061,14 @@ impl V2BridgeController {
             }
             "reject_incoming" => {
                 let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if g.state != BridgeState::Incoming {
+                if g.state != BridgeState::Incoming || g.incoming_accepted {
                     return (
                         BridgeResponseEnvelope::err(
                             "illegal_state_transition",
-                            format!("reject_incoming forbidden in state {:?}", g.state),
+                            format!(
+                                "reject_incoming forbidden in state {:?} (accepted={})",
+                                g.state, g.incoming_accepted
+                            ),
                         ),
                         false,
                     );
@@ -920,6 +1086,7 @@ impl V2BridgeController {
                 }
                 let sid = g.pending_incoming_session_id_hex.take().unwrap_or_default();
                 let reason = env.reason.unwrap_or_else(|| "user_rejected".into());
+                g.incoming_accepted = false;
                 g.verified_caller = None;
                 g.state = BridgeState::Listening;
                 g.push_event(
@@ -972,6 +1139,15 @@ impl V2BridgeController {
                     }
                 };
                 let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !g.allows_config_mutation() {
+                    return (
+                        BridgeResponseEnvelope::err(
+                            "illegal_state_transition",
+                            format!("set_transport_mode forbidden in state {:?}", g.state),
+                        ),
+                        false,
+                    );
+                }
                 g.transport_mode = mode;
                 if let Some(cfg) = g.config.as_mut() {
                     cfg.transport_mode = mode;
@@ -1004,6 +1180,18 @@ impl V2BridgeController {
                         false,
                     );
                 };
+                if payload_b64.len() > BRIDGE_MAX_CLIP_B64_BYTES {
+                    return (
+                        BridgeResponseEnvelope::err(
+                            "too_large",
+                            format!(
+                                "payload_b64 length {}B exceeds {BRIDGE_MAX_CLIP_B64_BYTES}B pre-decode cap",
+                                payload_b64.len()
+                            ),
+                        ),
+                        false,
+                    );
+                }
                 let payload = match B64.decode(payload_b64) {
                     Ok(p) if !p.is_empty() => p,
                     Ok(_) => {
@@ -1313,8 +1501,16 @@ mod tests {
         let tid = [0x77; 16];
         let local_cert = sample_cert([0x11; 16], tid);
         let peer_cert = sample_cert([0x22; 16], tid);
-        ctrl.on_bootstrap_complete(&local_cert, full_policy(tid), true);
+        ctrl.on_bootstrap_complete(&local_cert, full_policy(tid), true)
+            .unwrap();
         assert_eq!(ctrl.state(), BridgeState::Listening);
+
+        assert!(serde_json::from_str::<BridgeResponseEnvelope>(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"set_transport_mode","mode":"tls443"}"#)
+        )
+        .unwrap()
+        .ok);
+        assert_eq!(ctrl.snapshot().transport_mode, TransportMode::Tls443Only);
 
         let sid = [0xAA; 16];
         ctrl.on_incoming_verified_call(sid, &peer_cert).unwrap();
@@ -1343,7 +1539,7 @@ mod tests {
             Some(ActiveTransportMode::DualTls443)
         );
 
-        // set_audio_mute + set_transport_mode + send_clipboard + send_file + cancel_file
+        // set_audio_mute + send_clipboard + send_file + cancel_file (set_transport_mode rejected during Streaming)
         assert!(serde_json::from_str::<BridgeResponseEnvelope>(
             &ctrl.execute_command_json(r#"{"v":1,"cmd":"set_audio_mute","muted":true}"#)
         )
@@ -1351,12 +1547,11 @@ mod tests {
         .ok);
         assert!(ctrl.snapshot().audio_muted);
 
-        assert!(serde_json::from_str::<BridgeResponseEnvelope>(
-            &ctrl.execute_command_json(r#"{"v":1,"cmd":"set_transport_mode","mode":"tls443"}"#)
+        assert!(!serde_json::from_str::<BridgeResponseEnvelope>(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"set_transport_mode","mode":"udp"}"#)
         )
         .unwrap()
         .ok);
-        assert_eq!(ctrl.snapshot().transport_mode, TransportMode::Tls443Only);
 
         let clip_resp: BridgeResponseEnvelope = serde_json::from_str(&ctrl.execute_command_json(
             &format!(
@@ -1389,7 +1584,7 @@ mod tests {
         .unwrap()
         .ok);
         assert_eq!(ctrl.state(), BridgeState::Closing);
-        ctrl.on_closed(true);
+        ctrl.on_closed(true).unwrap();
         assert_eq!(ctrl.state(), BridgeState::Listening);
 
         // Verify reject_incoming path
@@ -1405,6 +1600,159 @@ mod tests {
         let events = ctrl.drain_events();
         assert!(!events.is_empty());
         assert!(ctrl.recv_event().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bridge_p1_state_guards_anti_double_accept_size_caps_and_recv_timeout() {
+        let ctrl = V2BridgeController::new();
+        let tid = [0x22; 16];
+        let local_cert = sample_cert([0xA1; 16], tid);
+        let peer_cert = sample_cert([0xB2; 16], tid);
+
+        // 1. on_bootstrap_complete & on_closed reject Idle
+        assert!(ctrl
+            .on_bootstrap_complete(&local_cert, full_policy(tid), true)
+            .is_err());
+        assert!(ctrl.on_closed(false).is_err());
+
+        // 2. Oversized command JSON (> 512 KiB) & oversized payload_b64 (> 360 KiB) rejected before decode
+        let huge_cmd = " ".repeat(BRIDGE_MAX_CMD_JSON_BYTES + 1);
+        let huge_resp: BridgeResponseEnvelope =
+            serde_json::from_str(&ctrl.execute_command_json(&huge_cmd)).unwrap();
+        assert!(!huge_resp.ok);
+        assert_eq!(huge_resp.error_code.as_deref(), Some("too_large"));
+
+        let huge_b64 = "A".repeat(BRIDGE_MAX_CLIP_B64_BYTES + 4);
+        let clip_cap_resp: BridgeResponseEnvelope = serde_json::from_str(
+            &ctrl.execute_command_json(&format!(
+                r#"{{"v":1,"cmd":"send_clipboard","mime_kind":1,"payload_b64":"{huge_b64}"}}"#
+            )),
+        )
+        .unwrap();
+        assert!(!clip_cap_resp.ok);
+        assert_eq!(clip_cap_resp.error_code.as_deref(), Some("too_large"));
+
+        // 3. Save valid config -> start_host -> Listening -> Incoming -> accept_incoming
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zd-br-p1-{}-{uniq}", std::process::id()));
+        crate::v2_session::config::ensure_dir_0700(&dir).unwrap();
+        let cfg_path = dir.join("cfg.json");
+
+        // Invalid config (empty endpoint) rejected by save_config BEFORE writing to disk
+        let bad_save: BridgeResponseEnvelope = serde_json::from_str(&ctrl.execute_command_json(
+            &format!(
+                r#"{{"v":1,"cmd":"save_config","path":"{}","config":{{"v":1,"control_plane_endpoint":"","signaling_addr":"127.0.0.1:9001","identity_dir":"{}"}}}}"#,
+                cfg_path.display(),
+                dir.display()
+            ),
+        ))
+        .unwrap();
+        assert!(!bad_save.ok);
+        assert!(!cfg_path.exists());
+
+        let good_save: BridgeResponseEnvelope = serde_json::from_str(&ctrl.execute_command_json(
+            &format!(
+                r#"{{"v":1,"cmd":"save_config","path":"{}","config":{{"v":1,"control_plane_endpoint":"https://127.0.0.1:8443","signaling_addr":"127.0.0.1:9001","identity_dir":"{}"}}}}"#,
+                cfg_path.display(),
+                dir.display()
+            ),
+        ))
+        .unwrap();
+        assert!(good_save.ok);
+
+        assert!(serde_json::from_str::<BridgeResponseEnvelope>(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"start_host"}"#)
+        )
+        .unwrap()
+        .ok);
+        // Active Bootstrapping rejects set_transport_mode / load_config / save_config
+        let mut_during_boot: BridgeResponseEnvelope = serde_json::from_str(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"set_transport_mode","mode":"udp"}"#),
+        )
+        .unwrap();
+        assert!(!mut_during_boot.ok);
+        assert_eq!(
+            mut_during_boot.error_code.as_deref(),
+            Some("illegal_state_transition")
+        );
+
+        ctrl.on_bootstrap_complete(&local_cert, full_policy(tid), true)
+            .unwrap();
+        ctrl.on_incoming_verified_call([0xCC; 16], &peer_cert)
+            .unwrap();
+
+        // First accept_incoming succeeds; second accept_incoming & subsequent reject_incoming MUST fail!
+        assert!(serde_json::from_str::<BridgeResponseEnvelope>(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"accept_incoming"}"#)
+        )
+        .unwrap()
+        .ok);
+        let dup_accept: BridgeResponseEnvelope = serde_json::from_str(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"accept_incoming"}"#),
+        )
+        .unwrap();
+        assert!(!dup_accept.ok);
+        assert_eq!(
+            dup_accept.error_code.as_deref(),
+            Some("illegal_state_transition")
+        );
+        let contra_reject: BridgeResponseEnvelope = serde_json::from_str(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"reject_incoming"}"#),
+        )
+        .unwrap();
+        assert!(!contra_reject.ok);
+        assert_eq!(
+            contra_reject.error_code.as_deref(),
+            Some("illegal_state_transition")
+        );
+
+        // Transition to Streaming -> on_bootstrap_complete updates policy ONLY without overwriting Streaming!
+        ctrl.on_streaming_started([0xCC; 16], &peer_cert, ActiveTransportMode::DualTls443)
+            .unwrap();
+        let mut refreshed = full_policy(tid);
+        refreshed.version = 9;
+        ctrl.on_bootstrap_complete(&local_cert, refreshed, true)
+            .unwrap();
+        assert_eq!(ctrl.state(), BridgeState::Streaming);
+        assert_eq!(ctrl.snapshot().policy.unwrap().version, 9);
+
+        // set_transport_mode forbidden during Streaming
+        let tm_stream: BridgeResponseEnvelope = serde_json::from_str(
+            &ctrl.execute_command_json(r#"{"v":1,"cmd":"set_transport_mode","mode":"tls443"}"#),
+        )
+        .unwrap();
+        assert!(!tm_stream.ok);
+        assert_eq!(
+            tm_stream.error_code.as_deref(),
+            Some("illegal_state_transition")
+        );
+
+        // Faulted -> on_closed clears fault_reason
+        ctrl.on_faulted("test fault");
+        assert_eq!(ctrl.state(), BridgeState::Faulted);
+        assert!(ctrl.snapshot().fault_reason.is_some());
+        ctrl.on_closed(false).unwrap();
+        assert_eq!(ctrl.state(), BridgeState::Ready);
+        assert!(ctrl.snapshot().fault_reason.is_none());
+
+        // 4. recv_event_timeout wakes reliably without lost wakeup
+        let _ = ctrl.drain_events();
+        let ctrl_c = ctrl.clone();
+        let wake_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = ctrl_c.execute_command_json(r#"{"v":1,"cmd":"set_audio_mute","muted":true}"#);
+        });
+        let ev = ctrl
+            .recv_event_timeout(Duration::from_secs(2))
+            .await
+            .expect("recv_event_timeout should receive event");
+        assert_eq!(ev.kind, "audio_mute_changed");
+        wake_task.await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }

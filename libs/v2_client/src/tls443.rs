@@ -107,6 +107,17 @@ pub enum StreamRecvEvent {
     },
 }
 
+const PENDING_RX_CAP_FRAMES: usize = 512;
+
+impl StreamRecvEvent {
+    fn approx_bytes(&self) -> usize {
+        match self {
+            Self::EdgeCtrl(_) => 64,
+            Self::L3Data { payload, .. } => 32 + payload.len(),
+        }
+    }
+}
+
 /// Single authenticated TLS 1.3 fallback stream (`Realtime` or `Bulk`) to `v2-edge --bind-tls443`.
 pub struct Tls443Stream {
     role: Tls443StreamRole,
@@ -118,6 +129,7 @@ pub struct Tls443Stream {
     next_leg_seq: u32,
     parser: StreamFrameParser,
     pending_rx: VecDeque<StreamRecvEvent>,
+    pending_rx_bytes: usize,
     send_queue: TcpStreamSendQueue,
     queued_bytes: usize,
     poisoned: bool,
@@ -182,6 +194,7 @@ impl Tls443Stream {
                 next_leg_seq: 1,
                 parser: StreamFrameParser::new(),
                 pending_rx: VecDeque::new(),
+                pending_rx_bytes: 0,
                 send_queue: TcpStreamSendQueue::default(),
                 queued_bytes: 0,
                 poisoned: false,
@@ -284,12 +297,34 @@ impl Tls443Stream {
         Ok(())
     }
 
+    fn push_pending_rx(&mut self, ev: StreamRecvEvent) -> Result<(), ClientError> {
+        let ev_bytes = ev.approx_bytes();
+        if self.pending_rx.len() >= PENDING_RX_CAP_FRAMES
+            || self.pending_rx_bytes.saturating_add(ev_bytes) > STREAM_QUEUE_CAP_BYTES
+        {
+            return Err(ClientError::Timeout(
+                "TLS-443 pending_rx buffer cap exceeded during ping wait".into(),
+            ));
+        }
+        self.pending_rx_bytes = self.pending_rx_bytes.saturating_add(ev_bytes);
+        self.pending_rx.push_back(ev);
+        Ok(())
+    }
+
+    fn pop_pending_rx(&mut self) -> Option<StreamRecvEvent> {
+        let ev = self.pending_rx.pop_front()?;
+        self.pending_rx_bytes = self.pending_rx_bytes.saturating_sub(ev.approx_bytes());
+        Some(ev)
+    }
+
     pub async fn ping(&mut self, timeout: Duration) -> Result<u64, ClientError> {
         self.ensure_healthy()?;
         let ts_us = now_us();
         let start = Instant::now();
         self.send_edge_ctrl(&EdgeCtrlFrame::Ping { ts_us }).await?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("TLS-443 ping timeout overflows monotonic clock".into())
+        })?;
         loop {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("TLS-443 Ping timed out".into()));
@@ -298,11 +333,10 @@ impl Tls443Stream {
                 StreamRecvEvent::EdgeCtrl(EdgeCtrlFrame::Pong { ts_us: echo }) if echo == ts_us => {
                     return Ok(start.elapsed().as_micros() as u64);
                 }
-                ev @ StreamRecvEvent::L3Data { .. } => {
-                    self.pending_rx.push_back(ev);
+                ev @ (StreamRecvEvent::L3Data { .. } | StreamRecvEvent::EdgeCtrl(_)) => {
+                    self.push_pending_rx(ev)?;
                     continue;
                 }
-                StreamRecvEvent::EdgeCtrl(_) => continue,
             }
         }
     }
@@ -468,7 +502,7 @@ impl Tls443Stream {
     /// Pops any already-buffered event or already-parsed frame without reading from the socket.
     pub(crate) async fn try_pop_buffered(&mut self) -> Result<Option<StreamRecvEvent>, ClientError> {
         self.ensure_healthy()?;
-        if let Some(ev) = self.pending_rx.pop_front() {
+        if let Some(ev) = self.pop_pending_rx() {
             return Ok(Some(ev));
         }
         match self.parser.next_frame() {
@@ -480,7 +514,9 @@ impl Tls443Stream {
 
     async fn recv_frame_raw(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
         self.ensure_healthy()?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("TLS-443 recv_frame timeout overflows monotonic clock".into())
+        })?;
         let mut buf = [0u8; 4096];
         loop {
             match self.parser.next_frame() {
@@ -510,7 +546,7 @@ impl Tls443Stream {
     /// and updates `BwHintController` / `bulk_paused` on `EdgeCtrl::BwHint`.
     pub async fn recv_frame(&mut self, timeout: Duration) -> Result<StreamRecvEvent, ClientError> {
         self.ensure_healthy()?;
-        if let Some(ev) = self.pending_rx.pop_front() {
+        if let Some(ev) = self.pop_pending_rx() {
             return Ok(ev);
         }
         self.recv_frame_raw(timeout).await

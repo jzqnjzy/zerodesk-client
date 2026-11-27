@@ -175,6 +175,15 @@ impl OpusWireFrame {
         let ts_u32 = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let dtx_u8 = bytes[4];
         let payload = &bytes[AUDIO_WIRE_HDR_LEN..];
+        if payload.len() > AUDIO_MAX_OPUS_PACKET_BYTES {
+            return Err(AudioError::InvalidFraming {
+                error_code: AUDIO_ERROR_INVALID_FRAMING,
+                reason: format!(
+                    "audio payload {}B exceeds {AUDIO_MAX_OPUS_PACKET_BYTES}B max",
+                    payload.len()
+                ),
+            });
+        }
         match dtx_u8 {
             0 => {
                 if payload.is_empty() {
@@ -409,6 +418,18 @@ impl Drop for V2AudioDecoder {
     }
 }
 
+fn map_opus_decode_error(op: &'static str, code: c_int) -> AudioError {
+    // OPUS_BAD_ARG (-1), OPUS_BUFFER_TOO_SMALL (-2), OPUS_INVALID_PACKET (-4)
+    if matches!(code, -1 | -2 | -4) {
+        AudioError::InvalidFraming {
+            error_code: AUDIO_ERROR_INVALID_FRAMING,
+            reason: format!("{op} rejected malformed/invalid Opus packet (code={code})"),
+        }
+    } else {
+        AudioError::OpusError { op, code }
+    }
+}
+
 impl V2AudioDecoder {
     pub fn new(channels: u8) -> Result<Self, AudioError> {
         if channels != 1 && channels != 2 {
@@ -450,13 +471,16 @@ impl V2AudioDecoder {
         vec![0.0f32; AUDIO_FRAME_SAMPLES_PER_CH * usize::from(self.channels)]
     }
 
-    /// Decodes a non-empty Opus payload via `opus_decode_float`.
+    /// Decodes a non-empty Opus payload via `opus_decode_float`, verifying exact 20ms (`960`
+    /// samples/ch) output and mapping Opus packet/framing errors (`-1`/`-2`/`-4`) to `0x0103`.
     pub fn decode_active(&mut self, payload: &[u8]) -> Result<Vec<f32>, AudioError> {
-        if payload.is_empty() {
+        if payload.is_empty() || payload.len() > AUDIO_MAX_OPUS_PACKET_BYTES {
             return Err(AudioError::InvalidFraming {
                 error_code: AUDIO_ERROR_INVALID_FRAMING,
-                reason: "decode_active called with empty payload (use DTX silence path instead)"
-                    .into(),
+                reason: format!(
+                    "decode_active payload len {} outside 1..={AUDIO_MAX_OPUS_PACKET_BYTES}",
+                    payload.len()
+                ),
             });
         }
         let mut pcm = vec![0.0f32; AUDIO_FRAME_SAMPLES_PER_CH * usize::from(self.channels)];
@@ -471,13 +495,17 @@ impl V2AudioDecoder {
             )
         };
         if decoded < 0 {
-            return Err(AudioError::OpusError {
-                op: "opus_decode_float",
-                code: decoded,
+            return Err(map_opus_decode_error("opus_decode_float", decoded));
+        }
+        if decoded as usize != AUDIO_FRAME_SAMPLES_PER_CH {
+            return Err(AudioError::InvalidFraming {
+                error_code: AUDIO_ERROR_INVALID_FRAMING,
+                reason: format!(
+                    "opus_decode_float returned {decoded} samples/ch (expected exact {AUDIO_FRAME_SAMPLES_PER_CH})"
+                ),
             });
         }
         self.active_decode_calls = self.active_decode_calls.saturating_add(1);
-        pcm.truncate((decoded as usize) * usize::from(self.channels));
         Ok(pcm)
     }
 
@@ -495,13 +523,17 @@ impl V2AudioDecoder {
             )
         };
         if decoded < 0 {
-            return Err(AudioError::OpusError {
-                op: "opus_decode_float(PLC)",
-                code: decoded,
+            return Err(map_opus_decode_error("opus_decode_float(PLC)", decoded));
+        }
+        if decoded as usize != AUDIO_FRAME_SAMPLES_PER_CH {
+            return Err(AudioError::InvalidFraming {
+                error_code: AUDIO_ERROR_INVALID_FRAMING,
+                reason: format!(
+                    "opus_decode_float(PLC) returned {decoded} samples/ch (expected {AUDIO_FRAME_SAMPLES_PER_CH})"
+                ),
             });
         }
         self.plc_decode_calls = self.plc_decode_calls.saturating_add(1);
-        pcm.truncate((decoded as usize) * usize::from(self.channels));
         Ok(pcm)
     }
 
@@ -1243,6 +1275,41 @@ mod tests {
         assert!(matches!(
             denied_gate.check_allowed(),
             Err(AudioError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn audio_decode_enforces_1100b_cap_exact_960_samples_and_invalid_packet_0x0103() {
+        // 1. Wire frame > 1100B payload MUST fail with InvalidFraming(0x0103)
+        let mut oversized = vec![0u8; AUDIO_WIRE_HDR_LEN + AUDIO_MAX_OPUS_PACKET_BYTES + 1];
+        oversized[4] = 0;
+        assert!(matches!(
+            OpusWireFrame::decode(&oversized),
+            Err(AudioError::InvalidFraming {
+                error_code: AUDIO_ERROR_INVALID_FRAMING,
+                ..
+            })
+        ));
+
+        let mut dec = V2AudioDecoder::new(1).unwrap();
+        // 2. Non-20ms Opus packet (10ms SILK NB TOC = 0x00, 1 frame -> 480 samples != 960) -> 0x0103
+        let ten_ms_pkt = [0x00u8, 0x01, 0x02, 0x03];
+        assert!(matches!(
+            dec.decode_active(&ten_ms_pkt),
+            Err(AudioError::InvalidFraming {
+                error_code: AUDIO_ERROR_INVALID_FRAMING,
+                ..
+            })
+        ));
+
+        // 3. Invalid Opus packet (code 3 arbitrary frame count with 0 frame count byte -> OPUS_INVALID_PACKET -4) -> 0x0103
+        let bad_pkt = [0x03u8];
+        assert!(matches!(
+            dec.decode_active(&bad_pkt),
+            Err(AudioError::InvalidFraming {
+                error_code: AUDIO_ERROR_INVALID_FRAMING,
+                ..
+            })
         ));
     }
 }

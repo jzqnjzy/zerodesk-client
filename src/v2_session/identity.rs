@@ -25,6 +25,8 @@ use v2_identity::{
 const CERT_REFRESH_MARGIN_SECS: u64 = 300;
 const IDENTITY_LOCK_FILE_NAME: &str = ".lock";
 const PERSISTED_IDENTITY_VERSION: u32 = 1;
+const PERSISTED_POLICY_VERSION_SCHEMA: u32 = 1;
+pub const POLICY_VERSION_FILE_NAME: &str = "policy_version_v2.json";
 
 /// Cross-process exclusive advisory lock (`flock(LOCK_EX)`) on `identity_dir/.lock` (0600,
 /// `O_NOFOLLOW`, `uid == geteuid()`). Never held across `.await`.
@@ -113,6 +115,7 @@ pub enum IdentityStoreError {
     Client(ClientError),
     Storage(String),
     EnrollmentRequired(String),
+    PolicyRollback { attempted: u64, persisted: u64 },
 }
 
 impl fmt::Display for IdentityStoreError {
@@ -123,6 +126,13 @@ impl fmt::Display for IdentityStoreError {
             Self::Client(e) => write!(f, "control-plane error: {e}"),
             Self::Storage(msg) => write!(f, "identity storage error: {msg}"),
             Self::EnrollmentRequired(msg) => write!(f, "enrollment required: {msg}"),
+            Self::PolicyRollback {
+                attempted,
+                persisted,
+            } => write!(
+                f,
+                "policy version rollback refused: attempted={attempted} < persisted={persisted}"
+            ),
         }
     }
 }
@@ -147,6 +157,12 @@ impl From<ClientError> for IdentityStoreError {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPolicyVersionFile {
+    version: u32,
+    last_policy_version: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedIdentityFile {
     version: u32,
@@ -156,7 +172,9 @@ struct PersistedIdentityFile {
     tenant_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device_cert_pb_b64: Option<String>,
-    #[serde(default)]
+    // Legacy field read for backward compatibility only; authoritative high-water mark lives in
+    // dedicated `policy_version_v2.json` so `persist_identity()` can never overwrite it.
+    #[serde(default, skip_serializing)]
     last_policy_version: u64,
 }
 
@@ -240,15 +258,36 @@ impl PersistentV2Identity {
             X25519StaticKeyRotator::new(device_id, false, 0)
         };
 
+        let policy_ver_path = identity_dir.join(POLICY_VERSION_FILE_NAME);
+        let disk_policy_version = Self::read_policy_version_locked(&policy_ver_path)?;
+        let last_policy_version = disk_policy_version.max(persisted.last_policy_version);
+
         Ok(Self {
             identity_dir: identity_dir.to_path_buf(),
             device_id,
             tenant_id,
             keystore,
             device_cert,
-            last_policy_version: persisted.last_policy_version,
+            last_policy_version,
             rotator,
         })
+    }
+
+    fn read_policy_version_locked(path: &Path) -> Result<u64, IdentityStoreError> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let raw = read_file_0600_to_string(path)?;
+        let parsed: PersistedPolicyVersionFile = serde_json::from_str(&raw).map_err(|e| {
+            IdentityStoreError::Storage(format!("parse '{}': {e}", path.display()))
+        })?;
+        if parsed.version != PERSISTED_POLICY_VERSION_SCHEMA {
+            return Err(IdentityStoreError::Storage(format!(
+                "unsupported {POLICY_VERSION_FILE_NAME} version {} (expected {PERSISTED_POLICY_VERSION_SCHEMA})",
+                parsed.version
+            )));
+        }
+        Ok(parsed.last_policy_version)
     }
 
     /// Loads existing `identity_v2.json` + `delegation_v2.json` from `identity_dir` under an
@@ -307,26 +346,31 @@ impl PersistentV2Identity {
     }
 
     /// Atomically verifies `version >= persisted last_policy_version` under `identity_dir/.lock`
-    /// and persists the monotonic high-water mark (`0600` + parent-dir fsync).
+    /// and persists the monotonic high-water mark in dedicated `policy_version_v2.json` (`0600` +
+    /// parent-dir fsync). No-op on disk when `version == disk_last` without rewriting identity keys.
     pub fn advance_policy_version(&mut self, version: u64) -> Result<u64, IdentityStoreError> {
         let _lock = IdentityDirLock::acquire(&self.identity_dir)?;
-        let id_path = self.identity_dir.join(IDENTITY_FILE_NAME);
-        let mut disk_last = self.last_policy_version;
-        if id_path.exists() {
-            let raw = read_file_0600_to_string(&id_path)?;
-            let persisted: PersistedIdentityFile = serde_json::from_str(&raw).map_err(|e| {
-                IdentityStoreError::Storage(format!("parse '{}': {e}", id_path.display()))
-            })?;
-            disk_last = disk_last.max(persisted.last_policy_version);
-        }
-        if version < disk_last {
-            return Err(IdentityStoreError::Storage(format!(
-                "policy version rollback refused: version={version} < persisted last_policy_version={disk_last}"
-            )));
+        let pv_path = self.identity_dir.join(POLICY_VERSION_FILE_NAME);
+        let disk_last = Self::read_policy_version_locked(&pv_path)?;
+        let high_water = disk_last.max(self.last_policy_version);
+        if version < high_water {
+            self.last_policy_version = high_water;
+            return Err(IdentityStoreError::PolicyRollback {
+                attempted: version,
+                persisted: high_water,
+            });
         }
         self.last_policy_version = version;
-        let bytes = self.serialize_identity_bytes()?;
-        write_file_atomic_0600(&id_path, &bytes)?;
+        if version > disk_last {
+            let file = PersistedPolicyVersionFile {
+                version: PERSISTED_POLICY_VERSION_SCHEMA,
+                last_policy_version: version,
+            };
+            let bytes = serde_json::to_vec_pretty(&file).map_err(|e| {
+                IdentityStoreError::Storage(format!("serialize {POLICY_VERSION_FILE_NAME}: {e}"))
+            })?;
+            write_file_atomic_0600(&pv_path, &bytes)?;
+        }
         Ok(self.last_policy_version)
     }
 
@@ -624,6 +668,44 @@ mod tests {
             std::os::unix::fs::symlink(&id_path, &link).unwrap();
             assert!(read_file_0600_to_string(&link).is_err());
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_version_v2_isolated_from_stale_persist_identity_and_refuses_rollback() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zd-pv-iso-{}-{uniq}", std::process::id()));
+        ensure_dir_0700(&dir).unwrap();
+
+        let mut inst_a = PersistentV2Identity::load_or_create(&dir).unwrap();
+        assert_eq!(inst_a.advance_policy_version(7).unwrap(), 7);
+        // Load instance B at version 7
+        let mut inst_b = PersistentV2Identity::load_or_create(&dir).unwrap();
+        assert_eq!(inst_b.last_policy_version(), 7);
+
+        // Instance A advances to 8 (persisted into isolated policy_version_v2.json)
+        assert_eq!(inst_a.advance_policy_version(8).unwrap(), 8);
+        assert!(dir.join(POLICY_VERSION_FILE_NAME).exists());
+
+        // Stale instance B rewrites identity_v2.json via persist_identity()
+        inst_b.persist_identity().unwrap();
+
+        // Disk high-water mark MUST remain 8, and instance B attempting version 7 MUST fail with PolicyRollback
+        let reloaded = PersistentV2Identity::load_or_create(&dir).unwrap();
+        assert_eq!(reloaded.last_policy_version(), 8);
+        match inst_b.advance_policy_version(7) {
+            Err(IdentityStoreError::PolicyRollback {
+                attempted: 7,
+                persisted: 8,
+            }) => {}
+            other => panic!("expected PolicyRollback(7 < 8), got {other:?}"),
+        }
+        // Idempotent repeat of 8 succeeds without error
+        assert_eq!(inst_b.advance_policy_version(8).unwrap(), 8);
 
         let _ = fs::remove_dir_all(&dir);
     }

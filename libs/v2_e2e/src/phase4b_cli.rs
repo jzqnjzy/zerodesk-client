@@ -62,6 +62,19 @@ impl ScenarioFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseMode {
+    Allowed { send_file_twice: bool },
+    /// All privileged channels denied (`allow_audio=false, allow_clipboard=false, allow_file_transfer=false`):
+    /// verifies Controller local policy deny + Edge L2 `allowed_mask` / Host remote deny + zero
+    /// privileged data crossing while VP9 + 12/12 HID pass 100%.
+    AllDenied,
+    /// `allow_clipboard=true, allow_file_transfer=false, allow_audio=false`:
+    /// Edge allows `p3` for Clipboard so raw `FILE_OFFER` reaches Host over the wire and Host
+    /// MUST reply `FILE_ABORT(0x0401)` live over the wire!
+    PartialDeniedFileOnly,
+}
+
 #[derive(Debug, Clone)]
 struct Phase4bCaseSpec<'a> {
     name: &'a str,
@@ -73,8 +86,7 @@ struct Phase4bCaseSpec<'a> {
     expected_ctl_mode: &'a str,
     check_host_fallback_lt_3s: bool,
     check_ctl_fallback_lt_3s: bool,
-    denied_mode: bool,
-    send_file_twice: bool,
+    mode: CaseMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +118,8 @@ struct Phase4bE2eReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     scenario_b_denied_policy: Option<Phase4bCaseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    scenario_b2_host_wire_file_abort_0x0401: Option<Phase4bCaseReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     scenario_c1_ctrl_drop_udp_fallback: Option<Phase4bCaseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scenario_c2_host_drop_udp_fallback: Option<Phase4bCaseReport>,
@@ -127,6 +141,7 @@ fn build_sample_file_payload() -> (Vec<u8>, String) {
 
 fn verify_saved_files_on_disk(
     saved_paths: &[String],
+    download_dir: &Path,
     expected_sha_hex: &str,
     expect_twice_collision: bool,
 ) -> Result<bool, String> {
@@ -137,25 +152,42 @@ fn verify_saved_files_on_disk(
             saved_paths.len()
         ));
     }
+    let canon_dir = fs::canonicalize(download_dir).map_err(|e| {
+        format!(
+            "canonicalize download_dir '{}': {e}",
+            download_dir.display()
+        )
+    })?;
+    let mut canon_paths = Vec::with_capacity(saved_paths.len());
     for path_str in saved_paths {
         let p = Path::new(path_str);
+        let canon = fs::canonicalize(p)
+            .map_err(|e| format!("canonicalize saved file '{}': {e}", p.display()))?;
+        if !canon.starts_with(&canon_dir) {
+            return Err(format!(
+                "saved file '{}' escaped download_dir '{}'",
+                canon.display(),
+                canon_dir.display()
+            ));
+        }
         let bytes =
-            fs::read(p).map_err(|e| format!("read saved file '{}': {e}", p.display()))?;
+            fs::read(&canon).map_err(|e| format!("read saved file '{}': {e}", canon.display()))?;
         let actual_sha = hex::encode(Sha256::digest(&bytes));
         if actual_sha != expected_sha_hex {
             return Err(format!(
                 "saved file '{}' SHA-256 mismatch (expected {expected_sha_hex}, got {actual_sha})",
-                p.display()
+                canon.display()
             ));
         }
+        canon_paths.push(canon);
     }
     if expect_twice_collision {
-        if saved_paths[0] == saved_paths[1] {
-            return Err("second send overwrote first file instead of creating (1) collision copy".into());
+        if canon_paths[0] == canon_paths[1] {
+            return Err(
+                "second send overwrote first file instead of creating (1) collision copy".into(),
+            );
         }
-        let has_collision_suffix = saved_paths
-            .iter()
-            .any(|p| p.contains("(1)"));
+        let has_collision_suffix = saved_paths.iter().any(|p| p.contains("(1)"));
         if !has_collision_suffix {
             return Err(format!(
                 "expected '(1)' collision suffix in saved paths: {saved_paths:?}"
@@ -301,16 +333,19 @@ async fn run_phase4b_case(
     if spec.ctl_drop_udp {
         ctl_cmd.arg("--drop-udp");
     }
-    if spec.denied_mode {
-        ctl_cmd.arg("--probe-denied-channels");
-    } else {
-        ctl_cmd
-            .arg("--audio")
-            .arg("--clipboard")
-            .arg("--send-file")
-            .arg(sample_file_path);
-        if spec.send_file_twice {
-            ctl_cmd.arg("--send-file-twice");
+    match spec.mode {
+        CaseMode::AllDenied | CaseMode::PartialDeniedFileOnly => {
+            ctl_cmd.arg("--probe-denied-channels");
+        }
+        CaseMode::Allowed { send_file_twice } => {
+            ctl_cmd
+                .arg("--audio")
+                .arg("--clipboard")
+                .arg("--send-file")
+                .arg(sample_file_path);
+            if send_file_twice {
+                ctl_cmd.arg("--send-file-twice");
+            }
         }
     }
     if let Some(ca) = ca_der {
@@ -329,10 +364,18 @@ async fn run_phase4b_case(
         }
     };
 
-    let (ctl_res, host_res) = tokio::join!(
-        ctl_child.wait_with_output(Duration::from_secs(60)),
-        host_child.wait_with_output(Duration::from_secs(60)),
-    );
+    // Await Controller first (it sends 3x SESSION_CLOSE(0x0000) and exits first).
+    // On any Controller error/timeout, IMMEDIATELY kill & bounded-reap Host so no leaked
+    // v2-hostd can interfere with subsequent C1/C2/C3 cases!
+    let ctl_res = ctl_child.wait_with_output(Duration::from_secs(60)).await;
+    let host_res = match &ctl_res {
+        Ok(_) => host_child.wait_with_output(Duration::from_secs(20)).await,
+        Err(_) => {
+            host_child.sigkill_group();
+            let _ = host_child.wait_with_output(Duration::from_secs(3)).await;
+            Err("host terminated after controller timeout/error".into())
+        }
+    };
 
     let (ctl_summary, host_summary, parse_err) = match (ctl_res, host_res) {
         (Ok((_cs, cout, cerr)), Ok((_hs, hout, herr))) => {
@@ -454,75 +497,119 @@ async fn run_phase4b_case(
         ));
     }
 
-    if spec.denied_mode {
-        if !(c.audio_local_policy_denied
-            && c.clipboard_local_policy_denied
-            && c.file_local_policy_denied)
-        {
-            checks.push("controller local policy failed to deny audio/clipboard/file".into());
+    match spec.mode {
+        CaseMode::AllDenied => {
+            // Layer 1 (Controller local verified TenantPolicyBlob): all 3 channels denied
+            if !(c.audio_local_policy_denied
+                && c.clipboard_local_policy_denied
+                && c.file_local_policy_denied)
+            {
+                checks.push("controller local policy failed to deny audio/clipboard/file".into());
+            }
+            // Layer 2/3 (Edge allowed_mask + Host verified policy): zero privileged data crosses
+            // and Host explicitly drops/denies Audio probe
+            if h.audio_policy_denied < 1
+                || h.audio_frames_sent != 0
+                || c.audio_frames_received != 0
+            {
+                checks.push(format!(
+                    "denied audio policy gate mismatch: denied={}, sent={}, recv={}",
+                    h.audio_policy_denied, h.audio_frames_sent, c.audio_frames_received
+                ));
+            }
+            if h.clipboard_received_text != 0
+                || h.clipboard_received_png != 0
+                || c.clipboard_acks_ok != 0
+            {
+                checks.push(format!(
+                    "denied clipboard unexpectedly delivered: text={}, png={}, acks_ok={}",
+                    h.clipboard_received_text, h.clipboard_received_png, c.clipboard_acks_ok
+                ));
+            }
+            if h.file_transfers_completed != 0 || !h.file_saved_paths.is_empty() {
+                checks.push(format!(
+                    "denied file transfer unexpectedly succeeded: completed={}, saved={:?}",
+                    h.file_transfers_completed, h.file_saved_paths
+                ));
+            }
         }
-        if c.clipboard_acks_denied < 1 || h.clipboard_acks_denied < 1 {
-            checks.push("denied clipboard probe did not return CLIP_ACK POLICY_DENIED".into());
+        CaseMode::PartialDeniedFileOnly => {
+            // Layer 1: Controller local policy denies file transfer & audio
+            if !c.file_local_policy_denied || !c.audio_local_policy_denied {
+                checks.push(
+                    "partial-denied controller local policy failed to deny file/audio".into(),
+                );
+            }
+            // Layer 3 (Host wire enforcement): Edge allows p3 (allow_clipboard=true), so raw
+            // FILE_OFFER reaches Host and Host MUST reply FILE_ABORT(0x0401) over the wire!
+            if c.file_transfers_aborted_policy < 1 || h.file_transfers_aborted_policy < 1 {
+                checks.push(format!(
+                    "host wire FILE_ABORT(0x0401) missing: ctl={}, host={}",
+                    c.file_transfers_aborted_policy, h.file_transfers_aborted_policy
+                ));
+            }
+            if h.audio_policy_denied < 1
+                || h.audio_frames_sent != 0
+                || c.audio_frames_received != 0
+            {
+                checks.push(format!(
+                    "partial-denied audio gate mismatch: denied={}, sent={}, recv={}",
+                    h.audio_policy_denied, h.audio_frames_sent, c.audio_frames_received
+                ));
+            }
+            if h.file_transfers_completed != 0 || !h.file_saved_paths.is_empty() {
+                checks.push("partial-denied file transfer unexpectedly saved file".into());
+            }
         }
-        if c.file_transfers_aborted_policy < 1 || h.file_transfers_aborted_policy < 1 {
-            checks.push("denied file probe did not return FILE_ABORT 0x0401".into());
-        }
-        if h.audio_policy_denied < 1 || h.audio_frames_sent != 0 {
-            checks.push(format!(
-                "denied audio policy gate mismatch: denied={}, sent={}",
-                h.audio_policy_denied, h.audio_frames_sent
-            ));
-        }
-        if h.file_transfers_completed != 0 || h.clipboard_received_text != 0 {
-            checks.push("denied tenant unexpectedly delivered clipboard or file payload".into());
-        }
-    } else {
-        if h.audio_frames_sent < 35 || c.audio_frames_received < 30 {
-            checks.push(format!(
-                "audio frames too low: sent={}, recv={}",
-                h.audio_frames_sent, c.audio_frames_received
-            ));
-        }
-        if c.audio_dtx_frames_received < 1 {
-            checks.push("expected >= 1 Opus DTX silence frame received".into());
-        }
-        match c.audio_snr_db {
-            Some(snr) if snr.is_finite() && snr >= MIN_AUDIO_SNR_DB => {}
-            other => checks.push(format!(
-                "audio SNR below gate ({MIN_AUDIO_SNR_DB} dB): {other:?}"
-            )),
-        }
-        if c.clipboard_acks_ok < 3
-            || h.clipboard_received_text < 2
-            || h.clipboard_received_png < 1
-        {
-            checks.push(format!(
-                "clipboard check failed: acks_ok={}, text={}, png={}",
-                c.clipboard_acks_ok, h.clipboard_received_text, h.clipboard_received_png
-            ));
-        }
-        if !h.clipboard_anti_echo_suppressed || !c.clipboard_anti_echo_preserved {
-            checks.push(format!(
-                "clipboard anti-echo check failed: host_suppressed={}, ctl_aba_preserved={}",
-                h.clipboard_anti_echo_suppressed, c.clipboard_anti_echo_preserved
-            ));
-        }
-        let expected_files = if spec.send_file_twice { 2 } else { 1 };
-        if c.file_transfers_completed != expected_files
-            || h.file_transfers_completed != expected_files
-        {
-            checks.push(format!(
-                "file transfers completed mismatch: expected={expected_files}, ctl={}, host={}",
-                c.file_transfers_completed, h.file_transfers_completed
-            ));
-        } else {
-            match verify_saved_files_on_disk(
-                &h.file_saved_paths,
-                sample_file_sha_hex,
-                spec.send_file_twice,
-            ) {
-                Ok(col_ok) => file_collision_verified = col_ok,
-                Err(e) => checks.push(e),
+        CaseMode::Allowed { send_file_twice } => {
+            if h.audio_frames_sent < 35 || c.audio_frames_received < 30 {
+                checks.push(format!(
+                    "audio frames too low: sent={}, recv={}",
+                    h.audio_frames_sent, c.audio_frames_received
+                ));
+            }
+            if c.audio_dtx_frames_received < 1 {
+                checks.push("expected >= 1 Opus DTX silence frame received".into());
+            }
+            match c.audio_snr_db {
+                Some(snr) if snr.is_finite() && snr >= MIN_AUDIO_SNR_DB => {}
+                other => checks.push(format!(
+                    "audio SNR below gate ({MIN_AUDIO_SNR_DB} dB): {other:?}"
+                )),
+            }
+            if c.clipboard_acks_ok < 3
+                || h.clipboard_received_text < 2
+                || h.clipboard_received_png < 1
+            {
+                checks.push(format!(
+                    "clipboard check failed: acks_ok={}, text={}, png={}",
+                    c.clipboard_acks_ok, h.clipboard_received_text, h.clipboard_received_png
+                ));
+            }
+            if !h.clipboard_anti_echo_suppressed || !c.clipboard_anti_echo_preserved {
+                checks.push(format!(
+                    "clipboard anti-echo check failed: host_suppressed={}, ctl_aba_preserved={}",
+                    h.clipboard_anti_echo_suppressed, c.clipboard_anti_echo_preserved
+                ));
+            }
+            let expected_files = if send_file_twice { 2 } else { 1 };
+            if c.file_transfers_completed != expected_files
+                || h.file_transfers_completed != expected_files
+            {
+                checks.push(format!(
+                    "file transfers completed mismatch: expected={expected_files}, ctl={}, host={}",
+                    c.file_transfers_completed, h.file_transfers_completed
+                ));
+            } else {
+                match verify_saved_files_on_disk(
+                    &h.file_saved_paths,
+                    &download_dir,
+                    sample_file_sha_hex,
+                    send_file_twice,
+                ) {
+                    Ok(col_ok) => file_collision_verified = col_ok,
+                    Err(e) => checks.push(e),
+                }
             }
         }
     }
@@ -709,8 +796,9 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
                 expected_ctl_mode: "udp",
                 check_host_fallback_lt_3s: false,
                 check_ctl_fallback_lt_3s: false,
-                denied_mode: false,
-                send_file_twice: true,
+                mode: CaseMode::Allowed {
+                    send_file_twice: true,
+                },
             };
             Some(
                 run_phase4b_case(
@@ -738,7 +826,8 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
         None
     };
 
-    let scenario_b = if filter.run_b() {
+    let (scenario_b, scenario_b2) = if filter.run_b() {
+        // B1: All privileged channels denied -> Controller local + Edge L2 allowed_mask + Host Audio deny
         let tid_hex = hex::encode(random_bytes::<16>());
         let enroll = format!("v2-p4b-deny-{}", hex::encode(random_bytes::<8>()));
         let req = CreateTenantReq {
@@ -771,7 +860,7 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
             eprintln!("create denied identity dirs: {e}");
             return ExitCode::FAILURE;
         }
-        let spec = Phase4bCaseSpec {
+        let spec_b1 = Phase4bCaseSpec {
             name: "scenario_b_denied_policy",
             host_transport: "udp",
             host_drop_udp: false,
@@ -781,30 +870,92 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
             expected_ctl_mode: "udp",
             check_host_fallback_lt_3s: false,
             check_ctl_fallback_lt_3s: false,
-            denied_mode: true,
-            send_file_twice: false,
+            mode: CaseMode::AllDenied,
         };
-        Some(
-            run_phase4b_case(
-                &exe,
-                &spec,
-                &config_path,
-                resolved_ca.as_deref(),
-                signaling_tls,
-                &host_id,
-                &ctrl_id,
-                &work_dir,
-                &tid_hex,
-                &enroll,
-                codec,
-                frames,
-                &sample_file_path,
-                &sample_sha_hex,
-            )
-            .await,
+        let b1 = run_phase4b_case(
+            &exe,
+            &spec_b1,
+            &config_path,
+            resolved_ca.as_deref(),
+            signaling_tls,
+            &host_id,
+            &ctrl_id,
+            &work_dir,
+            &tid_hex,
+            &enroll,
+            codec,
+            frames,
+            &sample_file_path,
+            &sample_sha_hex,
         )
+        .await;
+
+        // B2: Partial deny (allow_clipboard=true, allow_file_transfer=false, allow_audio=false)
+        // Edge permits p3 for Clipboard so raw FILE_OFFER reaches Host and Host replies FILE_ABORT(0x0401) live!
+        let tid2_hex = hex::encode(random_bytes::<16>());
+        let enroll2 = format!("v2-p4b-pdeny-{}", hex::encode(random_bytes::<8>()));
+        let req2 = CreateTenantReq {
+            tenant_id_hex: tid2_hex.clone(),
+            name: Some("zerodesk-p4b-partial-denied".into()),
+            home_region: Some("local".into()),
+            plan_tier: Some("restricted-clip".into()),
+            monthly_quota_bytes: 20 * 1024 * 1024 * 1024,
+            bw_cap_kbps: 50_000,
+            exhaust_policy: 0,
+            allow_file_transfer: false,
+            enrollment_token: enroll2.clone(),
+            enrollment_ttl_sec: 3600,
+            policy_hash_hex: None,
+            allow_clipboard: Some(true),
+            allow_file_clipboard: Some(false),
+            allow_tcp_tunnel: Some(false),
+            allow_terminal: Some(false),
+            allow_audio: Some(false),
+            max_file_mb: Some(0),
+            max_clipboard_kb: Some(256),
+        };
+        if let Err(e) = cp.create_tenant(admin_token, &req2).await {
+            eprintln!("create partial-denied tenant failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        let host_id2 = work_dir.join("pdeny_host_id");
+        let ctrl_id2 = work_dir.join("pdeny_ctrl_id");
+        if let Err(e) = ensure_dir_0700(&host_id2).and_then(|_| ensure_dir_0700(&ctrl_id2)) {
+            eprintln!("create partial-denied identity dirs: {e}");
+            return ExitCode::FAILURE;
+        }
+        let spec_b2 = Phase4bCaseSpec {
+            name: "scenario_b2_host_wire_file_abort_0x0401",
+            host_transport: "udp",
+            host_drop_udp: false,
+            ctl_transport: "udp",
+            ctl_drop_udp: false,
+            expected_host_mode: "udp",
+            expected_ctl_mode: "udp",
+            check_host_fallback_lt_3s: false,
+            check_ctl_fallback_lt_3s: false,
+            mode: CaseMode::PartialDeniedFileOnly,
+        };
+        let b2 = run_phase4b_case(
+            &exe,
+            &spec_b2,
+            &config_path,
+            resolved_ca.as_deref(),
+            signaling_tls,
+            &host_id2,
+            &ctrl_id2,
+            &work_dir,
+            &tid2_hex,
+            &enroll2,
+            codec,
+            frames,
+            &sample_file_path,
+            &sample_sha_hex,
+        )
+        .await;
+        (Some(b1), Some(b2))
     } else {
-        None
+        (None, None)
     };
 
     let (scenario_c1, scenario_c2, scenario_c3) = if filter.run_c() {
@@ -819,8 +970,9 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
                 expected_ctl_mode: "dual_tls443",
                 check_host_fallback_lt_3s: false,
                 check_ctl_fallback_lt_3s: true,
-                denied_mode: false,
-                send_file_twice: false,
+                mode: CaseMode::Allowed {
+                    send_file_twice: false,
+                },
             };
             let c1 = run_phase4b_case(
                 &exe,
@@ -850,8 +1002,9 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
                 expected_ctl_mode: "udp",
                 check_host_fallback_lt_3s: true,
                 check_ctl_fallback_lt_3s: false,
-                denied_mode: false,
-                send_file_twice: false,
+                mode: CaseMode::Allowed {
+                    send_file_twice: false,
+                },
             };
             let c2 = run_phase4b_case(
                 &exe,
@@ -881,8 +1034,9 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
                 expected_ctl_mode: "dual_tls443",
                 check_host_fallback_lt_3s: false,
                 check_ctl_fallback_lt_3s: false,
-                denied_mode: false,
-                send_file_twice: false,
+                mode: CaseMode::Allowed {
+                    send_file_twice: false,
+                },
             };
             let c3 = run_phase4b_case(
                 &exe,
@@ -918,9 +1072,16 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
         Err(e) => (false, Some(format!("rendezvous scan failed: {e}"))),
     };
 
-    let all_cases_ok = [&scenario_a, &scenario_b, &scenario_c1, &scenario_c2, &scenario_c3]
-        .iter()
-        .all(|opt| opt.as_ref().is_none_or(|r| r.pass));
+    let all_cases_ok = [
+        &scenario_a,
+        &scenario_b,
+        &scenario_b2,
+        &scenario_c1,
+        &scenario_c2,
+        &scenario_c3,
+    ]
+    .iter()
+    .all(|opt| opt.as_ref().is_none_or(|r| r.pass));
     let pass = all_cases_ok && zero_rendezvous_verified;
 
     let report = Phase4bE2eReport {
@@ -928,6 +1089,7 @@ pub async fn cmd_phase4b_e2e(args: &[String]) -> ExitCode {
         zero_rendezvous_verified,
         scenario_a_allowed_udp: scenario_a,
         scenario_b_denied_policy: scenario_b,
+        scenario_b2_host_wire_file_abort_0x0401: scenario_b2,
         scenario_c1_ctrl_drop_udp_fallback: scenario_c1,
         scenario_c2_host_drop_udp_fallback: scenario_c2,
         scenario_c3_tls443_only: scenario_c3,
@@ -973,10 +1135,24 @@ mod tests {
         write_file_atomic_0600(&p2, &data).unwrap();
 
         let paths = vec![p1.display().to_string(), p2.display().to_string()];
-        assert_eq!(verify_saved_files_on_disk(&paths, &sha_hex, true), Ok(true));
+        assert_eq!(
+            verify_saved_files_on_disk(&paths, &dir, &sha_hex, true),
+            Ok(true)
+        );
         // Duplicate identical path must fail collision check
         let dup = vec![p1.display().to_string(), p1.display().to_string()];
-        assert!(verify_saved_files_on_disk(&dup, &sha_hex, true).is_err());
+        assert!(verify_saved_files_on_disk(&dup, &dir, &sha_hex, true).is_err());
+        // Path outside download_dir must fail canonicalize containment check
+        let outside_dir =
+            std::env::temp_dir().join(format!("zd-p4b-out-{}-{uniq}", std::process::id()));
+        ensure_dir_0700(&outside_dir).unwrap();
+        let outside = outside_dir.join("escape.bin");
+        write_file_atomic_0600(&outside, &data).unwrap();
+        assert!(
+            verify_saved_files_on_disk(&[outside.display().to_string()], &dir, &sha_hex, false)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(&outside_dir);
 
         let _ = fs::remove_dir_all(&dir);
     }

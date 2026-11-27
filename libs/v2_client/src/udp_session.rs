@@ -9,12 +9,14 @@ use crate::{
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     net::SocketAddr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::UdpSocket;
 use v2_identity::{ControlPreemptToken, DelegationStatement};
+#[cfg(any(test, feature = "test-utils"))]
+use v2_transport::CIPHER_AESGCM;
 use v2_transport::{
     default_channel_priority, decode_l4_frame, encode_l4_frame, rs64_decode_block,
     rs64_encode_block, seal_udp_v11, seq_u32_gt, AccessEpochState, AccessFlags, AccessHeaderV11,
@@ -25,7 +27,7 @@ use v2_transport::{
     VerifiedTenantPolicy, VideoFrameMeta, VideoReassembler, VideoSlice, ACCESS_HDR_V11_LEN,
     BW_EVENT_DROP_ACTIVE, BW_EVENT_PAUSE_FILE_CHUNK, BW_EVENT_SURVIVAL_MODE, CHAN_AUDIO,
     CHAN_CLIPBOARD, CHAN_DIAGNOSTICS, CHAN_FILE_TRANSFER, CHAN_INPUT_HID,
-    CHAN_REALTIME_ACTUATOR, CHAN_TELEMETRY, CHAN_TRANSPORT_CTRL, CHAN_VIDEO, CIPHER_AESGCM,
+    CHAN_REALTIME_ACTUATOR, CHAN_TELEMETRY, CHAN_TRANSPORT_CTRL, CHAN_VIDEO,
     DIR_CLIENT_TO_EDGE, DIR_EDGE_TO_CLIENT, L3_MTU_DEFAULT, SURVIVAL_RS_K, SURVIVAL_RS_M,
     TRANSPORT_DATAGRAM, UDP_MAX_LEN,
 };
@@ -196,6 +198,10 @@ impl ActiveTransportMode {
     }
 }
 
+const UDP_PENDING_RX_CAP: usize = 512;
+const MAX_HANDSHAKE_RESPONDER_ATTEMPTS: usize = 16;
+const MAX_CONSECUTIVE_BAD_L3_FRAMES: u32 = 32;
+
 /// Layer 2 UDP 28B Access Transport link to a single `v2-edge` PoP.
 pub struct UdpAccessLink {
     socket: UdpSocket,
@@ -208,6 +214,7 @@ pub struct UdpAccessLink {
     gap_tracker: LegGapTracker,
     rtx_cache: LegCiphertextCache,
     bw_hint: BwHintController,
+    pending: VecDeque<UdpRecvEvent>,
     bulk_paused: bool,
     rtt_ms: u64,
     pub auto_leg_nack: bool,
@@ -255,6 +262,7 @@ impl UdpAccessLink {
             gap_tracker: LegGapTracker::new(),
             rtx_cache: LegCiphertextCache::new(keys.access_epoch),
             bw_hint: BwHintController::new(lease_bw_cap_kbps, lease_bw_cap_kbps),
+            pending: VecDeque::new(),
             bulk_paused: false,
             rtt_ms: 20,
             auto_leg_nack: true,
@@ -361,8 +369,19 @@ impl UdpAccessLink {
         Ok(seq)
     }
 
+    fn push_pending(&mut self, ev: UdpRecvEvent) -> Result<(), ClientError> {
+        if self.pending.len() >= UDP_PENDING_RX_CAP {
+            return Err(ClientError::Timeout(
+                "UDP pending buffer cap exceeded during ping wait".into(),
+            ));
+        }
+        self.pending.push_back(ev);
+        Ok(())
+    }
+
     /// Sends an `EdgeCtrl::Ping` and waits for the matching `EdgeCtrl::Pong`, retrying on loss.
-    /// Returns measured RTT in microseconds.
+    /// Buffers non-matching `L3Data`/`EdgeCtrl` events in `self.pending` so packets already marked
+    /// in `dedup` are never lost. Returns measured RTT in microseconds.
     pub async fn ping_with_retry(
         &mut self,
         max_attempts: usize,
@@ -374,12 +393,16 @@ impl UdpAccessLink {
             let sent = Instant::now();
             self.send_edge_ctrl(&EdgeCtrlFrame::Ping { ts_us }).await?;
 
-            let deadline = Instant::now() + per_attempt_timeout;
+            let deadline = Instant::now()
+                .checked_add(per_attempt_timeout)
+                .ok_or_else(|| {
+                    ClientError::Protocol("UDP ping timeout overflows monotonic clock".into())
+                })?;
             loop {
                 let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
-                match self.recv_packet(rem).await {
+                match self.recv_packet_raw(rem).await {
                     Ok(UdpRecvEvent::EdgeCtrl(EdgeCtrlFrame::Pong { ts_us: echo }))
                         if echo == ts_us =>
                     {
@@ -387,7 +410,10 @@ impl UdpAccessLink {
                         self.rtt_ms = (rtt_us / 1000).max(1);
                         return Ok(rtt_us);
                     }
-                    Ok(_) => continue,
+                    Ok(ev) => {
+                        self.push_pending(ev)?;
+                        continue;
+                    }
                     Err(ClientError::Timeout(_)) => break,
                     Err(e) => return Err(e),
                 }
@@ -406,8 +432,12 @@ impl UdpAccessLink {
         total_timeout: Duration,
     ) -> Result<u64, ClientError> {
         let started = Instant::now();
-        let deadline = started + total_timeout;
-        let second_ping_at = started + Duration::from_millis(600);
+        let deadline = started.checked_add(total_timeout).ok_or_else(|| {
+            ClientError::Protocol("UDP probe timeout overflows monotonic clock".into())
+        })?;
+        let second_ping_at = started
+            .checked_add(Duration::from_millis(600))
+            .unwrap_or(deadline);
         let ts1 = now_us();
         self.send_edge_ctrl(&EdgeCtrlFrame::Ping { ts_us: ts1 }).await?;
         let mut ts2: Option<u64> = None;
@@ -434,7 +464,7 @@ impl UdpAccessLink {
                 rem
             };
 
-            match self.recv_packet(wait).await {
+            match self.recv_packet_raw(wait).await {
                 Ok(UdpRecvEvent::EdgeCtrl(EdgeCtrlFrame::Pong { ts_us: echo }))
                     if echo == ts1 || ts2 == Some(echo) =>
                 {
@@ -442,7 +472,10 @@ impl UdpAccessLink {
                     self.rtt_ms = (rtt_us / 1000).max(1);
                     return Ok(rtt_us);
                 }
-                Ok(_) => continue,
+                Ok(ev) => {
+                    self.push_pending(ev)?;
+                    continue;
+                }
                 Err(ClientError::Timeout(_)) => {
                     if ts2.is_none() && Instant::now() >= second_ping_at && Instant::now() < deadline
                     {
@@ -456,11 +489,21 @@ impl UdpAccessLink {
         }
     }
 
-    /// Receives and authenticates the next UDP packet from Edge.
+    /// Receives and authenticates the next UDP packet from Edge, draining any events buffered
+    /// during an earlier ping wait first.
     /// Automatically honors incoming `EdgeCtrl::LegNack` (emitting `rtx=1` packets),
     /// `EdgeCtrl::Ping` (replying `Pong`), and `EdgeCtrl::BwHint`.
     pub async fn recv_packet(&mut self, timeout: Duration) -> Result<UdpRecvEvent, ClientError> {
-        let deadline = Instant::now() + timeout;
+        if let Some(ev) = self.pending.pop_front() {
+            return Ok(ev);
+        }
+        self.recv_packet_raw(timeout).await
+    }
+
+    async fn recv_packet_raw(&mut self, timeout: Duration) -> Result<UdpRecvEvent, ClientError> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("UDP recv timeout overflows monotonic clock".into())
+        })?;
         let mut buf = [0u8; UDP_MAX_LEN + 64];
         loop {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
@@ -820,6 +863,7 @@ pub struct UdpE2eeSession {
     stream_dedup: StreamSeqDedup,
     next_stream_seq: [u32; 9],
     hs_replay: Option<HandshakeReplayCache>,
+    invalid_l3_frames_dropped: u64,
 }
 
 impl UdpE2eeSession {
@@ -851,9 +895,11 @@ impl UdpE2eeSession {
         link.send_l3_packet(0, false, true, 0, &msg1).await?;
 
         let is_udp = link.active_mode() == ActiveTransportMode::Udp;
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("E2EE handshake timeout overflows monotonic clock".into())
+        })?;
         let mut rtx_interval = HANDSHAKE_RTX_INITIAL_INTERVAL;
-        let mut next_rtx = Instant::now() + rtx_interval;
+        let mut next_rtx = Instant::now().checked_add(rtx_interval).unwrap_or(deadline);
         let msg2 = loop {
             let now = Instant::now();
             let Some(rem) = deadline
@@ -928,33 +974,61 @@ impl UdpE2eeSession {
     ) -> Result<(Self, E2eeHandshakeOutput), ClientError> {
         let mut link = link.into();
         let prologue = prologue_input.compute_prologue();
-        let mut hs = E2eeNoiseHandshake::build_ik_responder(
-            prologue_input.cipher_suite,
-            local_x25519_priv,
-            &prologue,
-        )?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("E2EE handshake timeout overflows monotonic clock".into())
+        })?;
+        let mut attempts = 0usize;
+        let mut last_err: Option<ClientError> = None;
 
-        let deadline = Instant::now() + timeout;
-        let msg1 = loop {
+        let (msg1, msg2, out) = loop {
+            if attempts >= MAX_HANDSHAKE_RESPONDER_ATTEMPTS {
+                return Err(last_err.unwrap_or_else(|| {
+                    ClientError::Protocol(
+                        "E2EE Noise_IK responder exceeded max invalid msg1 attempts".into(),
+                    )
+                }));
+            }
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("E2EE Noise_IK msg1 timed out".into()));
             };
-            match link.recv_packet(rem).await? {
-                UdpRecvEvent::L3Data { payload, .. } => break payload,
+            let candidate_msg1 = match link.recv_packet(rem).await? {
+                UdpRecvEvent::L3Data { payload, .. } => payload,
                 UdpRecvEvent::EdgeCtrl(_) => continue,
-            }
-        };
-        let _ = hs.read_message(&msg1)?;
-        let msg2 = hs.write_message(b"V2-SESSION-ACCEPT")?;
-        link.send_l3_packet(0, false, true, 0, &msg2).await?;
+            };
+            attempts += 1;
 
-        let out = hs.finish_split(
-            Some(peer_delegation),
-            expected_peer_device_id,
-            peer_device_spki_der,
-            peer_device_cert_exp_unix,
-            now_unix,
-        )?;
+            let mut hs = E2eeNoiseHandshake::build_ik_responder(
+                prologue_input.cipher_suite,
+                local_x25519_priv,
+                &prologue,
+            )?;
+            if let Err(e) = hs.read_message(&candidate_msg1) {
+                last_err = Some(e.into());
+                continue;
+            }
+            let msg2 = match hs.write_message(b"V2-SESSION-ACCEPT") {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            let out = match hs.finish_split(
+                Some(peer_delegation),
+                expected_peer_device_id,
+                peer_device_spki_der,
+                peer_device_cert_exp_unix,
+                now_unix,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+            };
+            link.send_l3_packet(0, false, true, 0, &msg2).await?;
+            break (candidate_msg1, msg2, out);
+        };
         let mut session = Self::from_handshake(link, &out, policy, local_device_id, l3_mtu);
         session.hs_replay = Some(HandshakeReplayCache::Responder {
             msg1,
@@ -983,10 +1057,12 @@ impl UdpE2eeSession {
             stream_dedup: StreamSeqDedup::default(),
             next_stream_seq: [0; 9],
             hs_replay: None,
+            invalid_l3_frames_dropped: 0,
         }
     }
 
-    /// Creates a session directly from pre-shared keys (convenience for local tests).
+    /// Creates a session directly from pre-shared keys (gated behind `test` / `test-utils`).
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_keys(
         link: impl Into<AccessDataPlane>,
         tx_key: [u8; 32],
@@ -1006,7 +1082,12 @@ impl UdpE2eeSession {
             stream_dedup: StreamSeqDedup::default(),
             next_stream_seq: [0; 9],
             hs_replay: None,
+            invalid_l3_frames_dropped: 0,
         }
+    }
+
+    pub fn invalid_l3_frames_dropped(&self) -> u64 {
+        self.invalid_l3_frames_dropped
     }
 
     pub fn data_plane(&self) -> &AccessDataPlane {
@@ -1103,9 +1184,11 @@ impl UdpE2eeSession {
             .await
     }
 
-    /// Sends a v1.2.4 channel-protocol L4 frame (`0x02 Audio`, `0x04 Clipboard`, `0x05 FileTransfer`)
-    /// whose policy gate & rejection replies (`CLIP_ACK(..., POLICY_DENIED)`, `FILE_ABORT(..., 0x0401)`)
-    /// are enforced by the channel state machine itself.
+    /// Sends a v1.2.4 channel-protocol L4 frame strictly limited to `0x02 Audio`, `0x04 Clipboard`,
+    /// or `0x05 FileTransfer`. Enforces `self.policy.enforce_channel(...)` on all data frames,
+    /// exempting ONLY rejection/control reply frames (`CLIP_ACK` = `0x02`, `FILE_ABORT` = `0x06`,
+    /// `FILE_COMPLETE_ACK` = `0x07`) so a policy-denied receiver can always emit `POLICY_DENIED` /
+    /// `UNSUPPORTED` replies while `CHAN_INPUT_HID` / `CHAN_REALTIME_ACTUATOR` can NEVER bypass policy.
     pub async fn send_l4_raw(
         &mut self,
         chan_id: u8,
@@ -1114,8 +1197,45 @@ impl UdpE2eeSession {
         discardable: bool,
         body: &[u8],
     ) -> Result<u32, ClientError> {
-        self.send_l4_internal(chan_id, msg_type, flags, discardable, true, 0, body)
-            .await
+        let is_reply_exempt = matches!(
+            (chan_id, msg_type),
+            (CHAN_CLIPBOARD, 0x02) | (CHAN_FILE_TRANSFER, 0x06 | 0x07)
+        );
+        match chan_id {
+            CHAN_AUDIO | CHAN_CLIPBOARD | CHAN_FILE_TRANSFER => {
+                if !is_reply_exempt {
+                    let is_file_clipboard = chan_id == CHAN_CLIPBOARD && flags != 0;
+                    self.policy.enforce_channel(chan_id, is_file_clipboard)?;
+                }
+                self.send_l4_internal(chan_id, msg_type, flags, discardable, true, 0, body)
+                    .await
+            }
+            _ => Err(TransportError::InvalidFraming(format!(
+                "send_l4_raw only permits Audio/Clipboard/FileTransfer, got chan_id={chan_id:#04x}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Sends a raw negative-test wire probe on `0x02 Audio`, `0x04 Clipboard`, or `0x05 FileTransfer`
+    /// bypassing only the local policy check so E2E harnesses can verify Edge + remote Host
+    /// defense-in-depth rejection. Never permits `CHAN_INPUT_HID` or `CHAN_REALTIME_ACTUATOR`.
+    pub async fn send_negative_policy_probe(
+        &mut self,
+        chan_id: u8,
+        msg_type: u8,
+        body: &[u8],
+    ) -> Result<u32, ClientError> {
+        match chan_id {
+            CHAN_AUDIO | CHAN_CLIPBOARD | CHAN_FILE_TRANSFER => {
+                self.send_l4_internal(chan_id, msg_type, 0, false, true, 0, body)
+                    .await
+            }
+            _ => Err(TransportError::InvalidFraming(format!(
+                "send_negative_policy_probe only permits Audio/Clipboard/FileTransfer, got {chan_id:#04x}"
+            ))
+            .into()),
+        }
     }
 
     pub async fn send_hid(&mut self, frame: &HidFrame) -> Result<u32, ClientError> {
@@ -1137,6 +1257,7 @@ impl UdpE2eeSession {
         meta: &VideoFrameMeta,
         frame_data: &[u8],
     ) -> Result<usize, ClientError> {
+        self.policy.enforce_channel(CHAN_VIDEO, false)?;
         let slices = VideoSlice::slice_frame(
             meta.codec_id,
             meta.frame_id,
@@ -1209,6 +1330,7 @@ impl UdpE2eeSession {
         &mut self,
         deadline: Instant,
     ) -> Result<(u8, L4Header, Vec<u8>, u64), ClientError> {
+        let mut consecutive_bad_l3 = 0u32;
         loop {
             let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ClientError::Timeout("E2EE recv_event timed out".into()));
@@ -1247,9 +1369,20 @@ impl UdpE2eeSession {
                 Some(hdr.flags.pp),
                 now,
             ) {
-                Ok(v) => v,
+                Ok(v) => {
+                    consecutive_bad_l3 = 0;
+                    v
+                }
                 Err(TransportError::ReplayDetected) => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    self.invalid_l3_frames_dropped =
+                        self.invalid_l3_frames_dropped.saturating_add(1);
+                    consecutive_bad_l3 = consecutive_bad_l3.saturating_add(1);
+                    if consecutive_bad_l3 >= MAX_CONSECUTIVE_BAD_L3_FRAMES {
+                        return Err(e.into());
+                    }
+                    continue;
+                }
             };
             let (l4_hdr, body) = decode_l4_frame(&pt)?;
             if !self.stream_dedup.mark_if_new(l3_hdr.chan_id, l4_hdr.stream_seq) {
@@ -1263,7 +1396,9 @@ impl UdpE2eeSession {
     /// `0x04 Clipboard`, and `0x05 FileTransfer` so their v1.2.4 state machines can enforce
     /// exact framing, policy replies (`POLICY_DENIED`), and unknown `msg_type` handling.
     pub async fn recv_v124_event(&mut self, timeout: Duration) -> Result<V2RecvEvent, ClientError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("E2EE recv_v124_event timeout overflows monotonic clock".into())
+        })?;
         loop {
             let (chan_id, l4_hdr, body, now) = self.recv_decrypted_l4(deadline).await?;
             match chan_id {
@@ -1397,7 +1532,9 @@ impl UdpE2eeSession {
     /// Receives and dispatches the next L4 `TransportEvent`, verifying L3 AEAD, 2048-bit
     /// replay window, `chan_id <-> pp`, `VerifiedTenantPolicy`, and `0x07 ActuatorReceiver`.
     pub async fn recv_event(&mut self, timeout: Duration) -> Result<TransportEvent, ClientError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            ClientError::Protocol("E2EE recv_event timeout overflows monotonic clock".into())
+        })?;
         loop {
             let (chan_id, l4_hdr, body, now) = self.recv_decrypted_l4(deadline).await?;
             if let Some(ev) = self.dispatch_standard_channel(chan_id, l4_hdr, &body, now)? {
@@ -2353,5 +2490,180 @@ mod tests {
             h.abort();
         }
         let _ = std::fs::remove_file(&tmp_ca);
+    }
+
+    #[tokio::test]
+    async fn udp_ping_buffers_interleaved_l3_data_without_loss() {
+        let edge_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let edge_addr = edge_sock.local_addr().unwrap();
+        let cid = [0x61; 8];
+        let hs = [0x62; 32];
+        let keys = AccessKeys::derive(cid, hs, 0).unwrap();
+
+        let mut link = UdpAccessLink::connect(&edge_addr.to_string(), &keys, 10_000)
+            .await
+            .unwrap();
+
+        let edge_task = tokio::spawn(async move {
+            let mut rx_ep =
+                AccessEpochState::new(cid, hs, TRANSPORT_DATAGRAM, DIR_CLIENT_TO_EDGE, 0, 10)
+                    .unwrap();
+            let tx_ep =
+                AccessEpochState::new(cid, hs, TRANSPORT_DATAGRAM, DIR_EDGE_TO_CLIENT, 0, 10)
+                    .unwrap();
+            let mut buf = [0u8; 2048];
+            let (n, peer) = edge_sock.recv_from(&mut buf).await.unwrap();
+            let (hdr, body) = rx_ep.verify_udp_packet(&buf[..n], now_ms()).unwrap();
+            assert!(hdr.flags.is_ctrl_edge);
+            let EdgeCtrlFrame::Ping { ts_us } = EdgeCtrlFrame::decode(body).unwrap() else {
+                panic!("expected Ping");
+            };
+
+            // Send an L3Data packet BEFORE Pong so ping_with_retry receives it while awaiting Pong!
+            let data_hdr = AccessHeaderV11 {
+                flags: AccessFlags {
+                    pp: 0,
+                    discardable: false,
+                    frame_end: true,
+                    is_ctrl_edge: false,
+                    dir_edge_to_client: true,
+                    rtx: false,
+                },
+                route_cid: cid,
+                access_epoch: 0,
+                leg_seq: 1,
+                mac_64: [0; 8],
+            };
+            let data_wire = seal_udp_v11(tx_ep.cur_key(), data_hdr, b"PRESERVED-L3-DATA").unwrap();
+            edge_sock.send_to(&data_wire, peer).await.unwrap();
+
+            // Then send the matching Pong
+            let pong_hdr = AccessHeaderV11 {
+                flags: AccessFlags {
+                    pp: 0,
+                    discardable: false,
+                    frame_end: false,
+                    is_ctrl_edge: true,
+                    dir_edge_to_client: true,
+                    rtx: false,
+                },
+                route_cid: cid,
+                access_epoch: 0,
+                leg_seq: 0,
+                mac_64: [0; 8],
+            };
+            let pong_wire = seal_udp_v11(
+                tx_ep.cur_key(),
+                pong_hdr,
+                &EdgeCtrlFrame::Pong { ts_us }.encode(),
+            )
+            .unwrap();
+            edge_sock.send_to(&pong_wire, peer).await.unwrap();
+        });
+
+        let rtt = link
+            .ping_with_retry(1, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(rtt < 2_000_000);
+        // The interleaved L3Data packet MUST be delivered by the next recv_packet call!
+        match link.recv_packet(Duration::from_millis(200)).await.unwrap() {
+            UdpRecvEvent::L3Data { payload, .. } => assert_eq!(payload, b"PRESERVED-L3-DATA"),
+            other => panic!("expected buffered L3Data, got {other:?}"),
+        }
+        edge_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_decrypted_l4_drops_stray_bad_aead_and_send_l4_raw_enforces_policy() {
+        let fixture = spawn_lossy_udp_relay_pair(0, 0, false).await;
+        let denied_policy = VerifiedTenantPolicy {
+            tenant_id: [0x11; 16],
+            policy_version: 1,
+            policy_hash: [0x22; 32],
+            allow_file_transfer: false,
+            allow_clipboard: false,
+            allow_file_clipboard: false,
+            allow_tcp_tunnel: false,
+            allow_terminal: false,
+            allow_realtime_actuator: false,
+            bw_cap_kbps: 10_000,
+            exhaust_policy: QuotaExhaustPolicy::Throttle256Kbps,
+        };
+        let mut sess_a = UdpE2eeSession::from_keys(
+            fixture.link_a,
+            [0xA1; 32],
+            [0xB2; 32],
+            denied_policy.clone(),
+            [0x01; 16],
+        );
+        let mut sess_b = UdpE2eeSession::from_keys(
+            fixture.link_b,
+            [0xB2; 32],
+            [0xA1; 32],
+            denied_policy,
+            [0x02; 16],
+        );
+
+        // 1. send_l4_raw MUST reject CHAN_INPUT_HID / CHAN_REALTIME_ACTUATOR and denied CLIP_SYNC / FILE_OFFER
+        assert!(sess_a
+            .send_l4_raw(CHAN_INPUT_HID, 0x01, 0, false, b"hid")
+            .await
+            .is_err());
+        assert!(sess_a
+            .send_l4_raw(CHAN_REALTIME_ACTUATOR, 0x01, 0, false, b"act")
+            .await
+            .is_err());
+        assert!(sess_a
+            .send_l4_raw(CHAN_CLIPBOARD, 0x01, 0, false, b"denied-sync")
+            .await
+            .is_err());
+        assert!(sess_a
+            .send_l4_raw(CHAN_FILE_TRANSFER, 0x01, 0, false, b"denied-offer")
+            .await
+            .is_err());
+        // Rejection replies CLIP_ACK(0x02) & FILE_ABORT(0x06) remain allowed even when channel is denied
+        assert!(sess_a
+            .send_l4_raw(CHAN_CLIPBOARD, 0x02, 0, false, &[0u8; 9])
+            .await
+            .is_ok());
+
+        // 2. Inject 2 stray/corrupted L3 packets directly on link_a, followed by a valid HID frame.
+        sess_a
+            .data_plane_mut()
+            .send_l3_packet(0, false, true, 0, &[0xFFu8; 48])
+            .await
+            .unwrap();
+        sess_a
+            .data_plane_mut()
+            .send_l3_packet(0, false, true, 0, &[0xEEu8; 48])
+            .await
+            .unwrap();
+        sess_a
+            .send_hid(&HidFrame {
+                msg_type: 0x01,
+                payload: Bytes::from_static(b"VALID-AFTER-STRAY"),
+            })
+            .await
+            .unwrap();
+
+        // Drain the CLIP_ACK first, then verify sess_b drops the 2 corrupt L3 packets and delivers the valid HID!
+        let mut got_hid = false;
+        for _ in 0..3 {
+            match sess_b.recv_v124_event(Duration::from_secs(2)).await.unwrap() {
+                V2RecvEvent::ClipboardRaw(_) => {}
+                V2RecvEvent::Transport(TransportEvent::Hid(f)) => {
+                    assert_eq!(f.payload.as_ref(), b"VALID-AFTER-STRAY");
+                    got_hid = true;
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(got_hid);
+        assert_eq!(sess_b.invalid_l3_frames_dropped(), 2);
+
+        let _ = fixture.stop_tx.send(()).await;
+        fixture.relay_task.abort();
     }
 }

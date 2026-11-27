@@ -15,7 +15,7 @@ use super::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -798,6 +798,12 @@ impl FileSenderWindow {
         accept: &FileAccept,
         now: Instant,
     ) -> Result<(), FileTransferError> {
+        if self.accepted {
+            return Err(FileTransferError::InvalidFraming {
+                error_code: FILE_ERR_INVALID_FRAMING,
+                reason: "duplicate FILE_ACCEPT rejected".into(),
+            });
+        }
         if accept.transfer_id != self.transfer_id {
             return Err(FileTransferError::InvalidFraming {
                 error_code: FILE_ERR_INVALID_FRAMING,
@@ -970,6 +976,8 @@ pub enum FileRecvAction {
     SessionFatal(String),
 }
 
+pub const FILE_AUDIT_LOG_CAP: usize = 1_024;
+
 /// Push-only `0x05 FileTransfer` receiver enforcing policy, max 2 concurrent transfers,
 /// 30s stall timeout, `statvfs` disk space pre-check, streaming SHA-256, and non-overwriting
 /// atomic save with `(1)..(999)` collision suffix retries.
@@ -978,7 +986,7 @@ pub struct FileTransferReceiver {
     download_dir: PathBuf,
     window_size: u64,
     active: HashMap<u64, ActiveInboundTransfer>,
-    pub audit_records: Vec<FileTransferAuditRecord>,
+    pub audit_records: VecDeque<FileTransferAuditRecord>,
 }
 
 impl FileTransferReceiver {
@@ -988,8 +996,15 @@ impl FileTransferReceiver {
             download_dir,
             window_size: FILE_DEFAULT_WINDOW_BYTES,
             active: HashMap::new(),
-            audit_records: Vec::new(),
+            audit_records: VecDeque::new(),
         }
+    }
+
+    fn push_audit(&mut self, record: FileTransferAuditRecord) {
+        if self.audit_records.len() >= FILE_AUDIT_LOG_CAP {
+            let _ = self.audit_records.pop_front();
+        }
+        self.audit_records.push_back(record);
     }
 
     pub fn with_window_size(mut self, window_size: u64) -> Self {
@@ -1022,7 +1037,7 @@ impl FileTransferReceiver {
         let mut aborts = Vec::with_capacity(stalled_ids.len());
         for tid in stalled_ids {
             if let Some(st) = self.active.remove(&tid) {
-                self.audit_records.push(FileTransferAuditRecord {
+                self.push_audit(FileTransferAuditRecord {
                     direction: "inbound".into(),
                     transfer_id: tid,
                     rel_name: st.offer.rel_name.clone(),
@@ -1128,8 +1143,29 @@ impl FileTransferReceiver {
         };
 
         let _ = fs::remove_file(&st.tmp_path);
-        sync_parent_dir(&final_path)
-            .map_err(|e| FileTransferError::Io(format!("fsync parent dir: {e}")))?;
+        if let Err(e) = sync_parent_dir(&final_path) {
+            let unsupported_dir_sync = {
+                #[cfg(unix)]
+                {
+                    matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS))
+                        || matches!(
+                            e.kind(),
+                            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                        )
+                }
+                #[cfg(not(unix))]
+                {
+                    matches!(
+                        e.kind(),
+                        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                    )
+                }
+            };
+            if !unsupported_dir_sync {
+                let _ = fs::remove_file(&final_path);
+                return Err(FileTransferError::Io(format!("fsync parent dir: {e}")));
+            }
+        }
         Ok(final_path)
     }
 
@@ -1171,7 +1207,7 @@ impl FileTransferReceiver {
 
                 // Policy gate (NOT counted toward consecutive 0x0103 counter!)
                 if let Err(e) = check_file_policy(&self.policy, file_size) {
-                    self.audit_records.push(FileTransferAuditRecord {
+                    self.push_audit(FileTransferAuditRecord {
                         direction: "inbound".into(),
                         transfer_id: tid,
                         rel_name: offer.rel_name,
@@ -1266,11 +1302,23 @@ impl FileTransferReceiver {
                 };
                 let data_len = chunk.data.len() as u64;
                 let end_off = chunk.offset.checked_add(data_len);
-                let chunk_valid = chunk.offset == st.next_expected_offset
+                let chunk_valid = data_len > 0
+                    && chunk.offset == st.next_expected_offset
                     && data_len <= u64::from(st.offer.chunk_size)
                     && end_off.is_some_and(|e| e <= st.window_end_offset && e <= st.offer.file_size);
                 if !chunk_valid {
-                    self.active.remove(&tid);
+                    if let Some(removed) = self.active.remove(&tid) {
+                        self.push_audit(FileTransferAuditRecord {
+                            direction: "inbound".into(),
+                            transfer_id: tid,
+                            rel_name: removed.offer.rel_name.clone(),
+                            file_size: removed.offer.file_size,
+                            sha256_hex: hex::encode(removed.offer.sha256),
+                            final_path: None,
+                            outcome: "chunk_invalid".into(),
+                            error_code: FILE_ERR_INVALID_FRAMING,
+                        });
+                    }
                     if err_counter.record_framing_error() {
                         return FileRecvAction::SessionFatal(
                             "consecutive 0x0103 errors >= 3 (out-of-order/over-window FILE_CHUNK)"
@@ -1285,7 +1333,18 @@ impl FileTransferReceiver {
 
                 if let Some(f) = st.tmp_file.as_mut() {
                     if f.write_all(&chunk.data).is_err() {
-                        self.active.remove(&tid);
+                        if let Some(removed) = self.active.remove(&tid) {
+                            self.push_audit(FileTransferAuditRecord {
+                                direction: "inbound".into(),
+                                transfer_id: tid,
+                                rel_name: removed.offer.rel_name.clone(),
+                                file_size: removed.offer.file_size,
+                                sha256_hex: hex::encode(removed.offer.sha256),
+                                final_path: None,
+                                outcome: "write_failed".into(),
+                                error_code: FILE_ERR_PATH_FAILED,
+                            });
+                        }
                         return FileRecvAction::SendAbort(FileAbort {
                             transfer_id: tid,
                             error_code: FILE_ERR_PATH_FAILED,
@@ -1342,7 +1401,7 @@ impl FileTransferReceiver {
                         outcome: "hash_mismatch".into(),
                         error_code: FILE_ERR_INVALID_FRAMING,
                     };
-                    self.audit_records.push(audit.clone());
+                    self.push_audit(audit.clone());
                     err_counter.reset();
                     return FileRecvAction::SendCompleteAck {
                         ack: FileCompleteAck {
@@ -1366,7 +1425,7 @@ impl FileTransferReceiver {
                             outcome: "ok".into(),
                             error_code: FILE_ERR_OK,
                         };
-                        self.audit_records.push(audit.clone());
+                        self.push_audit(audit.clone());
                         err_counter.reset();
                         FileRecvAction::SendCompleteAck {
                             ack: FileCompleteAck {
@@ -1388,7 +1447,7 @@ impl FileTransferReceiver {
                             outcome: format!("io_error: {e}"),
                             error_code: FILE_ERR_PATH_FAILED,
                         };
-                        self.audit_records.push(audit.clone());
+                        self.push_audit(audit.clone());
                         FileRecvAction::SendCompleteAck {
                             ack: FileCompleteAck {
                                 transfer_id: tid,
@@ -1402,7 +1461,7 @@ impl FileTransferReceiver {
             }
             FileMessage::Abort(ab) => {
                 if let Some(st) = self.active.remove(&ab.transfer_id) {
-                    self.audit_records.push(FileTransferAuditRecord {
+                    self.push_audit(FileTransferAuditRecord {
                         direction: "inbound".into(),
                         transfer_id: ab.transfer_id,
                         rel_name: st.offer.rel_name.clone(),
@@ -1412,12 +1471,19 @@ impl FileTransferReceiver {
                         outcome: "peer_aborted".into(),
                         error_code: ab.error_code,
                     });
+                    err_counter.reset();
                 }
-                err_counter.reset();
+                // Unknown transfer_id Abort is ignored WITHOUT resetting err_counter!
                 FileRecvAction::None
             }
             FileMessage::Accept(_) | FileMessage::Ack(_) | FileMessage::CompleteAck(_) => {
-                err_counter.reset();
+                // Role-violation: receiver-only message received on receiver side!
+                if err_counter.record_framing_error() {
+                    return FileRecvAction::SessionFatal(
+                        "consecutive 0x0103 errors >= 3 (receiver-only frame role violation)"
+                            .into(),
+                    );
+                }
                 FileRecvAction::None
             }
         }
@@ -1744,6 +1810,106 @@ mod tests {
                 now,
             )
             .is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_transfer_duplicate_accept_role_violation_counter_and_bounded_audit() {
+        let now = Instant::now();
+        let policy = allow_file_policy(16);
+        let sha = [0x44u8; 32];
+
+        // 1. Duplicate FILE_ACCEPT MUST fail closed with InvalidFraming
+        let (mut sw, _) =
+            FileSenderWindow::new(&policy, 400, "dup.bin", 1024, 512, sha, now).unwrap();
+        let acc = FileAccept {
+            transfer_id: 400,
+            resume_offset: 0,
+            initial_window_end_offset: 1024,
+        };
+        sw.on_accept(&acc, now).unwrap();
+        assert!(matches!(
+            sw.on_accept(&acc, now),
+            Err(FileTransferError::InvalidFraming {
+                error_code: FILE_ERR_INVALID_FRAMING,
+                ..
+            })
+        ));
+
+        // 2. Role-violation frames (Accept/Ack/CompleteAck) & unknown Abort MUST NOT bypass err_counter
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("zd-ft-p1-{}-{uniq}", std::process::id()));
+        let mut rx = FileTransferReceiver::new(policy.clone(), dir.clone());
+        let mut err_cnt = ChannelFramingErrorCounter::new();
+
+        let acc_body = acc.encode().unwrap();
+        let acc_hdr = L4Header {
+            msg_type: FILE_MSG_ACCEPT,
+            flags: 0,
+            body_len: acc_body.len() as u16,
+            stream_seq: 1,
+        };
+        assert_eq!(
+            rx.on_l4_frame(&acc_hdr, &acc_body, now, &mut err_cnt),
+            FileRecvAction::None
+        );
+        assert_eq!(err_cnt.consecutive(), 1);
+
+        // Unknown transfer_id Abort MUST NOT reset err_cnt
+        let unk_ab = FileAbort {
+            transfer_id: 999_999,
+            error_code: FILE_ERR_PATH_FAILED,
+        }
+        .encode();
+        let ab_hdr = L4Header {
+            msg_type: FILE_MSG_ABORT,
+            flags: 0,
+            body_len: unk_ab.len() as u16,
+            stream_seq: 2,
+        };
+        assert_eq!(
+            rx.on_l4_frame(&ab_hdr, &unk_ab, now, &mut err_cnt),
+            FileRecvAction::None
+        );
+        assert_eq!(err_cnt.consecutive(), 1);
+
+        // 2nd & 3rd receiver-only role-violation frames MUST escalate to SessionFatal!
+        assert_eq!(
+            rx.on_l4_frame(&acc_hdr, &acc_body, now, &mut err_cnt),
+            FileRecvAction::None
+        );
+        assert!(matches!(
+            rx.on_l4_frame(&acc_hdr, &acc_body, now, &mut err_cnt),
+            FileRecvAction::SessionFatal(_)
+        ));
+
+        // 3. Policy-denied Offer flood MUST remain bounded at FILE_AUDIT_LOG_CAP (1024)
+        let denied = EffectiveTenantPolicy::degraded([1; 16], [2; 32], "denied");
+        let mut denied_rx = FileTransferReceiver::new(denied, dir.clone());
+        let mut err_cnt2 = ChannelFramingErrorCounter::new();
+        for tid in 1..=(FILE_AUDIT_LOG_CAP as u64 + 64) {
+            let offer_body = FileOffer {
+                transfer_id: tid,
+                file_size: 16,
+                chunk_size: 1024,
+                sha256: sha,
+                rel_name: "flood.bin".into(),
+            }
+            .encode()
+            .unwrap();
+            let offer_hdr = L4Header {
+                msg_type: FILE_MSG_OFFER,
+                flags: 0,
+                body_len: offer_body.len() as u16,
+                stream_seq: tid as u32,
+            };
+            let _ = denied_rx.on_l4_frame(&offer_hdr, &offer_body, now, &mut err_cnt2);
+        }
+        assert_eq!(denied_rx.audit_records.len(), FILE_AUDIT_LOG_CAP);
 
         let _ = fs::remove_dir_all(&dir);
     }
