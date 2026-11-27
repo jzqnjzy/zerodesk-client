@@ -1046,7 +1046,8 @@ impl BridgeActor {
     }
 
     fn sync_snapshot(&self) {
-        let snap = self.controller.snapshot();
+        let mut snap = self.controller.snapshot();
+        snap.real_input_enabled = self.options.real_input_permit.is_some();
         *self
             .snapshot_cache
             .write()
@@ -1479,7 +1480,12 @@ impl BridgeActor {
             }
             "get_snapshot" | "snapshot" => {
                 self.sync_snapshot();
-                match serde_json::to_value(self.controller.snapshot()) {
+                let snap = self
+                    .snapshot_cache
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                match serde_json::to_value(snap) {
                     Ok(val) => RuntimeReplyEnvelope::ok(val),
                     Err(e) => RuntimeReplyEnvelope::err("Internal", e.to_string()),
                 }

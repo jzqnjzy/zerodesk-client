@@ -215,8 +215,34 @@ pub fn ingest_sck_audio_buffers(
     Ok(total_pushed)
 }
 
-/// Checks whether a previously received SCK frame has aged past `max_age`, preventing
-/// infinite resending of a frozen frame when the SCK stream silently stalls.
+/// Pure helper deciding what `capture_frame()` returns when `take_latest_wait` times out
+/// (no display damage within the poll window):
+/// - If `stream_failed` is `true` -> fail closed immediately with `OsError::CaptureFailed`.
+/// - If `stream_failed` is `false` and a previous frame exists -> smoothly reuse `last_raw`
+///   (ScreenCaptureKit legitimately emits no frames while the display is static).
+/// - Otherwise (never received an initial frame) -> `Err(OsError::CaptureFailed)`.
+pub fn resolve_idle_capture_frame(
+    stream_failed: bool,
+    last_error: Option<&str>,
+    last_raw: Option<&RawCapturedFrame>,
+) -> Result<RawCapturedFrame, OsError> {
+    if stream_failed {
+        return Err(OsError::CaptureFailed(
+            last_error
+                .unwrap_or("ScreenCaptureKit stream stopped")
+                .to_string(),
+        ));
+    }
+    if let Some(prev) = last_raw {
+        return Ok(prev.clone());
+    }
+    Err(OsError::CaptureFailed(
+        "ScreenCaptureKit produced no initial frame within timeout".into(),
+    ))
+}
+
+/// Explicit diagnostic helper checking whether a previously received frame has aged past
+/// `max_age` (useful for telemetry/liveness diagnostics without breaking static screens).
 pub fn check_sck_frame_staleness(
     last_received_at: Instant,
     now: Instant,
@@ -224,7 +250,7 @@ pub fn check_sck_frame_staleness(
 ) -> Result<(), OsError> {
     if now.saturating_duration_since(last_received_at) > max_age {
         Err(OsError::CaptureFailed(format!(
-            "ScreenCaptureKit stream stalled (no fresh frame for >{}ms)",
+            "ScreenCaptureKit frame age exceeded {}ms",
             max_age.as_millis()
         )))
     } else {
@@ -717,15 +743,24 @@ mod macos_sck_impl {
                 self.last_raw = Some((latest.raw.clone(), latest.received_at));
                 return Ok(latest.raw);
             }
-            // ScreenCaptureKit delivers frames on display damage; reuse last frame ONLY within
-            // bounded staleness window so a frozen/stalled stream fails closed.
-            if let Some((prev, received_at)) = &self.last_raw {
-                check_sck_frame_staleness(*received_at, Instant::now(), SCK_STALE_FRAME_TIMEOUT)?;
-                return Ok(prev.clone());
-            }
-            Err(OsError::CaptureFailed(
-                "ScreenCaptureKit produced no initial frame within timeout".into(),
-            ))
+            // ScreenCaptureKit only emits frames on display damage: smoothly reuse `last_raw` on
+            // a static screen as long as `stream_failed` is false; fail closed immediately if
+            // `stream_failed` became true!
+            let failed = self.inner.stream_failed.load(Ordering::Acquire);
+            let err_msg = if failed {
+                self.inner
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            } else {
+                None
+            };
+            resolve_idle_capture_frame(
+                failed,
+                err_msg.as_deref(),
+                self.last_raw.as_ref().map(|(f, _)| f),
+            )
         }
     }
 
@@ -1113,7 +1148,23 @@ mod tests {
         assert!(latest.i420.y.iter().all(|&y| y > 180));
         assert!(slot.take_latest().is_none());
 
-        // Stale frame detection fails closed once frame age exceeds SCK_STALE_FRAME_TIMEOUT.
+        // Static-screen idle reuse vs failed-stream fail-closed behavior:
+        // 1. Healthy static screen (stream_failed == false) smoothly reuses `last_raw` even
+        //    beyond 3 seconds of zero display damage.
+        let reused = resolve_idle_capture_frame(false, None, Some(&latest.raw)).unwrap();
+        assert_eq!(reused.width, 64);
+        assert_eq!(reused.height, 32);
+        // 2. Failed stream (stream_failed == true) ALWAYS fails closed even with `last_raw`.
+        assert!(matches!(
+            resolve_idle_capture_frame(true, Some("SCStream stopped"), Some(&latest.raw)),
+            Err(OsError::CaptureFailed(_))
+        ));
+        // 3. No initial frame yet -> fails closed.
+        assert!(matches!(
+            resolve_idle_capture_frame(false, None, None),
+            Err(OsError::CaptureFailed(_))
+        ));
+        // Explicit diagnostic staleness helper remains available.
         let t0 = Instant::now();
         assert!(check_sck_frame_staleness(t0, t0 + Duration::from_secs(2), SCK_STALE_FRAME_TIMEOUT).is_ok());
         assert!(matches!(

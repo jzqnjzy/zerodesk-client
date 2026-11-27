@@ -52,8 +52,9 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 #[derive(Debug, Default, Serialize)]
 struct Phase6E2eReport {
     pass: bool,
-    host_capture_mode: String,
-    host_hid_mode: String,
+    host_capture_mode_requested: String,
+    host_hid_mode_requested: String,
+    host_real_input_enabled_observed: Option<bool>,
     host_child_spawned: bool,
     host_snapshot_verified: bool,
     live_video_frame_verified: bool,
@@ -100,12 +101,26 @@ impl ChildHostGuard {
         let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ESRCH) {
-                // Keep `self.child` intact so `Drop` can still clean it up.
-                return Err(format!("kill({pid}, SIGKILL) failed: {err}"));
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                // Reap zombie if present and fail loudly — host exited BEFORE SIGKILL!
+                let mut status: libc::c_int = 0;
+                loop {
+                    let w = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+                    if w >= 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break;
+                    }
+                }
+                if let Some(mut owned) = self.child.take() {
+                    let _ = owned.try_wait();
+                }
+                return Err(format!("host pid {pid} exited before SIGKILL (ESRCH)"));
             }
+            // Keep `self.child` intact so `Drop` can still clean it up.
+            return Err(format!("kill({pid}, SIGKILL) failed: {err}"));
         }
-        // Reap with explicit EINTR retry loop.
+        // Reap with explicit EINTR retry loop; any other waitpid error fails closed.
         let mut status: libc::c_int = 0;
         loop {
             let w = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
@@ -117,13 +132,19 @@ impl ChildHostGuard {
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                break;
+                return Err(format!("waitpid({pid}) after SIGKILL failed: {err}"));
             }
+            return Err(format!("waitpid({pid}) returned unexpected pid {w}"));
         }
-        // Take child handle after reaping so Drop does not double-wait/kill.
-        let mut owned = self.child.take().unwrap();
-        let _ = owned.try_wait();
+        if let Some(mut owned) = self.child.take() {
+            let _ = owned.try_wait();
+        }
         self.killed_host_pid = Some(pid);
+        if !libc::WIFSIGNALED(status) || libc::WTERMSIG(status) != libc::SIGKILL {
+            return Err(format!(
+                "host pid {pid} did not terminate via SIGKILL (raw wait status={status:#x})"
+            ));
+        }
         Ok(pid)
     }
 
@@ -474,8 +495,8 @@ pub async fn cmd_phase6_e2e(args: &[String]) -> ExitCode {
     }
 
     let mut report = Phase6E2eReport {
-        host_capture_mode: "synthetic_dryrun".into(),
-        host_hid_mode: "dryrun_zero_os_injection".into(),
+        host_capture_mode_requested: "synthetic_dryrun".into(),
+        host_hid_mode_requested: "dryrun_zero_os_injection".into(),
         ..Phase6E2eReport::default()
     };
     let res = run_phase6_suite(
@@ -498,6 +519,7 @@ pub async fn cmd_phase6_e2e(args: &[String]) -> ExitCode {
     } else {
         report.pass = report.host_child_spawned
             && report.host_snapshot_verified
+            && report.host_real_input_enabled_observed == Some(false)
             && report.live_video_frame_verified
             && report.hid_delivery_barrier_confirmed
             && report.watchdog_report_mode_0600
@@ -735,6 +757,16 @@ async fn run_phase6_suite(
             "snapshot device_id_hex ({snap_device_id}) != start_host event device_id_hex ({event_device_id})"
         ));
     }
+    let observed_real_input = snap_reply["body"]["data"]["real_input_enabled"]
+        .as_bool()
+        .ok_or_else(|| format!("get_snapshot missing boolean data.real_input_enabled: {snap_reply}"))?;
+    report.host_real_input_enabled_observed = Some(observed_real_input);
+    if observed_real_input {
+        return Err(
+            "host child reported real_input_enabled=true; automated phase6-e2e MUST run in dry-run HID mode"
+                .into(),
+        );
+    }
     report.host_snapshot_verified = true;
     let host_device_id = event_device_id;
 
@@ -821,10 +853,13 @@ async fn run_phase6_suite(
         m["stream"] == "event" && m["body"]["kind"] == "ClipboardReceived"
     })
     .ok_or_else(|| "host child never emitted ClipboardReceived delivery barrier".to_string())?;
-    for _ in 0..2 {
-        let _ = wait_for_ctrl_event(&ctrl_rt, Duration::from_secs(3), |ev| {
+    for frame_idx in 0..2 {
+        wait_for_ctrl_event(&ctrl_rt, Duration::from_secs(3), |ev| {
             ev["kind"] == "VideoFrameReady"
-        });
+        })
+        .ok_or_else(|| {
+            format!("controller did not receive post-HID VideoFrameReady barrier frame #{}", frame_idx + 1)
+        })?;
     }
     report.hid_delivery_barrier_confirmed = true;
 

@@ -77,17 +77,20 @@ ZdSckHandle* zd_sck_create(
 );
 
 /* Starts capture. Threading contract:
- * - MUST NOT be invoked on the main thread (waits up to 3s on SCK async completion). */
+ * - May block up to ~6 seconds (shareable content discovery + stream start); MUST NOT be
+ *   invoked on the main thread.
+ * - Callbacks (video_cb, audio_cb, err_cb) MUST be non-blocking and MUST NEVER invoke any
+ *   zd_sck_* function synchronously. */
 int32_t zd_sck_start(ZdSckHandle* h);
 
 /* Stops capture with bounded timeout (default 2000ms when timeout_ms == 0).
  * Threading contract:
- * - MUST NOT be invoked synchronously from inside a video/audio callback; returns
- *   ZD_SCK_ERR_INVALID_ARG if called re-entrantly on a callback queue. */
+ * - MUST NOT be invoked synchronously from inside any video/audio/error callback; returns
+ *   ZD_SCK_ERR_INVALID_ARG if called re-entrantly from a callback thread/queue. */
 int32_t zd_sck_stop(ZdSckHandle* h, uint32_t timeout_ms);
 
 /* Stops (if needed), detaches delegate under lock, drains queues, and frees handle.
- * MUST NOT be invoked from inside a video/audio callback. */
+ * MUST NOT be invoked from inside any video/audio/error callback. */
 void zd_sck_destroy(ZdSckHandle* h);
 
 int32_t zd_sck_get_dimensions(
