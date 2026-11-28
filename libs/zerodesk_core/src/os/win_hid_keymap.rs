@@ -50,12 +50,16 @@ pub const ALL_MOUSE_BUTTON_BITS: [u8; 5] = [
 
 /// Single bidirectional entry between USB HID Usage Page `0x07`, Windows Set 1
 /// hardware scan code (+ `extended` E0 flag), and Windows Virtual Key (`VK_*`).
+///
+/// `use_vk_mode` is `true` ONLY for Pause (`0x48`), because Windows scan code `0x45`
+/// collides with NumLock unless injected via `wVk = VK_PAUSE` without `KEYEVENTF_SCANCODE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WinKeyMapping {
     pub hid_usage: u16,
     pub scan_code: u16,
     pub extended: bool,
     pub vk_code: u16,
+    pub use_vk_mode: bool,
 }
 
 impl WinKeyMapping {
@@ -65,13 +69,29 @@ impl WinKeyMapping {
             scan_code,
             extended,
             vk_code,
+            use_vk_mode: false,
         }
     }
 
-    /// Computes Win32 `KEYBDINPUT.dwFlags` for scan-code injection.
+    pub const fn new_vk_only(hid_usage: u16, scan_code: u16, vk_code: u16) -> Self {
+        Self {
+            hid_usage,
+            scan_code,
+            extended: false,
+            vk_code,
+            use_vk_mode: true,
+        }
+    }
+
+    /// Computes Win32 `KEYBDINPUT.dwFlags` for `SendInput`.
+    /// Omits `WIN_KEYEVENTF_SCANCODE` when `use_vk_mode == true` (Pause `0x48`).
     pub const fn send_input_flags(self, down: bool) -> u32 {
-        let mut flags = WIN_KEYEVENTF_SCANCODE;
-        if self.extended {
+        let mut flags = if self.use_vk_mode {
+            0
+        } else {
+            WIN_KEYEVENTF_SCANCODE
+        };
+        if !self.use_vk_mode && self.extended {
             flags |= WIN_KEYEVENTF_EXTENDEDKEY;
         }
         if !down {
@@ -156,9 +176,10 @@ const WIN_KEY_TABLE: &[WinKeyMapping] = &[
     WinKeyMapping::new(0x44, 0x57, false, 0x7A), // F11
     WinKeyMapping::new(0x45, 0x58, false, 0x7B), // F12
     // System / lock keys (USB HID 0x46..=0x48)
-    WinKeyMapping::new(0x46, 0x37, true, 0x2C),  // PrintScreen / VK_SNAPSHOT
+    WinKeyMapping::new(0x46, 0x37, true, 0x2C), // PrintScreen / VK_SNAPSHOT
     WinKeyMapping::new(0x47, 0x46, false, 0x91), // ScrollLock / VK_SCROLL
-    WinKeyMapping::new(0x48, 0x45, false, 0x13), // Pause / VK_PAUSE
+    // Pause MUST use VK_PAUSE without KEYEVENTF_SCANCODE so scan code 0x45 never toggles NumLock.
+    WinKeyMapping::new_vk_only(0x48, 0x45, 0x13), // Pause / VK_PAUSE
     // Navigation & editing cluster (USB HID 0x49..=0x4E, all extended E0)
     WinKeyMapping::new(0x49, 0x52, true, 0x2D), // Insert / VK_INSERT
     WinKeyMapping::new(0x4A, 0x47, true, 0x24), // Home / VK_HOME
@@ -172,12 +193,12 @@ const WIN_KEY_TABLE: &[WinKeyMapping] = &[
     WinKeyMapping::new(0x51, 0x50, true, 0x28), // DownArrow / VK_DOWN
     WinKeyMapping::new(0x52, 0x48, true, 0x26), // UpArrow / VK_UP
     // Keypad cluster (USB HID 0x53..=0x63, 0x67)
-    WinKeyMapping::new(0x53, 0x45, true, 0x90),  // NumLock / VK_NUMLOCK
-    WinKeyMapping::new(0x54, 0x35, true, 0x6F),  // KeypadDivide / VK_DIVIDE
+    WinKeyMapping::new(0x53, 0x45, true, 0x90), // NumLock / VK_NUMLOCK
+    WinKeyMapping::new(0x54, 0x35, true, 0x6F), // KeypadDivide / VK_DIVIDE
     WinKeyMapping::new(0x55, 0x37, false, 0x6A), // KeypadMultiply / VK_MULTIPLY
     WinKeyMapping::new(0x56, 0x4A, false, 0x6D), // KeypadMinus / VK_SUBTRACT
     WinKeyMapping::new(0x57, 0x4E, false, 0x6B), // KeypadPlus / VK_ADD
-    WinKeyMapping::new(0x58, 0x1C, true, 0x0D),  // KeypadEnter (extended E0 + 0x1C)
+    WinKeyMapping::new(0x58, 0x1C, true, 0x0D), // KeypadEnter (extended E0 + 0x1C)
     WinKeyMapping::new(0x59, 0x4F, false, 0x61), // Keypad1 / VK_NUMPAD1
     WinKeyMapping::new(0x5A, 0x50, false, 0x62), // Keypad2 / VK_NUMPAD2
     WinKeyMapping::new(0x5B, 0x51, false, 0x63), // Keypad3 / VK_NUMPAD3
@@ -191,17 +212,17 @@ const WIN_KEY_TABLE: &[WinKeyMapping] = &[
     WinKeyMapping::new(0x63, 0x53, false, 0x6E), // KeypadDecimal / VK_DECIMAL
     // ISO non-US backslash / pipe & Application menu & Keypad Equals
     WinKeyMapping::new(0x64, 0x56, false, 0xE2), // ISO Backslash / VK_OEM_102
-    WinKeyMapping::new(0x65, 0x5D, true, 0x5D),  // Application / VK_APPS
+    WinKeyMapping::new(0x65, 0x5D, true, 0x5D), // Application / VK_APPS
     WinKeyMapping::new(0x67, 0x59, false, 0x92), // KeypadEquals / VK_OEM_NEC_EQUAL
     // Left & Right Modifiers (USB HID 0xE0..=0xE7, strictly distinct)
     WinKeyMapping::new(0xE0, 0x1D, false, 0xA2), // LeftControl / VK_LCONTROL
     WinKeyMapping::new(0xE1, 0x2A, false, 0xA0), // LeftShift / VK_LSHIFT
     WinKeyMapping::new(0xE2, 0x38, false, 0xA4), // LeftAlt / VK_LMENU
-    WinKeyMapping::new(0xE3, 0x5B, true, 0x5B),  // LeftWin / VK_LWIN
-    WinKeyMapping::new(0xE4, 0x1D, true, 0xA3),  // RightControl / VK_RCONTROL
+    WinKeyMapping::new(0xE3, 0x5B, true, 0x5B), // LeftWin / VK_LWIN
+    WinKeyMapping::new(0xE4, 0x1D, true, 0xA3), // RightControl / VK_RCONTROL
     WinKeyMapping::new(0xE5, 0x36, false, 0xA1), // RightShift / VK_RSHIFT
-    WinKeyMapping::new(0xE6, 0x38, true, 0xA5),  // RightAlt / VK_RMENU
-    WinKeyMapping::new(0xE7, 0x5C, true, 0x5C),  // RightWin / VK_RWIN
+    WinKeyMapping::new(0xE6, 0x38, true, 0xA5), // RightAlt / VK_RMENU
+    WinKeyMapping::new(0xE7, 0x5C, true, 0x5C), // RightWin / VK_RWIN
 ];
 
 /// Bidirectional USB HID <-> Windows Scan Code / Virtual Key mapper.
@@ -231,8 +252,8 @@ impl WinHidKeyMap {
     }
 
     /// Maps a Windows Virtual Key (`VK_*`) back to USB HID Usage Page `0x07`.
-    /// For `VK_RETURN` (`0x0D`), prefers main Enter (`0x28`) unless extended flag is known
-    /// (use `scan_code_to_hid` whenever hardware scan codes are available).
+    /// For `VK_RETURN` (`0x0D`), prefers main Enter (`0x28`); use `scan_code_to_hid`
+    /// whenever hardware scan codes are available to distinguish Keypad Enter (`0x58`).
     pub fn vk_to_hid(vk_code: u16) -> Option<u16> {
         WIN_KEY_TABLE
             .iter()
@@ -303,7 +324,7 @@ pub fn mouse_buttons_mask_to_release_actions(buttons_mask: u8) -> Vec<WinMouseBu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn table_has_unique_hid_usages_and_unique_scan_code_pairs() {
@@ -331,6 +352,55 @@ mod tests {
     }
 
     #[test]
+    fn pause_uses_vk_mode_without_scancode_flag_and_all_others_use_scancode() {
+        let pause = WinHidKeyMap::hid_to_win(0x48).unwrap();
+        assert!(pause.use_vk_mode);
+        assert_eq!(pause.vk_code, 0x13);
+        assert_eq!(pause.send_input_flags(true), 0);
+        assert_eq!(pause.send_input_flags(false), WIN_KEYEVENTF_KEYUP);
+        assert_eq!(pause.send_input_flags(true) & WIN_KEYEVENTF_SCANCODE, 0);
+        assert_eq!(pause.send_input_flags(false) & WIN_KEYEVENTF_SCANCODE, 0);
+
+        for m in WinHidKeyMap::all_mappings() {
+            if m.hid_usage != 0x48 {
+                assert!(!m.use_vk_mode, "only Pause 0x48 may set use_vk_mode");
+                assert_ne!(m.send_input_flags(true) & WIN_KEYEVENTF_SCANCODE, 0);
+                assert_ne!(m.send_input_flags(false) & WIN_KEYEVENTF_SCANCODE, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn vk_to_hid_round_trips_and_vk_return_is_sole_duplicate() {
+        let mut vk_counts: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
+        for m in WinHidKeyMap::all_mappings() {
+            vk_counts.entry(m.vk_code).or_default().push(m.hid_usage);
+        }
+        let dups: Vec<u16> = vk_counts
+            .iter()
+            .filter(|(_, hids)| hids.len() > 1)
+            .map(|(&vk, _)| vk)
+            .collect();
+        assert_eq!(dups, vec![0x0D], "VK_RETURN (0x0D) must be the sole duplicate VK");
+        assert_eq!(WinHidKeyMap::vk_to_hid(0x0D), Some(0x28));
+        assert_eq!(WinHidKeyMap::scan_code_to_hid(0x1C, false), Some(0x28));
+        assert_eq!(WinHidKeyMap::scan_code_to_hid(0x1C, true), Some(0x58));
+
+        for m in WinHidKeyMap::all_mappings() {
+            if m.hid_usage == 0x58 {
+                assert_eq!(WinHidKeyMap::vk_to_hid(m.vk_code), Some(0x28));
+            } else {
+                assert_eq!(
+                    WinHidKeyMap::vk_to_hid(m.vk_code),
+                    Some(m.hid_usage),
+                    "vk_to_hid mismatch for VK {:#04x}",
+                    m.vk_code
+                );
+            }
+        }
+    }
+
+    #[test]
     fn extended_keys_and_all_eight_modifiers_are_distinct() {
         let mut mod_scans = BTreeSet::new();
         let mut mod_vks = BTreeSet::new();
@@ -341,7 +411,6 @@ mod tests {
             assert!(mod_scans.insert((m.scan_code, m.extended)));
             assert!(mod_vks.insert(m.vk_code));
         }
-        // RightCtrl, RightAlt, LeftWin, RightWin, arrows, nav cluster MUST set extended=true
         for ext_usage in [
             0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x54, 0x58, 0xE3, 0xE4,
             0xE6, 0xE7,

@@ -6,65 +6,53 @@
 //! Outputs a single versioned JSON report covering:
 //! 1. DXGI adapters, attached outputs, Adapter LUIDs, and multi-monitor layout;
 //! 2. Media Foundation `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)` H.264/HEVC/AV1 MFTs
-//!    and LUID match status against the primary DXGI adapter;
-//! 3. UIPI elevation status, `OpenInputDesktop` probe, and non-destructive
-//!    watchdog spawn + heartbeat + empty-batch release self-test.
+//!    and LUID zero-copy match status against the primary DXGI adapter;
+//! 3. UIPI elevation + `LocalSystem` status, `OpenInputDesktop` probe, and
+//!    non-destructive watchdog spawn + heartbeat + empty-batch release self-test.
 //!
-//! On non-Windows hosts, compiles cleanly and prints a structured JSON message
-//! indicating that a Windows host is required.
-
-// Standalone binary does not link `src/platform/macos.mm`, which provides `BackingScaleFactor`
-// for `scrap::quartz::Display::scale()`.
-#[cfg(target_os = "macos")]
-#[no_mangle]
-pub extern "C" fn BackingScaleFactor(display: u32) -> f32 {
-    use std::ffi::c_void;
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGDisplayPixelsWide(display: u32) -> usize;
-        fn CGDisplayCopyDisplayMode(display: u32) -> *const c_void;
-        fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
-        fn CGDisplayModeRelease(mode: *const c_void);
-    }
-    unsafe {
-        let mode = CGDisplayCopyDisplayMode(display);
-        if mode.is_null() {
-            return 1.0;
-        }
-        let pixel_w = CGDisplayModeGetPixelWidth(mode);
-        CGDisplayModeRelease(mode);
-        let point_w = CGDisplayPixelsWide(display);
-        if point_w == 0 || pixel_w == 0 {
-            1.0
-        } else {
-            (pixel_w as f32 / point_w as f32).max(1.0)
-        }
-    }
-}
+//! On non-Windows hosts, emits a clean static JSON stub without linking `zerodesk_core`
+//! or platform screen-capture libraries.
 
 use std::{
-    env,
     io::{self, Write},
     process::ExitCode,
 };
-use zerodesk_core::os::win_diag::WinDiagReport;
+
+#[cfg(not(windows))]
+const STUB_JSON_PREFIX: &str = "{\n  \"schema_version\": 1,\n  \"host_os\": \"";
+#[cfg(not(windows))]
+const STUB_JSON_SUFFIX: &str = "\",\n  \"windows_host_required\": true,\n  \"note\": \"zerodesk-win-diag requires a Windows host to probe DXGI, Media Foundation hardware MFTs, UIPI/OpenInputDesktop, and Windows watchdog handles\"\n}";
 
 #[cfg(windows)]
-fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
+fn run_windows_diagnostics(skip_watchdog: bool) -> zerodesk_core::os::win_diag::WinDiagReport {
+    use std::thread;
     use zerodesk_core::os::{
         watchdog_supervisor::HidWatchdogConfig,
         win_diag::{
-            WinDiagCodecProbe, WinDiagDxgiSection, WinDiagInputSection, WinDiagMfSection,
-            WinDiagWatchdogSection, WIN_DIAG_SCHEMA_VERSION,
+            sanitize_diag_text, WinDiagCodecProbe, WinDiagDxgiSection, WinDiagInputSection,
+            WinDiagMfSection, WinDiagReport, WinDiagWatchdogSection, WIN_DIAG_SCHEMA_VERSION,
         },
         win_dxgi::enumerate_dxgi_outputs,
         win_input::{
-            execute_atomic_release_batch, is_process_elevated, probe_input_desktop_accessible,
-            WIN_UIPI_LIMITATION_NOTE,
+            execute_atomic_release_batch, is_local_system, is_process_elevated,
+            probe_input_desktop_accessible, WIN_UIPI_LIMITATION_NOTE,
         },
         win_mf::enumerate_hw_video_mfts,
-        win_mf_logic::{select_hw_mft_for_luid, MfHwCodec},
+        win_mf_logic::{select_hw_mft_for_luid, LuidMatchOutcome, MfHwCodec},
         win_watchdog::WinHidWatchdogSupervisor,
+    };
+
+    // Run empty-batch SendInput + OpenInputDesktop self-test on a fresh clean thread BEFORE
+    // DXGI/MF initialization so SetThreadDesktop can never fail with ERROR_BUSY due to GPU hooks.
+    let empty_batch_ok = if skip_watchdog {
+        false
+    } else {
+        thread::Builder::new()
+            .name("zd-win-diag-input".into())
+            .spawn(|| execute_atomic_release_batch(&[]).is_ok())
+            .ok()
+            .and_then(|h| h.join().ok())
+            .unwrap_or(false)
     };
 
     // 1. DXGI adapter & multi-monitor output enumeration.
@@ -90,7 +78,7 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
                 ok: false,
                 primary_adapter_luid: None,
                 outputs: Vec::new(),
-                error: Some(e.to_string()),
+                error: Some(sanitize_diag_text(&e.to_string())),
             },
             None,
         ),
@@ -98,12 +86,12 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
 
     // 2. Media Foundation hardware-only MFT enumeration + LUID match against primary DXGI adapter.
     let mut codec_probes = Vec::with_capacity(3);
-    let mut mf_any_ok = false;
+    let mut any_hw_mft_found = false;
     for codec in [MfHwCodec::H264, MfHwCodec::Hevc, MfHwCodec::Av1] {
         match enumerate_hw_video_mfts(codec) {
             Ok(mfts) => {
                 if !mfts.is_empty() {
-                    mf_any_ok = true;
+                    any_hw_mft_found = true;
                 }
                 let luid_match =
                     primary_luid.map(|luid| select_hw_mft_for_luid(&mfts, codec, luid, false));
@@ -119,29 +107,40 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
                     codec,
                     hardware_mfts: Vec::new(),
                     luid_match: None,
-                    error: Some(e.to_string()),
+                    error: Some(sanitize_diag_text(&e.to_string())),
                 });
             }
         }
     }
+    let mf_zero_copy_ok = codec_probes
+        .iter()
+        .any(|c| matches!(c.luid_match, Some(LuidMatchOutcome::ExactLuidZeroCopy { .. })));
     let mf_section = WinDiagMfSection {
-        ok: mf_any_ok,
+        ok: mf_zero_copy_ok,
+        any_hw_mft_found,
         codecs: codec_probes,
-        error: if mf_any_ok {
+        error: if mf_zero_copy_ok {
             None
+        } else if any_hw_mft_found {
+            Some(
+                "hardware video encoder MFT found, but none achieved ExactLuidZeroCopy against primary DXGI adapter"
+                    .into(),
+            )
         } else {
             Some("no Media Foundation hardware video encoder MFTs enumerated".into())
         },
     };
 
-    // 3. Input / UIPI elevation + OpenInputDesktop probe.
+    // 3. Input / UIPI elevation + LocalSystem + OpenInputDesktop probe.
     let elevated = is_process_elevated();
+    let local_system = is_local_system();
     let (desktop_ok, desktop_err) = match probe_input_desktop_accessible() {
         Ok(()) => (true, None),
-        Err(e) => (false, Some(e.to_string())),
+        Err(e) => (false, Some(sanitize_diag_text(&e.to_string()))),
     };
     let input_section = WinDiagInputSection {
         uipi_elevated: elevated,
+        is_local_system: local_system,
         input_desktop_accessible: desktop_ok,
         uipi_limitation_note: WIN_UIPI_LIMITATION_NOTE.to_string(),
         error: desktop_err,
@@ -158,7 +157,6 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
             error: Some("skipped via --skip-watchdog".into()),
         }
     } else {
-        let empty_batch_ok = execute_atomic_release_batch(&[]).is_ok();
         let cfg = HidWatchdogConfig {
             real_os_input: false,
             ..HidWatchdogConfig::default()
@@ -166,17 +164,19 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
         match WinHidWatchdogSupervisor::spawn(cfg) {
             Ok(sup) => {
                 let hb_ok = sup.send_heartbeat().is_ok();
-                sup.shutdown(None);
+                let _ = sup.shutdown(None);
                 WinDiagWatchdogSection {
                     tested: true,
                     ok: hb_ok && empty_batch_ok,
                     spawn_ok: true,
                     heartbeat_ok: hb_ok,
                     empty_batch_release_ok: empty_batch_ok,
-                    error: if hb_ok {
+                    error: if hb_ok && empty_batch_ok {
                         None
-                    } else {
+                    } else if !hb_ok {
                         Some("watchdog heartbeat failed".into())
+                    } else {
+                        Some("empty-batch atomic release probe failed".into())
                     },
                 }
             }
@@ -186,7 +186,7 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
                 spawn_ok: false,
                 heartbeat_ok: false,
                 empty_batch_release_ok: empty_batch_ok,
-                error: Some(e.to_string()),
+                error: Some(sanitize_diag_text(&e.to_string())),
             },
         }
     };
@@ -204,27 +204,39 @@ fn run_windows_diagnostics(skip_watchdog: bool) -> WinDiagReport {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let skip_watchdog = args.iter().any(|a| a == "--skip-watchdog");
-
     #[cfg(windows)]
-    let report = run_windows_diagnostics(skip_watchdog);
+    {
+        let skip_watchdog = std::env::args_os()
+            .skip(1)
+            .any(|a| a == std::ffi::OsStr::new("--skip-watchdog"));
+        let report = run_windows_diagnostics(skip_watchdog);
+        let all_ok = report.all_sections_ok();
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                let mut out = io::stdout().lock();
+                if writeln!(out, "{json}").is_ok() && all_ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(_) => ExitCode::FAILURE,
+        }
+    }
 
     #[cfg(not(windows))]
-    let report = {
-        let _ = skip_watchdog;
-        WinDiagReport::non_windows_stub()
-    };
-
-    match serde_json::to_string_pretty(&report) {
-        Ok(json) => {
-            let mut out = io::stdout().lock();
-            if writeln!(out, "{json}").is_ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
+    {
+        let mut out = io::stdout().lock();
+        if writeln!(
+            out,
+            "{STUB_JSON_PREFIX}{}{STUB_JSON_SUFFIX}",
+            std::env::consts::OS
+        )
+        .is_ok()
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
         }
-        Err(_) => ExitCode::FAILURE,
     }
 }

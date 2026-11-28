@@ -9,22 +9,26 @@
 //!   the exact `[cmd_read, ack_write]` pipe handles are inherited (preventing grandchild
 //!   handle leaks from blocking pipe EOF!)
 //! - `GetProcessTimes` creation timestamp (`FILETIME` 100ns) passed to the watchdog for
-//!   PID-reuse protection (`is_same_process_instance`).
+//!   PID-reuse protection (`is_same_process_instance`)
+//! - Session nonce transmitted strictly inside the `Hello` pipe frame (NEVER leaked in argv!).
+
+#![cfg(windows)]
 
 use super::{
-    traits::{HidWatchdogBackend, InputPrivilegeStatus},
+    traits::{check_release_report, HidWatchdogBackend, InputPrivilegeStatus},
     watchdog_proto::{
         bitmap_clear_key, bitmap_set_key, WatchdogFrame, WatchdogMsgType, WATCHDOG_FRAME_LEN,
     },
     watchdog_supervisor::{HidGatePhase, HidWatchdogConfig, WATCHDOG_BIN_NAME},
     win_input::win_input_privilege_status,
-    win_watchdog_logic::{ProcessIdentity, DEFAULT_WIN_HEARTBEAT_TIMEOUT_MS},
-    EmergencyKeyReleaser, OsError,
+    win_watchdog_logic::{quote_win_arg, ProcessIdentity, DEFAULT_WIN_HEARTBEAT_TIMEOUT_MS},
+    EmergencyKeyReleaser, OsError, ReleaseReport,
 };
 use rand_core::{OsRng, RngCore};
 use std::{
     ffi::OsStr,
     mem::size_of,
+    num::NonZeroU32,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr,
@@ -52,6 +56,8 @@ use windows::{
         },
     },
 };
+
+const WIN_WATCHDOG_PIPE_BUF_SIZE: u32 = 4096;
 
 /// Queries a process handle's creation timestamp (`FILETIME` in 100-ns units)
 /// via `GetProcessTimes` for PID-reuse validation.
@@ -82,37 +88,6 @@ pub fn current_process_identity() -> Result<ProcessIdentity, OsError> {
 
 fn to_wide_nul(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
-}
-
-fn quote_win_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
-        return arg.to_string();
-    }
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('"');
-    let mut backslashes = 0usize;
-    for ch in arg.chars() {
-        if ch == '\\' {
-            backslashes += 1;
-        } else if ch == '"' {
-            for _ in 0..(backslashes * 2 + 1) {
-                out.push('\\');
-            }
-            out.push('"');
-            backslashes = 0;
-        } else {
-            for _ in 0..backslashes {
-                out.push('\\');
-            }
-            backslashes = 0;
-            out.push(ch);
-        }
-    }
-    for _ in 0..(backslashes * 2) {
-        out.push('\\');
-    }
-    out.push('"');
-    out
 }
 
 fn resolve_windows_watchdog_binary(explicit: Option<&Path>) -> Result<PathBuf, OsError> {
@@ -150,6 +125,7 @@ fn resolve_windows_watchdog_binary(explicit: Option<&Path>) -> Result<PathBuf, O
 /// RAII wrapper around a Win32 `HANDLE` that closes it automatically on Drop.
 struct OwnedHandle(HANDLE);
 
+// SAFETY: Win32 kernel pipe/process handles are process-global and safe to transfer across threads.
 unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
@@ -176,7 +152,7 @@ fn create_inheritable_pipe() -> Result<(OwnedHandle, OwnedHandle), OsError> {
     };
     let mut read_h = HANDLE::default();
     let mut write_h = HANDLE::default();
-    unsafe { CreatePipe(&mut read_h, &mut write_h, Some(&sa), 4096) }
+    unsafe { CreatePipe(&mut read_h, &mut write_h, Some(&sa), WIN_WATCHDOG_PIPE_BUF_SIZE) }
         .map_err(|e| OsError::CaptureFailed(format!("CreatePipe failed: {e}")))?;
     Ok((OwnedHandle(read_h), OwnedHandle(write_h)))
 }
@@ -186,7 +162,23 @@ fn clear_handle_inherit(handle: HANDLE) -> Result<(), OsError> {
         .map_err(|e| OsError::CaptureFailed(format!("SetHandleInformation failed: {e}")))
 }
 
+/// Checks pipe buffer occupancy via `PeekNamedPipe` before `WriteFile` so a
+/// stalled watchdog cannot deadlock the host input thread under lock.
+fn ensure_pipe_headroom(handle: HANDLE, needed: usize) -> Result<(), OsError> {
+    let mut queued = 0u32;
+    if unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut queued), None) }.is_ok() {
+        let free = (WIN_WATCHDOG_PIPE_BUF_SIZE as usize).saturating_sub(queued as usize);
+        if free < needed {
+            return Err(OsError::CaptureFailed(format!(
+                "watchdog pipe buffer saturated (queued={queued}, free={free}, needed={needed})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn write_exact_handle(handle: HANDLE, bytes: &[u8]) -> Result<(), OsError> {
+    ensure_pipe_headroom(handle, bytes.len())?;
     let mut written_total = 0usize;
     while written_total < bytes.len() {
         let mut written = 0u32;
@@ -257,7 +249,7 @@ fn spawn_with_explicit_handle_list(
     bin_path: &Path,
     args: &[String],
     inherited_handles: &mut [HANDLE],
-) -> Result<(OwnedHandle, u32), OsError> {
+) -> Result<(OwnedHandle, NonZeroU32), OsError> {
     let mut attr_size: usize = 0;
     let _ = unsafe {
         InitializeProcThreadAttributeList(
@@ -273,7 +265,6 @@ fn spawn_with_explicit_handle_list(
         ));
     }
 
-    // Align buffer for LPPROC_THREAD_ATTRIBUTE_LIST via Vec<u64>.
     let word_count = attr_size.div_ceil(size_of::<u64>());
     let mut attr_buf = vec![0u64; word_count];
     let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr().cast());
@@ -345,7 +336,11 @@ fn spawn_with_explicit_handle_list(
             let _ = CloseHandle(proc_info.hThread);
         }
     }
-    Ok((OwnedHandle(proc_info.hProcess), proc_info.dwProcessId))
+    let proc_handle = OwnedHandle(proc_info.hProcess);
+    let pid = NonZeroU32::new(proc_info.dwProcessId).ok_or_else(|| {
+        OsError::CaptureFailed("CreateProcessW returned invalid PID 0".into())
+    })?;
+    Ok((proc_handle, pid))
 }
 
 struct WinGateState {
@@ -353,8 +348,16 @@ struct WinGateState {
     keys_bitmap: [u8; 32],
     buttons: u8,
     mods: u8,
+    dirty: bool,
     next_seq: u64,
     cmd_write: Option<OwnedHandle>,
+}
+
+impl WinGateState {
+    fn close_on_write_failure(&mut self) {
+        self.phase = HidGatePhase::Closed;
+        self.cmd_write = None;
+    }
 }
 
 /// Windows supervisor for `zerodesk-hid-watchdog.exe` enforcing strict handle
@@ -362,7 +365,7 @@ struct WinGateState {
 /// binding (`GetProcessTimes`).
 pub struct WinHidWatchdogSupervisor {
     gate: Mutex<WinGateState>,
-    child_process: Mutex<Option<(OwnedHandle, u32)>>,
+    child_process: Mutex<Option<(OwnedHandle, NonZeroU32)>>,
     ack_read: Mutex<Option<OwnedHandle>>,
     shutdown_timeout: Duration,
 }
@@ -379,17 +382,15 @@ impl WinHidWatchdogSupervisor {
         clear_handle_inherit(cmd_write.raw())?;
         clear_handle_inherit(ack_read.raw())?;
 
+        // Nonce travels strictly inside the `Hello` pipe frame (NEVER exposed in process argv!).
         let mut nonce = [0u8; 8];
         OsRng.fill_bytes(&mut nonce);
-        let nonce_hex = hex::encode(nonce);
 
         let mut args = vec![
             "--parent-pid".to_string(),
             host_identity.pid.to_string(),
             "--parent-creation-time".to_string(),
             host_identity.creation_time_100ns.to_string(),
-            "--nonce-hex".to_string(),
-            nonce_hex,
             "--cmd-handle".to_string(),
             (cmd_read.raw().0 as usize).to_string(),
             "--ack-handle".to_string(),
@@ -419,6 +420,7 @@ impl WinHidWatchdogSupervisor {
                 keys_bitmap: [0u8; 32],
                 buttons: 0,
                 mods: 0,
+                dirty: false,
                 next_seq: 0,
                 cmd_write: Some(cmd_write),
             }),
@@ -429,11 +431,12 @@ impl WinHidWatchdogSupervisor {
 
         let hello = WatchdogFrame::hello(host_identity.pid, nonce).encode();
         {
-            let g = sup.gate.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(h) = g.cmd_write.as_ref() else {
+            let mut g = sup.gate.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(raw_h) = g.cmd_write.as_ref().map(OwnedHandle::raw) else {
                 return Err(OsError::Interlocked);
             };
-            if let Err(e) = write_exact_handle(h.raw(), &hello) {
+            if let Err(e) = write_exact_handle(raw_h, &hello) {
+                g.close_on_write_failure();
                 drop(g);
                 sup.force_terminate();
                 return Err(e);
@@ -456,7 +459,7 @@ impl WinHidWatchdogSupervisor {
         Ok(sup)
     }
 
-    pub fn child_pid(&self) -> Option<u32> {
+    pub fn child_pid(&self) -> Option<NonZeroU32> {
         self.child_process
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -476,17 +479,17 @@ impl WinHidWatchdogSupervisor {
             return Err(OsError::Interlocked);
         }
         let Some(raw_h) = g.cmd_write.as_ref().map(OwnedHandle::raw) else {
-            g.phase = HidGatePhase::Closed;
+            g.close_on_write_failure();
             return Err(OsError::Interlocked);
         };
-        g.next_seq = g.next_seq.saturating_add(1);
-        let frame = WatchdogFrame::state_snapshot(g.next_seq, g.keys_bitmap, g.buttons, g.mods)
+        let next_seq = g.next_seq.saturating_add(1);
+        let frame = WatchdogFrame::state_snapshot(next_seq, g.keys_bitmap, g.buttons, g.mods)
             .encode();
         if let Err(e) = write_exact_handle(raw_h, &frame) {
-            g.phase = HidGatePhase::Closed;
-            g.cmd_write = None;
+            g.close_on_write_failure();
             return Err(e);
         }
+        g.next_seq = next_seq;
         Ok(())
     }
 
@@ -496,16 +499,20 @@ impl WinHidWatchdogSupervisor {
             return Err(OsError::Interlocked);
         }
         let Some(raw_h) = g.cmd_write.as_ref().map(OwnedHandle::raw) else {
-            g.phase = HidGatePhase::Closed;
+            g.close_on_write_failure();
             return Err(OsError::Interlocked);
         };
         let mut next_bm = g.keys_bitmap;
         bitmap_set_key(&mut next_bm, usage);
         let next_seq = g.next_seq.saturating_add(1);
         let frame = WatchdogFrame::state_snapshot(next_seq, next_bm, g.buttons, modifiers).encode();
-        write_exact_handle(raw_h, &frame)?;
+        if let Err(e) = write_exact_handle(raw_h, &frame) {
+            g.close_on_write_failure();
+            return Err(e);
+        }
         g.keys_bitmap = next_bm;
         g.mods = modifiers;
+        g.dirty = true;
         g.next_seq = next_seq;
         Ok(())
     }
@@ -516,30 +523,36 @@ impl WinHidWatchdogSupervisor {
             return Ok(());
         }
         let Some(raw_h) = g.cmd_write.as_ref().map(OwnedHandle::raw) else {
+            g.close_on_write_failure();
             return Ok(());
         };
         bitmap_clear_key(&mut g.keys_bitmap, usage);
         g.mods = modifiers;
-        g.next_seq = g.next_seq.saturating_add(1);
-        let frame = WatchdogFrame::state_snapshot(g.next_seq, g.keys_bitmap, g.buttons, g.mods)
-            .encode();
-        let _ = write_exact_handle(raw_h, &frame);
+        g.dirty = g.keys_bitmap.iter().any(|&b| b != 0) || g.buttons != 0;
+        let next_seq = g.next_seq.saturating_add(1);
+        let frame =
+            WatchdogFrame::state_snapshot(next_seq, g.keys_bitmap, g.buttons, g.mods).encode();
+        if let Err(e) = write_exact_handle(raw_h, &frame) {
+            g.close_on_write_failure();
+            return Err(e);
+        }
+        g.next_seq = next_seq;
         Ok(())
     }
 
     fn force_terminate(&self) {
         {
             let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-            g.phase = HidGatePhase::Closed;
-            g.cmd_write = None;
+            g.close_on_write_failure();
         }
         *self.ack_read.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Some((proc_h, _)) = self
+        // Take child handle and drop MutexGuard BEFORE blocking Win32 WaitForSingleObject!
+        let taken = self
             .child_process
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .take();
+        if let Some((proc_h, _)) = taken {
             unsafe {
                 let _ = TerminateProcess(proc_h.raw(), 1);
                 let _ = WaitForSingleObject(proc_h.raw(), 500);
@@ -547,21 +560,24 @@ impl WinHidWatchdogSupervisor {
         }
     }
 
-    pub fn shutdown(&self, local_releaser: Option<&dyn EmergencyKeyReleaser>) {
-        let was_open = {
+    pub fn shutdown(
+        &self,
+        local_releaser: Option<&dyn EmergencyKeyReleaser>,
+    ) -> Option<ReleaseReport> {
+        let (was_open, was_dirty) = {
             let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-            if g.phase == HidGatePhase::Open {
+            let open = g.phase == HidGatePhase::Open;
+            let dirty = g.dirty;
+            if open {
                 g.phase = HidGatePhase::Quiescing;
-                true
-            } else {
-                false
             }
+            (open, dirty)
         };
-        if was_open {
-            if let Some(releaser) = local_releaser {
-                let _ = releaser.release_all_keys();
-            }
-        }
+        let release_report = if was_open || was_dirty {
+            local_releaser.map(EmergencyKeyReleaser::release_all_keys)
+        } else {
+            None
+        };
         {
             let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(h) = g.cmd_write.take() {
@@ -575,15 +591,18 @@ impl WinHidWatchdogSupervisor {
             g.keys_bitmap = [0u8; 32];
             g.buttons = 0;
             g.mods = 0;
+            g.dirty = false;
             g.phase = HidGatePhase::Closed;
         }
         *self.ack_read.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Some((proc_h, _)) = self
+
+        // Take child handle and drop MutexGuard BEFORE blocking WaitForSingleObject!
+        let taken = self
             .child_process
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .take();
+        if let Some((proc_h, _)) = taken {
             let wait_ms = self
                 .shutdown_timeout
                 .as_millis()
@@ -596,12 +615,13 @@ impl WinHidWatchdogSupervisor {
                 }
             }
         }
+        release_report
     }
 }
 
 impl Drop for WinHidWatchdogSupervisor {
     fn drop(&mut self) {
-        self.shutdown(None);
+        let _ = self.shutdown(None);
     }
 }
 
@@ -618,12 +638,12 @@ impl WinHidWatchdogBackend {
 }
 
 impl HidWatchdogBackend for WinHidWatchdogBackend {
-    fn spawn(&mut self, cfg: HidWatchdogConfig) -> Result<u32, OsError> {
+    fn spawn(&mut self, cfg: HidWatchdogConfig) -> Result<Option<NonZeroU32>, OsError> {
         if let Some(old) = self.supervisor.take() {
-            old.shutdown(None);
+            let _ = old.shutdown(None);
         }
         let sup = WinHidWatchdogSupervisor::spawn(cfg)?;
-        let pid = sup.child_pid().unwrap_or(0);
+        let pid = sup.child_pid();
         self.supervisor = Some(sup);
         Ok(pid)
     }
@@ -635,16 +655,31 @@ impl HidWatchdogBackend for WinHidWatchdogBackend {
         sup.send_heartbeat()
     }
 
-    fn release_all(&self, local_releaser: Option<&dyn EmergencyKeyReleaser>) -> Result<(), OsError> {
-        if let Some(releaser) = local_releaser {
-            let _ = releaser.release_all_keys();
-        }
-        Ok(())
+    fn release_all(
+        &self,
+        local_releaser: Option<&dyn EmergencyKeyReleaser>,
+    ) -> Result<ReleaseReport, OsError> {
+        let Some(releaser) = local_releaser else {
+            return Err(OsError::InvalidData(
+                "release_all requires a local EmergencyKeyReleaser".into(),
+            ));
+        };
+        check_release_report(releaser.release_all_keys())
     }
 
-    fn shutdown(&mut self, local_releaser: Option<&dyn EmergencyKeyReleaser>) {
-        if let Some(sup) = self.supervisor.take() {
-            sup.shutdown(local_releaser);
+    fn shutdown(
+        &mut self,
+        local_releaser: Option<&dyn EmergencyKeyReleaser>,
+    ) -> Result<ReleaseReport, OsError> {
+        let report = if let Some(sup) = self.supervisor.take() {
+            sup.shutdown(local_releaser)
+                .or_else(|| local_releaser.map(EmergencyKeyReleaser::release_all_keys))
+        } else {
+            local_releaser.map(EmergencyKeyReleaser::release_all_keys)
+        };
+        match report {
+            Some(rep) => check_release_report(rep),
+            None => Ok(ReleaseReport::default()),
         }
     }
 

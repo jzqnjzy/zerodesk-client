@@ -2,10 +2,10 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 //! Shared cross-platform USB HID Usage Page `0x07` keymap test vectors verifying:
-//! 1. Full bidirectional round-trip integrity of `WinHidKeyMap` (`hid -> (scan, ext) -> hid`);
-//! 2. 100% key coverage parity between `WinHidKeyMap` and Rust `hid_usage_to_macos_keycode`;
-//! 3. 100% coverage of the canonical macOS `MacHidKeyMap` standard HID usage vector
-//!    (letters, digits, control/punctuation, F1..F12, nav/arrows, numpad, and all 8 modifiers);
+//! 1. Full bidirectional round-trip integrity of `WinHidKeyMap` (`hid -> (scan, ext) -> hid` & `vk_to_hid`);
+//! 2. Hardcoded golden `HID -> (scan_code, extended)` vectors + exact Win32 constant values;
+//! 3. Exact bidirectional parity between Rust `hid_usage_to_macos_keycode`, canonical
+//!    `MAC_HID_KEYMAP_STANDARD_USAGES`, and `WinHidKeyMap` with explicit `WIN_EXTRA_ALLOWED`;
 //! 4. Mouse button mask parity across all 5 standard buttons (`Left`, `Right`, `Middle`, `X1`, `X2`).
 
 use std::collections::BTreeSet;
@@ -15,10 +15,11 @@ use zerodesk_core::os::{
     win_hid_keymap::{
         mouse_button_bit_to_win, mouse_buttons_mask_to_release_actions, WinHidKeyMap,
         ALL_MOUSE_BUTTON_BITS, WIN_KEYEVENTF_EXTENDEDKEY, WIN_KEYEVENTF_KEYUP,
-        WIN_KEYEVENTF_SCANCODE, WIN_MOUSEEVENTF_LEFTDOWN, WIN_MOUSEEVENTF_LEFTUP,
-        WIN_MOUSEEVENTF_MIDDLEDOWN, WIN_MOUSEEVENTF_MIDDLEUP, WIN_MOUSEEVENTF_RIGHTDOWN,
-        WIN_MOUSEEVENTF_RIGHTUP, WIN_MOUSEEVENTF_XDOWN, WIN_MOUSEEVENTF_XUP, WIN_XBUTTON1,
-        WIN_XBUTTON2,
+        WIN_KEYEVENTF_SCANCODE, WIN_MOUSEEVENTF_ABSOLUTE, WIN_MOUSEEVENTF_HWHEEL,
+        WIN_MOUSEEVENTF_LEFTDOWN, WIN_MOUSEEVENTF_LEFTUP, WIN_MOUSEEVENTF_MIDDLEDOWN,
+        WIN_MOUSEEVENTF_MIDDLEUP, WIN_MOUSEEVENTF_MOVE, WIN_MOUSEEVENTF_RIGHTDOWN,
+        WIN_MOUSEEVENTF_RIGHTUP, WIN_MOUSEEVENTF_VIRTUALDESK, WIN_MOUSEEVENTF_WHEEL,
+        WIN_MOUSEEVENTF_XDOWN, WIN_MOUSEEVENTF_XUP, WIN_XBUTTON1, WIN_XBUTTON2,
     },
 };
 
@@ -47,8 +48,95 @@ const MAC_HID_KEYMAP_STANDARD_USAGES: &[u16] = &[
     0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7,
 ];
 
+/// Explicit allowlist of Windows-specific USB HID keys beyond macOS `MacHidKeyMap`:
+/// PrintScreen (`0x46`), ScrollLock (`0x47`), Pause (`0x48`), ISO Backslash (`0x64`),
+/// and Application/Menu (`0x65`).
+const WIN_EXTRA_ALLOWED: &[u16] = &[0x46, 0x47, 0x48, 0x64, 0x65];
+
+/// Hardcoded golden reference vectors `(hid_usage, scan_code, extended, vk_code)`
+/// verifying AT Set 1 scan codes independent of the implementation table.
+const GOLDEN_HID_TO_WIN_VECTORS: &[(u16, u16, bool, u16)] = &[
+    (0x04, 0x1E, false, 0x41), // A
+    (0x10, 0x32, false, 0x4D), // M
+    (0x14, 0x10, false, 0x51), // Q
+    (0x1A, 0x11, false, 0x57), // W
+    (0x1D, 0x2C, false, 0x5A), // Z
+    (0x1E, 0x02, false, 0x31), // 1
+    (0x27, 0x0B, false, 0x30), // 0
+    (0x28, 0x1C, false, 0x0D), // Enter
+    (0x29, 0x01, false, 0x1B), // Escape
+    (0x2A, 0x0E, false, 0x08), // Backspace
+    (0x2B, 0x0F, false, 0x09), // Tab
+    (0x2C, 0x39, false, 0x20), // Space
+    (0x39, 0x3A, false, 0x14), // CapsLock
+    (0x3A, 0x3B, false, 0x70), // F1
+    (0x44, 0x57, false, 0x7A), // F11
+    (0x45, 0x58, false, 0x7B), // F12
+    (0x46, 0x37, true, 0x2C),  // PrintScreen
+    (0x48, 0x45, false, 0x13), // Pause (VK-only)
+    (0x49, 0x52, true, 0x2D),  // Insert
+    (0x4A, 0x47, true, 0x24),  // Home
+    (0x4B, 0x49, true, 0x21),  // PageUp
+    (0x4C, 0x53, true, 0x2E),  // Delete
+    (0x4D, 0x4F, true, 0x23),  // End
+    (0x4E, 0x51, true, 0x22),  // PageDown
+    (0x4F, 0x4D, true, 0x27),  // RightArrow
+    (0x50, 0x4B, true, 0x25),  // LeftArrow
+    (0x51, 0x50, true, 0x28),  // DownArrow
+    (0x52, 0x48, true, 0x26),  // UpArrow
+    (0x54, 0x35, true, 0x6F),  // KeypadDivide
+    (0x58, 0x1C, true, 0x0D),  // KeypadEnter
+    (0x64, 0x56, false, 0xE2), // ISO Backslash (VK_OEM_102)
+    (0xE0, 0x1D, false, 0xA2), // LeftControl
+    (0xE1, 0x2A, false, 0xA0), // LeftShift
+    (0xE2, 0x38, false, 0xA4), // LeftAlt
+    (0xE3, 0x5B, true, 0x5B),  // LeftWin
+    (0xE4, 0x1D, true, 0xA3),  // RightControl
+    (0xE5, 0x36, false, 0xA1), // RightShift
+    (0xE6, 0x38, true, 0xA5),  // RightAlt
+    (0xE7, 0x5C, true, 0x5C),  // RightWin
+];
+
 #[test]
-fn win_hid_keymap_round_trips_every_entry_and_has_no_collisions() {
+fn win32_constants_and_hardcoded_golden_vectors_match_spec() {
+    assert_eq!(WIN_KEYEVENTF_EXTENDEDKEY, 0x0001);
+    assert_eq!(WIN_KEYEVENTF_KEYUP, 0x0002);
+    assert_eq!(WIN_KEYEVENTF_SCANCODE, 0x0008);
+    assert_eq!(WIN_MOUSEEVENTF_MOVE, 0x0001);
+    assert_eq!(WIN_MOUSEEVENTF_LEFTDOWN, 0x0002);
+    assert_eq!(WIN_MOUSEEVENTF_LEFTUP, 0x0004);
+    assert_eq!(WIN_MOUSEEVENTF_RIGHTDOWN, 0x0008);
+    assert_eq!(WIN_MOUSEEVENTF_RIGHTUP, 0x0010);
+    assert_eq!(WIN_MOUSEEVENTF_MIDDLEDOWN, 0x0020);
+    assert_eq!(WIN_MOUSEEVENTF_MIDDLEUP, 0x0040);
+    assert_eq!(WIN_MOUSEEVENTF_XDOWN, 0x0080);
+    assert_eq!(WIN_MOUSEEVENTF_XUP, 0x0100);
+    assert_eq!(WIN_MOUSEEVENTF_WHEEL, 0x0800);
+    assert_eq!(WIN_MOUSEEVENTF_HWHEEL, 0x1000);
+    assert_eq!(WIN_MOUSEEVENTF_VIRTUALDESK, 0x4000);
+    assert_eq!(WIN_MOUSEEVENTF_ABSOLUTE, 0x8000);
+    assert_eq!(WIN_XBUTTON1, 0x0001);
+    assert_eq!(WIN_XBUTTON2, 0x0002);
+    assert_eq!(ALL_MOUSE_BUTTON_BITS, [1, 2, 4, 8, 16]);
+    assert_eq!(
+        ALL_MODIFIER_HID_USAGES,
+        [0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7]
+    );
+
+    assert!(GOLDEN_HID_TO_WIN_VECTORS.len() >= 30);
+    for &(hid, scan, ext, vk) in GOLDEN_HID_TO_WIN_VECTORS {
+        let m = WinHidKeyMap::hid_to_win(hid)
+            .unwrap_or_else(|| panic!("missing golden HID {hid:#04x}"));
+        assert_eq!(
+            (m.scan_code, m.extended, m.vk_code),
+            (scan, ext, vk),
+            "golden mismatch for HID {hid:#04x}"
+        );
+    }
+}
+
+#[test]
+fn win_hid_keymap_round_trips_every_entry_and_verifies_exact_flags() {
     let mut seen_scans = BTreeSet::new();
     for entry in WinHidKeyMap::all_mappings() {
         assert_eq!(
@@ -69,25 +157,49 @@ fn win_hid_keymap_round_trips_every_entry_and_has_no_collisions() {
             entry.scan_code,
             entry.extended
         );
-        // Verify SendInput scan-code flags carry SCANCODE + KEYUP/EXTENDEDKEY accurately
-        let down_flags = entry.send_input_flags(true);
-        let up_flags = entry.send_input_flags(false);
-        assert_ne!(down_flags & WIN_KEYEVENTF_SCANCODE, 0);
-        assert_eq!(down_flags & WIN_KEYEVENTF_KEYUP, 0);
-        assert_ne!(up_flags & WIN_KEYEVENTF_KEYUP, 0);
-        assert_eq!((down_flags & WIN_KEYEVENTF_EXTENDEDKEY) != 0, entry.extended);
+
+        let expected_down = if entry.use_vk_mode {
+            0
+        } else {
+            WIN_KEYEVENTF_SCANCODE | if entry.extended { WIN_KEYEVENTF_EXTENDEDKEY } else { 0 }
+        };
+        let expected_up = expected_down | WIN_KEYEVENTF_KEYUP;
+        assert_eq!(
+            entry.send_input_flags(true),
+            expected_down,
+            "exact down_flags mismatch for HID {:#04x}",
+            entry.hid_usage
+        );
+        assert_eq!(
+            entry.send_input_flags(false),
+            expected_up,
+            "exact up_flags mismatch for HID {:#04x}",
+            entry.hid_usage
+        );
     }
 }
 
 #[test]
-fn win_hid_keymap_achieves_full_parity_with_macos_rust_allowlist_and_mac_hid_keymap() {
-    // 1. Every USB HID usage mapped by Rust `hid_usage_to_macos_keycode` MUST be mapped by `WinHidKeyMap`.
+fn win_hid_keymap_achieves_bidirectional_parity_with_macos_tables() {
+    // 1. Every USB HID usage mapped by Rust `hid_usage_to_macos_keycode` MUST be mapped by
+    //    BOTH `MAC_HID_KEYMAP_STANDARD_USAGES` and `WinHidKeyMap`.
+    let mac_std_set: BTreeSet<u16> = MAC_HID_KEYMAP_STANDARD_USAGES.iter().copied().collect();
+    let extra_set: BTreeSet<u16> = WIN_EXTRA_ALLOWED.iter().copied().collect();
+    let win_set: BTreeSet<u16> = WinHidKeyMap::all_mappings()
+        .iter()
+        .map(|m| m.hid_usage)
+        .collect();
+
     let mut mac_rust_count = 0usize;
     for usage in 0u16..=0xFFu16 {
         if hid_usage_to_macos_keycode(usage).is_some() {
             mac_rust_count += 1;
             assert!(
-                WinHidKeyMap::hid_to_win(usage).is_some(),
+                mac_std_set.contains(&usage),
+                "MAC_HID_KEYMAP_STANDARD_USAGES missing Rust macOS allowlist usage {usage:#04x}"
+            );
+            assert!(
+                win_set.contains(&usage),
                 "WinHidKeyMap missing HID usage {usage:#04x} present in hid_usage_to_macos_keycode"
             );
         }
@@ -97,19 +209,14 @@ fn win_hid_keymap_achieves_full_parity_with_macos_rust_allowlist_and_mac_hid_key
         "expected >= 75 macOS Rust allowlist keys, got {mac_rust_count}"
     );
 
-    // 2. Every canonical MacHidKeyMap usage (including full numpad & Insert) MUST be mapped by WinHidKeyMap.
-    for &usage in MAC_HID_KEYMAP_STANDARD_USAGES {
-        let win = WinHidKeyMap::hid_to_win(usage).unwrap_or_else(|| {
-            panic!("WinHidKeyMap missing canonical MacHidKeyMap HID usage {usage:#04x}")
-        });
-        assert_eq!(
-            WinHidKeyMap::scan_code_to_hid(win.scan_code, win.extended),
-            Some(usage),
-            "WinHidKeyMap failed reverse round-trip for MacHidKeyMap usage {usage:#04x}"
-        );
-    }
+    // 2. Exact bidirectional parity: WinHidKeyMap == MAC_HID_KEYMAP_STANDARD_USAGES ∪ WIN_EXTRA_ALLOWED.
+    let expected_win: BTreeSet<u16> = mac_std_set.union(&extra_set).copied().collect();
+    assert_eq!(
+        win_set, expected_win,
+        "WinHidKeyMap must match MAC_HID_KEYMAP_STANDARD_USAGES ∪ WIN_EXTRA_ALLOWED exactly"
+    );
 
-    // 3. All 8 modifiers must remain strictly distinct on BOTH macOS and Windows.
+    // 3. All 8 modifiers remain strictly distinct on BOTH macOS and Windows.
     let mut mac_mods = BTreeSet::new();
     let mut win_mods = BTreeSet::new();
     for &mod_usage in &ALL_MODIFIER_HID_USAGES {
@@ -129,14 +236,13 @@ fn win_hid_keymap_rejects_unmapped_and_maps_all_five_mouse_buttons() {
     assert_eq!(WinHidKeyMap::hid_to_win(0xFF), None);
     assert_eq!(WinHidKeyMap::hid_to_win(0x9999), None);
 
-    let expected_down = [
+    for (bit, flags, data) in [
         (ALL_MOUSE_BUTTON_BITS[0], WIN_MOUSEEVENTF_LEFTDOWN, 0),
         (ALL_MOUSE_BUTTON_BITS[1], WIN_MOUSEEVENTF_RIGHTDOWN, 0),
         (ALL_MOUSE_BUTTON_BITS[2], WIN_MOUSEEVENTF_MIDDLEDOWN, 0),
         (ALL_MOUSE_BUTTON_BITS[3], WIN_MOUSEEVENTF_XDOWN, WIN_XBUTTON1),
         (ALL_MOUSE_BUTTON_BITS[4], WIN_MOUSEEVENTF_XDOWN, WIN_XBUTTON2),
-    ];
-    for (bit, flags, data) in expected_down {
+    ] {
         let act = mouse_button_bit_to_win(bit, true).unwrap();
         assert_eq!(act.flags, flags);
         assert_eq!(act.mouse_data, data);

@@ -5,34 +5,40 @@
 //! emergency releaser backed by `win_hid_keymap` and `win_watchdog_logic`.
 //!
 //! # UIPI Limitation (Windows User Interface Privilege Isolation)
-//! Without an installed Windows Service (running as `LocalSystem` in Session 0
-//! spawning a helper into the active user session) or a signed `uiAccess=true`
-//! manifest installed under a trusted location (`Program Files`), Windows UIPI
-//! silently blocks `SendInput` targeting elevated (`Administrator`) windows and
-//! blocks `OpenInputDesktop` / injection on the Secure/UAC Desktop (`Winlogon`).
-//! ZeroDesk explicitly surfaces UIPI elevation status (`is_process_elevated()`)
-//! and accounts for every `SendInput` short return in `ReleaseReport::residual_*`.
+//! Without an installed Windows Service (running as `LocalSystem` / `S-1-5-18` in
+//! Session 0 spawning a helper into the active user session) or a signed
+//! `uiAccess=true` manifest installed under a trusted location (`Program Files`),
+//! Windows UIPI silently blocks `SendInput` targeting elevated (`Administrator`)
+//! windows and blocks `OpenInputDesktop` / injection on the Secure/UAC Desktop
+//! (`Winlogon`). ZeroDesk explicitly surfaces UIPI elevation status
+//! (`is_process_elevated()`), `LocalSystem` status (`is_local_system()`), and
+//! accounts for every `SendInput` short return in `ReleaseReport::residual_*`.
+
+#![cfg(windows)]
 
 use super::{
     input::{PressedHidState, RealInputPermit},
     traits::{InputPrivilegeStatus, OsInputInjector},
     win_hid_keymap::{
-        mouse_button_bit_to_win, WinHidKeyMap, ALL_MOUSE_BUTTON_BITS, WIN_KEYEVENTF_EXTENDEDKEY,
-        WIN_KEYEVENTF_KEYUP, WIN_KEYEVENTF_SCANCODE, WIN_MOUSEEVENTF_ABSOLUTE,
-        WIN_MOUSEEVENTF_HWHEEL, WIN_MOUSEEVENTF_MOVE, WIN_MOUSEEVENTF_VIRTUALDESK,
-        WIN_MOUSEEVENTF_WHEEL,
+        mouse_button_bit_to_win, WinHidKeyMap, WinKeyMapping, ALL_MOUSE_BUTTON_BITS,
+        WIN_KEYEVENTF_EXTENDEDKEY, WIN_KEYEVENTF_KEYUP, WIN_KEYEVENTF_SCANCODE,
+        WIN_MOUSEEVENTF_ABSOLUTE, WIN_MOUSEEVENTF_HWHEEL, WIN_MOUSEEVENTF_MOVE,
+        WIN_MOUSEEVENTF_VIRTUALDESK, WIN_MOUSEEVENTF_WHEEL,
     },
     win_watchdog_logic::{build_release_batch, WinInputEventDesc},
     EmergencyKeyReleaser, OsError, OsHidSink, ReleaseReport,
 };
 use crate::session::hid::{KeyEvent, MouseEvent, MouseKind};
 use std::{
-    mem::{size_of, zeroed},
+    mem::size_of,
     sync::{Arc, Mutex},
 };
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE},
-    Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+    Foundation::{CloseHandle, HANDLE, PSID},
+    Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, TokenElevation, TokenUser,
+        WinLocalSystemSid, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+    },
     System::{
         StationsAndDesktops::{
             CloseDesktop, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
@@ -49,22 +55,29 @@ use windows::Win32::{
 const DESKTOP_READOBJECTS_FLAG: u32 = 0x0001;
 const DESKTOP_WRITEOBJECTS_FLAG: u32 = 0x0080;
 const WHEEL_DELTA_CLAMP: i32 = 2400;
+const SECURITY_MAX_SID_SIZE: usize = 68;
+
+// Compile-time layout sanity for Win32 INPUT struct.
+const _: () = assert!(size_of::<INPUT>() > 0 && size_of::<INPUT>() <= i32::MAX as usize);
 
 /// Public documentation string explaining Windows UIPI constraints.
-pub const WIN_UIPI_LIMITATION_NOTE: &str = "Without an installed Windows Service or signed uiAccess=true binary, Windows UIPI blocks SendInput into elevated windows and Secure/UAC desktops.";
+pub const WIN_UIPI_LIMITATION_NOTE: &str = "Without an installed Windows Service (LocalSystem S-1-5-18) or signed uiAccess=true binary, Windows UIPI blocks SendInput into elevated windows and Secure/UAC desktops.";
 
 /// RAII guard binding the calling thread to the current active input desktop via
 /// `OpenInputDesktop(0, FALSE, DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS)` +
 /// `SetThreadDesktop`, restoring the previous thread desktop and closing `HDESK`
 /// unconditionally on Drop.
 pub struct ScopedInputDesktop {
-    previous: Option<HDESK>,
+    previous: HDESK,
     opened: HDESK,
 }
 
 impl ScopedInputDesktop {
     pub fn enter() -> Result<Self, OsError> {
-        let previous = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok();
+        // Query previous thread desktop FIRST so failure never leaks an opened HDESK.
+        let previous = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.map_err(|e| {
+            OsError::CaptureFailed(format!("GetThreadDesktop failed before desktop switch: {e}"))
+        })?;
         let access = DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS_FLAG | DESKTOP_WRITEOBJECTS_FLAG);
         let opened = unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, access) }.map_err(
             |e| {
@@ -87,12 +100,8 @@ impl ScopedInputDesktop {
 
 impl Drop for ScopedInputDesktop {
     fn drop(&mut self) {
-        if let Some(prev) = self.previous {
-            unsafe {
-                let _ = SetThreadDesktop(prev);
-            }
-        }
         unsafe {
+            let _ = SetThreadDesktop(self.previous);
             let _ = CloseDesktop(self.opened);
         }
     }
@@ -133,18 +142,87 @@ pub fn is_process_elevated() -> Option<bool> {
     res.ok().map(|()| elevation.TokenIsElevated != 0)
 }
 
-fn build_kb_input(scan_code: u16, flags: u32) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(0),
-                wScan: scan_code,
-                dwFlags: KEYBD_EVENT_FLAGS(flags),
-                time: 0,
-                dwExtraInfo: 0,
+/// Queries whether the current Windows process runs as `NT AUTHORITY\SYSTEM`
+/// (`S-1-5-18`, `WinLocalSystemSid`) via `GetTokenInformation(TokenUser)`.
+/// Only `LocalSystem` (or a signed `uiAccess=true` broker) can inject into the
+/// Secure/UAC Desktop (`Winlogon`).
+pub fn is_local_system() -> bool {
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() && self.0 .0 != 0 {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    let _token_guard = TokenGuard(token);
+
+    let mut needed = 0u32;
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    if needed < size_of::<TOKEN_USER>() as u32 {
+        return false;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+
+    let mut system_sid_buf = [0u8; SECURITY_MAX_SID_SIZE];
+    let mut sid_len = system_sid_buf.len() as u32;
+    let system_psid = PSID(system_sid_buf.as_mut_ptr().cast());
+    if unsafe { CreateWellKnownSid(WinLocalSystemSid, PSID::default(), system_psid, &mut sid_len) }
+        .is_err()
+    {
+        return false;
+    }
+
+    let user_sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    unsafe { EqualSid(user_sid, system_psid) }.is_ok()
+}
+
+fn build_kb_input_for_mapping(mapping: WinKeyMapping, down: bool) -> INPUT {
+    if mapping.use_vk_mode {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(mapping.vk_code),
+                    wScan: 0,
+                    dwFlags: KEYBD_EVENT_FLAGS(mapping.send_input_flags(down)),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
             },
-        },
+        }
+    } else {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: mapping.scan_code,
+                    dwFlags: KEYBD_EVENT_FLAGS(mapping.send_input_flags(down)),
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
     }
 }
 
@@ -169,18 +247,58 @@ fn desc_to_win_input(desc: &WinInputEventDesc) -> INPUT {
         WinInputEventDesc::KeyboardScanUp {
             scan_code,
             extended,
+            vk_code,
+            use_vk_mode,
             ..
         } => {
-            let mut flags = WIN_KEYEVENTF_SCANCODE | WIN_KEYEVENTF_KEYUP;
-            if extended {
-                flags |= WIN_KEYEVENTF_EXTENDEDKEY;
+            if use_vk_mode {
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(vk_code),
+                            wScan: 0,
+                            dwFlags: KEYBD_EVENT_FLAGS(WIN_KEYEVENTF_KEYUP),
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                }
+            } else {
+                let mut flags = WIN_KEYEVENTF_SCANCODE | WIN_KEYEVENTF_KEYUP;
+                if extended {
+                    flags |= WIN_KEYEVENTF_EXTENDEDKEY;
+                }
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0),
+                            wScan: scan_code,
+                            dwFlags: KEYBD_EVENT_FLAGS(flags),
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                }
             }
-            build_kb_input(scan_code, flags)
         }
         WinInputEventDesc::MouseButtonUp {
             flags, mouse_data, ..
         } => build_mouse_input(0, 0, mouse_data, flags),
     }
+}
+
+fn count_batch_events(batch: &[WinInputEventDesc]) -> (usize, usize) {
+    let mut keys = 0usize;
+    let mut buttons = 0usize;
+    for desc in batch {
+        match desc {
+            WinInputEventDesc::KeyboardScanUp { .. } => keys += 1,
+            WinInputEventDesc::MouseButtonUp { .. } => buttons += 1,
+        }
+    }
+    (keys, buttons)
 }
 
 /// Executes an atomic single-call `SendInput` batch release after switching the
@@ -193,9 +311,15 @@ pub fn execute_atomic_release_batch(batch: &[WinInputEventDesc]) -> Result<Relea
     if batch.is_empty() {
         return Ok(ReleaseReport::default());
     }
-    // Bind calling thread to active input desktop before releasing so desktop/lock
-    // transitions do not silently drop releases. Keep guard alive across SendInput.
-    let _desktop_guard = ScopedInputDesktop::enter().ok();
+    let _desktop_guard = match ScopedInputDesktop::enter() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            eprintln!(
+                "[zerodesk_core::os::win_input] WARN: ScopedInputDesktop::enter failed before atomic release batch: {err}"
+            );
+            None
+        }
+    };
 
     let inputs: Vec<INPUT> = batch.iter().map(desc_to_win_input).collect();
     let cb_size = i32::try_from(size_of::<INPUT>())
@@ -255,27 +379,43 @@ impl EmergencyKeyReleaser for WinEmergencyKeyReleaser {
             (keys, buttons)
         };
         let batch = build_release_batch(&keys, 0, buttons);
+        let (total_keys, total_buttons) = count_batch_events(&batch);
         execute_atomic_release_batch(&batch).unwrap_or(ReleaseReport {
             released_keys: 0,
             released_buttons: 0,
-            residual_keys: keys.len() + 8,
-            residual_buttons: 5,
+            residual_keys: total_keys,
+            residual_buttons: total_buttons,
         })
     }
 }
 
 /// Windows `SendInput` HID injector implementing `OsHidSink` and `OsInputInjector`.
 pub struct WinOsInputInjector {
+    permit: Arc<RealInputPermit>,
     pressed: Arc<Mutex<PressedHidState>>,
 }
 
 impl WinOsInputInjector {
     /// Requires explicit runtime `Arc<RealInputPermit>` (same fail-closed gating
     /// contract as macOS `MacOsHidSink`).
-    pub fn new(_permit: Arc<RealInputPermit>) -> Result<Self, OsError> {
+    pub fn new(permit: Arc<RealInputPermit>) -> Result<Self, OsError> {
+        if !super::input::real_input_compiled_in() {
+            return Err(OsError::UnsupportedPlatform(
+                "real OS input disabled at compile time (enable --features real-input)",
+            ));
+        }
         Ok(Self {
+            permit,
             pressed: PressedHidState::new_shared(),
         })
+    }
+
+    fn verify_permit(&self) -> Result<(), OsError> {
+        let _ = &self.permit;
+        if !super::input::real_input_compiled_in() {
+            return Err(OsError::NotPermitted);
+        }
+        Ok(())
     }
 
     fn send_single_input(input: INPUT) -> Result<(), OsError> {
@@ -294,6 +434,7 @@ impl WinOsInputInjector {
 
 impl OsHidSink for WinOsInputInjector {
     fn send_key(&mut self, ev: &KeyEvent) -> Result<(), OsError> {
+        self.verify_permit()?;
         let Ok(usage) = u16::try_from(ev.usb_hid_usage) else {
             return Err(OsError::InvalidData(format!(
                 "USB HID usage {:#x} exceeds u16 range",
@@ -309,17 +450,14 @@ impl OsHidSink for WinOsInputInjector {
                 return Err(OsError::Interlocked);
             }
         }
-        let input = build_kb_input(mapping.scan_code, mapping.send_input_flags(ev.down));
+        let input = build_kb_input_for_mapping(mapping, ev.down);
         Self::send_single_input(input)?;
 
         let mut g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
         if g.interlocked {
             if ev.down {
                 drop(g);
-                let _ = Self::send_single_input(build_kb_input(
-                    mapping.scan_code,
-                    mapping.send_input_flags(false),
-                ));
+                let _ = Self::send_single_input(build_kb_input_for_mapping(mapping, false));
             }
             return Err(OsError::Interlocked);
         }
@@ -332,6 +470,7 @@ impl OsHidSink for WinOsInputInjector {
     }
 
     fn send_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsError> {
+        self.verify_permit()?;
         {
             let g = self.pressed.lock().unwrap_or_else(|e| e.into_inner());
             if g.interlocked {
@@ -449,21 +588,17 @@ impl OsInputInjector for WinOsInputInjector {
     }
 }
 
-/// Computes Windows UIPI & interactive desktop accessibility privilege summary.
+/// Computes Windows UIPI, `LocalSystem` (`S-1-5-18`), and interactive desktop
+/// accessibility privilege summary.
 pub fn win_input_privilege_status() -> InputPrivilegeStatus {
     let elevated = is_process_elevated();
+    let local_system = is_local_system();
     let desktop_ok = probe_input_desktop_accessible().is_ok();
-    let secure_desktop_blocked = !desktop_ok || elevated != Some(true);
+    let secure_desktop_blocked = !desktop_ok || !local_system;
     InputPrivilegeStatus {
         accessibility_granted: desktop_ok,
         uipi_elevated: elevated,
         secure_desktop_blocked,
         note: Some(WIN_UIPI_LIMITATION_NOTE.to_string()),
     }
-}
-
-/// Compiles a zero-initialized `INPUT` solely for layout sanity (unused at runtime).
-#[allow(dead_code)]
-fn _zero_input_sanity() -> INPUT {
-    unsafe { zeroed() }
 }

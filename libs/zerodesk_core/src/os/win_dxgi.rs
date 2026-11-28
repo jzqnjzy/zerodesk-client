@@ -4,15 +4,21 @@
 //! Thin `#[cfg(windows)]` DXGI Desktop Duplication FFI adapter backed by the
 //! official Microsoft `windows` crate and driven by `win_dxgi_logic`.
 //!
-//! Uses `CreateDXGIFactory1`, `D3D11CreateDevice`, `IDXGIOutput1::DuplicateOutput`,
-//! `AcquireNextFrame` -> `classify_dxgi_hresult`, cursor shape/position readback,
-//! staging `ID3D11Texture2D` BGRA readback, and RAII `ReleaseFrame`/`Unmap` guards.
+//! Uses `CreateDXGIFactory1`, `D3D11CreateDevice` with `BGRA_SUPPORT | VIDEO_SUPPORT`
+//! plus `ID3D11Multithread::SetMultithreadProtected(true)`, `IDXGIOutput1::DuplicateOutput`,
+//! `AcquireNextFrame` -> `classify_dxgi_hresult`, rotation-aware cursor & dimensions,
+//! row-by-row staging readback, and RAII `ReleaseFrame`/`Unmap` guards.
+
+#![cfg(windows)]
 
 use super::{
-    traits::{CaptureError, CapturedFrame, CapturedSurface, ScreenCapturer},
+    traits::{
+        CaptureError, CapturedFrame, CapturedSurface, D3d11SharedFrame, D3d11SurfaceFormat,
+        ScreenCapturer,
+    },
     win_dxgi_logic::{
-        CursorShapeUpdate, DxgiAdapterLuid, DxgiCaptureStateMachine, DxgiOutputDescriptor,
-        DxgiTransitionOutcome,
+        rotate_point, rotated_dims, CursorShapeUpdate, DxgiAdapterLuid, DxgiCaptureStateMachine,
+        DxgiOutputDescriptor, DxgiTransitionOutcome,
     },
     OsError, OsScreenCapture, RawCapturedFrame,
 };
@@ -20,6 +26,7 @@ use crate::frame::PixelFormat;
 use std::{
     ffi::OsString,
     os::windows::ffi::OsStringExt,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use windows::{
@@ -32,18 +39,21 @@ use windows::{
                 D3D_FEATURE_LEVEL_11_1,
             },
             Direct3D11::{
-                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-                D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+                ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
             },
             Dxgi::{
                 Common::{
-                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_ROTATE180,
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180,
                     DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_ROTATE90, DXGI_SAMPLE_DESC,
                 },
                 CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
                 IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_NOT_FOUND,
-                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
+                DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+                DXGI_OUTPUT_DESC,
             },
         },
     },
@@ -61,6 +71,15 @@ fn now_epoch_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn rotation_enum_to_degrees(rot: DXGI_MODE_ROTATION) -> u16 {
+    match rot {
+        DXGI_MODE_ROTATION_ROTATE90 => 90,
+        DXGI_MODE_ROTATION_ROTATE180 => 180,
+        DXGI_MODE_ROTATION_ROTATE270 => 270,
+        _ => 0,
+    }
 }
 
 /// Enumerates all attached DXGI outputs across all GPU adapters along with
@@ -103,14 +122,9 @@ pub fn enumerate_dxgi_outputs() -> Result<Vec<DxgiOutputDescriptor>, CaptureErro
             let mut odesc = DXGI_OUTPUT_DESC::default();
             if unsafe { output.GetDesc(&mut odesc) }.is_ok() && odesc.AttachedToDesktop.as_bool() {
                 let r = odesc.DesktopCoordinates;
-                let width = (r.right - r.left).max(0) as u32;
-                let height = (r.bottom - r.top).max(0) as u32;
-                let rotation_degrees = match odesc.Rotation {
-                    DXGI_MODE_ROTATION_ROTATE90 => 90,
-                    DXGI_MODE_ROTATION_ROTATE180 => 180,
-                    DXGI_MODE_ROTATION_ROTATE270 => 270,
-                    _ => 0,
-                };
+                let width = r.right.saturating_sub(r.left).max(0) as u32;
+                let height = r.bottom.saturating_sub(r.top).max(0) as u32;
+                let rotation_degrees = rotation_enum_to_degrees(odesc.Rotation);
                 outputs.push(DxgiOutputDescriptor {
                     monitor_index,
                     adapter_index,
@@ -162,21 +176,32 @@ impl Drop for MappedStagingGuard<'_> {
     }
 }
 
+struct DuplicationBundle {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    duplication: IDXGIOutputDuplication,
+    surface_dims: (u32, u32),
+    rotation_degrees: u16,
+}
+
 /// Windows DXGI Desktop Duplication capturer implementing `ScreenCapturer` and
-/// `OsScreenCapture`, exposing its D3D11 device and adapter LUID for zero-copy
-/// Media Foundation hardware MFT binding.
+/// `OsScreenCapture`, exposing its D3D11 device (with `VIDEO_SUPPORT` +
+/// `ID3D11Multithread::SetMultithreadProtected(true)`) and adapter LUID for
+/// zero-copy Media Foundation hardware MFT binding.
 pub struct WinDxgiCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: Option<ID3D11Texture2D>,
-    staging_dims: (u32, u32),
+    surface_dims: (u32, u32),
+    effective_dims: (u32, u32),
+    rotation_degrees: u16,
     state: DxgiCaptureStateMachine,
     acquire_timeout_ms: u32,
 }
 
-// Safety: COM interfaces used exclusively from the single owning capturer thread (`&mut self`);
-// D3D11 device/context and DXGI duplication objects are free-threaded agile COM interfaces.
+// SAFETY: COM interfaces are owned exclusively by this capturer (`&mut self`), and
+// `ID3D11Multithread::SetMultithreadProtected(true)` is enabled on the immediate context.
 unsafe impl Send for WinDxgiCapturer {}
 
 impl WinDxgiCapturer {
@@ -190,15 +215,22 @@ impl WinDxgiCapturer {
         let mut state = DxgiCaptureStateMachine::new();
         state.set_outputs(outputs);
         let target = state.select_monitor(monitor_index)?.clone();
-        let (device, context, duplication) = Self::create_duplication_for_output(&target)?;
-        state.on_recreate_succeeded();
+        let bundle = Self::create_duplication_for_output(&target)?;
+        state.on_recreate_succeeded()?;
+        let effective_dims = rotated_dims(
+            bundle.surface_dims.0,
+            bundle.surface_dims.1,
+            bundle.rotation_degrees,
+        );
 
         Ok(Self {
-            device,
-            context,
-            duplication,
+            device: bundle.device,
+            context: bundle.context,
+            duplication: bundle.duplication,
             staging: None,
-            staging_dims: (target.width, target.height),
+            surface_dims: bundle.surface_dims,
+            effective_dims,
+            rotation_degrees: bundle.rotation_degrees,
             state,
             acquire_timeout_ms: 16,
         })
@@ -212,8 +244,16 @@ impl WinDxgiCapturer {
         &self.device
     }
 
+    pub fn d3d11_context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
     pub fn adapter_luid(&self) -> Option<DxgiAdapterLuid> {
         self.state.active_adapter_luid()
+    }
+
+    pub fn rotation_degrees(&self) -> u16 {
+        self.rotation_degrees
     }
 
     pub fn state_machine(&self) -> &DxgiCaptureStateMachine {
@@ -222,7 +262,7 @@ impl WinDxgiCapturer {
 
     fn create_duplication_for_output(
         target: &DxgiOutputDescriptor,
-    ) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication), CaptureError> {
+    ) -> Result<DuplicationBundle, CaptureError> {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
             .map_err(|e| CaptureError::Fatal(format!("CreateDXGIFactory1 failed: {e}")))?;
         let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(target.adapter_index) }
@@ -240,9 +280,9 @@ impl WinDxgiCapturer {
                 ))
             },
         )?;
-        let output1: IDXGIOutput1 = output
-            .cast()
-            .map_err(|e| CaptureError::Fatal(format!("QueryInterface(IDXGIOutput1) failed: {e}")))?;
+        let output1: IDXGIOutput1 = output.cast().map_err(|e| {
+            CaptureError::Fatal(format!("QueryInterface(IDXGIOutput1) failed: {e}"))
+        })?;
 
         let feature_levels: [D3D_FEATURE_LEVEL; 2] =
             [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
@@ -253,7 +293,7 @@ impl WinDxgiCapturer {
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 Some(&feature_levels),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -269,6 +309,13 @@ impl WinDxgiCapturer {
             CaptureError::Fatal("D3D11CreateDevice returned null immediate context".into())
         })?;
 
+        let mt: ID3D11Multithread = context.cast().map_err(|e| {
+            CaptureError::Fatal(format!("QueryInterface(ID3D11Multithread) failed: {e}"))
+        })?;
+        unsafe {
+            let _ = mt.SetMultithreadProtected(true);
+        }
+
         let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(|e| {
             let hr = e.code().0;
             match super::win_dxgi_logic::classify_dxgi_hresult(hr) {
@@ -282,11 +329,27 @@ impl WinDxgiCapturer {
             }
         })?;
 
-        Ok((device, context, duplication))
+        let mut dupl_desc = DXGI_OUTDUPL_DESC::default();
+        unsafe { duplication.GetDesc(&mut dupl_desc) };
+        let surface_w = dupl_desc.ModeDesc.Width.max(1);
+        let surface_h = dupl_desc.ModeDesc.Height.max(1);
+        let rotation_degrees = rotation_enum_to_degrees(dupl_desc.Rotation);
+
+        Ok(DuplicationBundle {
+            device,
+            context,
+            duplication,
+            surface_dims: (surface_w, surface_h),
+            rotation_degrees,
+        })
     }
 
-    fn ensure_staging_texture(&mut self, width: u32, height: u32) -> Result<&ID3D11Texture2D, CaptureError> {
-        let needs_new = self.staging.is_none() || self.staging_dims != (width, height);
+    fn ensure_staging_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<&ID3D11Texture2D, CaptureError> {
+        let needs_new = self.staging.is_none() || self.surface_dims != (width, height);
         if needs_new {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
@@ -304,10 +367,12 @@ impl WinDxgiCapturer {
                 MiscFlags: 0,
             };
             let mut tex: Option<ID3D11Texture2D> = None;
-            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-                .map_err(|e| CaptureError::Fatal(format!("CreateTexture2D(staging) failed: {e}")))?;
+            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) }.map_err(|e| {
+                CaptureError::Fatal(format!("CreateTexture2D(staging) failed: {e}"))
+            })?;
             self.staging = tex;
-            self.staging_dims = (width, height);
+            self.surface_dims = (width, height);
+            self.effective_dims = rotated_dims(width, height, self.rotation_degrees);
         }
         self.staging
             .as_ref()
@@ -315,9 +380,16 @@ impl WinDxgiCapturer {
     }
 
     fn update_cursor_from_frame_info(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) {
-        self.state.cursor_mut().update_position(
+        let (rx, ry) = rotate_point(
             info.PointerPosition.Position.x,
             info.PointerPosition.Position.y,
+            self.surface_dims.0,
+            self.surface_dims.1,
+            self.rotation_degrees,
+        );
+        self.state.cursor_mut().update_position(
+            rx,
+            ry,
             info.PointerPosition.Visible.as_bool(),
             info.LastMouseUpdateTime,
         );
@@ -348,35 +420,61 @@ impl WinDxgiCapturer {
         }
     }
 
-    pub fn recreate(&mut self) -> Result<(), CaptureError> {
-        let outputs = enumerate_dxgi_outputs()?;
-        self.state.set_outputs(outputs);
-        let Some(target) = self.state.active_output().cloned() else {
-            return Err(CaptureError::DesktopUnavailable(
-                "no active DXGI output available during recreate".into(),
-            ));
+    /// Captures the next desktop frame directly into a GPU-resident `ID3D11Texture2D`
+    /// copy wrapped in `CapturedSurface::D3d11Texture(Arc<D3d11SharedFrame>)` for
+    /// zero-copy Media Foundation hardware encoding (zero CPU readback).
+    pub fn capture_next_d3d11_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let (gpu_tex, _guard) = self.acquire_gpu_texture()?;
+        let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { gpu_tex.GetDesc(&mut tex_desc) };
+        if tex_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(CaptureError::Fatal(format!(
+                "unsupported DXGI surface format {:?} (expected DXGI_FORMAT_B8G8R8A8_UNORM)",
+                tex_desc.Format
+            )));
+        }
+        let copy_desc = D3D11_TEXTURE2D_DESC {
+            Width: tex_desc.Width,
+            Height: tex_desc.Height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
         };
-        let (device, context, duplication) = Self::create_duplication_for_output(&target)?;
-        self.device = device;
-        self.context = context;
-        self.duplication = duplication;
-        self.staging = None;
-        self.staging_dims = (target.width, target.height);
-        self.state.on_recreate_succeeded();
-        Ok(())
+        let mut owned_tex: Option<ID3D11Texture2D> = None;
+        unsafe { self.device.CreateTexture2D(&copy_desc, None, Some(&mut owned_tex)) }
+            .map_err(|e| CaptureError::Fatal(format!("CreateTexture2D(gpu copy) failed: {e}")))?;
+        let owned_tex = owned_tex
+            .ok_or_else(|| CaptureError::Fatal("CreateTexture2D(gpu copy) returned null".into()))?;
+        unsafe {
+            self.context.CopyResource(&owned_tex, &gpu_tex);
+        }
+        let luid = self.state.active_adapter_luid().unwrap_or_default().as_tuple();
+        let shared = Arc::new(D3d11SharedFrame::from_texture(
+            owned_tex,
+            luid,
+            D3d11SurfaceFormat::Bgra8Unorm,
+            None,
+        ));
+        Ok(CapturedFrame {
+            width: tex_desc.Width,
+            height: tex_desc.Height,
+            stride: tex_desc.Width.saturating_mul(4),
+            surface: CapturedSurface::D3d11Texture(shared),
+            timestamp_us: now_epoch_us(),
+            monitor_id: self.state.active_monitor_index(),
+            cursor: Some(self.state.cursor().to_metadata()),
+        })
     }
-}
 
-impl ScreenCapturer for WinDxgiCapturer {
-    fn dimensions(&self) -> (u32, u32) {
-        self.staging_dims
-    }
-
-    fn monitor_id(&self) -> u32 {
-        self.state.active_monitor_index()
-    }
-
-    fn capture_next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+    fn acquire_gpu_texture(&mut self) -> Result<(ID3D11Texture2D, AcquiredFrameGuard), CaptureError> {
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource: Option<IDXGIResource> = None;
 
@@ -411,11 +509,12 @@ impl ScreenCapturer for WinDxgiCapturer {
             };
         }
 
-        // Frame acquired: guard guarantees ReleaseFrame runs before returning.
-        let _frame_guard = AcquiredFrameGuard {
+        let frame_guard = AcquiredFrameGuard {
             duplication: self.duplication.clone(),
         };
-        self.state.on_frame_acquired();
+        if let DxgiTransitionOutcome::Failed { error, .. } = self.state.on_frame_acquired() {
+            return Err(error);
+        }
         self.update_cursor_from_frame_info(&frame_info);
 
         let resource = desktop_resource.ok_or_else(|| {
@@ -424,9 +523,54 @@ impl ScreenCapturer for WinDxgiCapturer {
         let gpu_tex: ID3D11Texture2D = resource.cast().map_err(|e| {
             CaptureError::Fatal(format!("QueryInterface(ID3D11Texture2D) failed: {e}"))
         })?;
+        Ok((gpu_tex, frame_guard))
+    }
+
+    pub fn recreate(&mut self) -> Result<(), CaptureError> {
+        let outputs = enumerate_dxgi_outputs()?;
+        self.state.set_outputs(outputs);
+        let Some(target) = self.state.active_output().cloned() else {
+            return Err(CaptureError::DesktopUnavailable(
+                "no active DXGI output available during recreate".into(),
+            ));
+        };
+        let bundle = Self::create_duplication_for_output(&target)?;
+        self.device = bundle.device;
+        self.context = bundle.context;
+        self.duplication = bundle.duplication;
+        self.staging = None;
+        self.surface_dims = bundle.surface_dims;
+        self.rotation_degrees = bundle.rotation_degrees;
+        self.effective_dims = rotated_dims(
+            bundle.surface_dims.0,
+            bundle.surface_dims.1,
+            bundle.rotation_degrees,
+        );
+        self.state.on_recreate_succeeded()?;
+        Ok(())
+    }
+}
+
+impl ScreenCapturer for WinDxgiCapturer {
+    fn dimensions(&self) -> (u32, u32) {
+        self.effective_dims
+    }
+
+    fn monitor_id(&self) -> u32 {
+        self.state.active_monitor_index()
+    }
+
+    fn capture_next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let (gpu_tex, _frame_guard) = self.acquire_gpu_texture()?;
 
         let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { gpu_tex.GetDesc(&mut tex_desc) };
+        if tex_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(CaptureError::Fatal(format!(
+                "unsupported DXGI surface format {:?} (expected DXGI_FORMAT_B8G8R8A8_UNORM)",
+                tex_desc.Format
+            )));
+        }
         let width = tex_desc.Width;
         let height = tex_desc.Height;
 
@@ -446,22 +590,39 @@ impl ScreenCapturer for WinDxgiCapturer {
             texture: &staging,
         };
 
-        let row_pitch = mapped.RowPitch;
-        let total_bytes = (row_pitch as usize)
+        let row_bytes = (width as usize)
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::Fatal("BGRA row_bytes overflow".into()))?;
+        let row_pitch = mapped.RowPitch as usize;
+        if row_pitch < row_bytes {
+            return Err(CaptureError::Fatal(format!(
+                "mapped RowPitch {row_pitch} < width*4 ({row_bytes})"
+            )));
+        }
+        let packed_len = row_bytes
             .checked_mul(height as usize)
-            .ok_or_else(|| CaptureError::Fatal("mapped BGRA buffer size overflow".into()))?;
+            .ok_or_else(|| CaptureError::Fatal("packed BGRA buffer overflow".into()))?;
         if mapped.pData.is_null() {
             return Err(CaptureError::Fatal(
                 "ID3D11DeviceContext::Map returned null pData".into(),
             ));
         }
-        let data = unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), total_bytes) }
-            .to_vec();
+
+        // Copy strictly row-by-row (`width * 4` bytes per row) so we NEVER read past
+        // `RowPitch * (Height - 1) + Width * 4` on the last scanline.
+        let mut data = vec![0u8; packed_len];
+        let src_base = mapped.pData.cast::<u8>();
+        for row in 0..(height as usize) {
+            let src_row = unsafe {
+                std::slice::from_raw_parts(src_base.add(row * row_pitch), row_bytes)
+            };
+            data[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(src_row);
+        }
 
         Ok(CapturedFrame {
             width,
             height,
-            stride: row_pitch,
+            stride: width.saturating_mul(4),
             surface: CapturedSurface::Bgra8 { data },
             timestamp_us: now_epoch_us(),
             monitor_id: self.state.active_monitor_index(),

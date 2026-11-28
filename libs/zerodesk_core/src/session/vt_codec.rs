@@ -4,9 +4,10 @@
 #[cfg(target_os = "macos")]
 use super::video::{CODEC_ID_H264, CODEC_ID_HEVC};
 use super::video::{BgraFrame, I420Frame, VideoCodec, VideoError};
-#[cfg(any(target_os = "macos", test))]
-use std::{collections::VecDeque, time::Instant};
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 #[cfg(target_os = "macos")]
 use v2_transport::{CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW};
 
@@ -28,14 +29,14 @@ pub struct AnnexbParseSummary {
     pub total_param_bytes: usize,
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct VtRebuildTracker {
     rebuild_times: VecDeque<Instant>,
     total_rebuilds: u64,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl VtRebuildTracker {
     pub(crate) fn record_and_allow(&mut self, now: Instant) -> bool {
         while let Some(&oldest) = self.rebuild_times.front() {

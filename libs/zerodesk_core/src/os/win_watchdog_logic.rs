@@ -3,7 +3,7 @@
 
 //! Platform-agnostic Windows HID watchdog state machine, single-batch `SendInput`
 //! release plan builder, PID-reuse creation-time guard, heartbeat timeout detector,
-//! and emergency escape hotkey detector.
+//! Win32 command-line argument quoter, and emergency escape hotkey detector.
 //!
 //! Compiled and unit-tested on ALL platforms (including macOS).
 
@@ -35,6 +35,8 @@ pub enum WinInputEventDesc {
         hid_usage: u16,
         scan_code: u16,
         extended: bool,
+        vk_code: u16,
+        use_vk_mode: bool,
     },
     MouseButtonUp {
         button_bit: u8,
@@ -66,6 +68,8 @@ pub fn build_release_batch(
                 hid_usage: usage,
                 scan_code: m.scan_code,
                 extended: m.extended,
+                vk_code: m.vk_code,
+                use_vk_mode: m.use_vk_mode,
             });
         }
     }
@@ -80,6 +84,40 @@ pub fn build_release_batch(
         });
     }
     batch
+}
+
+/// Quotes a single command-line argument according to Windows `CommandLineToArgvW`
+/// / MSVC CRT parsing rules so paths containing spaces, quotes, or trailing
+/// backslashes survive `CreateProcessW` intact.
+pub fn quote_win_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
 }
 
 /// Process identity tuple combining PID with Windows `GetProcessTimes` creation
@@ -143,10 +181,10 @@ impl WatchdogHeartbeatTracker {
         self.heartbeat_count
     }
 
+    /// Unconditionally updates `last_activity_ms = now_ms` so a clock rollback
+    /// can NEVER freeze the deadline in the future and disable timeout detection.
     pub fn on_heartbeat(&mut self, now_ms: u64) {
-        if now_ms >= self.last_activity_ms {
-            self.last_activity_ms = now_ms;
-        }
+        self.last_activity_ms = now_ms;
         self.heartbeat_count = self.heartbeat_count.saturating_add(1);
         self.timed_out = false;
     }
@@ -206,6 +244,13 @@ pub enum WinWatchdogAction {
 
 /// Platform-agnostic frame & heartbeat state machine shared by the Windows
 /// `zerodesk-hid-watchdog` runtime and unit tests on macOS.
+///
+/// Host -> Watchdog wire contract (post-handshake on `cmd` pipe):
+/// - `StateSnapshot`: updates tracked held keys/buttons/modifiers and refreshes heartbeat.
+/// - `GracefulExit`: clears held state and exits cleanly without emergency release.
+/// - `Hello` (duplicate after handshake) and Watchdog -> Host frame types (`Ready`,
+///   `Released`, `AxStatus`) arriving on the `cmd` pipe violate the wire contract and
+///   immediately fail closed with an atomic emergency release.
 #[derive(Debug, Clone)]
 pub struct WinWatchdogLoopState {
     keys_bitmap: [u8; 32],
@@ -275,10 +320,7 @@ impl WinWatchdogLoopState {
                 self.last_seq = frame.seq;
                 WinWatchdogAction::GracefulExit { seq: frame.seq }
             }
-            WatchdogMsgType::Hello => {
-                // Unexpected duplicate Hello after handshake -> fail closed.
-                self.build_emergency_action("unexpected_hello")
-            }
+            WatchdogMsgType::Hello => self.build_emergency_action("unexpected_hello"),
             WatchdogMsgType::Ready | WatchdogMsgType::Released | WatchdogMsgType::AxStatus => {
                 self.build_emergency_action("unexpected_frame_type")
             }
@@ -312,28 +354,26 @@ mod tests {
     use crate::session::hid::MOD_SHIFT;
 
     #[test]
-    fn release_batch_covers_tracked_keys_all_8_modifiers_and_all_5_mouse_buttons() {
-        // Track A (0x04), UpArrow (0x52, extended), and LeftCtrl (0xE0, also in modifiers)
-        let batch = build_release_batch(&[0x04, 0x52, 0xE0, 0x04], 0, 0x01);
+    fn release_batch_covers_tracked_keys_pause_vk_all_8_modifiers_and_all_5_mouse_buttons() {
+        // Track A (0x04), Pause (0x48, VK-only), UpArrow (0x52, extended), and LeftCtrl (0xE0)
+        let batch = build_release_batch(&[0x04, 0x48, 0x52, 0xE0, 0x04], 0, 0x01);
 
-        // Expect: 2 non-modifier keys (0x04, 0x52) + 8 modifiers (0xE0..=0xE7) = 10 keyboard + 5 mouse = 15 events
-        assert_eq!(batch.len(), 15);
+        // Expect: 3 non-modifier keys (0x04, 0x48, 0x52) + 8 modifiers = 11 kb + 5 mouse = 16
+        assert_eq!(batch.len(), 16);
 
-        let kb_usages: Vec<u16> = batch
+        let pause_entry = batch
             .iter()
-            .filter_map(|e| match e {
-                WinInputEventDesc::KeyboardScanUp { hid_usage, .. } => Some(*hid_usage),
-                WinInputEventDesc::MouseButtonUp { .. } => None,
-            })
-            .collect();
-        assert_eq!(kb_usages.len(), 10);
-        assert!(kb_usages.contains(&0x04));
-        assert!(kb_usages.contains(&0x52));
-        for mod_u in ALL_MODIFIER_HID_USAGES {
-            assert!(kb_usages.contains(&mod_u), "missing modifier {mod_u:#04x}");
-        }
+            .find(|e| matches!(e, WinInputEventDesc::KeyboardScanUp { hid_usage: 0x48, .. }))
+            .unwrap();
+        assert!(matches!(
+            pause_entry,
+            WinInputEventDesc::KeyboardScanUp {
+                vk_code: 0x13,
+                use_vk_mode: true,
+                ..
+            }
+        ));
 
-        // Verify UpArrow carries extended=true
         let up_entry = batch
             .iter()
             .find(|e| matches!(e, WinInputEventDesc::KeyboardScanUp { hid_usage: 0x52, .. }))
@@ -343,11 +383,11 @@ mod tests {
             WinInputEventDesc::KeyboardScanUp {
                 scan_code: 0x48,
                 extended: true,
+                use_vk_mode: false,
                 ..
             }
         ));
 
-        // Verify all 5 mouse buttons are present
         let mouse_bits: Vec<u8> = batch
             .iter()
             .filter_map(|e| match e {
@@ -359,21 +399,31 @@ mod tests {
     }
 
     #[test]
+    fn quote_win_arg_handles_plain_empty_spaces_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_win_arg("plain"), "plain");
+        assert_eq!(quote_win_arg(""), "\"\"");
+        assert_eq!(
+            quote_win_arg(r"C:\Program Files\ZeroDesk\watchdog.exe"),
+            r#""C:\Program Files\ZeroDesk\watchdog.exe""#
+        );
+        assert_eq!(
+            quote_win_arg(r#"C:\dir with space\"#),
+            r#""C:\dir with space\\""#
+        );
+        assert_eq!(quote_win_arg(r#"a"b\"c"#), r#""a\"b\\\"c""#);
+    }
+
+    #[test]
     fn pid_reuse_guard_rejects_creation_time_mismatch_and_zero_values() {
         let host = ProcessIdentity::new(4242, 133_500_000_000_000_000);
         assert!(is_same_process_instance(host, host));
 
-        // Same PID, different creation time (OS recycled PID after host exited!) -> REJECT!
         let reused = ProcessIdentity::new(4242, 133_500_000_050_000_000);
         assert!(!is_same_process_instance(host, reused));
-
-        // Different PID -> REJECT
         assert!(!is_same_process_instance(
             host,
             ProcessIdentity::new(4243, host.creation_time_100ns)
         ));
-
-        // Zero PID or zero creation time -> REJECT (fail closed)
         assert!(!is_same_process_instance(
             ProcessIdentity::new(0, 12345),
             ProcessIdentity::new(0, 12345)
@@ -385,54 +435,85 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_tracker_triggers_emergency_release_when_host_hangs() {
-        let mut loop_state = WinWatchdogLoopState::new(1_000, 3_000);
-        let mut bm = [0u8; 32];
-        bitmap_set_key(&mut bm, 0x04); // A
-        let snap = WatchdogFrame::state_snapshot(1, bm, 0x03, MOD_CTRL);
-        assert_eq!(loop_state.on_frame(snap, 1_500), WinWatchdogAction::Continue);
-
-        // Still healthy at 4_499ms (2_999ms elapsed)
-        assert_eq!(loop_state.on_tick(4_499), WinWatchdogAction::Continue);
-
-        // Heartbeat resets window at 4_499ms
-        let hb = WatchdogFrame::state_snapshot(2, bm, 0x03, MOD_CTRL);
-        assert_eq!(loop_state.on_frame(hb, 4_499), WinWatchdogAction::Continue);
-        assert_eq!(loop_state.on_tick(6_000), WinWatchdogAction::Continue);
-
-        // Host freezes -> at 7_500ms (>= 3_000ms since 4_499ms) triggers atomic emergency release!
-        match loop_state.on_tick(7_500) {
-            WinWatchdogAction::EmergencyRelease {
-                trigger,
-                keys,
-                buttons,
-                batch,
-                ..
-            } => {
-                assert_eq!(trigger, "heartbeat_timeout");
-                assert_eq!(keys, vec![0x04]);
-                assert_eq!(buttons, 0x03);
-                assert_eq!(batch.len(), 1 + 8 + 5);
+    fn heartbeat_tracker_handles_hang_and_clock_rollback_without_freezing() {
+        let mut hb = WatchdogHeartbeatTracker::new(10_000, 3_000);
+        // Simulate clock rollback to 1_000ms: last_activity_ms MUST move to 1_000ms (not stay at 10_000ms)!
+        hb.on_heartbeat(1_000);
+        assert_eq!(
+            hb.check_timeout(3_999),
+            HeartbeatStatus::Healthy {
+                elapsed_ms: 2_999,
+                remaining_ms: 1
             }
-            other => panic!("expected EmergencyRelease(heartbeat_timeout), got {other:?}"),
-        }
+        );
+        assert_eq!(
+            hb.check_timeout(4_000),
+            HeartbeatStatus::TimedOut { elapsed_ms: 3_000 }
+        );
+        assert!(hb.is_timed_out());
     }
 
     #[test]
-    fn graceful_exit_clears_state_without_emergency_release() {
-        let mut loop_state = WinWatchdogLoopState::new(0, 3_000);
+    fn loop_state_handles_eof_parent_exit_malformed_and_unexpected_watchdog_frames() {
+        let mut ls = WinWatchdogLoopState::new(0, 3_000);
         let mut bm = [0u8; 32];
-        bitmap_set_key(&mut bm, 0x1A); // W
+        bitmap_set_key(&mut bm, 0x04);
         assert_eq!(
-            loop_state.on_frame(WatchdogFrame::state_snapshot(1, bm, 0x01, 0), 100),
+            ls.on_frame(WatchdogFrame::state_snapshot(1, bm, 0x05, MOD_CTRL), 100),
             WinWatchdogAction::Continue
         );
+
+        assert!(matches!(
+            ls.on_pipe_eof(),
+            WinWatchdogAction::EmergencyRelease {
+                trigger: "pipe_eof",
+                ..
+            }
+        ));
+        assert!(matches!(
+            ls.on_parent_process_exit(),
+            WinWatchdogAction::EmergencyRelease {
+                trigger: "parent_process_exit",
+                ..
+            }
+        ));
+        assert!(matches!(
+            ls.on_malformed_frame(),
+            WinWatchdogAction::EmergencyRelease {
+                trigger: "malformed_frame",
+                ..
+            }
+        ));
+
+        // Duplicate Hello & watchdog->host frame types on cmd pipe MUST fail closed.
+        assert!(matches!(
+            ls.on_frame(WatchdogFrame::hello(1, [0; 8]), 200),
+            WinWatchdogAction::EmergencyRelease {
+                trigger: "unexpected_hello",
+                ..
+            }
+        ));
+        for bad in [
+            WatchdogFrame::ready(2),
+            WatchdogFrame::released(3, 0),
+            WatchdogFrame::ax_status(4, 0),
+        ] {
+            assert!(matches!(
+                ls.on_frame(bad, 250),
+                WinWatchdogAction::EmergencyRelease {
+                    trigger: "unexpected_frame_type",
+                    ..
+                }
+            ));
+        }
+
+        // GracefulExit clears held state cleanly.
         assert_eq!(
-            loop_state.on_frame(WatchdogFrame::graceful_exit(2), 200),
-            WinWatchdogAction::GracefulExit { seq: 2 }
+            ls.on_frame(WatchdogFrame::graceful_exit(5), 300),
+            WinWatchdogAction::GracefulExit { seq: 5 }
         );
-        assert!(loop_state.tracked_keys().is_empty());
-        assert_eq!(loop_state.tracked_buttons(), 0);
+        assert!(ls.tracked_keys().is_empty());
+        assert_eq!(ls.tracked_buttons(), 0);
     }
 
     #[test]

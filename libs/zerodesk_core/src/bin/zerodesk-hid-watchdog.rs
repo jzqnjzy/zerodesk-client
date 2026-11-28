@@ -937,14 +937,17 @@ mod windows_impl {
     use super::*;
     use std::{
         fs,
-        sync::mpsc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc,
+        },
         thread,
     };
     use windows::Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         Storage::FileSystem::{ReadFile, WriteFile},
         System::Threading::{
-            CreateEventW, OpenProcess, SetEvent, WaitForMultipleObjects,
+            CreateEventW, OpenProcess, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         },
     };
@@ -957,10 +960,13 @@ mod windows_impl {
         },
     };
 
+    const WAIT_OBJECT_PIPE: u32 = WAIT_OBJECT_0.0 + 1;
+    const PARENT_EXIT_PIPE_DRAIN_MS: u32 = 50;
+
     struct WinWatchdogArgs {
         parent_pid: u32,
         parent_creation_time_100ns: u64,
-        nonce: [u8; 8],
+        expected_nonce: Option<[u8; 8]>,
         cmd_handle: usize,
         ack_handle: usize,
         heartbeat_timeout_ms: u64,
@@ -971,7 +977,7 @@ mod windows_impl {
     fn parse_win_args(args: &[String]) -> Result<WinWatchdogArgs, String> {
         let mut parent_pid: Option<u32> = None;
         let mut parent_creation_time_100ns: Option<u64> = None;
-        let mut nonce: Option<[u8; 8]> = None;
+        let mut expected_nonce: Option<[u8; 8]> = None;
         let mut cmd_handle: Option<usize> = None;
         let mut ack_handle: Option<usize> = None;
         let mut heartbeat_timeout_ms = DEFAULT_WIN_HEARTBEAT_TIMEOUT_MS;
@@ -1010,6 +1016,7 @@ mod windows_impl {
                     parent_creation_time_100ns = Some(ct);
                 }
                 "--nonce-hex" => {
+                    // Optional backward-compat flag; default supervisor sends nonce strictly over pipe Hello.
                     let raw = next_val(&mut i, "--nonce-hex")?;
                     let bytes = hex::decode(&raw).map_err(|_| "invalid --nonce-hex".to_string())?;
                     if bytes.len() != 8 {
@@ -1017,7 +1024,7 @@ mod windows_impl {
                     }
                     let mut arr = [0u8; 8];
                     arr.copy_from_slice(&bytes);
-                    nonce = Some(arr);
+                    expected_nonce = Some(arr);
                 }
                 "--cmd-handle" => {
                     let raw = next_val(&mut i, "--cmd-handle")?;
@@ -1068,7 +1075,7 @@ mod windows_impl {
             parent_pid: parent_pid.ok_or_else(|| "missing --parent-pid".to_string())?,
             parent_creation_time_100ns: parent_creation_time_100ns
                 .ok_or_else(|| "missing --parent-creation-time".to_string())?,
-            nonce: nonce.ok_or_else(|| "missing --nonce-hex".to_string())?,
+            expected_nonce,
             cmd_handle,
             ack_handle,
             heartbeat_timeout_ms,
@@ -1188,13 +1195,31 @@ mod windows_impl {
         release_ok
     }
 
+    fn drain_pipe_events(
+        rx: &mpsc::Receiver<PipeEvent>,
+        loop_state: &mut WinWatchdogLoopState,
+        now_ms: u64,
+    ) -> WinWatchdogAction {
+        while let Ok(ev) = rx.try_recv() {
+            let action = match ev {
+                PipeEvent::Frame(frame) => loop_state.on_frame(frame, now_ms),
+                PipeEvent::Malformed => loop_state.on_malformed_frame(),
+                PipeEvent::Eof => loop_state.on_pipe_eof(),
+            };
+            if !matches!(action, WinWatchdogAction::Continue) {
+                return action;
+            }
+        }
+        WinWatchdogAction::Continue
+    }
+
     pub fn run(raw_args: &[String]) -> ExitCode {
         let args = match parse_win_args(raw_args) {
             Ok(a) => a,
             Err(_) => return ExitCode::from(2),
         };
-        let cmd_handle = HANDLE(args.cmd_handle as isize);
-        let ack_handle = HANDLE(args.ack_handle as isize);
+        let cmd_guard = HandleGuard(HANDLE(args.cmd_handle as isize));
+        let ack_guard = HandleGuard(HANDLE(args.ack_handle as isize));
 
         // 1. Validate optional real-input permit.
         let mut ready_flags = 0u8;
@@ -1231,13 +1256,21 @@ mod windows_impl {
             return ExitCode::FAILURE;
         }
 
-        // 3. Handshake: read Hello and verify (parent_pid, nonce).
-        let hello = match read_exact_frame(cmd_handle) {
+        // 3. Handshake: read Hello from pipe and verify parent_pid (plus optional expected_nonce).
+        let hello = match read_exact_frame(cmd_guard.0) {
             Ok(f) => f,
             Err(_) => return ExitCode::FAILURE,
         };
-        if hello.parse_hello() != Some((args.parent_pid, args.nonce)) {
+        let Some((hello_pid, hello_nonce)) = hello.parse_hello() else {
             return ExitCode::FAILURE;
+        };
+        if hello_pid != args.parent_pid {
+            return ExitCode::FAILURE;
+        }
+        if let Some(exp_nonce) = args.expected_nonce {
+            if hello_nonce != exp_nonce {
+                return ExitCode::FAILURE;
+            }
         }
 
         // 4. Create wakeup event and pipe reader thread so WaitForMultipleObjects monitors
@@ -1248,32 +1281,41 @@ mod windows_impl {
         let pipe_event = HandleGuard(pipe_event_raw);
 
         let ready = WatchdogFrame::ready_with_flags(0, ready_flags).encode();
-        write_best_effort(ack_handle, &ready);
+        write_best_effort(ack_guard.0, &ready);
 
         let (tx, rx) = mpsc::channel::<PipeEvent>();
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let reader_done_bg = Arc::clone(&reader_done);
         let cmd_raw = args.cmd_handle;
         let ev_raw = pipe_event.0 .0 as usize;
-        let _reader = thread::spawn(move || {
-            let h_cmd = HANDLE(cmd_raw as isize);
-            let h_ev = HANDLE(ev_raw as isize);
-            loop {
-                match read_exact_frame(h_cmd) {
-                    Ok(frame) => {
-                        let _ = tx.send(PipeEvent::Frame(frame));
-                        unsafe {
-                            let _ = SetEvent(h_ev);
+        if thread::Builder::new()
+            .name("zd-win-wd-reader".into())
+            .spawn(move || {
+                let h_cmd = HANDLE(cmd_raw as isize);
+                let h_ev = HANDLE(ev_raw as isize);
+                loop {
+                    match read_exact_frame(h_cmd) {
+                        Ok(frame) => {
+                            let _ = tx.send(PipeEvent::Frame(frame));
+                            unsafe {
+                                let _ = SetEvent(h_ev);
+                            }
                         }
-                    }
-                    Err(ev) => {
-                        let _ = tx.send(ev);
-                        unsafe {
-                            let _ = SetEvent(h_ev);
+                        Err(ev) => {
+                            let _ = tx.send(ev);
+                            reader_done_bg.store(true, Ordering::Release);
+                            unsafe {
+                                let _ = SetEvent(h_ev);
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
-            }
-        });
+            })
+            .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
 
         let boot = Instant::now();
         let mut loop_state = WinWatchdogLoopState::new(0, args.heartbeat_timeout_ms);
@@ -1291,23 +1333,30 @@ mod windows_impl {
 
             // Always drain pending pipe frames first so a GracefulExit sent right before
             // parent exit is never misclassified as a crash.
-            let mut action = WinWatchdogAction::Continue;
-            while let Ok(ev) = rx.try_recv() {
-                action = match ev {
-                    PipeEvent::Frame(frame) => loop_state.on_frame(frame, now_ms),
-                    PipeEvent::Malformed => loop_state.on_malformed_frame(),
-                    PipeEvent::Eof => loop_state.on_pipe_eof(),
-                };
-                if !matches!(action, WinWatchdogAction::Continue) {
-                    break;
-                }
-            }
+            let mut action = drain_pipe_events(&rx, &mut loop_state, now_ms);
 
             if matches!(action, WinWatchdogAction::Continue) {
                 if wait == WAIT_OBJECT_0 {
-                    action = loop_state.on_parent_process_exit();
+                    // Parent exited: wait briefly (<= 50ms) for the reader thread to finish
+                    // draining any final GracefulExit or StateSnapshot before deciding.
+                    if !reader_done.load(Ordering::Acquire) {
+                        unsafe {
+                            let _ = WaitForSingleObject(pipe_event.0, PARENT_EXIT_PIPE_DRAIN_MS);
+                        }
+                    }
+                    let post_now = boot.elapsed().as_millis() as u64;
+                    action = drain_pipe_events(&rx, &mut loop_state, post_now);
+                    if matches!(action, WinWatchdogAction::Continue) {
+                        action = loop_state.on_parent_process_exit();
+                    }
+                } else if wait.0 == WAIT_OBJECT_PIPE {
+                    // Always enforce heartbeat deadline on every iteration even under wakeups.
+                    action = loop_state.on_tick(now_ms);
                 } else if wait == WAIT_TIMEOUT {
                     action = loop_state.on_tick(now_ms);
+                } else {
+                    // WAIT_FAILED or unexpected return: fail closed immediately (never spin!).
+                    action = loop_state.on_parent_process_exit();
                 }
             }
 
@@ -1316,7 +1365,7 @@ mod windows_impl {
                 WinWatchdogAction::GracefulExit { seq } => {
                     let ack =
                         WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL).encode();
-                    write_best_effort(ack_handle, &ack);
+                    write_best_effort(ack_guard.0, &ack);
                     return ExitCode::SUCCESS;
                 }
                 WinWatchdogAction::EmergencyRelease {
@@ -1336,7 +1385,7 @@ mod windows_impl {
                         },
                         &args,
                         real_permit.as_ref(),
-                        ack_handle,
+                        ack_guard.0,
                     );
                     return if ok {
                         ExitCode::SUCCESS

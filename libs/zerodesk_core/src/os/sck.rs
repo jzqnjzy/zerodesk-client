@@ -8,10 +8,6 @@
 //! (`ingest_sck_bgra_frame` / `SckVideoSlot`), and staleness checks are compiled on all
 //! platforms and 100% unit-testable without OS permissions or display hardware.
 
-#[cfg(any(all(target_os = "macos", feature = "os-sck"), test))]
-use super::audio::{create_spsc_audio_ring, OS_AUDIO_FRAME_SAMPLES};
-#[cfg(all(target_os = "macos", feature = "os-sck"))]
-use super::{audio::SpscAudioConsumer, OsAudioCapture, OsScreenCapture};
 use super::{
     audio::{SpscAudioProducer, OS_AUDIO_CHANNELS, OS_AUDIO_SAMPLE_RATE},
     capture::convert_captured_stride_to_i420,
@@ -21,8 +17,6 @@ use crate::{
     frame::{checked_frame_byte_len, PixelFormat},
     session::video::I420Frame,
 };
-#[cfg(all(target_os = "macos", feature = "os-sck"))]
-use std::sync::Arc;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -475,10 +469,14 @@ pub fn preflight_sck_permission() -> Result<bool, OsError> {
 #[cfg(all(target_os = "macos", feature = "os-sck"))]
 mod macos_sck_impl {
     use super::*;
+    use crate::os::{
+        audio::{create_spsc_audio_ring, SpscAudioConsumer, OS_AUDIO_FRAME_SAMPLES},
+        OsAudioCapture, OsScreenCapture,
+    };
     use std::{
         cell::UnsafeCell,
         ffi::{c_char, c_void, CStr},
-        sync::atomic::AtomicBool,
+        sync::{atomic::AtomicBool, Arc},
     };
 
     const ZD_SCK_OK: i32 = 0;
@@ -1003,6 +1001,7 @@ pub fn open_sck_capture(cfg: SckCaptureConfig) -> Result<OsCapturePair, OsError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::os::audio::{create_spsc_audio_ring, OS_AUDIO_FRAME_SAMPLES};
 
     fn f32_slice_to_le_bytes(samples: &[f32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(samples.len() * 4);

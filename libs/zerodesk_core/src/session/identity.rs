@@ -30,10 +30,10 @@ const PERSISTED_IDENTITY_VERSION: u32 = 1;
 const PERSISTED_POLICY_VERSION_SCHEMA: u32 = 1;
 pub const POLICY_VERSION_FILE_NAME: &str = "policy_version_v2.json";
 
-/// Cross-process exclusive advisory lock (`flock(LOCK_EX)`) on `identity_dir/.lock` (0600,
-/// `O_NOFOLLOW`, `uid == geteuid()`). Never held across `.await`.
+/// Cross-process exclusive lock (`flock(LOCK_EX)` on Unix, `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`
+/// on Windows) on `identity_dir/.lock`. Never held across `.await`.
 struct IdentityDirLock {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     file: File,
 }
 
@@ -90,10 +90,45 @@ impl IdentityDirLock {
             }
             Ok(Self { file })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Phase 4A targets Unix (macOS/Linux); Windows cross-process LockFileEx enforcement
-            // is required before Windows production release.
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{
+                Foundation::HANDLE,
+                Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK},
+                System::IO::OVERLAPPED,
+            };
+            let lock_path = identity_dir.join(IDENTITY_LOCK_FILE_NAME);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|e| {
+                    IdentityStoreError::Storage(format!("open lock '{}': {e}", lock_path.display()))
+                })?;
+            let mut overlapped = OVERLAPPED::default();
+            unsafe {
+                LockFileEx(
+                    HANDLE(file.as_raw_handle() as isize),
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            }
+            .map_err(|e| {
+                IdentityStoreError::Storage(format!(
+                    "LockFileEx(LOCKFILE_EXCLUSIVE_LOCK) '{}': {e}",
+                    lock_path.display()
+                ))
+            })?;
+            Ok(Self { file })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             let _ = (File::open::<&Path>, OpenOptions::new, IDENTITY_LOCK_FILE_NAME);
             Ok(Self {})
         }
@@ -106,6 +141,26 @@ impl Drop for IdentityDirLock {
         use std::os::unix::io::AsRawFd;
         unsafe {
             let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for IdentityDirLock {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE, Storage::FileSystem::UnlockFileEx, System::IO::OVERLAPPED,
+        };
+        let mut overlapped = OVERLAPPED::default();
+        unsafe {
+            let _ = UnlockFileEx(
+                HANDLE(self.file.as_raw_handle() as isize),
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            );
         }
     }
 }

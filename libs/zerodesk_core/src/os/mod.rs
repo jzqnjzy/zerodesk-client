@@ -11,25 +11,22 @@ pub mod traits;
 pub mod watchdog_proto;
 pub mod watchdog_supervisor;
 pub mod win_diag;
-#[cfg(windows)]
 pub mod win_dxgi;
 pub mod win_dxgi_logic;
 pub mod win_hid_keymap;
-#[cfg(windows)]
 pub mod win_input;
-#[cfg(windows)]
 pub mod win_mf;
 pub mod win_mf_logic;
-#[cfg(windows)]
 pub mod win_watchdog;
 pub mod win_watchdog_logic;
 
 pub use traits::{
-    CaptureError, CapturedFrame, CapturedSurface, CursorMetadata, CursorShapeKind,
-    D3d11SurfaceFormat, HardwareCodec, HardwareCodecEvent, HardwareCodecKind, HardwareCodecState,
-    HardwareEncodedPacket, HardwareVideoDecoder, HardwareVideoEncoder, HidWatchdogBackend,
-    InputPrivilegeStatus, MacVtHardwareDecoder, MacVtHardwareEncoder, OsHidSinkInjector,
-    OsInputInjector, OsScreenCaptureAdapter, ScreenCapturer, UnixHidWatchdogBackend,
+    check_release_report, CaptureError, CapturedFrame, CapturedSurface, CodecLifecycle,
+    CursorMetadata, CursorShapeKind, D3d11SharedFrame, D3d11SurfaceFormat, HardwareCodec,
+    HardwareCodecEvent, HardwareCodecKind, HardwareCodecState, HardwareEncodedPacket,
+    HardwareVideoDecoder, HardwareVideoEncoder, HidWatchdogBackend, InputPrivilegeStatus,
+    MacVtHardwareDecoder, MacVtHardwareEncoder, OsHidSinkInjector, OsInputInjector,
+    OsScreenCaptureAdapter, ScreenCapturer, UnixHidWatchdogBackend,
     HW_DECODER_FAILED_RENEGOTIATE_EVENT, HW_ENCODER_FAILED_RENEGOTIATE_EVENT,
 };
 

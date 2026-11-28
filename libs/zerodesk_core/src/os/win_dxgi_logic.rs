@@ -2,8 +2,8 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 //! Platform-agnostic Windows DXGI Desktop Duplication state machine, 3-class
-//! HRESULT classifier, multi-monitor / LUID selection, cursor tracking, and
-//! dirty/move rect utilities.
+//! HRESULT classifier, multi-monitor / LUID selection, rotation helpers, cursor
+//! tracking, and dirty/move rect utilities.
 //!
 //! Compiled and unit-tested on ALL platforms (including macOS) without any
 //! Windows SDK dependency.
@@ -55,6 +55,31 @@ pub fn classify_dxgi_hresult(hr: i32) -> DxgiAction {
             DxgiAction::PauseAndWaitDesktop
         }
         other => DxgiAction::Fatal(other),
+    }
+}
+
+/// Computes effective desktop `(width, height)` after applying DXGI output
+/// rotation (`0`, `90`, `180`, `270` degrees clockwise).
+pub const fn rotated_dims(width: u32, height: u32, rotation_degrees: u16) -> (u32, u32) {
+    match rotation_degrees % 360 {
+        90 | 270 => (height, width),
+        _ => (width, height),
+    }
+}
+
+/// Maps a point `(x, y)` in unrotated surface coordinates `(width, height)` to
+/// rotated desktop coordinates according to DXGI rotation (`0`, `90`, `180`, `270`).
+pub fn rotate_point(x: i32, y: i32, width: u32, height: u32, rotation_degrees: u16) -> (i32, i32) {
+    let w = i32::try_from(width).unwrap_or(i32::MAX);
+    let h = i32::try_from(height).unwrap_or(i32::MAX);
+    match rotation_degrees % 360 {
+        90 => (h.saturating_sub(1).saturating_sub(y), x),
+        180 => (
+            w.saturating_sub(1).saturating_sub(x),
+            h.saturating_sub(1).saturating_sub(y),
+        ),
+        270 => (y, w.saturating_sub(1).saturating_sub(x)),
+        _ => (x, y),
     }
 }
 
@@ -207,11 +232,11 @@ impl CursorState {
 
     pub fn update_shape(&mut self, update: CursorShapeUpdate) -> Result<(), CaptureError> {
         let kind = parse_dxgi_cursor_shape_type(update.raw_shape_type)?;
-        let expected_min =
-            expected_cursor_shape_min_bytes(kind, update.width, update.height, update.pitch)?;
-        if update.bytes.len() < expected_min {
+        let required =
+            expected_cursor_shape_bytes(kind, update.width, update.height, update.pitch)?;
+        if update.bytes.len() != required {
             return Err(CaptureError::Fatal(format!(
-                "DXGI cursor shape buffer len {} < expected minimum {expected_min}",
+                "DXGI cursor shape buffer len {} != required {required} for {kind:?}",
                 update.bytes.len()
             )));
         }
@@ -256,7 +281,12 @@ pub fn parse_dxgi_cursor_shape_type(raw: u32) -> Result<CursorShapeKind, Capture
     }
 }
 
-pub fn expected_cursor_shape_min_bytes(
+/// Computes exact required DXGI pointer shape buffer size in bytes.
+///
+/// For `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME`, the buffer holds BOTH the
+/// AND mask and XOR mask (`2 * pitch * height`); for `Color` and `MaskedColor`,
+/// it holds `pitch * height`.
+pub fn expected_cursor_shape_bytes(
     kind: CursorShapeKind,
     width: u32,
     height: u32,
@@ -278,10 +308,15 @@ pub fn expected_cursor_shape_min_bytes(
             "DXGI cursor pitch {pitch} < minimum {min_pitch} for {kind:?}"
         )));
     }
-    // Monochrome DXGI cursors store AND mask + XOR mask stacked vertically (height already reflects 2*actual_h).
-    (pitch as usize)
+    let plane_bytes = (pitch as usize)
         .checked_mul(height as usize)
-        .ok_or_else(|| CaptureError::Fatal("cursor buffer size overflow".into()))
+        .ok_or_else(|| CaptureError::Fatal("cursor buffer size overflow".into()))?;
+    match kind {
+        CursorShapeKind::Monochrome => plane_bytes
+            .checked_mul(2)
+            .ok_or_else(|| CaptureError::Fatal("monochrome cursor buffer size overflow".into())),
+        CursorShapeKind::Color | CursorShapeKind::MaskedColor => Ok(plane_bytes),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,11 +333,11 @@ impl DxgiDirtyRect {
     }
 
     pub fn width(&self) -> u32 {
-        (self.right - self.left).max(0) as u32
+        self.right.saturating_sub(self.left).max(0) as u32
     }
 
     pub fn height(&self) -> u32 {
-        (self.bottom - self.top).max(0) as u32
+        self.bottom.saturating_sub(self.top).max(0) as u32
     }
 
     pub fn clamp_to_bounds(&self, frame_width: u32, frame_height: u32) -> Option<Self> {
@@ -325,8 +360,22 @@ pub struct DxgiMoveRect {
     pub dst: DxgiDirtyRect,
 }
 
-/// Computes the union bounding box of all valid dirty rects and move-rect destinations,
-/// clamped to `frame_width x frame_height`.
+impl DxgiMoveRect {
+    /// Returns the source rectangle corresponding to this move rect (`src_x..src_x+dst.width`).
+    pub fn src_rect(&self) -> DxgiDirtyRect {
+        let w = i32::try_from(self.dst.width()).unwrap_or(i32::MAX);
+        let h = i32::try_from(self.dst.height()).unwrap_or(i32::MAX);
+        DxgiDirtyRect {
+            left: self.src_x,
+            top: self.src_y,
+            right: self.src_x.saturating_add(w),
+            bottom: self.src_y.saturating_add(h),
+        }
+    }
+}
+
+/// Computes the union bounding box of all valid dirty rects and BOTH source and
+/// destination rectangles of all move rects, clamped to `frame_width x frame_height`.
 pub fn merge_damage_bounding_box(
     dirty_rects: &[DxgiDirtyRect],
     move_rects: &[DxgiMoveRect],
@@ -337,7 +386,7 @@ pub fn merge_damage_bounding_box(
     let all_rects = dirty_rects
         .iter()
         .copied()
-        .chain(move_rects.iter().map(|m| m.dst));
+        .chain(move_rects.iter().flat_map(|m| [m.src_rect(), m.dst]));
     for rect in all_rects {
         let Some(clamped) = rect.clamp_to_bounds(frame_width, frame_height) else {
             continue;
@@ -361,6 +410,7 @@ pub struct DxgiCaptureStateMachine {
     phase: DxgiCapturePhase,
     outputs: Vec<DxgiOutputDescriptor>,
     active_monitor_index: u32,
+    active_output_identity: Option<(String, DxgiAdapterLuid)>,
     active_adapter_luid: Option<DxgiAdapterLuid>,
     cursor: CursorState,
     consecutive_timeouts: u64,
@@ -382,6 +432,7 @@ impl DxgiCaptureStateMachine {
             phase: DxgiCapturePhase::Active,
             outputs: Vec::new(),
             active_monitor_index: 0,
+            active_output_identity: None,
             active_adapter_luid: None,
             cursor: CursorState::default(),
             consecutive_timeouts: 0,
@@ -410,6 +461,21 @@ impl DxgiCaptureStateMachine {
         &self.phase
     }
 
+    pub fn is_failed(&self) -> bool {
+        matches!(self.phase, DxgiCapturePhase::Failed { .. })
+    }
+
+    /// Explicitly resets a terminal `Failed` state machine back to `Recreating`
+    /// so caller-driven recovery can attempt fresh duplication initialization.
+    pub fn reset(&mut self) {
+        self.phase = DxgiCapturePhase::Recreating {
+            backoff_ms: 0,
+            attempt: 1,
+        };
+        self.consecutive_timeouts = 0;
+        self.cursor = CursorState::default();
+    }
+
     pub fn outputs(&self) -> &[DxgiOutputDescriptor] {
         &self.outputs
     }
@@ -434,23 +500,49 @@ impl DxgiCaptureStateMachine {
         &mut self.cursor
     }
 
+    /// Updates the enumerated DXGI outputs list after initial discovery or monitor
+    /// hotplug, tracking the previously selected output by stable `(device_name, adapter_luid)`
+    /// first, then falling back to `monitor_index`, primary output, or first output.
+    /// Resets `CursorState` whenever the resolved active output identity changes.
     pub fn set_outputs(&mut self, outputs: Vec<DxgiOutputDescriptor>) {
+        let prev_identity = self.active_output_identity.clone();
         self.outputs = outputs;
-        if let Some(out) = self
-            .outputs
-            .iter()
-            .find(|o| o.monitor_index == self.active_monitor_index)
+        let matched = self
+            .active_output_identity
+            .as_ref()
+            .and_then(|(dev, luid)| {
+                self.outputs
+                    .iter()
+                    .find(|o| &o.device_name == dev && o.adapter_luid == *luid)
+            })
+            .or_else(|| {
+                self.outputs
+                    .iter()
+                    .find(|o| o.monitor_index == self.active_monitor_index)
+            })
             .or_else(|| self.outputs.iter().find(|o| o.is_primary))
-            .or_else(|| self.outputs.first())
-        {
+            .or_else(|| self.outputs.first());
+
+        if let Some(out) = matched {
+            let new_identity = (out.device_name.clone(), out.adapter_luid);
+            let changed = prev_identity.as_ref() != Some(&new_identity);
             self.active_monitor_index = out.monitor_index;
             self.active_adapter_luid = Some(out.adapter_luid);
+            self.active_output_identity = Some(new_identity);
+            if changed {
+                self.cursor = CursorState::default();
+            }
         } else {
             self.active_adapter_luid = None;
+            self.active_output_identity = None;
+            self.cursor = CursorState::default();
         }
     }
 
-    pub fn select_monitor(&mut self, monitor_index: u32) -> Result<&DxgiOutputDescriptor, CaptureError> {
+    pub fn select_monitor(
+        &mut self,
+        monitor_index: u32,
+    ) -> Result<&DxgiOutputDescriptor, CaptureError> {
         let Some(pos) = self
             .outputs
             .iter()
@@ -461,20 +553,37 @@ impl DxgiCaptureStateMachine {
                 self.outputs.len()
             )));
         };
-        let switched = self.active_monitor_index != monitor_index;
+        let new_identity = (
+            self.outputs[pos].device_name.clone(),
+            self.outputs[pos].adapter_luid,
+        );
+        let switched = self.active_output_identity.as_ref() != Some(&new_identity);
         self.active_monitor_index = monitor_index;
         self.active_adapter_luid = Some(self.outputs[pos].adapter_luid);
+        self.active_output_identity = Some(new_identity);
         if switched {
-            self.phase = DxgiCapturePhase::Recreating {
-                backoff_ms: 0,
-                attempt: 1,
-            };
+            self.cursor = CursorState::default();
+            if !self.is_failed() {
+                self.phase = DxgiCapturePhase::Recreating {
+                    backoff_ms: 0,
+                    attempt: 1,
+                };
+            }
             self.consecutive_timeouts = 0;
         }
         Ok(&self.outputs[pos])
     }
 
     pub fn active_output(&self) -> Option<&DxgiOutputDescriptor> {
+        if let Some((dev, luid)) = &self.active_output_identity {
+            if let Some(out) = self
+                .outputs
+                .iter()
+                .find(|o| &o.device_name == dev && o.adapter_luid == *luid)
+            {
+                return Some(out);
+            }
+        }
         self.outputs
             .iter()
             .find(|o| o.monitor_index == self.active_monitor_index)
@@ -488,13 +597,29 @@ impl DxgiCaptureStateMachine {
             .min(self.max_backoff_ms)
     }
 
+    fn terminal_failed_outcome(hresult: i32) -> DxgiTransitionOutcome {
+        DxgiTransitionOutcome::Failed {
+            hresult,
+            error: CaptureError::Fatal(format!(
+                "DXGI capturer is in terminal Failed state (hr={:#010x}); explicit reset() required",
+                hresult as u32
+            )),
+        }
+    }
+
     pub fn on_frame_acquired(&mut self) -> DxgiTransitionOutcome {
+        if let DxgiCapturePhase::Failed { hresult } = self.phase {
+            return Self::terminal_failed_outcome(hresult);
+        }
         self.phase = DxgiCapturePhase::Active;
         self.consecutive_timeouts = 0;
         DxgiTransitionOutcome::FrameReady
     }
 
     pub fn on_acquire_hresult(&mut self, hr: i32) -> DxgiTransitionOutcome {
+        if let DxgiCapturePhase::Failed { hresult } = self.phase {
+            return Self::terminal_failed_outcome(hresult);
+        }
         if hr == S_OK {
             return self.on_frame_acquired();
         }
@@ -556,18 +681,40 @@ impl DxgiCaptureStateMachine {
         }
     }
 
-    pub fn on_recreate_succeeded(&mut self) {
+    pub fn on_recreate_succeeded(&mut self) -> Result<(), CaptureError> {
+        if let DxgiCapturePhase::Failed { hresult } = self.phase {
+            return Err(CaptureError::Fatal(format!(
+                "cannot mark recreate succeeded from terminal Failed state (hr={:#010x}); call reset() first",
+                hresult as u32
+            )));
+        }
         self.phase = DxgiCapturePhase::Active;
         self.consecutive_timeouts = 0;
+        Ok(())
     }
 
     pub fn on_recreate_failed(&mut self, hr: i32) -> DxgiTransitionOutcome {
         self.on_acquire_hresult(hr)
     }
 
-    pub fn on_desktop_resumed(&mut self) {
-        self.phase = DxgiCapturePhase::Active;
-        self.consecutive_timeouts = 0;
+    /// Transitions `DesktopPaused` -> `Recreating { backoff_ms: 0, attempt: 1 }`
+    /// so caller MUST recreate `IDXGIOutputDuplication` and call `on_recreate_succeeded()`
+    /// before resuming `Active` capture (never reuses an invalidated duplication!).
+    pub fn on_desktop_resumed(&mut self) -> Result<(), CaptureError> {
+        if let DxgiCapturePhase::Failed { hresult } = self.phase {
+            return Err(CaptureError::Fatal(format!(
+                "cannot resume desktop from terminal Failed state (hr={:#010x}); call reset() first",
+                hresult as u32
+            )));
+        }
+        if matches!(self.phase, DxgiCapturePhase::DesktopPaused { .. }) {
+            self.phase = DxgiCapturePhase::Recreating {
+                backoff_ms: 0,
+                attempt: 1,
+            };
+            self.consecutive_timeouts = 0;
+        }
+        Ok(())
     }
 }
 
@@ -639,15 +786,17 @@ mod tests {
             );
         }
         let unexpected = 0x8000_FFFFu32 as i32;
-        assert_eq!(classify_dxgi_hresult(unexpected), DxgiAction::Fatal(unexpected));
+        assert_eq!(
+            classify_dxgi_hresult(unexpected),
+            DxgiAction::Fatal(unexpected)
+        );
     }
 
     #[test]
-    fn state_machine_backoff_recreate_pause_and_exhaustion() {
+    fn state_machine_backoff_terminal_failed_and_desktop_resume_recreate() {
         let mut sm = DxgiCaptureStateMachine::new().with_backoff_policy(50, 200, 500, 3);
         assert_eq!(sm.phase(), &DxgiCapturePhase::Active);
 
-        // Normal timeout does not leave Active
         assert_eq!(
             sm.on_acquire_hresult(DXGI_ERROR_WAIT_TIMEOUT),
             DxgiTransitionOutcome::TimeoutNoChange
@@ -655,7 +804,6 @@ mod tests {
         assert_eq!(sm.consecutive_timeouts(), 1);
         assert_eq!(sm.phase(), &DxgiCapturePhase::Active);
 
-        // Recreate exponential backoff: 50 -> 100 -> 200 -> Failed on 4th
         assert_eq!(
             sm.on_acquire_hresult(DXGI_ERROR_ACCESS_LOST),
             DxgiTransitionOutcome::ScheduleRecreate {
@@ -684,18 +832,30 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            sm.phase(),
-            &DxgiCapturePhase::Failed {
-                hresult: DXGI_ERROR_DEVICE_REMOVED
-            }
-        );
+        assert!(sm.is_failed());
 
-        // Recovery after recreate succeeds
-        sm.on_recreate_succeeded();
+        // Failed state is strictly terminal until explicit reset()!
+        assert!(matches!(
+            sm.on_frame_acquired(),
+            DxgiTransitionOutcome::Failed { .. }
+        ));
+        assert!(matches!(
+            sm.on_acquire_hresult(S_OK),
+            DxgiTransitionOutcome::Failed { .. }
+        ));
+        assert!(sm.on_recreate_succeeded().is_err());
+        assert!(sm.on_desktop_resumed().is_err());
+
+        // Explicit reset() enables recreate -> Active.
+        sm.reset();
+        assert!(matches!(
+            sm.phase(),
+            DxgiCapturePhase::Recreating { attempt: 1, .. }
+        ));
+        sm.on_recreate_succeeded().unwrap();
         assert_eq!(sm.phase(), &DxgiCapturePhase::Active);
 
-        // UAC / lock screen pause and clean resume
+        // UAC / lock screen pause -> on_desktop_resumed transitions to Recreating, NOT Active!
         assert_eq!(
             sm.on_acquire_hresult(DXGI_ERROR_SESSION_DISCONNECTED),
             DxgiTransitionOutcome::PauseDesktop {
@@ -703,39 +863,56 @@ mod tests {
                 retry_after_ms: 500
             }
         );
+        sm.on_desktop_resumed().unwrap();
         assert_eq!(
             sm.phase(),
-            &DxgiCapturePhase::DesktopPaused {
-                reason: DxgiPauseReason::SessionDisconnected,
-                retry_after_ms: 500
+            &DxgiCapturePhase::Recreating {
+                backoff_ms: 0,
+                attempt: 1
             }
         );
-        sm.on_desktop_resumed();
+        sm.on_recreate_succeeded().unwrap();
         assert_eq!(sm.phase(), &DxgiCapturePhase::Active);
     }
 
     #[test]
-    fn monitor_switching_tracks_adapter_luid_and_schedules_recreate() {
+    fn monitor_hotplug_tracks_stable_device_luid_and_resets_cursor_on_switch() {
         let mut sm = DxgiCaptureStateMachine::new();
         sm.set_outputs(sample_outputs());
+        sm.select_monitor(1).unwrap();
+        sm.cursor_mut().update_position(500, 600, true, 100);
+        assert_eq!(sm.cursor().x, 500);
+
+        // Hotplug reorders DISPLAY2 from monitor_index 1 -> monitor_index 0: stable (device_name, luid) stays selected!
+        let mut reordered = vec![sample_outputs()[1].clone(), sample_outputs()[0].clone()];
+        reordered[0].monitor_index = 0;
+        reordered[1].monitor_index = 1;
+        sm.set_outputs(reordered);
         assert_eq!(sm.active_monitor_index(), 0);
         assert_eq!(
-            sm.active_adapter_luid(),
-            Some(DxgiAdapterLuid::new(0x1111, 0))
+            sm.active_output().unwrap().device_name,
+            r"\\.\DISPLAY2"
         );
+        assert_eq!(sm.cursor().x, 500);
 
-        let selected = sm.select_monitor(1).unwrap();
-        assert_eq!(selected.device_name, r"\\.\DISPLAY2");
-        assert_eq!(
-            sm.active_adapter_luid(),
-            Some(DxgiAdapterLuid::new(0x2222, 1))
-        );
-        assert!(matches!(
-            sm.phase(),
-            DxgiCapturePhase::Recreating { attempt: 1, .. }
-        ));
-
+        // Switching to DISPLAY1 resets CursorState!
+        sm.select_monitor(1).unwrap();
+        assert_eq!(sm.cursor().x, 0);
+        assert_eq!(sm.cursor().last_mouse_update_time, 0);
         assert!(sm.select_monitor(99).is_err());
+    }
+
+    #[test]
+    fn rotation_helpers_transform_dims_and_points_accurately() {
+        assert_eq!(rotated_dims(1920, 1080, 0), (1920, 1080));
+        assert_eq!(rotated_dims(1920, 1080, 90), (1080, 1920));
+        assert_eq!(rotated_dims(1920, 1080, 180), (1920, 1080));
+        assert_eq!(rotated_dims(1920, 1080, 270), (1080, 1920));
+
+        assert_eq!(rotate_point(10, 20, 100, 50, 0), (10, 20));
+        assert_eq!(rotate_point(10, 20, 100, 50, 90), (29, 10));
+        assert_eq!(rotate_point(10, 20, 100, 50, 180), (89, 29));
+        assert_eq!(rotate_point(10, 20, 100, 50, 270), (20, 89));
     }
 
     #[test]
@@ -747,13 +924,13 @@ mod tests {
     }
 
     #[test]
-    fn cursor_state_updates_position_and_validates_shapes() {
+    fn cursor_state_updates_position_and_validates_monochrome_and_color_shapes() {
         let mut c = CursorState::default();
         assert!(!c.update_position(10, 20, true, 0));
         assert!(c.update_position(120, 240, true, 999));
         assert_eq!((c.x, c.y, c.visible), (120, 240, true));
 
-        // Valid 16x16 color cursor (pitch = 64, bytes = 1024)
+        // Valid 16x16 color cursor (pitch = 64, exact bytes = 1024)
         c.update_shape(CursorShapeUpdate {
             raw_shape_type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
             width: 16,
@@ -770,7 +947,18 @@ mod tests {
         assert_eq!(meta.hotspot_y, 3);
         assert_eq!(meta.shape_bytes.as_ref().map(Vec::len), Some(1024));
 
-        // Monochrome cursor (16x32 AND+XOR, pitch 2 -> 64 bytes)
+        // Monochrome cursor (16x32, pitch=2): MUST require 2 * pitch * height = 128 bytes (AND + XOR masks)!
+        assert!(c
+            .update_shape(CursorShapeUpdate {
+                raw_shape_type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
+                width: 16,
+                height: 32,
+                pitch: 2,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                bytes: vec![0x55; 64],
+            })
+            .is_err());
         c.update_shape(CursorShapeUpdate {
             raw_shape_type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
             width: 16,
@@ -778,12 +966,13 @@ mod tests {
             pitch: 2,
             hotspot_x: 0,
             hotspot_y: 0,
-            bytes: vec![0x55; 64],
+            bytes: vec![0x55; 128],
         })
         .unwrap();
         assert_eq!(c.shape_kind, Some(CursorShapeKind::Monochrome));
+        assert_eq!(c.shape_bytes.len(), 128);
 
-        // Truncated buffer rejected
+        // Truncated or oversized buffer rejected (strict len != required)
         assert!(c
             .update_shape(CursorShapeUpdate {
                 raw_shape_type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
@@ -793,6 +982,17 @@ mod tests {
                 hotspot_x: 0,
                 hotspot_y: 0,
                 bytes: vec![0; 100],
+            })
+            .is_err());
+        assert!(c
+            .update_shape(CursorShapeUpdate {
+                raw_shape_type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+                width: 16,
+                height: 16,
+                pitch: 64,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                bytes: vec![0; 2048],
             })
             .is_err());
         // Unknown shape type rejected
@@ -810,42 +1010,38 @@ mod tests {
     }
 
     #[test]
-    fn dirty_and_move_rect_bounding_box_clamps_and_merges() {
-        let dirty = [
-            DxgiDirtyRect {
-                left: -10,
-                top: 20,
-                right: 100,
-                bottom: 80,
-            },
-            DxgiDirtyRect {
-                left: 50,
-                top: 50,
-                right: 50,
-                bottom: 90,
-            }, // empty, ignored
-        ];
+    fn dirty_and_move_rect_unions_src_and_dst_and_avoids_i32_overflow() {
+        // Extreme coordinates must not panic on subtraction.
+        let extreme = DxgiDirtyRect {
+            left: i32::MIN,
+            top: i32::MIN,
+            right: i32::MAX,
+            bottom: i32::MAX,
+        };
+        assert_eq!(extreme.width(), i32::MAX as u32);
+        assert_eq!(extreme.height(), i32::MAX as u32);
+
+        // Move rect whose src=(10, 10, 60, 50) lies far from dst=(500, 400, 550, 440):
+        // bounding box MUST union BOTH src AND dst!
         let moves = [DxgiMoveRect {
-            src_x: 0,
-            src_y: 0,
+            src_x: 10,
+            src_y: 10,
             dst: DxgiDirtyRect {
-                left: 80,
-                top: 10,
-                right: 2500,
-                bottom: 1200,
+                left: 500,
+                top: 400,
+                right: 550,
+                bottom: 440,
             },
         }];
-        let merged = merge_damage_bounding_box(&dirty, &moves, 1920, 1080).unwrap();
+        let merged = merge_damage_bounding_box(&[], &moves, 1920, 1080).unwrap();
         assert_eq!(
             merged,
             DxgiDirtyRect {
-                left: 0,
+                left: 10,
                 top: 10,
-                right: 1920,
-                bottom: 1080
+                right: 550,
+                bottom: 440,
             }
         );
-        assert_eq!(merged.width(), 1920);
-        assert_eq!(merged.height(), 1070);
     }
 }
