@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const FAST_START_PROBE_BITRATE_KBPS: u32 = 1_500;
 /// Number of initial frames encoded at the lightweight probe bitrate.
 pub const FAST_START_PROBE_FRAMES: u32 = 3;
+/// Maximum duration (ms) to remain in `Probing` if feedback is delayed or lost.
+pub const FAST_START_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,7 +126,7 @@ impl FastStartController {
             self.phase = FastStartPhase::HandedOff;
             return FastStartDirective {
                 phase: self.phase,
-                force_idr: false,
+                force_idr: self.initial_idr_pending,
                 probe_bitrate_kbps: None,
                 handed_off_now: true,
             };
@@ -138,17 +140,50 @@ impl FastStartController {
         }
     }
 
+    /// Watchdog tick: hands off cleanly from `Probing` to `HandedOff` if feedback is delayed
+    /// past `FAST_START_TIMEOUT_MS` (2000ms) so bitrate is never stuck at the probe ceiling.
+    pub fn on_tick(&mut self, now_ms: u64) -> FastStartDirective {
+        if self.phase == FastStartPhase::Probing
+            && self
+                .connected_at_ms
+                .is_some_and(|c| now_ms.saturating_sub(c) >= FAST_START_TIMEOUT_MS)
+        {
+            self.phase = FastStartPhase::HandedOff;
+            return FastStartDirective {
+                phase: self.phase,
+                force_idr: self.initial_idr_pending,
+                probe_bitrate_kbps: None,
+                handed_off_now: true,
+            };
+        }
+        FastStartDirective {
+            phase: self.phase,
+            force_idr: self.initial_idr_pending,
+            probe_bitrate_kbps: if self.phase == FastStartPhase::Probing {
+                Some(self.probe_bitrate_kbps)
+            } else {
+                None
+            },
+            handed_off_now: false,
+        }
+    }
+
     /// Records receiver feedback arrival. Hands off smoothly to CC `Startup` once
-    /// the first 3 lightweight probe frames have launched.
+    /// the first 3 lightweight probe frames have launched (or if `FAST_START_TIMEOUT_MS` elapsed).
     pub fn on_feedback(&mut self, now_ms: u64) -> FastStartDirective {
         if self.first_feedback_at_ms.is_none() {
             self.first_feedback_at_ms = Some(now_ms);
         }
-        if self.phase == FastStartPhase::Probing && self.frames_encoded >= self.probe_frame_limit {
+        let timed_out = self
+            .connected_at_ms
+            .is_some_and(|c| now_ms.saturating_sub(c) >= FAST_START_TIMEOUT_MS);
+        if self.phase == FastStartPhase::Probing
+            && (self.frames_encoded >= self.probe_frame_limit || timed_out)
+        {
             self.phase = FastStartPhase::HandedOff;
             return FastStartDirective {
                 phase: self.phase,
-                force_idr: false,
+                force_idr: self.initial_idr_pending,
                 probe_bitrate_kbps: None,
                 handed_off_now: true,
             };
@@ -602,6 +637,24 @@ mod tests {
         assert_eq!(f3.phase, FastStartPhase::HandedOff);
         assert!(f3.handed_off_now);
         assert_eq!(f3.probe_bitrate_kbps, None);
+    }
+
+    #[test]
+    fn fast_start_timeout_watchdog_hands_off_after_2000ms_and_preserves_pending_idr() {
+        let mut fs = FastStartController::new();
+        fs.on_session_connected(500);
+        // No feedback and no IDR yet at +1999ms -> still Probing.
+        let t1 = fs.on_tick(500 + FAST_START_TIMEOUT_MS - 1);
+        assert_eq!(t1.phase, FastStartPhase::Probing);
+        assert!(!t1.handed_off_now);
+        assert!(t1.force_idr);
+
+        // At +2000ms -> hands off cleanly while keeping pending force_idr = true!
+        let t2 = fs.on_tick(500 + FAST_START_TIMEOUT_MS);
+        assert_eq!(t2.phase, FastStartPhase::HandedOff);
+        assert!(t2.handed_off_now);
+        assert_eq!(t2.probe_bitrate_kbps, None);
+        assert!(t2.force_idr);
     }
 
     #[test]

@@ -5,7 +5,10 @@
 //! and bounded-wait receiver reorder/recovery buffer.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+};
 
 /// Primitive polynomial for GF(2^8): `x^8 + x^4 + x^3 + x^2 + 1` (`0x11D`).
 pub const GF256_PRIMITIVE_POLY: u16 = 0x11D;
@@ -23,6 +26,8 @@ pub const FEC_WAIT_MIN_MS: u64 = 5;
 pub const FEC_WAIT_MAX_MS: u64 = 40;
 /// Maximum simultaneously tracked active FEC groups in `FecReorderBuffer`.
 pub const FEC_REORDER_MAX_GROUPS: usize = 64;
+/// Maximum retained extra-delay samples inside `FecReceiverStats` (bounded memory).
+pub const FEC_EXTRA_DELAY_MAX_SAMPLES: usize = 1_024;
 
 const fn build_gf256_tables() -> ([u8; 512], [u8; 256]) {
     let mut exp = [0u8; 512];
@@ -466,6 +471,7 @@ pub struct FecDecision {
 pub struct AdaptiveFecController {
     enabled: bool,
     redundancy_ratio: f64,
+    budget_ratio_cap: f64,
     last_loss_rate: f64,
     debounce_ms: u64,
     pending_target_enabled: Option<bool>,
@@ -489,6 +495,7 @@ impl AdaptiveFecController {
         Self {
             enabled: false,
             redundancy_ratio: 0.0,
+            budget_ratio_cap: FEC_MAX_REDUNDANCY_RATIO,
             last_loss_rate: 0.0,
             debounce_ms,
             pending_target_enabled: None,
@@ -504,6 +511,35 @@ impl AdaptiveFecController {
 
     pub fn redundancy_ratio(&self) -> f64 {
         self.redundancy_ratio
+    }
+
+    /// Effective redundancy ratio after applying any CC bitrate-floor budget cap.
+    pub fn effective_redundancy_ratio(&self) -> f64 {
+        if !self.enabled {
+            0.0
+        } else {
+            self.redundancy_ratio
+                .min(self.budget_ratio_cap)
+                .clamp(0.0, FEC_MAX_REDUNDANCY_RATIO)
+        }
+    }
+
+    /// Caps effective FEC redundancy to what actually fits inside `total_bitrate - media_bitrate`
+    /// (for example when media hits the 300 kbps protection floor).
+    pub fn set_budget_ratio_cap(&mut self, max_ratio: f64) {
+        self.budget_ratio_cap = if max_ratio.is_finite() {
+            max_ratio.clamp(0.0, FEC_MAX_REDUNDANCY_RATIO)
+        } else {
+            0.0
+        };
+    }
+
+    pub fn media_bytes_budget_acc(&self) -> u64 {
+        self.media_bytes_budget_acc
+    }
+
+    pub fn fec_bytes_budget_acc(&self) -> u64 {
+        self.fec_bytes_budget_acc
     }
 
     /// Maps an observed packet loss rate to the target redundancy ratio (when FEC is active).
@@ -522,9 +558,9 @@ impl AdaptiveFecController {
             let t = ((loss - 0.03) / 0.015).clamp(0.0, 1.0);
             (0.10 + 0.05 * t).min(0.15)
         } else {
-            // Scale dynamically above 8% loss up to the hard 25% cap.
+            // Continuous at 8% (0.15), scaling dynamically up to the hard 25% cap at >= 15% loss.
             let extra = ((loss - 0.08) / 0.07).clamp(0.0, 1.0);
-            (0.18 + 0.07 * extra).min(FEC_MAX_REDUNDANCY_RATIO)
+            (0.15 + 0.10 * extra).min(FEC_MAX_REDUNDANCY_RATIO)
         }
     }
 
@@ -546,6 +582,8 @@ impl AdaptiveFecController {
                         self.enabled = want_enabled;
                         self.pending_target_enabled = None;
                         self.pending_since_ms = None;
+                        self.media_bytes_budget_acc = 0;
+                        self.fec_bytes_budget_acc = 0;
                         switched_state = true;
                     }
                 }
@@ -579,25 +617,86 @@ impl AdaptiveFecController {
         }
     }
 
-    /// Computes how many RS parity shards `m` to generate for a group of `k` media shards
-    /// (`1 <= k <= 16`) while strictly respecting `m <= 4` and `<= 25%` overhead.
+    /// Atomically plans how many RS parity shards `m` to emit for a group of `k` media shards
+    /// (`1 <= k <= 16`) and records the exact wire-byte budget (including the `2 * k` length-table
+    /// header on every parity shard).
+    ///
+    /// Guarantees via overflow-free `u128` arithmetic that cumulative wire FEC bytes NEVER exceed
+    /// `25.0%` of cumulative media bytes across tiny (`k < 4`), medium, unequal-length, or max groups.
+    pub fn plan_group(&mut self, k: usize, group_media_bytes: u64, max_shard_len: usize) -> usize {
+        if !self.enabled || k == 0 || group_media_bytes == 0 {
+            return 0;
+        }
+        let eff_ratio = self.effective_redundancy_ratio();
+        if eff_ratio <= 0.0 {
+            self.media_bytes_budget_acc = self
+                .media_bytes_budget_acc
+                .saturating_add(group_media_bytes);
+            return 0;
+        }
+
+        let k_clamped = k.min(FEC_MAX_DATA_SHARDS);
+        let est_parity_per_shard =
+            (2usize.saturating_mul(k_clamped).saturating_add(max_shard_len)) as u128;
+        let group_media = u128::from(group_media_bytes);
+        let acc_media_after = u128::from(self.media_bytes_budget_acc).saturating_add(group_media);
+        let acc_fec_before = u128::from(self.fec_bytes_budget_acc);
+
+        let desired = ((k_clamped as f64) * eff_ratio)
+            .ceil()
+            .clamp(1.0, FEC_MAX_PARITY_SHARDS as f64) as usize;
+        let max_by_k = if k_clamped >= 4 {
+            (k_clamped / 4).min(FEC_MAX_PARITY_SHARDS)
+        } else {
+            1
+        };
+
+        let mut chosen_m = 0usize;
+        for cand_m in (1..=desired.min(max_by_k)).rev() {
+            let cand_fec = (cand_m as u128).saturating_mul(est_parity_per_shard);
+            // Prospective hard cap: cumulative wire FEC bytes * 4 <= cumulative media bytes (<= 25%).
+            // Also enforces that tiny groups (k < 4) cannot burst ~100% overhead before >= 4*est_parity
+            // of media has accumulated.
+            if acc_fec_before
+                .saturating_add(cand_fec)
+                .saturating_mul(4)
+                <= acc_media_after
+            {
+                chosen_m = cand_m;
+                break;
+            }
+        }
+
+        let chosen_fec_u64 = (chosen_m as u128)
+            .saturating_mul(est_parity_per_shard)
+            .min(u128::from(u64::MAX)) as u64;
+        self.media_bytes_budget_acc = self
+            .media_bytes_budget_acc
+            .saturating_add(group_media_bytes);
+        self.fec_bytes_budget_acc = self.fec_bytes_budget_acc.saturating_add(chosen_fec_u64);
+        chosen_m
+    }
+
+    /// Read-only estimate of RS parity shards `m` for a group of `k` media shards (`1 <= k <= 16`)
+    /// without mutating byte-budget accumulators. Prefer `plan_group` on the actual send path.
     pub fn parity_shards_for_group(&self, k: usize) -> usize {
-        if !self.enabled || k == 0 || self.redundancy_ratio <= 0.0 {
+        let eff_ratio = self.effective_redundancy_ratio();
+        if !self.enabled || k == 0 || eff_ratio <= 0.0 {
             return 0;
         }
         let k_clamped = k.min(FEC_MAX_DATA_SHARDS);
         let max_by_cap = (k_clamped / 4).min(FEC_MAX_PARITY_SHARDS);
         if max_by_cap == 0 {
-            // For tiny groups (k < 4), allow 1 parity shard only if aggregate FEC bytes stay <= 25%.
             let allow_tiny = self.media_bytes_budget_acc >= 4
-                && self.fec_bytes_budget_acc * 4 < self.media_bytes_budget_acc;
+                && u128::from(self.fec_bytes_budget_acc).saturating_mul(4)
+                    < u128::from(self.media_bytes_budget_acc);
             return usize::from(allow_tiny);
         }
-        let desired = (k_clamped as f64 * self.redundancy_ratio).ceil() as usize;
+        let desired = (k_clamped as f64 * eff_ratio).ceil() as usize;
         desired.clamp(1, max_by_cap)
     }
 
-    /// Records transmitted media & FEC bytes so tiny-group budget decisions remain `<= 25%`.
+    /// Records transmitted media & FEC bytes manually (for callers not using atomic `plan_group`).
     pub fn record_group_bytes(&mut self, media_bytes: u64, fec_bytes: u64) {
         self.media_bytes_budget_acc = self.media_bytes_budget_acc.saturating_add(media_bytes);
         self.fec_bytes_budget_acc = self.fec_bytes_budget_acc.saturating_add(fec_bytes);
@@ -606,18 +705,17 @@ impl AdaptiveFecController {
 
 /// Selects an MTU-bounded slice size for packetizing a frame into RS-FEC groups.
 ///
-/// When FEC is enabled on medium frames (`>= 4 KiB`), choosing at least 8 slices
-/// (subject to a 512-byte minimum slice floor) unlocks `m = 2` parity shards while
-/// strictly maintaining `m / k <= 25%`, boosting 5% random-loss frame recovery from
-/// ~94% (`k=7, m=1`) to `~98.8%` (`k=8, m=2`).
-pub fn choose_fec_slice_size(frame_len: usize, fec_enabled: bool, mtu: usize) -> usize {
+/// Only splits medium frames into 9 slices when `redundancy_ratio >= 0.12` (so 1%–8% low-redundancy
+/// bands are never degraded by over-splitting with `m = 0/1`). With `k = 9` and `m = 2`, exact wire
+/// parity bytes `2 * (2*9 + S)` remain strictly `<= 25%` of `9 * S` for all `S >= 512`.
+pub fn choose_fec_slice_size(frame_len: usize, redundancy_ratio: f64, mtu: usize) -> usize {
     let mtu = mtu.max(512);
-    if !fec_enabled || frame_len == 0 {
+    if !redundancy_ratio.is_finite() || redundancy_ratio < 0.12 || frame_len == 0 {
         return mtu;
     }
     let raw_slices = frame_len.div_ceil(mtu);
-    if (4..8).contains(&raw_slices) && frame_len >= 4_096 {
-        frame_len.div_ceil(8).clamp(512, mtu)
+    if (4..9).contains(&raw_slices) && frame_len >= 4_608 {
+        frame_len.div_ceil(9).clamp(512, mtu)
     } else {
         mtu
     }
@@ -673,7 +771,8 @@ pub struct FecReceiverStats {
     pub fec_timeout_groups: u64,
     pub duplicate_shards_ignored: u64,
     pub late_shards_ignored: u64,
-    pub fec_extra_delay_ms_samples: Vec<u64>,
+    pub invalid_shards: u64,
+    pub fec_extra_delay_ms_samples: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -696,10 +795,14 @@ struct ActiveFecGroup {
 /// - Complete data groups release immediately with `0ms` extra FEC delay.
 /// - Recoverable groups decode as soon as `data_received + parity_received >= k`.
 /// - Groups exceeding `fec_wait_ms` expire immediately on `poll_expired(now_ms)` and never block.
+/// - Capacity evictions and corrupted-shard decode failures queue `TimedOutNeedsNack` into
+///   `pending_outcomes` (drained via `drain_pending_outcomes` or `poll_expired`) without poisoning.
 #[derive(Debug, Clone)]
 pub struct FecReorderBuffer {
     groups: BTreeMap<u64, ActiveFecGroup>,
     completed_or_expired_ids: BTreeMap<u64, u64>,
+    pending_outcomes: VecDeque<FecGroupOutcome>,
+    max_seen_group_id: Option<u64>,
     max_groups: usize,
     stats: FecReceiverStats,
 }
@@ -715,6 +818,8 @@ impl FecReorderBuffer {
         Self {
             groups: BTreeMap::new(),
             completed_or_expired_ids: BTreeMap::new(),
+            pending_outcomes: VecDeque::new(),
+            max_seen_group_id: None,
             max_groups: FEC_REORDER_MAX_GROUPS,
             stats: FecReceiverStats::default(),
         }
@@ -726,6 +831,12 @@ impl FecReorderBuffer {
 
     pub fn active_group_count(&self) -> usize {
         self.groups.len()
+    }
+
+    /// Drains any pending `TimedOutNeedsNack` outcomes queued by capacity eviction or
+    /// corrupted-shard group retirement. Also drained automatically by `poll_expired`.
+    pub fn drain_pending_outcomes(&mut self) -> Vec<FecGroupOutcome> {
+        self.pending_outcomes.drain(..).collect()
     }
 
     /// Inserts a received media data shard (`shard_index in 0..k`) or parity shard
@@ -760,19 +871,31 @@ impl FecReorderBuffer {
             });
         }
 
-        // Ignore late or duplicate shards for already-finished groups.
-        if self.completed_or_expired_ids.contains_key(&group_id) {
+        // Ignore late or duplicate shards for already-finished groups or IDs behind the watermark
+        // so pruned historic group IDs can never resurrect as zombie groups.
+        let watermark_span = (self.max_groups as u64).saturating_mul(8);
+        if self.completed_or_expired_ids.contains_key(&group_id)
+            || self
+                .max_seen_group_id
+                .is_some_and(|max_id| group_id.saturating_add(watermark_span) < max_id)
+        {
             self.stats.late_shards_ignored = self.stats.late_shards_ignored.saturating_add(1);
             return Ok(None);
         }
+        self.max_seen_group_id = Some(
+            self.max_seen_group_id
+                .map_or(group_id, |prev| prev.max(group_id)),
+        );
 
-        // Enforce bounded memory by evicting the oldest active group if full.
+        // Enforce bounded memory by evicting the oldest active group if full, queuing its
+        // TimedOutNeedsNack outcome so NACK fallback is never silently lost.
         if !self.groups.contains_key(&group_id) && self.groups.len() >= self.max_groups {
             if let Some((&oldest_id, _)) = self.groups.iter().next() {
                 if let Some(evicted) = self.groups.remove(&oldest_id) {
-                    let _ = evicted;
                     self.mark_finished(oldest_id, now_ms);
                     self.stats.fec_timeout_groups = self.stats.fec_timeout_groups.saturating_add(1);
+                    self.pending_outcomes
+                        .push_back(Self::build_timeout_outcome(oldest_id, &evicted));
                 }
             }
         }
@@ -791,9 +914,10 @@ impl FecReorderBuffer {
             parity_received: 0,
         });
 
-        // Reject inconsistent group metadata safely.
+        // Ignore inconsistent untrusted shard metadata without poisoning the active group.
         if group.k != k || group.m != m {
-            return Err(FecError::InvalidParams { k, m });
+            self.stats.invalid_shards = self.stats.invalid_shards.saturating_add(1);
+            return Ok(None);
         }
 
         if is_parity {
@@ -845,7 +969,7 @@ impl FecReorderBuffer {
 
         // Case 2: data + parity >= k (with m > 0) -> decode immediately via Cauchy RS.
         if can_recover {
-            let (recovered_packets, extra_delay_ms, recovered) = {
+            let decode_attempt = {
                 let Some(g) = self.groups.get(&group_id) else {
                     return Ok(None);
                 };
@@ -861,31 +985,52 @@ impl FecReorderBuffer {
                     slice_refs.push(s.as_deref());
                 }
 
-                let recovered = RsCodec::decode(g.k, g.m, &slice_refs)?;
-                (recovered_packets, extra_delay_ms, recovered)
+                RsCodec::decode(g.k, g.m, &slice_refs)
+                    .map(|recovered| (recovered_packets, extra_delay_ms, recovered))
             };
-            self.groups.remove(&group_id);
-            self.mark_finished(group_id, now_ms);
-            self.stats.fec_recovered_groups = self.stats.fec_recovered_groups.saturating_add(1);
-            self.stats.fec_recovered_packets = self
-                .stats
-                .fec_recovered_packets
-                .saturating_add(recovered_packets as u64);
-            self.stats.fec_extra_delay_ms_samples.push(extra_delay_ms);
 
-            return Ok(Some(FecGroupOutcome::RecoveredViaFec {
-                group_id,
-                data_shards: recovered,
-                recovered_packets,
-                extra_delay_ms,
-            }));
+            match decode_attempt {
+                Ok((recovered_packets, extra_delay_ms, recovered)) => {
+                    self.groups.remove(&group_id);
+                    self.mark_finished(group_id, now_ms);
+                    self.stats.fec_recovered_groups =
+                        self.stats.fec_recovered_groups.saturating_add(1);
+                    self.stats.fec_recovered_packets = self
+                        .stats
+                        .fec_recovered_packets
+                        .saturating_add(recovered_packets as u64);
+                    self.push_extra_delay_sample(extra_delay_ms);
+
+                    return Ok(Some(FecGroupOutcome::RecoveredViaFec {
+                        group_id,
+                        data_shards: recovered,
+                        recovered_packets,
+                        extra_delay_ms,
+                    }));
+                }
+                Err(_) => {
+                    // Corrupted / untrusted shard failed RS decode: retire the group cleanly
+                    // with TimedOutNeedsNack and increment invalid_shards (zero poisoned group / error storm).
+                    self.stats.invalid_shards = self.stats.invalid_shards.saturating_add(1);
+                    if let Some(poisoned) = self.groups.remove(&group_id) {
+                        self.mark_finished(group_id, now_ms);
+                        self.stats.fec_timeout_groups =
+                            self.stats.fec_timeout_groups.saturating_add(1);
+                        self.pending_outcomes
+                            .push_back(Self::build_timeout_outcome(group_id, &poisoned));
+                    }
+                    return Ok(None);
+                }
+            }
         }
 
         Ok(None)
     }
 
-    /// Expires all incomplete groups whose hard deadline `deadline_ms <= now_ms`.
+    /// Expires all incomplete groups whose hard deadline `deadline_ms <= now_ms`,
+    /// returning both any previously queued eviction/corruption outcomes and newly expired groups.
     pub fn poll_expired(&mut self, now_ms: u64) -> Vec<FecGroupOutcome> {
+        let mut outcomes = self.drain_pending_outcomes();
         let expired_ids: Vec<u64> = self
             .groups
             .iter()
@@ -893,26 +1038,39 @@ impl FecReorderBuffer {
             .map(|(&id, _)| id)
             .collect();
 
-        let mut outcomes = Vec::with_capacity(expired_ids.len());
+        outcomes.reserve(expired_ids.len());
         for id in expired_ids {
             if let Some(group) = self.groups.remove(&id) {
                 self.mark_finished(id, now_ms);
                 self.stats.fec_timeout_groups = self.stats.fec_timeout_groups.saturating_add(1);
-                let missing_data_indices = group
-                    .data_shards
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, s)| if s.is_none() { Some(idx) } else { None })
-                    .collect();
-                outcomes.push(FecGroupOutcome::TimedOutNeedsNack {
-                    group_id: id,
-                    missing_data_indices,
-                    received_data_count: group.data_received,
-                    k: group.k,
-                });
+                outcomes.push(Self::build_timeout_outcome(id, &group));
             }
         }
         outcomes
+    }
+
+    fn build_timeout_outcome(group_id: u64, group: &ActiveFecGroup) -> FecGroupOutcome {
+        let missing_data_indices = group
+            .data_shards
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, s)| if s.is_none() { Some(idx) } else { None })
+            .collect();
+        FecGroupOutcome::TimedOutNeedsNack {
+            group_id,
+            missing_data_indices,
+            received_data_count: group.data_received,
+            k: group.k,
+        }
+    }
+
+    fn push_extra_delay_sample(&mut self, extra_delay_ms: u64) {
+        while self.stats.fec_extra_delay_ms_samples.len() >= FEC_EXTRA_DELAY_MAX_SAMPLES {
+            self.stats.fec_extra_delay_ms_samples.pop_front();
+        }
+        self.stats
+            .fec_extra_delay_ms_samples
+            .push_back(extra_delay_ms);
     }
 
     fn mark_finished(&mut self, group_id: u64, now_ms: u64) {
@@ -1129,7 +1287,14 @@ mod tests {
             other => panic!("unexpected outcome: {other:?}"),
         }
         assert_eq!(buf.stats().fec_recovered_packets, 1);
-        assert_eq!(buf.stats().fec_extra_delay_ms_samples, vec![5]);
+        assert_eq!(
+            buf.stats()
+                .fec_extra_delay_ms_samples
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
 
         // Group 2 loses 2 shards with m=1 -> must expire cleanly at first_arrival + fec_wait_ms.
         assert!(buf.push_shard(2, 4, 1, false, 0, d0, 200, 10.0, 30).unwrap().is_none());
@@ -1149,11 +1314,173 @@ mod tests {
 
     #[test]
     fn choose_fec_slice_size_unlocks_two_parities_within_25pct_budget() {
-        assert_eq!(choose_fec_slice_size(8_400, false, 1_200), 1_200);
-        let sz = choose_fec_slice_size(8_400, true, 1_200);
+        // Off and low-redundancy bands (< 12%) must NOT over-split frames.
+        assert_eq!(choose_fec_slice_size(8_400, 0.0, 1_200), 1_200);
+        assert_eq!(choose_fec_slice_size(8_400, 0.05, 1_200), 1_200);
+        assert_eq!(choose_fec_slice_size(8_400, 0.10, 1_200), 1_200);
+        // At >= 12% redundancy, splits medium frames to 9 slices so m=2 fits strictly <= 25% wire bytes.
+        let sz = choose_fec_slice_size(8_400, 0.15, 1_200);
         assert!((512..=1_200).contains(&sz));
         let slices = 8_400usize.div_ceil(sz);
-        assert_eq!(slices, 8);
-        assert_eq!(choose_fec_slice_size(14_400, true, 1_200), 1_200);
+        assert_eq!(slices, 9);
+        assert_eq!(choose_fec_slice_size(14_400, 0.25, 1_200), 1_200);
+    }
+
+    #[test]
+    fn plan_group_strictly_enforces_25pct_wire_byte_cap_across_tiny_medium_and_max_groups() {
+        // Verify continuity at 8% boundary.
+        let at_8 = AdaptiveFecController::target_ratio_for_loss(0.08);
+        let above_8 = AdaptiveFecController::target_ratio_for_loss(0.080_001);
+        assert!((at_8 - 0.15).abs() < 1e-6);
+        assert!((above_8 - 0.15).abs() < 1e-3);
+
+        // Test tiny (k=1..3), medium (k=8..12), and max (k=16) groups at 25% target redundancy.
+        for &(k, shard_len) in &[
+            (1usize, 1_000usize),
+            (2, 1_000),
+            (3, 1_000),
+            (8, 1_050),
+            (9, 934),
+            (12, 1_100),
+            (16, 1_200),
+        ] {
+            let mut ctrl = AdaptiveFecController::with_debounce_ms(0);
+            ctrl.on_loss_sample(0, 0.20);
+            ctrl.on_loss_sample(1, 0.20);
+            assert!(ctrl.is_enabled());
+
+            let shards: Vec<Vec<u8>> = (0..k).map(|i| vec![(i as u8).wrapping_add(1); shard_len]).collect();
+            let refs: Vec<&[u8]> = shards.iter().map(Vec::as_slice).collect();
+            let group_media_bytes = (k * shard_len) as u64;
+
+            let mut total_media = 0u128;
+            let mut total_wire_fec = 0u128;
+            for iter in 0..24 {
+                let m = ctrl.plan_group(k, group_media_bytes, shard_len);
+                let actual_fec_bytes = if m > 0 {
+                    let parities = RsCodec::encode(&refs, m).unwrap();
+                    assert_eq!(parities.len(), m);
+                    parities.iter().map(|p| p.len() as u128).sum::<u128>()
+                } else {
+                    0u128
+                };
+                total_media += u128::from(group_media_bytes);
+                total_wire_fec += actual_fec_bytes;
+                assert!(
+                    total_wire_fec * 4 <= total_media,
+                    "k={k} iter={iter}: cumulative wire FEC bytes {total_wire_fec} exceeded 25% of media {total_media}"
+                );
+                if k < 4 && iter == 0 {
+                    // Tiny groups MUST NOT burst ~100% overhead at stream start.
+                    assert_eq!(m, 0, "tiny group k={k} must not emit parity on first group");
+                }
+                if k == 9 {
+                    // k=9 with 934B shards unlocks m=2 on every group within <=25% wire bytes.
+                    assert_eq!(m, 2);
+                }
+            }
+            assert!(
+                total_wire_fec > 0,
+                "k={k} should emit parity once cumulative budget allows"
+            );
+        }
+    }
+
+    #[test]
+    fn reorder_buffer_eviction_emits_pending_nack_and_watermark_blocks_zombie_resurrection() {
+        let mut buf = FecReorderBuffer::new();
+        // Fill buffer past FEC_REORDER_MAX_GROUPS (64) with incomplete groups -> oldest must evict
+        // AND emit TimedOutNeedsNack into pending_outcomes (never silently dropped).
+        for gid in 1..=(FEC_REORDER_MAX_GROUPS as u64 + 3) {
+            assert!(buf
+                .push_shard(gid, 4, 1, false, 0, b"payload".to_vec(), gid * 2, 5.0, 30)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(buf.active_group_count(), FEC_REORDER_MAX_GROUPS);
+        let evicted = buf.drain_pending_outcomes();
+        assert_eq!(evicted.len(), 3);
+        for (idx, outcome) in evicted.iter().enumerate() {
+            assert!(matches!(
+                outcome,
+                FecGroupOutcome::TimedOutNeedsNack { group_id, .. } if *group_id == (idx as u64 + 1)
+            ));
+        }
+
+        // Advance well beyond 8 * max_groups so completed_or_expired_ids prunes group 1,
+        // then inject a late shard for group 1 -> watermark MUST reject it as late (no zombie!).
+        let far_gid = (FEC_REORDER_MAX_GROUPS as u64) * 10 + 50;
+        assert!(buf
+            .push_shard(far_gid, 4, 1, false, 0, b"far".to_vec(), 5_000, 5.0, 30)
+            .unwrap()
+            .is_none());
+        let late_before = buf.stats().late_shards_ignored;
+        assert!(buf
+            .push_shard(1, 4, 1, false, 1, b"zombie".to_vec(), 5_001, 5.0, 30)
+            .unwrap()
+            .is_none());
+        assert_eq!(buf.stats().late_shards_ignored, late_before + 1);
+        assert_eq!(buf.active_group_count(), FEC_REORDER_MAX_GROUPS);
+
+        // Verify fec_extra_delay_ms_samples stays bounded at <= FEC_EXTRA_DELAY_MAX_SAMPLES.
+        let mut cap_buf = FecReorderBuffer::new();
+        let d0 = b"aaaa".to_vec();
+        let d1 = b"bbbb".to_vec();
+        let p = RsCodec::encode(&[&d0, &d1], 1).unwrap();
+        for gid in 1..=(FEC_EXTRA_DELAY_MAX_SAMPLES as u64 + 50) {
+            let _ = cap_buf
+                .push_shard(gid, 2, 1, false, 0, d0.clone(), gid * 10, 5.0, 30)
+                .unwrap();
+            let _ = cap_buf
+                .push_shard(gid, 2, 1, true, 0, p[0].clone(), gid * 10 + 2, 5.0, 30)
+                .unwrap();
+        }
+        assert_eq!(
+            cap_buf.stats().fec_extra_delay_ms_samples.len(),
+            FEC_EXTRA_DELAY_MAX_SAMPLES
+        );
+    }
+
+    #[test]
+    fn reorder_buffer_handles_corrupted_parity_and_km_mismatch_without_error_storm() {
+        let mut buf = FecReorderBuffer::new();
+        let d0 = b"hello-0".to_vec();
+        let d2 = b"hello-2".to_vec();
+        let d3 = b"hello-3".to_vec();
+
+        // Populate 3 of 4 data shards for group 10 (k=4, m=1).
+        assert!(buf.push_shard(10, 4, 1, false, 0, d0, 100, 5.0, 30).unwrap().is_none());
+        // Inject a mismatched k/m shard -> must NOT return Err or poison group 10!
+        assert!(buf
+            .push_shard(10, 5, 1, false, 1, b"bad-meta".to_vec(), 101, 5.0, 30)
+            .unwrap()
+            .is_none());
+        assert_eq!(buf.stats().invalid_shards, 1);
+        assert_eq!(buf.active_group_count(), 1);
+
+        assert!(buf.push_shard(10, 4, 1, false, 2, d2, 102, 5.0, 30).unwrap().is_none());
+        assert!(buf.push_shard(10, 4, 1, false, 3, d3, 103, 5.0, 30).unwrap().is_none());
+
+        // Inject a corrupted/truncated parity shard -> must retire group cleanly with TimedOutNeedsNack,
+        // return Ok(None), increment invalid_shards, and leave zero poisoned active group.
+        let res = buf.push_shard(10, 4, 1, true, 0, vec![0xFF, 0xFF], 104, 5.0, 30);
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none());
+        assert_eq!(buf.stats().invalid_shards, 2);
+        assert_eq!(buf.active_group_count(), 0);
+
+        let pending = buf.drain_pending_outcomes();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            FecGroupOutcome::TimedOutNeedsNack { group_id: 10, .. }
+        ));
+
+        // Subsequent shards for retired group 10 are ignored cleanly (no error storm).
+        assert!(buf
+            .push_shard(10, 4, 1, false, 1, b"late".to_vec(), 105, 5.0, 30)
+            .unwrap()
+            .is_none());
+        assert_eq!(buf.stats().late_shards_ignored, 1);
     }
 }

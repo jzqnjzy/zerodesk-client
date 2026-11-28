@@ -318,6 +318,7 @@ pub struct CongestionController {
     cfg: CongestionConfig,
     state: CcState,
     feedback_received: bool,
+    rtt_initialized: bool,
 
     total_bitrate_kbps: u32,
     media_bitrate_kbps: u32,
@@ -328,6 +329,7 @@ pub struct CongestionController {
     srtt_ms: f64,
     min_rtt: AgingMinRtt,
     queue_delay_ms: f64,
+    queue_overuse_windows: u32,
     jitter_ms: f64,
     jitter_buffer_ms: f64,
     loss_window: VecDeque<(u64, u32, u32)>,
@@ -371,6 +373,7 @@ impl Default for CongestionController {
 
 impl CongestionController {
     pub fn new(mut cfg: CongestionConfig) -> Self {
+        let defaults = CongestionConfig::default();
         cfg.min_bitrate_kbps = cfg.min_bitrate_kbps.max(CC_MIN_BITRATE_KBPS);
         cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.max(cfg.min_bitrate_kbps);
         cfg.start_bitrate_kbps = cfg
@@ -378,13 +381,43 @@ impl CongestionController {
             .clamp(cfg.min_bitrate_kbps, cfg.max_bitrate_kbps);
         cfg.min_fps = cfg.min_fps.max(CC_MIN_FPS_CAP);
         cfg.max_fps = cfg.max_fps.max(cfg.min_fps);
-        let tier_index = cfg.initial_tier_index.min(RESOLUTION_LADDER.len() - 1);
+        cfg.initial_tier_index = cfg.initial_tier_index.min(RESOLUTION_LADDER.len() - 1);
+        cfg.queue_overuse_ms = if cfg.queue_overuse_ms.is_finite() && cfg.queue_overuse_ms > 2.0 {
+            cfg.queue_overuse_ms
+        } else {
+            defaults.queue_overuse_ms
+        };
+        cfg.queue_drain_exit_ms = if cfg.queue_drain_exit_ms.is_finite()
+            && cfg.queue_drain_exit_ms >= 0.0
+            && cfg.queue_drain_exit_ms < cfg.queue_overuse_ms
+        {
+            cfg.queue_drain_exit_ms
+        } else {
+            defaults
+                .queue_drain_exit_ms
+                .min((cfg.queue_overuse_ms * 0.5).max(0.0))
+        };
+        cfg.trend_overuse_slope =
+            if cfg.trend_overuse_slope.is_finite() && cfg.trend_overuse_slope > 0.0 {
+                cfg.trend_overuse_slope
+            } else {
+                defaults.trend_overuse_slope
+            };
+        cfg.burst_loss_threshold = if cfg.burst_loss_threshold.is_finite()
+            && (0.01..=1.0).contains(&cfg.burst_loss_threshold)
+        {
+            cfg.burst_loss_threshold
+        } else {
+            defaults.burst_loss_threshold
+        };
+        let tier_index = cfg.initial_tier_index;
 
         let start = cfg.start_bitrate_kbps;
         Self {
             cfg,
             state: CcState::Startup,
             feedback_received: false,
+            rtt_initialized: false,
             total_bitrate_kbps: start,
             media_bitrate_kbps: start,
             fec_budget_kbps: 0,
@@ -392,6 +425,7 @@ impl CongestionController {
             srtt_ms: 40.0,
             min_rtt: AgingMinRtt::new(CC_MIN_RTT_WINDOW_MS),
             queue_delay_ms: 0.0,
+            queue_overuse_windows: 0,
             jitter_ms: 0.0,
             jitter_buffer_ms: 0.0,
             loss_window: VecDeque::with_capacity(32),
@@ -502,22 +536,37 @@ impl CongestionController {
         fec_redundancy_ratio: f64,
     ) -> EncoderTarget {
         let now_ms = sample.now_ms;
-        let rtt_ms = if sample.rtt_ms.is_finite() && sample.rtt_ms > 0.0 {
-            sample.rtt_ms
-        } else {
-            self.srtt_ms
-        };
+        let has_valid_rtt = sample.rtt_ms.is_finite() && sample.rtt_ms > 0.0;
 
         // 1. Update RTT / min_rtt / queuing delay / jitter / delivery rate / loss.
-        let min_rtt = self.min_rtt.update(now_ms, rtt_ms);
+        // Only genuine measured RTT samples enter AgingMinRtt and SRTT; never poison min_rtt
+        // with the synthetic 40ms default SRTT when sample.rtt_ms is <= 0 or non-finite.
         if !self.feedback_received {
             self.feedback_received = true;
-            self.srtt_ms = rtt_ms;
             self.state_entered_ms = now_ms;
-        } else {
-            self.srtt_ms = 0.75 * self.srtt_ms + 0.25 * rtt_ms;
         }
-        self.queue_delay_ms = (rtt_ms - min_rtt).max(0.0);
+        let (min_rtt, raw_queue_ms) = if has_valid_rtt {
+            let m = self.min_rtt.update(now_ms, sample.rtt_ms);
+            let raw_q = (sample.rtt_ms - m).max(0.0);
+            if !self.rtt_initialized {
+                self.rtt_initialized = true;
+                self.srtt_ms = sample.rtt_ms;
+                self.queue_delay_ms = raw_q;
+            } else {
+                self.srtt_ms = 0.75 * self.srtt_ms + 0.25 * sample.rtt_ms;
+                // Light EWMA over queuing delay filters single-sample jitter while remaining
+                // responsive to genuine queue buildup and clearing during Drain.
+                self.queue_delay_ms = 0.45 * self.queue_delay_ms + 0.55 * raw_q;
+            }
+            (m, raw_q)
+        } else {
+            let m = self.min_rtt.value();
+            if !self.rtt_initialized || m <= 0.0 {
+                self.queue_delay_ms = 0.0;
+            }
+            (m, 0.0)
+        };
+        let _ = min_rtt;
         self.jitter_ms = if sample.jitter_ms.is_finite() && sample.jitter_ms >= 0.0 {
             0.7 * self.jitter_ms + 0.3 * sample.jitter_ms
         } else {
@@ -584,8 +633,15 @@ impl CongestionController {
         let slope = self
             .trendline
             .update(now_ms, sample.delay_delta_ms, self.queue_delay_ms);
-        let delay_overusing = slope > self.cfg.trend_overuse_slope
-            || self.queue_delay_ms >= self.cfg.queue_overuse_ms;
+        if self.queue_delay_ms >= self.cfg.queue_overuse_ms
+            && raw_queue_ms >= self.cfg.queue_overuse_ms
+        {
+            self.queue_overuse_windows = self.queue_overuse_windows.saturating_add(1);
+        } else {
+            self.queue_overuse_windows = 0;
+        }
+        let delay_overusing =
+            slope > self.cfg.trend_overuse_slope || self.queue_overuse_windows >= 2;
         let delay_underusing = slope < -0.02 && self.queue_delay_ms <= 8.0;
         self.last_delay_signal = if delay_overusing {
             DelaySignal::Overusing
@@ -596,17 +652,22 @@ impl CongestionController {
         };
 
         // 3. Primary Signal 2: Burst packet loss (evaluated ONLY if delay gradient did not trigger).
-        // Require either a statistically significant burst (total_pkts >= 20 and >= 4 lost packets
-        // at >= burst_loss_threshold) or smoothed EWMA loss crossing burst_loss_threshold, so
-        // 1-2 random drops in a small 10-packet window under 5% random loss do not false-trigger.
+        // Require a genuine burst spike (not steady 5% wireless loss absorbed by FEC) before
+        // cutting bitrate on the combined loss + moderate queue path.
         let significant_window_burst = total_pkts >= 25
             && sample.packets_lost >= 6
             && window_loss >= self.cfg.burst_loss_threshold.max(0.12);
+        let loss_with_queue_burst = self.loss_ewma >= 0.05
+            && self.queue_delay_ms >= 18.0
+            && (self.last_window_loss >= 2.0 * self.loss_ewma
+                || self.last_window_loss >= self.cfg.burst_loss_threshold);
         let burst_loss = significant_window_burst
             || self.loss_ewma >= self.cfg.burst_loss_threshold
-            || (self.loss_ewma >= 0.05 && self.queue_delay_ms >= 18.0);
+            || loss_with_queue_burst;
 
-        let rtt_interval_ms = (self.srtt_ms.ceil() as u64).max(100);
+        let srtt_clamped_ms = self.srtt_ms.clamp(1.0, 60_000.0).ceil() as u64;
+        let rtt_interval_ms = srtt_clamped_ms.max(100);
+        let drain_rtt_interval_ms = srtt_clamped_ms.max(50);
         let prev_total = self.total_bitrate_kbps;
         let mut urgent_rate_change = false;
 
@@ -622,22 +683,27 @@ impl CongestionController {
                 } else if burst_loss {
                     self.last_steady_bitrate_kbps = self.total_bitrate_kbps;
                     let next = self.compute_recover_target();
-                    self.apply_total_bitrate(next, now_ms, false);
-                    self.transition(now_ms, CcState::Recover, "startup_burst_loss");
-                    urgent_rate_change = true;
+                    if next < self.total_bitrate_kbps {
+                        self.apply_total_bitrate(next, now_ms, false);
+                        self.transition(now_ms, CcState::Recover, "startup_burst_loss");
+                        urgent_rate_change = true;
+                    }
                 } else if self.total_bitrate_kbps >= self.cfg.max_bitrate_kbps {
                     if self.confirm_exit_window(now_ms) {
                         self.last_steady_bitrate_kbps = self.total_bitrate_kbps;
                         self.transition(now_ms, CcState::Steady, "startup_reached_max_bitrate");
                     }
-                } else if self.can_increase_rate(now_ms, rtt_interval_ms) {
+                } else if self.queue_overuse_windows == 0
+                    && self.queue_delay_ms < 14.0
+                    && self.can_increase_rate(now_ms, rtt_interval_ms)
+                {
                     // Startup aggressive ramp: up to x1.6 per RTT, bounded by delivery headroom.
                     let mut next = ((self.total_bitrate_kbps as f64) * 1.6).round() as u32;
                     if let Some(dr) = sample.delivery_rate_kbps.filter(|v| v.is_finite() && *v > 0.0)
                     {
-                        // If observed delivery rate is well below our send rate and queue is rising,
-                        // cap ramp gently instead of blindly overshooting into severe bufferbloat.
-                        if self.queue_delay_ms >= 15.0 {
+                        // Once smoothed queue begins rising (>= 6ms -> ~24ms raw queue), cap ramp
+                        // to delivery headroom instead of overshooting blindly into bufferbloat.
+                        if self.queue_delay_ms >= 6.0 {
                             next = next.min((dr * 1.15).round() as u32);
                         }
                     }
@@ -658,9 +724,11 @@ impl CongestionController {
                 } else if burst_loss {
                     self.last_steady_bitrate_kbps = self.total_bitrate_kbps;
                     let next = self.compute_recover_target();
-                    self.apply_total_bitrate(next, now_ms, false);
-                    self.transition(now_ms, CcState::Recover, "steady_burst_loss");
-                    urgent_rate_change = true;
+                    if next < self.total_bitrate_kbps {
+                        self.apply_total_bitrate(next, now_ms, false);
+                        self.transition(now_ms, CcState::Recover, "steady_burst_loss");
+                        urgent_rate_change = true;
+                    }
                 } else {
                     // Check if delivery rate dropped sharply without queue crossing threshold yet
                     // (e.g., sudden bottleneck reduction already reflected in delivery rate).
@@ -725,7 +793,7 @@ impl CongestionController {
 
             CcState::Drain => {
                 let dwell_ms = now_ms.saturating_sub(self.state_entered_ms);
-                let min_dwell = rtt_interval_ms;
+                let min_dwell = drain_rtt_interval_ms;
 
                 // While draining, if queue is still overloaded or delivery rate is still much lower,
                 // step down again once per RTT (strictly respecting single-step >= x0.5).
@@ -742,7 +810,7 @@ impl CongestionController {
                     let since_last_dec = self
                         .last_rate_decrease_ms
                         .map_or(u64::MAX, |t| now_ms.saturating_sub(t));
-                    if since_last_dec >= rtt_interval_ms {
+                    if since_last_dec >= drain_rtt_interval_ms {
                         let next = self.compute_drain_target(false);
                         if next < self.total_bitrate_kbps {
                             self.apply_total_bitrate(next, now_ms, false);
@@ -776,7 +844,9 @@ impl CongestionController {
                     urgent_rate_change = true;
                 } else {
                     let rtt_recovered = self.queue_delay_ms <= 20.0;
-                    if dwell_ms >= min_dwell && rtt_recovered && self.confirm_exit_window(now_ms) {
+                    if !rtt_recovered {
+                        self.reset_exit_confirmation();
+                    } else if dwell_ms >= min_dwell && self.confirm_exit_window(now_ms) {
                         self.last_steady_bitrate_kbps = self.total_bitrate_kbps;
                         self.post_congestion_cooldown_until_ms = now_ms.saturating_add(
                             if self.consecutive_flips >= 1 {
@@ -937,6 +1007,7 @@ impl CongestionController {
         self.state = to;
         self.state_entered_ms = now_ms;
         self.clean_steady_probes = 0;
+        self.queue_overuse_windows = 0;
         self.reset_up_confirmation();
         self.reset_exit_confirmation();
 
@@ -996,7 +1067,7 @@ impl CongestionController {
                 let high = RES_DOWNGRADE_KBPS[max_tier - 1] as f64;
                 let frac = ((media as f64 - low) / (high - low).max(1.0)).clamp(0.0, 1.0);
                 let fps = (self.cfg.min_fps as f64
-                    + frac * ((self.cfg.max_fps - self.cfg.min_fps) as f64))
+                    + frac * (self.cfg.max_fps.saturating_sub(self.cfg.min_fps) as f64))
                     .round() as u32;
                 self.fps_cap = fps.clamp(self.cfg.min_fps, self.cfg.max_fps);
             }
@@ -1040,9 +1111,9 @@ mod tests {
         cc.on_feedback(sample(100, 30.0, 0.0, 50, 0, Some(10_000.0)), 0.0);
         assert_eq!(cc.state(), CcState::Startup);
 
-        // Simultaneous queuing delay overuse (+45ms) AND 12% burst loss -> MUST enter Drain, NOT Recover!
+        // Simultaneous delay gradient overuse (rising slope + queue) AND 12% burst loss -> MUST enter Drain, NOT Recover!
         let before = cc.total_bitrate_kbps();
-        cc.on_feedback(sample(200, 75.0, 25.0, 44, 6, Some(4_000.0)), 0.15);
+        cc.on_feedback(sample(200, 120.0, 45.0, 44, 6, Some(4_000.0)), 0.15);
         assert_eq!(cc.state(), CcState::Drain);
         assert!(cc.total_bitrate_kbps() < before);
         assert!(cc.total_bitrate_kbps() >= (before as f64 * 0.5).floor() as u32);
@@ -1159,18 +1230,21 @@ mod tests {
             max_bitrate_kbps: 15_000,
             ..Default::default()
         });
-        // Push into Drain briefly then settle into Steady.
+        // Push into Drain briefly (sustained queue/trend) then settle into Steady.
         cc.on_feedback(sample(0, 30.0, 0.0, 50, 0, Some(3_000.0)), 0.0);
-        cc.on_feedback(sample(100, 70.0, 20.0, 50, 0, Some(3_000.0)), 0.0);
+        cc.on_feedback(sample(100, 30.0, 0.0, 50, 0, Some(3_000.0)), 0.0);
+        cc.on_feedback(sample(200, 120.0, 45.0, 50, 0, Some(3_000.0)), 0.0);
         assert_eq!(cc.state(), CcState::Drain);
-        cc.on_feedback(sample(300, 32.0, -10.0, 50, 0, Some(3_000.0)), 0.0);
+        for t in [300, 400, 500, 600] {
+            cc.on_feedback(sample(t, 30.0, -10.0, 50, 0, Some(3_000.0)), 0.0);
+        }
         assert_eq!(cc.state(), CcState::Steady);
 
         // Run 10 seconds in clean Steady at 100ms feedback ticks.
         let mut prev_br = cc.total_bitrate_kbps();
         let mut steady_changes = 0u32;
         for step in 1..=100u64 {
-            let now = 300 + step * 100;
+            let now = 600 + step * 100;
             let t = cc.on_feedback(sample(now, 30.0, 0.0, 50, 0, Some(15_000.0)), 0.0);
             assert_eq!(cc.state(), CcState::Steady);
             if t.total_bitrate_kbps != prev_br {
@@ -1186,5 +1260,152 @@ mod tests {
             "Steady changes/sec {changes_per_sec} exceeded 1.0"
         );
         assert!(steady_changes >= 3, "expected gentle periodic probing");
+    }
+
+    #[test]
+    fn zero_or_non_finite_rtt_never_poisons_min_rtt_or_triggers_false_drain() {
+        let mut cc = CongestionController::default();
+        // First feedback carries invalid rtt_ms = 0.0 (and NaN) -> must NEVER seed min_rtt with 40ms!
+        cc.on_feedback(sample(0, 0.0, 0.0, 10, 0, Some(5_000.0)), 0.0);
+        cc.on_feedback(sample(50, f64::NAN, 0.0, 10, 0, Some(5_000.0)), 0.0);
+        assert_eq!(cc.min_rtt_ms(), 0.0);
+        assert_eq!(cc.queue_delay_ms(), 0.0);
+        assert_eq!(cc.state(), CcState::Startup);
+
+        // Genuine steady 200ms WAN RTT follows for 5 seconds -> must NOT enter false Drain!
+        for step in 1..=50u64 {
+            let now = 100 + step * 100;
+            cc.on_feedback(sample(now, 200.0, 0.0, 40, 0, Some(10_000.0)), 0.0);
+            assert_ne!(
+                cc.state(),
+                CcState::Drain,
+                "false Drain at t={now}ms (min_rtt={}, srtt={}, q={})",
+                cc.min_rtt_ms(),
+                cc.srtt_ms(),
+                cc.queue_delay_ms()
+            );
+        }
+        assert!((cc.min_rtt_ms() - 200.0).abs() < 1e-6);
+        assert!(cc.queue_delay_ms() < 1.0);
+    }
+
+    #[test]
+    fn single_delayed_ack_spike_does_not_false_trigger_drain_requires_two_windows() {
+        let mut cc = CongestionController::new(CongestionConfig {
+            start_bitrate_kbps: 6_000,
+            max_bitrate_kbps: 6_000,
+            ..Default::default()
+        });
+        // Establish steady baseline at 30ms RTT over 12 samples so OLS window is populated.
+        for i in 0..12u64 {
+            cc.on_feedback(sample(i * 100, 30.0, 0.0, 50, 0, Some(6_000.0)), 0.0);
+        }
+        assert_eq!(cc.state(), CcState::Steady);
+
+        // Single delayed-ACK RTT spike (160ms, raw queue +130ms -> srtt = 62.5ms, queue = 32.5ms >= 28ms)
+        // for ONE window only, then immediately returns to 30ms -> MUST stay in Steady!
+        cc.on_feedback(sample(1_200, 160.0, 0.0, 50, 0, Some(6_000.0)), 0.0);
+        assert_eq!(cc.state(), CcState::Steady);
+        cc.on_feedback(sample(1_300, 30.0, 0.0, 50, 0, Some(6_000.0)), 0.0);
+        assert_eq!(cc.state(), CcState::Steady);
+
+        // Settle back to baseline, then apply sustained high RTT across >= 2 consecutive queue-overuse windows -> MUST Drain!
+        for i in 14..22u64 {
+            cc.on_feedback(sample(i * 100, 30.0, 0.0, 50, 0, Some(6_000.0)), 0.0);
+        }
+        assert_eq!(cc.state(), CcState::Steady);
+        cc.on_feedback(sample(2_200, 160.0, 0.0, 50, 0, Some(6_000.0)), 0.0);
+        assert_eq!(cc.state(), CcState::Steady);
+        cc.on_feedback(sample(2_300, 160.0, 0.0, 50, 0, Some(6_000.0)), 0.0);
+        assert_eq!(cc.state(), CcState::Drain);
+    }
+
+    #[test]
+    fn steady_five_percent_wireless_loss_with_moderate_queue_does_not_trigger_recover() {
+        let mut cc = CongestionController::new(CongestionConfig {
+            start_bitrate_kbps: 6_000,
+            max_bitrate_kbps: 6_000,
+            ..Default::default()
+        });
+        for i in 0..12u64 {
+            cc.on_feedback(sample(i * 100, 40.0, 0.0, 60, 0, Some(6_000.0)), 0.0);
+        }
+        assert_eq!(cc.state(), CcState::Steady);
+        let initial_br = cc.total_bitrate_kbps();
+
+        // Feed steady 5% wireless loss (3 lost out of 60) with moderate ~20ms queue (60ms RTT, < 28ms overuse).
+        // Must NOT repeatedly enter Recover or slash bitrate.
+        for i in 12..35u64 {
+            cc.on_feedback(sample(i * 100, 60.0, 0.0, 57, 3, Some(6_000.0)), 0.15);
+            assert_eq!(
+                cc.state(),
+                CcState::Steady,
+                "steady 5% wireless loss falsely triggered {:?} at step {i}",
+                cc.state()
+            );
+        }
+        assert_eq!(cc.total_bitrate_kbps(), initial_br);
+
+        // Genuine sudden burst spike (12% window loss, >= 2x EWMA) DOES trigger Recover!
+        cc.on_feedback(sample(3_600, 60.0, 0.0, 44, 6, Some(6_000.0)), 0.15);
+        assert_eq!(cc.state(), CcState::Recover);
+        assert!(cc.total_bitrate_kbps() < initial_br);
+    }
+
+    #[test]
+    fn config_normalization_and_recover_at_floor_and_exit_reset_hygiene() {
+        // Adversarial NaN / inverted config must normalize safely without panicking.
+        let mut cc = CongestionController::new(CongestionConfig {
+            min_bitrate_kbps: 50,
+            start_bitrate_kbps: 50_000,
+            max_bitrate_kbps: 100,
+            min_fps: 2,
+            max_fps: 1,
+            initial_tier_index: 99,
+            queue_overuse_ms: f64::NAN,
+            queue_drain_exit_ms: 999.0,
+            trend_overuse_slope: -1.0,
+            burst_loss_threshold: f64::INFINITY,
+        });
+        assert_eq!(cc.total_bitrate_kbps(), CC_MIN_BITRATE_KBPS);
+        assert_eq!(cc.current_resolution(), RESOLUTION_LADDER[RESOLUTION_LADDER.len() - 1]);
+        assert_eq!(cc.fps_cap(), CC_MIN_FPS_CAP);
+
+        // Move to Steady at floor (300 kbps).
+        for i in 0..5u64 {
+            cc.on_feedback(sample(i * 100, 40.0, 0.0, 50, 0, Some(300.0)), 0.0);
+        }
+        assert_eq!(cc.state(), CcState::Steady);
+        let transitions_before = cc.transitions().len();
+
+        // Repeated burst loss while already pinned at min_bitrate_kbps must NOT spam Steady->Recover.
+        for i in 5..12u64 {
+            cc.on_feedback(sample(i * 100, 40.0, 0.0, 40, 10, Some(300.0)), 0.25);
+            assert_eq!(cc.state(), CcState::Steady);
+        }
+        assert_eq!(cc.transitions().len(), transitions_before);
+
+        // Verify Recover exit resets confirm_exit_windows when rtt_recovered drops false.
+        let mut rcc = CongestionController::new(CongestionConfig {
+            start_bitrate_kbps: 6_000,
+            max_bitrate_kbps: 6_000,
+            ..Default::default()
+        });
+        for i in 0..5u64 {
+            rcc.on_feedback(sample(i * 100, 40.0, 0.0, 60, 0, Some(6_000.0)), 0.0);
+        }
+        assert_eq!(rcc.state(), CcState::Steady);
+        rcc.on_feedback(sample(500, 40.0, 0.0, 44, 6, Some(6_000.0)), 0.15);
+        assert_eq!(rcc.state(), CcState::Recover);
+        // Two good windows (confirm_exit_windows = 2), then one elevated RTT window (> 20ms queue) resets it.
+        rcc.on_feedback(sample(600, 40.0, 0.0, 60, 0, Some(6_000.0)), 0.0);
+        rcc.on_feedback(sample(700, 40.0, 0.0, 60, 0, Some(6_000.0)), 0.0);
+        assert_eq!(rcc.state(), CcState::Recover);
+        rcc.on_feedback(sample(800, 130.0, 0.0, 60, 0, Some(6_000.0)), 0.0);
+        // srtt = 62.5 -> queue_delay_ms = 22.5 > 20.0 -> confirmation counter must reset!
+        assert_eq!(rcc.state(), CcState::Recover);
+        // One good window at 900ms is NOT enough because confirmation was reset (needs 3 windows / 200ms).
+        rcc.on_feedback(sample(900, 40.0, 0.0, 60, 0, Some(6_000.0)), 0.0);
+        assert_eq!(rcc.state(), CcState::Recover);
     }
 }

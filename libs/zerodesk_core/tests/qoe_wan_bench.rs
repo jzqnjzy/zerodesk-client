@@ -260,18 +260,33 @@ fn gate_5_bufferbloat_suppression_under_bottleneck_saturation() {
     };
     let m = WanSimulator::run(&sc);
     println!(
-        "[GATE 5] Bufferbloat (4 Mbps bottleneck, 400ms router queue): queue_p95={:.1}ms, queue_max={:.1}ms (limit <= 100ms), final_br={} kbps",
-        m.p95_queue_delay_ms, m.max_queue_delay_ms, m.final_bitrate_kbps
+        "[GATE 5] Bufferbloat (4 Mbps bottleneck, 400ms router queue): gt_steady_p95={:.1}ms, gt_steady_max={:.1}ms, gt_overall_max={:.1}ms, cc_q_p95={:.1}ms (limit <= 100ms), final_br={} kbps",
+        m.steady_gt_queue_p95_ms,
+        m.steady_gt_queue_max_ms,
+        m.overall_gt_queue_max_ms,
+        m.p95_queue_delay_ms,
+        m.final_bitrate_kbps
     );
     assert_eq!(m.decoder_errors, 0);
+    // Assert directly against ground-truth per-packet bottleneck queue wait (NOT just CC's self-estimate).
+    assert!(
+        m.steady_gt_queue_p95_ms <= 100.0,
+        "ground-truth steady queue delay P95 {:.1}ms exceeded 100ms",
+        m.steady_gt_queue_p95_ms
+    );
+    assert!(
+        m.steady_gt_queue_max_ms <= 100.0,
+        "ground-truth steady queue delay max {:.1}ms exceeded 100ms",
+        m.steady_gt_queue_max_ms
+    );
     assert!(
         m.p95_queue_delay_ms <= 100.0,
-        "queue delay P95 {:.1}ms exceeded 100ms",
+        "CC queue delay P95 {:.1}ms exceeded 100ms",
         m.p95_queue_delay_ms
     );
     assert!(
         m.max_queue_delay_ms <= 100.0,
-        "queue delay max {:.1}ms exceeded 100ms",
+        "CC queue delay max {:.1}ms exceeded 100ms",
         m.max_queue_delay_ms
     );
 }
@@ -288,19 +303,35 @@ fn gate_6_anti_oscillation_steady_rate_and_flip_bound() {
 
     for sc in scenarios {
         let m = WanSimulator::run(&sc);
+        let total_span_ms = sc.duration_ms.max(1);
+        let steady_dwell_ratio = (m.steady_duration_ms as f64) / (total_span_ms as f64);
         println!(
-            "[GATE 6] {}: steady_dur={}ms, steady_changes={}, changes/s={:.2} (<= 1.0), max_consecutive_flips={} (< 3)",
+            "[GATE 6] {}: steady_dur={}ms (dwell_ratio={:.2} >= 0.70), steady_changes={}, changes/s={:.2} (<= 1.0), max_consecutive_flips={} (< 3), cc_transitions={} (<= 12)",
             m.scenario_name,
             m.steady_duration_ms,
+            steady_dwell_ratio,
             m.steady_bitrate_changes,
             m.steady_changes_per_sec,
             m.max_consecutive_flips,
+            m.cc_transitions,
         );
         assert!(
             m.steady_duration_ms >= 5_000,
             "{}: insufficient steady dwell ({}ms)",
             m.scenario_name,
             m.steady_duration_ms
+        );
+        assert!(
+            steady_dwell_ratio >= 0.70,
+            "{}: steady dwell ratio {:.2} < 0.70 (anti-oscillation gate cannot be bypassed via frequent state exits)",
+            m.scenario_name,
+            steady_dwell_ratio
+        );
+        assert!(
+            m.cc_transitions <= 12,
+            "{}: cc_transitions {} > 12 (excessive FSM flapping)",
+            m.scenario_name,
+            m.cc_transitions
         );
         assert!(
             m.steady_changes_per_sec <= 1.0,
@@ -315,6 +346,53 @@ fn gate_6_anti_oscillation_steady_rate_and_flip_bound() {
             m.max_consecutive_flips
         );
     }
+}
+
+#[test]
+fn wan_sim_zero_arrival_blackout_feedback_and_invalid_scenario_input_safety() {
+    // 100% packet loss blackout: ReceiverTick must emit zero-arrival timeout feedback so CC
+    // reacts and drops bitrate from 1500 kbps rather than remaining blind.
+    let mut blackout = base_scenario("total_blackout_100pct", 0x9A80, 50.0, 5_000);
+    blackout.duration_ms = 4_000;
+    blackout.loss_model = LossModel::Random { loss_rate: 1.0 };
+    let mb = WanSimulator::run(&blackout);
+    assert_eq!(mb.decoder_errors, 0);
+    assert!(
+        mb.cc_transitions >= 1,
+        "CC must react via zero-arrival timeout feedback during 100% loss blackout"
+    );
+    assert!(
+        mb.final_bitrate_kbps < 1_500,
+        "bitrate {} should back off during total blackout",
+        mb.final_bitrate_kbps
+    );
+
+    // Adversarial / unsorted / non-finite scenario inputs must normalize safely without NaN or panic.
+    let ugly = WanScenario {
+        name: "adversarial_inputs".to_string(),
+        seed: 42,
+        duration_ms: 0,
+        steady_measure_start_ms: 0,
+        base_rtt_ms: f64::NAN,
+        jitter_ms: -10.0,
+        max_queue_delay_ms: f64::NEG_INFINITY,
+        loss_model: LossModel::Random { loss_rate: 5.0 },
+        bandwidth_schedule: vec![
+            BandwidthStep {
+                at_ms: 500,
+                bandwidth_kbps: 0,
+            },
+            BandwidthStep {
+                at_ms: 0,
+                bandwidth_kbps: 0,
+            },
+        ],
+        step_down_check: None,
+        qoe_config: QoeConfig::default(),
+    };
+    let mu = WanSimulator::run(&ugly);
+    assert!(mu.steady_gt_queue_p95_ms.is_finite());
+    assert!(mu.glass_to_glass_p50_ms.is_finite());
 }
 
 #[test]

@@ -11,7 +11,7 @@
 
 use super::{
     congestion::{CcState, FeedbackSample},
-    fast_start::{ParameterSetInliner, ZeroBufferPacer},
+    fast_start::{PacerDecision, ParameterSetInliner, ZeroBufferPacer},
     fec::{
         choose_fec_slice_size, compute_fec_wait_ms, FecGroupOutcome, FecReorderBuffer, RsCodec,
         FEC_MAX_DATA_SHARDS,
@@ -22,7 +22,7 @@ use crate::session::video::VideoCodec;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
 };
 
 const MTU_PAYLOAD_BYTES: usize = 1_200;
@@ -177,6 +177,12 @@ pub struct WanBenchMetrics {
     pub fec_extra_delay_max_ms: u64,
     pub max_queue_delay_ms: f64,
     pub p95_queue_delay_ms: f64,
+    /// Ground-truth steady-state per-packet bottleneck queue wait P95 (ms).
+    pub steady_gt_queue_p95_ms: f64,
+    /// Ground-truth steady-state per-packet bottleneck queue wait max (ms).
+    pub steady_gt_queue_max_ms: f64,
+    /// Ground-truth overall per-packet bottleneck queue wait max (ms).
+    pub overall_gt_queue_max_ms: f64,
     pub step_down_converge_ms: Option<u64>,
     pub post_step_down_bitrate_kbps: Option<u32>,
     pub freeze_events: u64,
@@ -262,12 +268,76 @@ struct RxFrameAssembly {
     failed: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BottleneckTx {
+    arrival_us: Option<u64>,
+    queue_wait_ms: f64,
+}
+
+fn clamp_prob(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn validate_and_normalize_scenario(raw: &WanScenario) -> WanScenario {
+    let mut sc = raw.clone();
+    sc.duration_ms = sc.duration_ms.max(1);
+    sc.base_rtt_ms = if sc.base_rtt_ms.is_finite() && sc.base_rtt_ms >= 0.0 {
+        sc.base_rtt_ms.min(10_000.0)
+    } else {
+        40.0
+    };
+    sc.jitter_ms = if sc.jitter_ms.is_finite() && sc.jitter_ms >= 0.0 {
+        sc.jitter_ms.min(5_000.0)
+    } else {
+        0.0
+    };
+    sc.max_queue_delay_ms = if sc.max_queue_delay_ms.is_finite() && sc.max_queue_delay_ms > 0.0 {
+        sc.max_queue_delay_ms.min(60_000.0)
+    } else {
+        400.0
+    };
+    sc.loss_model = match sc.loss_model {
+        LossModel::None => LossModel::None,
+        LossModel::Random { loss_rate } => LossModel::Random {
+            loss_rate: clamp_prob(loss_rate),
+        },
+        LossModel::GilbertElliott {
+            p_good_to_bad,
+            p_bad_to_good,
+            loss_in_good,
+            loss_in_bad,
+        } => LossModel::GilbertElliott {
+            p_good_to_bad: clamp_prob(p_good_to_bad),
+            p_bad_to_good: clamp_prob(p_bad_to_good),
+            loss_in_good: clamp_prob(loss_in_good),
+            loss_in_bad: clamp_prob(loss_in_bad),
+        },
+    };
+    if sc.bandwidth_schedule.is_empty() {
+        sc.bandwidth_schedule.push(BandwidthStep {
+            at_ms: 0,
+            bandwidth_kbps: 10_000,
+        });
+    } else {
+        sc.bandwidth_schedule.sort_by_key(|s| s.at_ms);
+        for step in &mut sc.bandwidth_schedule {
+            step.bandwidth_kbps = step.bandwidth_kbps.max(300);
+        }
+    }
+    sc
+}
+
 /// Deterministic discrete-event WAN simulator.
 pub struct WanSimulator;
 
 impl WanSimulator {
     /// Executes a complete deterministic simulation for `scenario` and returns exact metrics.
-    pub fn run(scenario: &WanScenario) -> WanBenchMetrics {
+    pub fn run(raw_scenario: &WanScenario) -> WanBenchMetrics {
+        let scenario = &validate_and_normalize_scenario(raw_scenario);
         let mut rng = DetRng::new(scenario.seed);
         let mut loss_channel = LossChannelState::new(scenario.loss_model);
         let mut qoe = QoeEngine::new(scenario.qoe_config);
@@ -279,9 +349,11 @@ impl WanSimulator {
         let mut current_target = qoe.on_session_connected(0);
         let mut pending_force_idr = current_target.force_idr;
 
-        // First frame begins capture after a compact connection setup (~1/2 RTT control trigger,
-        // modeled as 1 RTT on initial connect handshake + zero-wait IDR launch).
-        let connect_setup_ms = (scenario.base_rtt_ms.round() as u64).min(scenario.duration_ms);
+        // First frame begins capture after a compact connection setup (~1 RTT handshake + zero-wait IDR).
+        let base_rtt_u64 = scenario.base_rtt_ms.round().clamp(0.0, 10_000.0) as u64;
+        let connect_setup_ms = base_rtt_u64.min(scenario.duration_ms);
+        let one_way_prop_ms_u64 = (scenario.base_rtt_ms * 0.5).round().clamp(0.0, 10_000.0) as u64;
+        let max_jitter_u64 = scenario.jitter_ms.ceil().clamp(0.0, 5_000.0) as u64;
 
         let mut heap: BinaryHeap<SimEvent> = BinaryHeap::new();
         let mut next_event_order = 0u64;
@@ -295,10 +367,16 @@ impl WanSimulator {
         };
 
         let feedback_interval_ms = ((scenario.base_rtt_ms * 0.5).round() as u64).clamp(40, 80);
-        push_event(&mut heap, connect_setup_ms * 1_000, SimEventKind::SendFrame);
         push_event(
             &mut heap,
-            (connect_setup_ms + feedback_interval_ms) * 1_000,
+            connect_setup_ms.saturating_mul(1_000),
+            SimEventKind::SendFrame,
+        );
+        push_event(
+            &mut heap,
+            connect_setup_ms
+                .saturating_add(feedback_interval_ms)
+                .saturating_mul(1_000),
             SimEventKind::ReceiverTick,
         );
 
@@ -310,9 +388,16 @@ impl WanSimulator {
         let mut next_group_id = 1u64;
         let mut next_pkt_seq = 1u64;
         let mut sent_frames: BTreeMap<u64, SentFrameTruth> = BTreeMap::new();
+        let mut sent_pkts_due: VecDeque<(u64, u64)> = VecDeque::new();
+        let mut overdue_max_seq = 0u64;
         let mut frames_sent_steady = 0u64;
 
-        // Receiver assembly & telemetry state
+        // Ground-truth bottleneck queue delay tracking (independent of CC self-estimate)
+        let mut steady_gt_queue_samples: Vec<f64> = Vec::new();
+        let mut steady_gt_queue_max_ms = 0.0f64;
+        let mut overall_gt_queue_max_ms = 0.0f64;
+
+        // Receiver assembly & telemetry state (BTreeMap for deterministic oldest-first pruning)
         let mut rx_frames: BTreeMap<u64, RxFrameAssembly> = BTreeMap::new();
         let mut group_to_frame: BTreeMap<u64, (u64, usize)> = BTreeMap::new();
         let mut frames_completed_steady = 0u64;
@@ -365,18 +450,24 @@ impl WanSimulator {
             match ev.kind {
                 SimEventKind::SendFrame => {
                     let frame_id = next_frame_id;
-                    next_frame_id += 1;
+                    next_frame_id = next_frame_id.saturating_add(1);
+
+                    // Advance FastStart watchdog in case feedback is delayed/blacked out.
+                    let tick_dir = qoe.on_fast_start_tick(now_ms);
+                    pending_force_idr |= tick_dir.force_idr;
 
                     let fps = current_target.fps_cap.max(5);
                     let frame_interval_ms = (1_000u64 / u64::from(fps)).max(16);
                     let is_idr = frame_id == 0 || pending_force_idr || frame_id.is_multiple_of(120);
                     pending_force_idr = false;
 
-                    // Compute realistic frame payload size from current media bitrate target.
-                    let avg_p_bytes = ((u64::from(current_target.media_bitrate_kbps) * 1_000)
+                    // Compute realistic frame payload size from current media bitrate target
+                    // (200-byte floor is physically consistent with 300 kbps minimum protection).
+                    let avg_p_bytes = ((u64::from(current_target.media_bitrate_kbps)
+                        .saturating_mul(1_000))
                         / 8
                         / u64::from(fps))
-                    .max(1_200) as usize;
+                    .max(200) as usize;
                     let jitter_scale = 0.94 + 0.12 * rng.next_f64();
                     let raw_target_bytes = if is_idr {
                         if frame_id == 0 {
@@ -391,14 +482,16 @@ impl WanSimulator {
 
                     // Construct synthetic Annex-B H.264 bitstream and run real ParameterSetInliner.
                     let raw_annex_b = synthesize_annex_b_h264(frame_id, is_idr, raw_target_bytes);
-                    let inlined = qoe.on_frame_encoded(VideoCodec::H264, &raw_annex_b, is_idr);
+                    let (inlined, fs_dir) =
+                        qoe.on_frame_encoded(VideoCodec::H264, &raw_annex_b, is_idr);
+                    pending_force_idr |= fs_dir.force_idr;
                     let frame_bytes = inlined.data;
 
-                    // Split frame into FEC-aware MTU slices and balance evenly across FEC groups
-                    // (k <= 16) so every group stays strictly within <= 25% redundancy.
+                    // Split frame into FEC-aware MTU slices (only splits to 9 slices when
+                    // effective redundancy >= 12%, so low-loss bands never over-split).
                     let slice_size = choose_fec_slice_size(
                         frame_bytes.len(),
-                        qoe.fec().is_enabled(),
+                        qoe.fec().effective_redundancy_ratio(),
                         MTU_PAYLOAD_BYTES,
                     );
                     let slices: Vec<&[u8]> = frame_bytes.chunks(slice_size).collect();
@@ -408,10 +501,11 @@ impl WanSimulator {
                     let group_count = group_chunks.len();
 
                     if now_ms >= scenario.steady_measure_start_ms
-                        && now_ms.saturating_add(scenario.base_rtt_ms as u64 + 150)
+                        && now_ms
+                            .saturating_add(base_rtt_u64.saturating_add(150))
                             <= scenario.duration_ms
                     {
-                        frames_sent_steady += 1;
+                        frames_sent_steady = frames_sent_steady.saturating_add(1);
                     }
 
                     sent_frames.insert(
@@ -429,50 +523,70 @@ impl WanSimulator {
                         }
                     }
 
-                    // Pacing window across a fraction of the frame interval.
-                    let total_packets_est: usize = group_chunks
-                        .iter()
-                        .map(|chunk| chunk.len() + qoe.parity_shards_for_group(chunk.len()))
-                        .sum();
-                    let pace_span_ms = (frame_interval_ms as f64 * 0.25).clamp(2.0, 8.0);
-                    let pkt_spacing_ms = if total_packets_est > 1 {
-                        pace_span_ms / ((total_packets_est - 1) as f64)
-                    } else {
-                        0.0
-                    };
-                    let encode_done_ms = (now_ms + ENCODE_DELAY_MS) as f64;
-                    let mut pkt_cursor = 0usize;
-
-                    for (g_idx, data_chunk) in group_chunks.iter().enumerate() {
+                    // Atomically plan RS parity counts for each group before pacing/sending so
+                    // wire-byte <= 25% accounting (including 2*k length tables) is exact.
+                    let mut planned_groups = Vec::with_capacity(group_chunks.len());
+                    let mut total_packets_planned = 0usize;
+                    for data_chunk in &group_chunks {
                         let k = data_chunk.len();
-                        let m = qoe.parity_shards_for_group(k);
+                        let media_bytes: u64 = data_chunk.iter().map(|s| s.len() as u64).sum();
+                        let max_shard_len: usize =
+                            data_chunk.iter().map(|s| s.len()).max().unwrap_or(0);
+                        let m = qoe.plan_fec_group(k, media_bytes, max_shard_len);
                         let parities = if m > 0 {
                             RsCodec::encode(data_chunk, m).unwrap_or_default()
                         } else {
                             Vec::new()
                         };
+                        total_packets_planned =
+                            total_packets_planned.saturating_add(k.saturating_add(parities.len()));
+                        planned_groups.push((data_chunk, parities));
+                    }
+
+                    let pace_span_ms = (frame_interval_ms as f64 * 0.25).clamp(2.0, 8.0);
+                    let pkt_spacing_ms = if total_packets_planned > 1 {
+                        pace_span_ms / ((total_packets_planned - 1) as f64)
+                    } else {
+                        0.0
+                    };
+                    let encode_done_ms = now_ms.saturating_add(ENCODE_DELAY_MS) as f64;
+                    let mut pkt_cursor = 0usize;
+
+                    for (g_idx, (data_chunk, parities)) in planned_groups.into_iter().enumerate() {
+                        let k = data_chunk.len();
                         let actual_m = parities.len();
                         let group_id = next_group_id;
-                        next_group_id += 1;
-
-                        let media_bytes: u64 = data_chunk.iter().map(|s| s.len() as u64).sum();
-                        let fec_bytes: u64 = parities.iter().map(|p| p.len() as u64).sum();
-                        qoe.fec_mut().record_group_bytes(media_bytes, fec_bytes);
+                        next_group_id = next_group_id.saturating_add(1);
 
                         // Transmit k data shards followed immediately by m parity shards.
                         for (shard_idx, slice) in data_chunk.iter().enumerate() {
                             let send_ms = encode_done_ms + (pkt_cursor as f64) * pkt_spacing_ms;
                             pkt_cursor += 1;
                             let seq_no = next_pkt_seq;
-                            next_pkt_seq += 1;
-                            if let Some((arr_us, q_wait)) = transmit_over_bottleneck(
+                            next_pkt_seq = next_pkt_seq.saturating_add(1);
+                            let tx = transmit_over_bottleneck(
                                 scenario,
                                 send_ms,
                                 slice.len(),
                                 &mut queue_drain_until_ms,
                                 &mut loss_channel,
                                 &mut rng,
-                            ) {
+                            );
+                            let due_ms = (send_ms.ceil().max(0.0) as u64)
+                                .saturating_add(one_way_prop_ms_u64)
+                                .saturating_add(max_jitter_u64)
+                                .saturating_add(5);
+                            sent_pkts_due.push_back((due_ms, seq_no));
+                            if tx.queue_wait_ms > overall_gt_queue_max_ms {
+                                overall_gt_queue_max_ms = tx.queue_wait_ms;
+                            }
+                            if (send_ms as u64) >= scenario.steady_measure_start_ms {
+                                steady_gt_queue_samples.push(tx.queue_wait_ms);
+                                if tx.queue_wait_ms > steady_gt_queue_max_ms {
+                                    steady_gt_queue_max_ms = tx.queue_wait_ms;
+                                }
+                            }
+                            if let Some(arr_us) = tx.arrival_us {
                                 push_event(
                                     &mut heap,
                                     arr_us,
@@ -488,7 +602,7 @@ impl WanSimulator {
                                         is_parity: false,
                                         shard_index: shard_idx,
                                         send_ms,
-                                        queue_wait_ms: q_wait,
+                                        queue_wait_ms: tx.queue_wait_ms,
                                         seq_no,
                                         payload: (*slice).to_vec(),
                                     },
@@ -500,15 +614,30 @@ impl WanSimulator {
                             let send_ms = encode_done_ms + (pkt_cursor as f64) * pkt_spacing_ms;
                             pkt_cursor += 1;
                             let seq_no = next_pkt_seq;
-                            next_pkt_seq += 1;
-                            if let Some((arr_us, q_wait)) = transmit_over_bottleneck(
+                            next_pkt_seq = next_pkt_seq.saturating_add(1);
+                            let tx = transmit_over_bottleneck(
                                 scenario,
                                 send_ms,
                                 parity.len(),
                                 &mut queue_drain_until_ms,
                                 &mut loss_channel,
                                 &mut rng,
-                            ) {
+                            );
+                            let due_ms = (send_ms.ceil().max(0.0) as u64)
+                                .saturating_add(one_way_prop_ms_u64)
+                                .saturating_add(max_jitter_u64)
+                                .saturating_add(5);
+                            sent_pkts_due.push_back((due_ms, seq_no));
+                            if tx.queue_wait_ms > overall_gt_queue_max_ms {
+                                overall_gt_queue_max_ms = tx.queue_wait_ms;
+                            }
+                            if (send_ms as u64) >= scenario.steady_measure_start_ms {
+                                steady_gt_queue_samples.push(tx.queue_wait_ms);
+                                if tx.queue_wait_ms > steady_gt_queue_max_ms {
+                                    steady_gt_queue_max_ms = tx.queue_wait_ms;
+                                }
+                            }
+                            if let Some(arr_us) = tx.arrival_us {
                                 push_event(
                                     &mut heap,
                                     arr_us,
@@ -524,7 +653,7 @@ impl WanSimulator {
                                         is_parity: true,
                                         shard_index: p_idx,
                                         send_ms,
-                                        queue_wait_ms: q_wait,
+                                        queue_wait_ms: tx.queue_wait_ms,
                                         seq_no,
                                         payload: parity,
                                     },
@@ -534,7 +663,9 @@ impl WanSimulator {
                     }
 
                     // Schedule next frame generation according to current fps_cap.
-                    let next_frame_us = ev.at_us.saturating_add(frame_interval_ms * 1_000);
+                    let next_frame_us = ev
+                        .at_us
+                        .saturating_add(frame_interval_ms.saturating_mul(1_000));
                     if next_frame_us <= duration_us {
                         push_event(&mut heap, next_frame_us, SimEventKind::SendFrame);
                     }
@@ -655,6 +786,17 @@ impl WanSimulator {
                             decoder_errors = decoder_errors.saturating_add(1);
                         }
                     }
+
+                    // Drain any eviction or corrupted-group NACK outcomes queued by push_shard.
+                    for pending in reorder.drain_pending_outcomes() {
+                        if let FecGroupOutcome::TimedOutNeedsNack { group_id: gid, .. } = pending {
+                            if let Some((fid, _)) = group_to_frame.remove(&gid) {
+                                if let Some(asm) = rx_frames.get_mut(&fid) {
+                                    asm.failed = true;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 SimEventKind::ReceiverTick => {
@@ -669,7 +811,7 @@ impl WanSimulator {
                         }
                     }
 
-                    // Prune old incomplete frames.
+                    // Prune old incomplete frames deterministically (oldest frame_id first via BTreeMap).
                     while rx_frames.len() > 128 {
                         if let Some((&oldest_fid, _)) = rx_frames.iter().next() {
                             rx_frames.remove(&oldest_fid);
@@ -678,12 +820,25 @@ impl WanSimulator {
                         }
                     }
 
-                    // 2. Emit feedback sample if any packets arrived in this window.
+                    // Advance overdue sent-packet frontier for blackout / zero-arrival loss detection.
+                    while let Some(&(due_ms, seq)) = sent_pkts_due.front() {
+                        if due_ms <= now_ms {
+                            overdue_max_seq = overdue_max_seq.max(seq);
+                            sent_pkts_due.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // 2. Emit feedback sample (including zero-arrival timeout feedback during
+                    // total blackout / heavy drop windows so CC is never blind).
+                    let jb_ms = compute_fec_wait_ms(rx_jitter_ewma, current_target.fps_cap);
+                    let fb_arrive_ms = now_ms.saturating_add(one_way_prop_ms_u64);
                     if win_pkts_recv > 0 {
                         let expected_in_win =
                             highest_seq_seen.saturating_sub(prev_highest_seq) as u32;
                         let lost_in_win = expected_in_win.saturating_sub(win_pkts_recv);
-                        prev_highest_seq = highest_seq_seen;
+                        prev_highest_seq = prev_highest_seq.max(highest_seq_seen);
 
                         let avg_q = if win_queue_count > 0 {
                             win_queue_sum / (win_queue_count as f64)
@@ -708,9 +863,7 @@ impl WanSimulator {
                             }
                             _ => None,
                         };
-                        let jb_ms = compute_fec_wait_ms(rx_jitter_ewma, current_target.fps_cap);
 
-                        let fb_arrive_ms = now_ms + (scenario.base_rtt_ms * 0.5).round() as u64;
                         let sample = FeedbackSample {
                             now_ms: fb_arrive_ms,
                             rtt_ms: measured_rtt,
@@ -723,7 +876,7 @@ impl WanSimulator {
                         };
                         push_event(
                             &mut heap,
-                            fb_arrive_ms * 1_000,
+                            fb_arrive_ms.saturating_mul(1_000),
                             SimEventKind::FeedbackArrive { sample },
                         );
 
@@ -735,9 +888,33 @@ impl WanSimulator {
                         win_bytes_recv = 0;
                         win_queue_sum = 0.0;
                         win_queue_count = 0;
+                    } else if overdue_max_seq > prev_highest_seq {
+                        let inferred_lost = overdue_max_seq
+                            .saturating_sub(prev_highest_seq)
+                            .min(u64::from(u32::MAX)) as u32;
+                        prev_highest_seq = overdue_max_seq;
+                        // Emit zero-arrival timeout feedback with rtt_ms = 0.0 (never poisons min_rtt)
+                        // and inferred packet loss so CC/FEC react promptly during total blackouts.
+                        let sample = FeedbackSample {
+                            now_ms: fb_arrive_ms,
+                            rtt_ms: 0.0,
+                            delay_delta_ms: 0.0,
+                            packets_received: 0,
+                            packets_lost: inferred_lost,
+                            jitter_ms: rx_jitter_ewma,
+                            jitter_buffer_ms: jb_ms as f64,
+                            delivery_rate_kbps: Some(0.0),
+                        };
+                        push_event(
+                            &mut heap,
+                            fb_arrive_ms.saturating_mul(1_000),
+                            SimEventKind::FeedbackArrive { sample },
+                        );
                     }
 
-                    let next_tick_us = ev.at_us.saturating_add(feedback_interval_ms * 1_000);
+                    let next_tick_us = ev
+                        .at_us
+                        .saturating_add(feedback_interval_ms.saturating_mul(1_000));
                     if next_tick_us <= duration_us {
                         push_event(&mut heap, next_tick_us, SimEventKind::ReceiverTick);
                     }
@@ -876,6 +1053,9 @@ impl WanSimulator {
             fec_extra_delay_max_ms,
             max_queue_delay_ms,
             p95_queue_delay_ms: percentile(&queue_delay_samples, 0.95),
+            steady_gt_queue_p95_ms: percentile(&steady_gt_queue_samples, 0.95),
+            steady_gt_queue_max_ms,
+            overall_gt_queue_max_ms,
             step_down_converge_ms,
             post_step_down_bitrate_kbps,
             freeze_events,
@@ -934,21 +1114,23 @@ fn finalize_received_frame(
     };
 
     let display_ms = now_ms.saturating_add(DECODE_DELAY_MS);
-    let _decision = pacer.on_decoded_frame_ready(display_ms, assembly.is_idr, has_ps);
+    match pacer.on_decoded_frame_ready(display_ms, assembly.is_idr, has_ps) {
+        PacerDecision::WaitForIdr => return,
+        PacerDecision::RenderImmediately { .. } | PacerDecision::RenderNormal { .. } => {}
+    }
 
     if let Some(prev_disp) = *last_display_ms {
         if display_ms.saturating_sub(prev_disp) > FREEZE_GAP_THRESHOLD_MS {
             *freeze_events = freeze_events.saturating_add(1);
         }
     }
-    if pacer.has_displayed_first_frame() {
-        *last_display_ms = Some(display_ms);
-    }
+    *last_display_ms = Some(display_ms);
 
+    let base_rtt_u64 = scenario.base_rtt_ms.round().clamp(0.0, 10_000.0) as u64;
     if assembly.capture_ms >= scenario.steady_measure_start_ms
         && assembly
             .capture_ms
-            .saturating_add(scenario.base_rtt_ms as u64 + 150)
+            .saturating_add(base_rtt_u64.saturating_add(150))
             <= scenario.duration_ms
     {
         *frames_completed_steady = frames_completed_steady.saturating_add(1);
@@ -964,14 +1146,17 @@ fn transmit_over_bottleneck(
     queue_drain_until_ms: &mut f64,
     loss_channel: &mut LossChannelState,
     rng: &mut DetRng,
-) -> Option<(u64, f64)> {
-    let bw_kbps = scenario.bandwidth_at(send_ms as u64) as f64;
+) -> BottleneckTx {
+    let bw_kbps = (scenario.bandwidth_at(send_ms.max(0.0) as u64) as f64).max(1.0);
     let tx_ms = ((size_bytes as f64) * 8.0) / bw_kbps;
     let queue_wait_ms = (*queue_drain_until_ms - send_ms).max(0.0);
 
     // Finite bottleneck buffer tail-drop (realistic router queue limit).
     if queue_wait_ms + tx_ms > scenario.max_queue_delay_ms {
-        return None;
+        return BottleneckTx {
+            arrival_us: None,
+            queue_wait_ms: queue_wait_ms.min(scenario.max_queue_delay_ms),
+        };
     }
 
     let depart_ms = send_ms.max(*queue_drain_until_ms) + tx_ms;
@@ -979,14 +1164,20 @@ fn transmit_over_bottleneck(
 
     // Stochastic / Gilbert-Elliott channel loss.
     if loss_channel.should_drop(rng) {
-        return None;
+        return BottleneckTx {
+            arrival_us: None,
+            queue_wait_ms,
+        };
     }
 
     let one_way_prop_ms = scenario.base_rtt_ms * 0.5;
     let jitter = rng.next_f64() * scenario.jitter_ms.max(0.0);
     let arrival_ms = depart_ms + one_way_prop_ms + jitter;
     let arrival_us = (arrival_ms * 1_000.0).round().max(0.0) as u64;
-    Some((arrival_us, queue_wait_ms))
+    BottleneckTx {
+        arrival_us: Some(arrival_us),
+        queue_wait_ms,
+    }
 }
 
 fn synthesize_annex_b_h264(frame_id: u64, is_idr: bool, target_len: usize) -> Vec<u8> {

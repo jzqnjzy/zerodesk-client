@@ -22,12 +22,14 @@ pub use congestion::{
 pub use fast_start::{
     FastStartController, FastStartDirective, FastStartPhase, InlineOutcome, PacerDecision,
     ParameterSetInliner, ZeroBufferPacer, FAST_START_PROBE_BITRATE_KBPS, FAST_START_PROBE_FRAMES,
+    FAST_START_TIMEOUT_MS,
 };
 pub use fec::{
-    cauchy_coeff, compute_fec_wait_ms, gf_inv, gf_mul, AdaptiveFecController, FecDecision,
-    FecError, FecGroupOutcome, FecReceiverStats, FecReorderBuffer, RsCodec, FEC_DEBOUNCE_MS,
-    FEC_MAX_DATA_SHARDS, FEC_MAX_PARITY_SHARDS, FEC_MAX_REDUNDANCY_RATIO, FEC_WAIT_MAX_MS,
-    FEC_WAIT_MIN_MS, GF256_PRIMITIVE_POLY,
+    cauchy_coeff, choose_fec_slice_size, compute_fec_wait_ms, gf_inv, gf_mul,
+    AdaptiveFecController, FecDecision, FecError, FecGroupOutcome, FecReceiverStats,
+    FecReorderBuffer, RsCodec, FEC_DEBOUNCE_MS, FEC_EXTRA_DELAY_MAX_SAMPLES, FEC_MAX_DATA_SHARDS,
+    FEC_MAX_PARITY_SHARDS, FEC_MAX_REDUNDANCY_RATIO, FEC_WAIT_MAX_MS, FEC_WAIT_MIN_MS,
+    GF256_PRIMITIVE_POLY,
 };
 pub use wan_sim::{
     BandwidthStep, LossModel, WanBenchMetrics, WanScenario, WanSimulator,
@@ -153,17 +155,21 @@ impl QoeEngine {
         self.last_target
     }
 
-    /// Invoked immediately when a V2 session connects: pre-triggers an immediate IDR at the
-    /// lightweight `1500 kbps` FastStart probe bitrate.
+    /// Invoked immediately when a V2 session connects: resets CC/FEC/parameter-set state for clean
+    /// cross-session reuse and pre-triggers an immediate IDR at the lightweight `1500 kbps` probe rate.
     pub fn on_session_connected(&mut self, now_ms: u64) -> EncoderTarget {
+        self.congestion = CongestionController::new(self.cfg.congestion);
+        self.fec = AdaptiveFecController::with_debounce_ms(self.cfg.fec_debounce_ms);
+        self.param_inliner = ParameterSetInliner::new();
+        self.fec_loss_window.clear();
+
         let dir = self.fast_start.on_session_connected(now_ms);
+        let min_br = self.cfg.congestion.min_bitrate_kbps.max(CC_MIN_BITRATE_KBPS);
+        let max_br = self.cfg.congestion.max_bitrate_kbps.max(min_br);
         let probe = dir
             .probe_bitrate_kbps
             .unwrap_or(self.cfg.fast_start_probe_bitrate_kbps)
-            .clamp(
-                self.cfg.congestion.min_bitrate_kbps,
-                self.cfg.congestion.max_bitrate_kbps,
-            );
+            .clamp(min_br, max_br);
         let (width, height) = self.congestion.current_resolution();
         let target = EncoderTarget {
             media_bitrate_kbps: probe,
@@ -186,10 +192,17 @@ impl QoeEngine {
         codec: VideoCodec,
         bitstream: &[u8],
         is_idr: bool,
-    ) -> InlineOutcome {
+    ) -> (InlineOutcome, FastStartDirective) {
         let outcome = self.param_inliner.inline_if_needed(codec, bitstream);
-        let _ = self.fast_start.on_frame_encoded(is_idr || outcome.contains_idr);
-        outcome
+        let fs_dir = self
+            .fast_start
+            .on_frame_encoded(is_idr || outcome.contains_idr);
+        (outcome, fs_dir)
+    }
+
+    /// Advances the FastStart timeout watchdog when no feedback has arrived yet.
+    pub fn on_fast_start_tick(&mut self, now_ms: u64) -> FastStartDirective {
+        self.fast_start.on_tick(now_ms)
     }
 
     /// Processes a receiver feedback window, updating adaptive FEC, FastStart handoff,
@@ -241,14 +254,39 @@ impl QoeEngine {
             target.total_bitrate_kbps = capped_total;
             target.media_bitrate_kbps = media;
             target.fec_budget_kbps = fec;
-            target.force_idr |= fs_dir.force_idr;
         }
+        // Always propagate pending initial IDR even after FastStart handoff.
+        target.force_idr |= fs_dir.force_idr;
+
+        // Propagate effective FEC ratio cap so FEC never overshoots total_bitrate_kbps when
+        // media is pinned at the 300 kbps minimum protection floor.
+        let effective_budget_ratio = if target.media_bitrate_kbps > 0 {
+            ((target.fec_budget_kbps as f64) / (target.media_bitrate_kbps as f64))
+                .clamp(0.0, FEC_MAX_REDUNDANCY_RATIO)
+        } else {
+            0.0
+        };
+        self.fec.set_budget_ratio_cap(effective_budget_ratio);
 
         self.last_target = target;
         target
     }
 
-    /// Plans how many RS parity shards `m` to emit for a frame/group of `k` media packets.
+    /// Atomically plans how many RS parity shards `m` to emit for a group of `k` media packets
+    /// while accounting for true wire-byte parity size (`2*k + max_shard_len`) and recording budget.
+    pub fn plan_fec_group(
+        &mut self,
+        k: usize,
+        group_media_bytes: u64,
+        max_shard_len: usize,
+    ) -> usize {
+        if !self.cfg.fec_enabled_by_policy {
+            return 0;
+        }
+        self.fec.plan_group(k, group_media_bytes, max_shard_len)
+    }
+
+    /// Read-only estimate of RS parity shards `m` for a frame/group of `k` media packets.
     pub fn parity_shards_for_group(&self, k: usize) -> usize {
         if !self.cfg.fec_enabled_by_policy {
             return 0;
@@ -316,7 +354,7 @@ impl QoeEngine {
             height,
             fps_cap: self.congestion.fps_cap(),
             fec_enabled: self.fec.is_enabled(),
-            fec_redundancy_ratio: self.fec.redundancy_ratio(),
+            fec_redundancy_ratio: self.fec.effective_redundancy_ratio(),
             srtt_ms: self.congestion.srtt_ms(),
             min_rtt_ms: self.congestion.min_rtt_ms(),
             queue_delay_ms: self.congestion.queue_delay_ms(),
@@ -412,14 +450,16 @@ mod tests {
             0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0, 0, 0, 1, 0x65,
             0x88,
         ];
-        let o0 = engine.on_frame_encoded(VideoCodec::H264, &idr_with_ps, true);
+        let (o0, d0) = engine.on_frame_encoded(VideoCodec::H264, &idr_with_ps, true);
         assert!(o0.has_complete_param_sets);
+        assert_eq!(d0.phase, FastStartPhase::Probing);
         let p1 = [0, 0, 0, 1, 0x41, 0x01];
         let _ = engine.on_frame_encoded(VideoCodec::H264, &p1, false);
         let bare_idr = [0, 0, 0, 1, 0x65, 0x99];
-        let o2 = engine.on_frame_encoded(VideoCodec::H264, &bare_idr, true);
+        let (o2, d2) = engine.on_frame_encoded(VideoCodec::H264, &bare_idr, true);
         assert!(o2.inlined_param_sets);
         assert!(o2.has_complete_param_sets);
+        assert_eq!(d2.phase, FastStartPhase::Probing);
 
         // Feedback arrives -> hands off to CC Startup and ramps cleanly.
         let t1 = engine.on_feedback(FeedbackSample {
@@ -436,5 +476,84 @@ mod tests {
         assert!(t1.media_bitrate_kbps + t1.fec_budget_kbps <= t1.total_bitrate_kbps);
         let snap = engine.snapshot();
         assert_eq!(snap.param_sets_inlined, 1);
+    }
+
+    #[test]
+    fn qoe_engine_handles_inverted_config_floor_fec_cap_pending_idr_and_session_reset() {
+        // P1-1: Inverted min > max config must NEVER panic on on_session_connected!
+        let bad_cfg = QoeConfig {
+            congestion: CongestionConfig {
+                min_bitrate_kbps: 2_000,
+                max_bitrate_kbps: 500,
+                start_bitrate_kbps: 1_500,
+                ..Default::default()
+            },
+            fec_debounce_ms: 0,
+            ..Default::default()
+        };
+        let mut engine = QoeEngine::new(bad_cfg);
+        let t0 = engine.on_session_connected(0);
+        assert_eq!(t0.total_bitrate_kbps, 2_000);
+        assert!(t0.force_idr);
+
+        // P2-1: Encode 3 non-IDR frames so initial_idr_pending stays true across handoff.
+        let p = [0, 0, 0, 1, 0x41, 0x01];
+        for _ in 0..3 {
+            let (_, dir) = engine.on_frame_encoded(VideoCodec::H264, &p, false);
+            assert!(dir.force_idr);
+        }
+        let t_handoff = engine.on_feedback(FeedbackSample {
+            now_ms: 100,
+            rtt_ms: 30.0,
+            delay_delta_ms: 0.0,
+            packets_received: 40,
+            packets_lost: 0,
+            jitter_ms: 1.0,
+            jitter_buffer_ms: 4.0,
+            delivery_rate_kbps: Some(4_000.0),
+        });
+        assert_eq!(engine.fast_start().phase(), FastStartPhase::HandedOff);
+        assert!(
+            t_handoff.force_idr,
+            "pending initial IDR must NOT be dropped on FastStart handoff"
+        );
+
+        // P2-3: At 300 kbps floor, FEC effective budget cap must drop to 0 so parity does not overshoot total.
+        let floor_cfg = QoeConfig {
+            congestion: CongestionConfig {
+                min_bitrate_kbps: CC_MIN_BITRATE_KBPS,
+                start_bitrate_kbps: CC_MIN_BITRATE_KBPS,
+                max_bitrate_kbps: CC_MIN_BITRATE_KBPS,
+                ..Default::default()
+            },
+            fec_debounce_ms: 0,
+            ..Default::default()
+        };
+        let mut floor_engine = QoeEngine::new(floor_cfg);
+        floor_engine.on_session_connected(0);
+        for step in 0..3u64 {
+            let t = floor_engine.on_feedback(FeedbackSample {
+                now_ms: step * 100,
+                rtt_ms: 40.0,
+                delay_delta_ms: 0.0,
+                packets_received: 40,
+                packets_lost: 10,
+                jitter_ms: 2.0,
+                jitter_buffer_ms: 5.0,
+                delivery_rate_kbps: Some(300.0),
+            });
+            assert_eq!(t.media_bitrate_kbps, CC_MIN_BITRATE_KBPS);
+            assert_eq!(t.fec_budget_kbps, 0);
+        }
+        assert!(floor_engine.fec().is_enabled());
+        assert_eq!(floor_engine.fec().effective_redundancy_ratio(), 0.0);
+        assert_eq!(floor_engine.plan_fec_group(9, 9 * 1_000, 1_000), 0);
+
+        // P2-5: Calling on_session_connected again resets CC, FEC, and rolling loss window cleanly.
+        let t_reset = floor_engine.on_session_connected(5_000);
+        assert!(t_reset.force_idr);
+        assert!(!floor_engine.fec().is_enabled());
+        assert_eq!(floor_engine.congestion().min_rtt_ms(), 0.0);
+        assert!(floor_engine.congestion().transitions().is_empty());
     }
 }
