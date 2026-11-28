@@ -37,6 +37,7 @@ pub enum OsPermission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OsError {
     PermissionDenied(OsPermission),
+    NotPermitted,
     CaptureFailed(String),
     AudioUnavailable(String),
     UnsupportedAudioFormat(String),
@@ -51,6 +52,7 @@ impl fmt::Display for OsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PermissionDenied(p) => write!(f, "OS permission denied: {p:?}"),
+            Self::NotPermitted => write!(f, "not_permitted"),
             Self::CaptureFailed(msg) => write!(f, "OS capture failed: {msg}"),
             Self::AudioUnavailable(msg) => write!(f, "OS audio unavailable: {msg}"),
             Self::UnsupportedAudioFormat(msg) => write!(f, "unsupported OS audio format: {msg}"),

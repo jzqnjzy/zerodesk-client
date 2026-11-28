@@ -1,11 +1,11 @@
 {
   "v": 1,
   "seq": 47,
-  "kind": "FileTransferComplete",
+  "kind": "file_transfer_complete",
   "payload": {
     "transfer_id": 7,
     "rel_name": "report.pdf",
-    "bytes": 1048576,
+    "bytes": 0,
     "sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "checksum_algo": "sha256",
     "saved_path": "/tmp/report.pdf"

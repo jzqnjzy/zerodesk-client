@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
-use super::{EmergencyKeyReleaser, OsError, OsHidSink, OsPermission, ReleaseReport};
+use super::{EmergencyKeyReleaser, OsError, OsHidSink, ReleaseReport};
 use crate::session::hid::{KeyEvent, MouseEvent};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -670,22 +670,53 @@ pub fn emergency_release_real_os_keys(
 /// - `AXIsProcessTrusted()` is attributed to the responsible process performing `CGEventPost`.
 /// - When launched via `ZeroDesk.app`, the child `zerodesk-hid-watchdog` inherits the app bundle's
 ///   TCC identity; in dev CLI runs, it inherits Terminal / the launching host process.
-/// - When the watchdog/injector process is active, `accessibility_granted` reflects its live probe
-///   (`watchdog_or_injector_process`). Otherwise, the UI process probe is clearly marked as a
-///   non-authoritative hint (`ui_process_hint`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// - Authoritative sources (`watchdog` or `injector_process`) strictly take precedence over
+///   `ui_process_hint`. A non-authoritative `ui_process_hint` (or unknown future value) can NEVER
+///   authorize `enable_os_input = true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionProbeSource {
-    WatchdogOrInjectorProcess,
+    Watchdog,
+    InjectorProcess,
     UiProcessHint,
+    Unknown(String),
 }
 
 impl PermissionProbeSource {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::WatchdogOrInjectorProcess => "watchdog_or_injector_process",
+            Self::Watchdog => "watchdog",
+            Self::InjectorProcess => "injector_process",
             Self::UiProcessHint => "ui_process_hint",
+            Self::Unknown(s) => s.as_str(),
         }
+    }
+
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::Watchdog | Self::InjectorProcess)
+    }
+}
+
+impl Serialize for PermissionProbeSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissionProbeSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "watchdog" => Self::Watchdog,
+            "injector_process" | "watchdog_or_injector_process" => Self::InjectorProcess,
+            "ui_process_hint" => Self::UiProcessHint,
+            _ => Self::Unknown(raw),
+        })
     }
 }
 
@@ -720,7 +751,7 @@ impl PermissionProbe for SystemPermissionProbe {
         let screen_capture_granted = super::capture::preflight_screen_capture_permission()
             .unwrap_or(false);
         let (accessibility_granted, probe_source) = match watchdog_ax_override {
-            Some(ax) => (ax, PermissionProbeSource::WatchdogOrInjectorProcess),
+            Some(ax) => (ax, PermissionProbeSource::Watchdog),
             None => (
                 is_accessibility_trusted(),
                 PermissionProbeSource::UiProcessHint,
@@ -749,6 +780,7 @@ impl OsInputGateError {
     pub fn status_code(&self) -> &'static str {
         match self {
             Self::NotPermitted => "not_permitted",
+            Self::Os(OsError::NotPermitted) => "not_permitted",
             Self::Os(_) => "os_error",
         }
     }
@@ -771,10 +803,16 @@ impl std::error::Error for OsInputGateError {}
 ///
 /// When unpermitted or disabled, every event is dropped immediately with ZERO queuing/buffering
 /// and ZERO calls to the inner injector, returning `OsInputGateError::NotPermitted` (`"not_permitted"`).
+/// If permission or the gate drops while `was_permitted == true`, the gate automatically invokes
+/// `self.inner.emergency_releaser().release_all_keys()` BEFORE returning `NotPermitted` so
+/// mid-keypress TCC revocation can NEVER leave stuck keys.
 pub struct GatedOsHidSink {
     inner: Box<dyn OsHidSink>,
     enable_os_input: Arc<AtomicBool>,
     permissions_ok: Arc<dyn Fn() -> bool + Send + Sync>,
+    was_permitted: AtomicBool,
+    probe_cache_ttl: std::time::Duration,
+    cached_perm: Mutex<Option<(bool, std::time::Instant)>>,
 }
 
 impl GatedOsHidSink {
@@ -783,36 +821,123 @@ impl GatedOsHidSink {
         enable_os_input: Arc<AtomicBool>,
         permissions_ok: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
+        Self::with_probe_cache_ttl(
+            inner,
+            enable_os_input,
+            permissions_ok,
+            std::time::Duration::ZERO,
+        )
+    }
+
+    /// Creates a `GatedOsHidSink` caching `permissions_ok` for up to `ttl` (clamped to `<= 250ms`,
+    /// fail-closed on expiry) so high-frequency mouse moves avoid per-event XPC on Tokio threads.
+    pub fn with_probe_cache_ttl(
+        inner: Box<dyn OsHidSink>,
+        enable_os_input: Arc<AtomicBool>,
+        permissions_ok: Arc<dyn Fn() -> bool + Send + Sync>,
+        ttl: std::time::Duration,
+    ) -> Self {
         Self {
             inner,
             enable_os_input,
             permissions_ok,
+            was_permitted: AtomicBool::new(false),
+            probe_cache_ttl: ttl.min(std::time::Duration::from_millis(250)),
+            cached_perm: Mutex::new(None),
         }
     }
 
+    pub(crate) fn set_enable_os_input(&self, enabled: bool) {
+        self.enable_os_input.store(enabled, Ordering::Release);
+        if !enabled {
+            *self.cached_perm.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub fn invalidate_permission_cache(&self) {
+        *self.cached_perm.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     pub fn is_permitted(&self) -> bool {
-        self.enable_os_input.load(Ordering::Acquire) && (self.permissions_ok)()
+        // Fast-path View-Only check FIRST (zero XPC / TCC calls when disabled).
+        if !self.enable_os_input.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.probe_cache_ttl.is_zero() {
+            return (self.permissions_ok)();
+        }
+        let now = std::time::Instant::now();
+        {
+            let g = self.cached_perm.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ok, ts)) = *g {
+                if now.saturating_duration_since(ts) <= self.probe_cache_ttl {
+                    return ok;
+                }
+            }
+        }
+        let ok = (self.permissions_ok)();
+        *self.cached_perm.lock().unwrap_or_else(|e| e.into_inner()) = Some((ok, now));
+        ok
+    }
+
+    fn release_if_was_permitted(&self) {
+        if self.was_permitted.swap(false, Ordering::AcqRel) {
+            let _ = self.inner.emergency_releaser().release_all_keys();
+        }
     }
 
     pub fn dispatch_key(&mut self, ev: &KeyEvent) -> Result<(), OsInputGateError> {
         if !self.is_permitted() {
+            self.release_if_was_permitted();
             return Err(OsInputGateError::NotPermitted);
         }
-        self.inner.send_key(ev).map_err(OsInputGateError::Os)
+        self.was_permitted.store(true, Ordering::Release);
+        match self.inner.send_key(ev) {
+            Ok(()) => Ok(()),
+            Err(e @ (OsError::PermissionDenied(_) | OsError::NotPermitted)) => {
+                self.invalidate_permission_cache();
+                self.release_if_was_permitted();
+                Err(OsInputGateError::Os(e))
+            }
+            Err(e) => Err(OsInputGateError::Os(e)),
+        }
     }
 
     pub fn dispatch_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsInputGateError> {
         if !self.is_permitted() {
+            self.release_if_was_permitted();
             return Err(OsInputGateError::NotPermitted);
         }
-        self.inner.send_mouse(ev).map_err(OsInputGateError::Os)
+        self.was_permitted.store(true, Ordering::Release);
+        match self.inner.send_mouse(ev) {
+            Ok(()) => Ok(()),
+            Err(e @ (OsError::PermissionDenied(_) | OsError::NotPermitted)) => {
+                self.invalidate_permission_cache();
+                self.release_if_was_permitted();
+                Err(OsInputGateError::Os(e))
+            }
+            Err(e) => Err(OsInputGateError::Os(e)),
+        }
+    }
+
+    /// Returns the ungated underlying `EmergencyKeyReleaser`, guaranteed to bypass
+    /// `enable_os_input` and permission gates unconditionally.
+    pub fn emergency_releaser(&self) -> Arc<dyn EmergencyKeyReleaser> {
+        self.inner.emergency_releaser()
     }
 
     /// Disables `enable_os_input` immediately and releases all held keys/buttons via the
     /// underlying emergency releaser.
     pub fn disable_and_release(&self) -> ReleaseReport {
-        self.enable_os_input.store(false, Ordering::Release);
+        self.set_enable_os_input(false);
+        self.was_permitted.store(false, Ordering::Release);
         self.inner.emergency_releaser().release_all_keys()
+    }
+}
+
+impl Drop for GatedOsHidSink {
+    fn drop(&mut self) {
+        let _ = self.disable_and_release();
     }
 }
 
@@ -820,9 +945,7 @@ impl OsHidSink for GatedOsHidSink {
     fn send_key(&mut self, ev: &KeyEvent) -> Result<(), OsError> {
         match self.dispatch_key(ev) {
             Ok(()) => Ok(()),
-            Err(OsInputGateError::NotPermitted) => {
-                Err(OsError::PermissionDenied(OsPermission::Accessibility))
-            }
+            Err(OsInputGateError::NotPermitted) => Err(OsError::NotPermitted),
             Err(OsInputGateError::Os(e)) => Err(e),
         }
     }
@@ -830,9 +953,7 @@ impl OsHidSink for GatedOsHidSink {
     fn send_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsError> {
         match self.dispatch_mouse(ev) {
             Ok(()) => Ok(()),
-            Err(OsInputGateError::NotPermitted) => {
-                Err(OsError::PermissionDenied(OsPermission::Accessibility))
-            }
+            Err(OsInputGateError::NotPermitted) => Err(OsError::NotPermitted),
             Err(OsInputGateError::Os(e)) => Err(e),
         }
     }

@@ -28,12 +28,58 @@ public struct FileTransferItem: Identifiable, Sendable, Equatable {
 
     public var progressFraction: Double {
         guard totalBytes > 0 else { return isInFlight ? 0.0 : 1.0 }
-        return min(max(Double(bytesTransferred) / Double(totalBytes), 0.0), 1.0)
+        let raw = Double(bytesTransferred) / Double(totalBytes)
+        guard raw.isFinite else { return 0.0 }
+        return min(max(raw, 0.0), 1.0)
     }
+}
+
+/// Isolated `@MainActor` store for 1 Hz HUD telemetry so `hud_stats` updates redraw ONLY
+/// `TelemetryHudView` instead of invalidating the entire `ContentView` hierarchy.
+@MainActor
+public final class HudStatsStore: ObservableObject {
+    @Published public var stats: HudStatsPayload = HudStatsPayload()
+
+    public init() {}
 }
 
 @MainActor
 public final class ZeroDeskViewModel: ObservableObject {
+    private static let defaultMaxDropFileBytes: UInt64 = 512 * 1024 * 1024 // 512 MiB hard UI cap
+
+    private final class AppMonitorCleanupBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var escapeMonitor: Any?
+        private var observers: [NSObjectProtocol] = []
+
+        func setEscapeMonitor(_ monitor: Any?) {
+            let old: Any?
+            lock.lock()
+            old = escapeMonitor
+            escapeMonitor = monitor
+            lock.unlock()
+            if let old {
+                NSEvent.removeMonitor(old)
+            }
+        }
+
+        func setObservers(_ next: [NSObjectProtocol]) {
+            let old: [NSObjectProtocol]
+            lock.lock()
+            old = observers
+            observers = next
+            lock.unlock()
+            for obs in old {
+                NotificationCenter.default.removeObserver(obs)
+            }
+        }
+
+        func teardownAll() {
+            setEscapeMonitor(nil)
+            setObservers([])
+        }
+    }
+
     @Published public var snapshot: BridgeSnapshot?
     @Published public var selftest: OsSelftestReport?
     @Published public var permissionStatus: PermissionStatusReport?
@@ -43,7 +89,14 @@ public final class ZeroDeskViewModel: ObservableObject {
     // Per-session OS input control (default OFF, NEVER persisted, strictly Rust-acknowledged!).
     @Published public var isOsInputEnabled: Bool = false
     @Published public var isInputTogglePending: Bool = false
-    @Published public var isPermissionGuidePresented: Bool = false
+    @Published public var inputRevokedNotice: String?
+    @Published public var isPermissionGuidePresented: Bool = false {
+        didSet {
+            if isPermissionGuidePresented {
+                inputGate?.releaseAll(reason: .sheetPresented)
+            }
+        }
+    }
 
     // Viewport & session control drawer state.
     @Published public var hasVideoFrame: Bool = false
@@ -52,8 +105,9 @@ public final class ZeroDeskViewModel: ObservableObject {
     @Published public var scrollOffset: CGPoint = .zero
     @Published public var isControlDrawerOpen: Bool = false
 
-    // Live 1 Hz Telemetry HUD (updated strictly from Rust `hud_stats`, NEVER per-frame!).
-    @Published public var hudStats: HudStatsPayload = HudStatsPayload()
+    // Isolated 1 Hz HUD telemetry store (zero full-view-tree SwiftUI redraws!).
+    public let hudStore = HudStatsStore()
+    public var hudStats: HudStatsPayload { hudStore.stats }
 
     // Codec / Bitrate / FPS controls.
     @Published public var activeCodecLabel: String = "auto"
@@ -70,7 +124,13 @@ public final class ZeroDeskViewModel: ObservableObject {
     @Published public var incomingCall: IncomingCallPrompt?
     @Published public var statusMessage: String = "Idle"
     @Published public var eventLog: [String] = []
-    @Published public var isSettingsPresented: Bool = false
+    @Published public var isSettingsPresented: Bool = false {
+        didSet {
+            if isSettingsPresented {
+                inputGate?.releaseAll(reason: .sheetPresented)
+            }
+        }
+    }
 
     @Published public var targetDeviceId: String = ""
     @Published public var outboundClipboardText: String = ""
@@ -90,6 +150,21 @@ public final class ZeroDeskViewModel: ObservableObject {
         snapshot?.state == "streaming"
     }
 
+    /// Single truth source for macOS Screen Recording & Accessibility permission state across
+    /// `ContentView`, `SessionControlPanelView`, and `SystemPermissionGuideView`.
+    public var effectivePermissionStatus: PermissionStatusReport? {
+        if let report = permissionStatus {
+            return report
+        }
+        guard let st = selftest else { return nil }
+        return PermissionStatusReport(
+            screenCaptureGranted: st.screenRecording.granted,
+            accessibilityGranted: st.accessibility.granted,
+            probeSource: .uiProcessHint,
+            enableOsInput: isOsInputEnabled
+        )
+    }
+
     public func hasCapability(_ cap: String) -> Bool {
         capabilities.contains(cap)
     }
@@ -100,11 +175,15 @@ public final class ZeroDeskViewModel: ObservableObject {
     private let identityDirPath: String
     private let qualityDebouncer = QualityControlDebouncer(delayMs: QualityControlDebouncer.defaultDelayMs)
     private let clipboardGuard = ClipboardSyncGuard()
+    private let monitorCleanupBox = AppMonitorCleanupBox()
     private var codecAckTimeoutTask: Task<Void, Never>?
+    private var inputToggleTimeoutTask: Task<Void, Never>?
     private var pendingCodecRequest: String?
+    private var isRefreshingPermissions = false
     private var isFrameFetchScheduled = false
     private var hasPendingFrame = false
     private var frameGeneration: UInt64 = 0
+    private var syntheticTransferCounter: UInt64 = 0
 
     public init() {
         self.metalRenderer = try? MetalVideoRenderer()
@@ -136,7 +215,7 @@ public final class ZeroDeskViewModel: ObservableObject {
                 }
             }
             self.client = bridge
-            self.inputGate = InputGate(sink: bridge, initialInputEnabled: false)
+            self.inputGate = InputGate(sink: bridge)
 
             if let hs = try? bridge.handshake() {
                 self.abiVersion = hs.abiVersion
@@ -154,6 +233,55 @@ public final class ZeroDeskViewModel: ObservableObject {
         } catch {
             setStatus("Bridge init error: \(error)")
         }
+
+        installAppLevelMonitors()
+    }
+
+    deinit {
+        monitorCleanupBox.teardownAll()
+    }
+
+    private func installAppLevelMonitors() {
+        // Unconditional app-level Emergency Escape (`Ctrl+Opt+Cmd+Escape`) monitor — active
+        // regardless of which view/drawer/sheet holds first responder!
+        let escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let consumed = MainActor.assumeIsolated { () -> Bool in
+                guard let self else { return false }
+                let flags = event.modifierFlags
+                var hidMods: UInt8 = 0
+                if flags.contains(.shift) { hidMods |= HidModifierMask.shift }
+                if flags.contains(.control) { hidMods |= HidModifierMask.ctrl }
+                if flags.contains(.option) { hidMods |= HidModifierMask.alt }
+                if flags.contains(.command) { hidMods |= HidModifierMask.meta }
+                let usage = MacHidKeyMap().lookup(event.keyCode)
+                guard let usage,
+                      MacHidKeyMap.isEmergencyEscapeCombo(usageId: usage, modifiers: hidMods)
+                else {
+                    return false
+                }
+                let shouldIntercept = self.isSessionStreaming
+                    || self.isOsInputEnabled
+                    || (self.inputGate?.hasAnyPressedInput == true)
+                guard shouldIntercept else { return false }
+                self.inputGate?.releaseAll(reason: .emergencyEscapeHotkey, forceEmit: true)
+                self.handleEmergencyEscapeTriggered()
+                return true
+            }
+            return consumed ? nil : event
+        }
+        monitorCleanupBox.setEscapeMonitor(escapeMonitor)
+
+        // Auto-refresh permissions whenever the user switches back from System Settings.
+        let becomeActive = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshPermissions()
+            }
+        }
+        monitorCleanupBox.setObservers([becomeActive])
     }
 
     // MARK: - Permissions & `enable_os_input` Gate
@@ -167,12 +295,29 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     /// Queries structured macOS permissions from Rust without popping any OS permission dialog.
+    /// Deduplicates overlapping calls triggered by notifications + polling.
     public func refreshPermissions() {
+        guard !isRefreshingPermissions else { return }
+        isRefreshingPermissions = true
+        defer { isRefreshingPermissions = false }
+
         refreshSelftest()
         guard let client else { return }
         if let report = try? client.getPermissions() {
+            let wasEnabled = isOsInputEnabled
             permissionStatus = report
+            if wasEnabled && !report.allRequiredPermissionsGranted {
+                inputRevokedNotice = "Input suspended — permission revoked"
+            } else if report.allRequiredPermissionsGranted {
+                inputRevokedNotice = nil
+            }
             applyAcknowledgedInputEnabled(report.enableOsInput)
+        }
+    }
+
+    public func openPermissionSettings(for permission: MacSystemPermissionKind) {
+        if SystemPermissionLinks.openSettings(for: permission) == nil {
+            showToast("Could not open System Settings automatically. Open System Settings -> Privacy & Security manually.")
         }
     }
 
@@ -183,6 +328,7 @@ public final class ZeroDeskViewModel: ObservableObject {
 
     public func closePermissionGuide() {
         isPermissionGuidePresented = false
+        refreshPermissions()
     }
 
     /// Requests toggling per-session `enable_os_input` over JSON-ABI.
@@ -190,9 +336,20 @@ public final class ZeroDeskViewModel: ObservableObject {
     public func requestSetInputEnabled(_ enabled: Bool, reason: String? = nil) {
         guard let client else { return }
         isInputTogglePending = true
+        inputToggleTimeoutTask?.cancel()
+        inputToggleTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled, self.isInputTogglePending else { return }
+            self.isInputTogglePending = false
+            if enabled {
+                self.applyAcknowledgedInputEnabled(false)
+            }
+            self.showToast("OS input toggle timed out (3s); remaining in View-Only mode.")
+        }
         do {
             let reply = try client.setInputEnabled(enabled, reason: reason)
             if !reply.ok {
+                inputToggleTimeoutTask?.cancel()
                 isInputTogglePending = false
                 if reply.errorCode == "not_permitted" {
                     applyAcknowledgedInputEnabled(false)
@@ -203,15 +360,32 @@ public final class ZeroDeskViewModel: ObservableObject {
                 }
             }
         } catch {
+            inputToggleTimeoutTask?.cancel()
             isInputTogglePending = false
             showToast("Input toggle error: \(error)")
         }
     }
 
     private func applyAcknowledgedInputEnabled(_ enabled: Bool) {
-        isOsInputEnabled = enabled
+        inputToggleTimeoutTask?.cancel()
+        let screenOk = effectivePermissionStatus?.screenCaptureGranted ?? true
+        let effectiveEnabled = enabled && screenOk
+        isOsInputEnabled = effectiveEnabled
         isInputTogglePending = false
-        inputGate?.setInputEnabledFromAck(enabled)
+        if effectiveEnabled {
+            inputRevokedNotice = nil
+        }
+        inputGate?.setInputEnabledFromAck(effectiveEnabled)
+    }
+
+    /// Unified fail-closed helper invoked at every session boundary, permission revocation, and
+    /// Emergency Escape to guarantee Swift `InputGate` and Rust `enable_os_input` never diverge.
+    private func forceDisableInputAndSync(reason: String, releaseReason: ReleaseReason = .inputDisabled) {
+        inputGate?.releaseAll(reason: releaseReason)
+        applyAcknowledgedInputEnabled(false)
+        if let client {
+            _ = try? client.setInputEnabled(false, reason: reason)
+        }
     }
 
     // MARK: - Overlay & Viewport Controls (Anti-Stuck-Key Triggers)
@@ -221,9 +395,7 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func toggleControlDrawer() {
-        if !isControlDrawerOpen {
-            notifyOverlayOpened()
-        }
+        notifyOverlayOpened()
         isControlDrawerOpen.toggle()
     }
 
@@ -252,27 +424,37 @@ public final class ZeroDeskViewModel: ObservableObject {
     // MARK: - Codec (Peer-Acknowledged + 3s Timeout Revert) & Debounced Quality Controls
 
     public func requestCodecChange(_ requested: String) {
+        let previousSelected = selectedCodecOption
+        let previousCodec = codec
+        notifyOverlayOpened()
         selectedCodecOption = requested
         codec = requested
-        guard let client else { return }
+        guard let client else {
+            selectedCodecOption = previousSelected
+            codec = previousCodec
+            return
+        }
 
         if !isSessionStreaming {
-            if let reply = try? client.setCodec(requested), reply.ok {
-                activeCodecLabel = requested
-                refreshSnapshot()
+            do {
+                let reply = try client.setCodec(requested)
+                if reply.ok {
+                    activeCodecLabel = requested
+                    refreshSnapshot()
+                } else {
+                    selectedCodecOption = previousSelected
+                    codec = previousCodec
+                    showToast("Codec change rejected: \(reply.error ?? reply.errorCode ?? "unsupported")")
+                }
+            } catch {
+                selectedCodecOption = previousSelected
+                codec = previousCodec
+                showToast("Codec change error: \(error)")
             }
             return
         }
 
-        pendingCodecRequest = requested
-        codecAckTimeoutTask?.cancel()
-        codecAckTimeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard let self, !Task.isCancelled, self.pendingCodecRequest == requested else { return }
-            self.pendingCodecRequest = nil
-            self.selectedCodecOption = self.activeCodecLabel
-            self.showToast("Codec switch to \(requested.uppercased()) timed out (3s); reverted to \(self.activeCodecLabel.uppercased()).")
-        }
+        startCodecAckTimeout(for: requested)
 
         do {
             let reply = try client.setCodec(requested)
@@ -280,22 +462,39 @@ public final class ZeroDeskViewModel: ObservableObject {
                 codecAckTimeoutTask?.cancel()
                 pendingCodecRequest = nil
                 selectedCodecOption = activeCodecLabel
-                showToast("Codec change rejected: \(reply.error ?? "unsupported")")
+                codec = activeCodecLabel
+                showToast("Codec change rejected: \(reply.error ?? reply.errorCode ?? "unsupported")")
             }
         } catch {
             codecAckTimeoutTask?.cancel()
             pendingCodecRequest = nil
             selectedCodecOption = activeCodecLabel
+            codec = activeCodecLabel
             showToast("Codec change error: \(error)")
         }
     }
 
+    private func startCodecAckTimeout(for requested: String) {
+        pendingCodecRequest = requested
+        codecAckTimeoutTask?.cancel()
+        codecAckTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled, self.pendingCodecRequest == requested else { return }
+            self.pendingCodecRequest = nil
+            self.selectedCodecOption = self.activeCodecLabel
+            self.codec = self.activeCodecLabel
+            self.showToast("Codec switch to \(requested.uppercased()) timed out (3s); reverted to \(self.activeCodecLabel.uppercased()).")
+        }
+    }
+
     public func updateBitrateTierDebounced(_ kbps: UInt32) {
+        notifyOverlayOpened()
         selectedBitrateKbps = kbps
         scheduleDebouncedQualityUpdate()
     }
 
     public func updateFpsCapDebounced(_ fps: UInt32) {
+        notifyOverlayOpened()
         selectedFpsCap = fps
         scheduleDebouncedQualityUpdate()
     }
@@ -332,9 +531,13 @@ public final class ZeroDeskViewModel: ObservableObject {
 
     public func sendClipboardText() {
         let text = outboundClipboardText
+        outboundClipboardText = ""
+        sendClipboardText(text)
+    }
+
+    public func sendClipboardText(_ text: String) {
         guard !text.isEmpty, let client else { return }
         let byteCount = text.utf8.count
-        outboundClipboardText = ""
         do {
             let reply = try client.execCommand(["cmd": "send_clipboard", "text": text])
             if reply.ok {
@@ -353,13 +556,16 @@ public final class ZeroDeskViewModel: ObservableObject {
         }
     }
 
-    /// Writes remote clipboard text to `NSPasteboard.general` while recording `changeCount`
-    /// so local polls skip echoing the remote write back.
+    /// Writes remote clipboard text to `NSPasteboard.general` while bracketing `changeCount`
+    /// (`before < current <= after`) so local polls skip echoing the remote write back without
+    /// suppressing concurrent external user copies.
     public func applyLocalPasteboardTextAntiEcho(_ text: String) {
         let pb = NSPasteboard.general
+        let before = pb.changeCount
+        clipboardGuard.beginLocalWrite(changeCountBefore: before)
         pb.clearContents()
         pb.setString(text, forType: .string)
-        clipboardGuard.recordLocalWrite(changeCount: pb.changeCount)
+        clipboardGuard.endLocalWrite(changeCountAfter: pb.changeCount)
     }
 
     public func shouldSkipLocalPasteboardPoll() -> Bool {
@@ -374,7 +580,7 @@ public final class ZeroDeskViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "Send File"
         if panel.runModal() == .OK, let url = panel.url {
-            sendFile(at: url.path)
+            validateAndSendFile(at: url)
         }
     }
 
@@ -382,18 +588,31 @@ public final class ZeroDeskViewModel: ObservableObject {
         var accepted = false
         for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             accepted = true
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, error in
+                if let error {
+                    Task { @MainActor [weak self] in
+                        self?.showToast("Dropped item unreadable: \(error.localizedDescription)")
+                    }
+                    return
+                }
                 let url: URL?
                 if let data = item as? Data {
                     url = URL(dataRepresentation: data, relativeTo: nil)
                 } else if let direct = item as? URL {
                     url = direct
+                } else if let str = item as? String {
+                    url = URL(string: str)
                 } else {
                     url = nil
                 }
-                guard let fileURL = url, fileURL.isFileURL else { return }
+                guard let fileURL = url, fileURL.isFileURL else {
+                    Task { @MainActor [weak self] in
+                        self?.showToast("Only local regular files can be transferred.")
+                    }
+                    return
+                }
                 Task { @MainActor [weak self] in
-                    self?.sendFile(at: fileURL.path)
+                    self?.validateAndSendFile(at: fileURL)
                 }
             }
         }
@@ -403,7 +622,79 @@ public final class ZeroDeskViewModel: ObservableObject {
     public func sendFile() {
         let path = outboundFilePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty else { return }
-        sendFile(at: path)
+        validateAndSendFile(at: URL(fileURLWithPath: path))
+    }
+
+    private func maxAllowedTransferBytes() -> UInt64 {
+        if let policyMax = snapshot?.policy?.maxFileBytes, policyMax > 0 {
+            return min(policyMax, Self.defaultMaxDropFileBytes)
+        }
+        return Self.defaultMaxDropFileBytes
+    }
+
+    private func validateAndSendFile(at url: URL) {
+        let maxBytes = maxAllowedTransferBytes()
+        let fileName = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+        Task { @MainActor [weak self] in
+            let validationError = await Task.detached(priority: .userInitiated) {
+                Self.validateLocalTransferFile(at: url, maxBytes: maxBytes)
+            }.value
+            guard let self else { return }
+            if let validationError {
+                self.recordLocalFileTransferError(fileName: fileName, message: validationError)
+            } else {
+                self.sendFile(at: url.path)
+            }
+        }
+    }
+
+    private nonisolated static func validateLocalTransferFile(at url: URL, maxBytes: UInt64) -> String? {
+        let path = url.path
+        var st = stat()
+        guard lstat(path, &st) == 0 else {
+            return "File does not exist or cannot be accessed."
+        }
+        let fileType = st.st_mode & S_IFMT
+        if fileType == S_IFLNK {
+            return "Symbolic links cannot be transferred."
+        }
+        if fileType == S_IFDIR {
+            return "Directories cannot be transferred."
+        }
+        if fileType != S_IFREG {
+            return "Only regular files can be transferred."
+        }
+        let size = UInt64(max(0, st.st_size))
+        if size > maxBytes {
+            let maxMiB = maxBytes / (1024 * 1024)
+            return "File exceeds maximum transfer size (\(maxMiB) MiB)."
+        }
+        return nil
+    }
+
+    private func recordLocalFileTransferError(fileName: String, message: String) {
+        showToast(message)
+        setStatus(message)
+        appendLog("File transfer rejected locally")
+        syntheticTransferCounter &+= 1
+        let syntheticId = UInt64(Date().timeIntervalSince1970 * 1000) &+ syntheticTransferCounter
+        fileTransfers.insert(
+            FileTransferItem(
+                id: syntheticId,
+                relName: fileName,
+                bytesTransferred: 0,
+                totalBytes: 0,
+                statusLabel: "Rejected",
+                isInFlight: false,
+                isError: true,
+                errorMessage: message,
+                checksumAlgo: nil
+            ),
+            at: 0
+        )
+        if fileTransfers.count > 20 {
+            fileTransfers.removeLast(fileTransfers.count - 20)
+        }
     }
 
     public func sendFile(at path: String) {
@@ -423,7 +714,8 @@ public final class ZeroDeskViewModel: ObservableObject {
                 }
                 setStatus(errMsg)
                 appendLog("File transfer rejected: \(reply.errorCode ?? "error")")
-                let syntheticId = UInt64(Date().timeIntervalSince1970 * 1000)
+                syntheticTransferCounter &+= 1
+                let syntheticId = UInt64(Date().timeIntervalSince1970 * 1000) &+ syntheticTransferCounter
                 fileTransfers.insert(
                     FileTransferItem(
                         id: syntheticId,
@@ -470,8 +762,7 @@ public final class ZeroDeskViewModel: ObservableObject {
                 clipboardSyncEnabled = clipOn
             }
             if wasStreaming && snap.state != "streaming" {
-                inputGate?.releaseAll(reason: .sessionLeftConnected)
-                applyAcknowledgedInputEnabled(false)
+                forceDisableInputAndSync(reason: "session_ended", releaseReason: .sessionLeftConnected)
             }
             if let cfg = snap.config, !isSettingsPresented {
                 controlPlaneEndpoint = cfg.controlPlaneEndpoint
@@ -523,13 +814,13 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func startHost() {
-        applyAcknowledgedInputEnabled(false)
+        forceDisableInputAndSync(reason: "start_host", releaseReason: .sessionLeftConnected)
         runSimpleCommand(["cmd": "start_host", "codec": codec], label: "Start Host")
     }
 
     public func stopHost() {
         clearVideoState(releaseReason: .sessionLeftConnected)
-        applyAcknowledgedInputEnabled(false)
+        forceDisableInputAndSync(reason: "stop_host", releaseReason: .sessionLeftConnected)
         runSimpleCommand(["cmd": "stop_host"], label: "Stop Host")
     }
 
@@ -539,9 +830,10 @@ public final class ZeroDeskViewModel: ObservableObject {
             setStatus("Enter a 32-hex target Device ID")
             return
         }
-        applyAcknowledgedInputEnabled(false)
+        forceDisableInputAndSync(reason: "dial_start", releaseReason: .sessionLeftConnected)
         activeCodecLabel = codec
         selectedCodecOption = codec
+        startCodecAckTimeout(for: codec)
         runSimpleCommand(
             ["cmd": "dial", "target_device_id_hex": trimmed, "codec": codec],
             label: "Dial"
@@ -550,17 +842,14 @@ public final class ZeroDeskViewModel: ObservableObject {
 
     public func disconnect() {
         clearVideoState(releaseReason: .sessionLeftConnected)
-        applyAcknowledgedInputEnabled(false)
+        forceDisableInputAndSync(reason: "disconnect", releaseReason: .sessionLeftConnected)
         runSimpleCommand(["cmd": "disconnect"], label: "Disconnect")
     }
 
     /// Emergency escape (`Ctrl+Opt+Cmd+Escape`): `InputGate` already emitted `release_all` and
     /// disabled input locally; sync `set_input_enabled(false, reason: "emergency_escape")` with Rust!
     public func handleEmergencyEscapeTriggered() {
-        applyAcknowledgedInputEnabled(false)
-        if let client {
-            _ = try? client.setInputEnabled(false, reason: "emergency_escape")
-        }
+        forceDisableInputAndSync(reason: "emergency_escape", releaseReason: .emergencyEscapeHotkey)
         setStatus("Emergency Escape (Ctrl+Opt+Cmd+Esc): released all inputs & returned to View-Only")
         showToast("Emergency Escape triggered — OS input disabled (View-Only).")
         appendLog("Emergency Escape: released all inputs & disabled OS input")
@@ -584,7 +873,9 @@ public final class ZeroDeskViewModel: ObservableObject {
     }
 
     public func shutdown() {
+        monitorCleanupBox.teardownAll()
         codecAckTimeoutTask?.cancel()
+        inputToggleTimeoutTask?.cancel()
         qualityDebouncer.cancel()
         clearVideoState(releaseReason: .viewTeardownOrTerminate)
         inputGate?.stop()
@@ -607,7 +898,8 @@ public final class ZeroDeskViewModel: ObservableObject {
         hasVideoFrame = false
         remoteSize = RemoteSize(width: 0, height: 0)
         scrollOffset = .zero
-        hudStats = HudStatsPayload()
+        inputRevokedNotice = nil
+        hudStore.stats = HudStatsPayload()
         metalRenderer?.clearFrame()
     }
 
@@ -641,33 +933,59 @@ public final class ZeroDeskViewModel: ObservableObject {
         if let parsed = try? ParsedBridgeEvent.decodeForwardCompat(from: rawData) {
             switch parsed {
             case .hudStats(let stats):
-                // Strictly 1 Hz HUD update (zero per-frame SwiftUI redraws!).
-                hudStats = stats
+                // Strictly 1 Hz HUD update isolated in `hudStore` (zero full-view-tree redraws!).
+                hudStore.stats = stats
                 if !stats.activeCodec.isEmpty {
-                    activeCodecLabel = stats.activeCodec
+                    if activeCodecLabel != stats.activeCodec {
+                        activeCodecLabel = stats.activeCodec
+                    }
                     if pendingCodecRequest == stats.activeCodec {
                         codecAckTimeoutTask?.cancel()
                         pendingCodecRequest = nil
                         selectedCodecOption = stats.activeCodec
+                        codec = stats.activeCodec
                     }
                 }
                 return
 
             case .permissionStatus(let report):
+                let wasEnabled = isOsInputEnabled
                 permissionStatus = report
-                applyAcknowledgedInputEnabled(report.enableOsInput)
+                if wasEnabled && !report.allRequiredPermissionsGranted {
+                    inputRevokedNotice = "Input suspended — permission revoked"
+                } else if report.allRequiredPermissionsGranted {
+                    inputRevokedNotice = nil
+                }
                 if !report.screenCaptureGranted && isSessionStreaming {
+                    forceDisableInputAndSync(
+                        reason: "screen_capture_revoked",
+                        releaseReason: .sessionLeftConnected
+                    )
                     clearVideoState(releaseReason: .sessionLeftConnected)
+                    inputRevokedNotice = "Input suspended — permission revoked"
                     openPermissionGuide()
                     showToast("Screen Recording permission revoked — capture stopped.")
+                } else {
+                    applyAcknowledgedInputEnabled(report.enableOsInput)
                 }
                 return
 
             case .inputEnabledAck(let ack):
+                let wasEnabled = isOsInputEnabled
                 applyAcknowledgedInputEnabled(ack.enabled)
+                if ack.releaseAll == "failed" {
+                    showToast("Warning: OS key release reported failure; press Emergency Escape if keys feel stuck.")
+                    appendLog("input_enabled_ack reported release_all=failed")
+                }
                 if ack.status == "not_permitted" {
+                    if wasEnabled {
+                        inputRevokedNotice = "Input suspended — permission revoked"
+                    }
                     showToast("OS input denied: Screen Recording and Accessibility permissions required.")
                     openPermissionGuide()
+                } else if !ack.enabled && ack.reason == "permission_lost" {
+                    inputRevokedNotice = "Input suspended — permission revoked"
+                    showToast("Input suspended — permission revoked.")
                 }
                 return
 
@@ -676,14 +994,17 @@ public final class ZeroDeskViewModel: ObservableObject {
                 pendingCodecRequest = nil
                 activeCodecLabel = ack.activeCodec
                 selectedCodecOption = ack.activeCodec
+                codec = ack.activeCodec
                 if !ack.accepted {
                     showToast("Peer rejected codec switch; using \(ack.activeCodec.uppercased()).")
                 }
                 return
 
             case .videoQualityAck(let ack):
-                selectedBitrateKbps = ack.bitrateKbps
-                selectedFpsCap = ack.fpsCap
+                if !qualityDebouncer.isPending {
+                    selectedBitrateKbps = ack.bitrateKbps
+                    selectedFpsCap = ack.fpsCap
+                }
                 return
 
             case .clipboardSyncStatus(let st):
@@ -713,6 +1034,10 @@ public final class ZeroDeskViewModel: ObservableObject {
                 appendLog("FileTransferComplete (#\(done.transferId))")
                 return
 
+            case .malformed(let kind):
+                appendLog("[\(ev.seq)] Malformed bridge event (\(kind)) ignored")
+                return
+
             case .unknown:
                 // Unknown event kinds/fields are ignored safely without error or disconnect!
                 break
@@ -720,9 +1045,7 @@ public final class ZeroDeskViewModel: ObservableObject {
         }
 
         if ev.kind == "QoeTelemetry" {
-            if let active = ev.payloadJSON["active_codec"], !active.isEmpty {
-                activeCodecLabel = active
-            }
+            // Active codec is updated strictly from peer-confirmed `codec_ack` / `hud_stats`.
             return
         }
 
@@ -746,15 +1069,27 @@ public final class ZeroDeskViewModel: ObservableObject {
             return
         }
 
-        if ev.kind == "HostCapabilityDegraded",
-           ev.payloadJSON["capability"] == "screen_recording_revoked"
-        {
-            clearVideoState(releaseReason: .sessionLeftConnected)
-            applyAcknowledgedInputEnabled(false)
-            openPermissionGuide()
-            showToast("Screen Recording permission revoked mid-session — capture stopped.")
-            appendLog("[\(ev.seq)] screen_recording_revoked")
-            refreshSnapshot()
+        if ev.kind == "HostCapabilityDegraded" {
+            let capability = ev.payloadJSON["capability"] ?? "unknown"
+            if capability == "screen_recording_revoked" {
+                forceDisableInputAndSync(
+                    reason: "screen_recording_revoked",
+                    releaseReason: .sessionLeftConnected
+                )
+                clearVideoState(releaseReason: .sessionLeftConnected)
+                inputRevokedNotice = "Input suspended — permission revoked"
+                openPermissionGuide()
+                showToast("Screen Recording permission revoked mid-session — capture stopped.")
+                appendLog("[\(ev.seq)] screen_recording_revoked")
+                refreshSnapshot()
+            } else {
+                forceDisableInputAndSync(
+                    reason: "capability_degraded",
+                    releaseReason: .inputDisabled
+                )
+                showToast("Host capability degraded (\(capability)).")
+                appendLog("[\(ev.seq)] HostCapabilityDegraded (\(capability))")
+            }
             return
         }
 
@@ -799,6 +1134,9 @@ public final class ZeroDeskViewModel: ObservableObject {
         appendLog("[\(ev.seq)] \(ev.kind)")
         if ev.kind == "IncomingCall", let incomingId = ev.payloadJSON["incoming_id"] {
             notifyOverlayOpened()
+            // Ensure the incoming call approval sheet always takes priority over settings/guide!
+            isSettingsPresented = false
+            isPermissionGuidePresented = false
             let verifiedByCa = ev.payloadBools["verified_by_ca"] ?? false
             incomingCall = IncomingCallPrompt(
                 id: incomingId,
@@ -807,8 +1145,10 @@ public final class ZeroDeskViewModel: ObservableObject {
                 verifiedByCa: verifiedByCa
             )
         } else if ev.kind == "SessionEnded" {
+            codecAckTimeoutTask?.cancel()
+            pendingCodecRequest = nil
             clearVideoState(releaseReason: .sessionLeftConnected)
-            applyAcknowledgedInputEnabled(false)
+            forceDisableInputAndSync(reason: "session_ended", releaseReason: .sessionLeftConnected)
             incomingCall = nil
         }
         refreshSnapshot()

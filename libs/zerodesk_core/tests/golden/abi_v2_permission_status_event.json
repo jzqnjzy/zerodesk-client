@@ -5,7 +5,7 @@
   "payload": {
     "screen_capture_granted": true,
     "accessibility_granted": false,
-    "probe_source": "watchdog_or_injector_process",
+    "probe_source": "watchdog",
     "enable_os_input": false,
     "secure_event_input_enabled": false
   }

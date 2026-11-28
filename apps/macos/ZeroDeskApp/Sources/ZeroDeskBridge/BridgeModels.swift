@@ -16,6 +16,7 @@ public enum ZeroDeskBridgeError: Error, Sendable, Equatable, CustomStringConvert
     case internalError
     case panic
     case closed
+    case unsupportedAbi(UInt32)
     case protocolError(String)
     case ioError(String)
 
@@ -32,6 +33,7 @@ public enum ZeroDeskBridgeError: Error, Sendable, Equatable, CustomStringConvert
         case .internalError: return "internal bridge error"
         case .panic: return "panic across FFI boundary"
         case .closed: return "bridge client is closed"
+        case .unsupportedAbi(let v): return "unsupported bridge ABI version \(v)"
         case .protocolError(let msg): return "bridge protocol error: \(msg)"
         case .ioError(let msg): return "bridge I/O error: \(msg)"
         }
@@ -236,6 +238,19 @@ public struct BridgeCommandReply: Codable, Sendable, Equatable {
         case errorCode = "error_code"
         case error
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.v = try c.decodeIfPresent(UInt32.self, forKey: .v) ?? 1
+        self.ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+        self.accepted = try c.decodeIfPresent(Bool.self, forKey: .accepted)
+        self.alreadyRunning = try c.decodeIfPresent(Bool.self, forKey: .alreadyRunning)
+        self.alreadyStopped = try c.decodeIfPresent(Bool.self, forKey: .alreadyStopped)
+        self.cmdId = try c.decodeIfPresent(UInt64.self, forKey: .cmdId)
+        self.sessionGen = try c.decodeIfPresent(UInt64.self, forKey: .sessionGen)
+        self.errorCode = try c.decodeIfPresent(String.self, forKey: .errorCode)
+        self.error = try c.decodeIfPresent(String.self, forKey: .error)
+    }
 }
 
 public struct BridgeEventEnvelope: Sendable {
@@ -358,9 +373,15 @@ public struct HandshakeCapabilitiesData: Codable, Sendable, Equatable {
         case caps
     }
 
-    public init(abiVersion: UInt32, caps: [String]) {
+    public init(abiVersion: UInt32 = 1, caps: [String] = []) {
         self.abiVersion = abiVersion
         self.caps = caps
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.abiVersion = try c.decodeIfPresent(UInt32.self, forKey: .abiVersion) ?? 1
+        self.caps = try c.decodeIfPresent([String].self, forKey: .caps) ?? []
     }
 }
 
@@ -378,11 +399,68 @@ public struct BridgeTypedReply<T: Codable & Sendable & Equatable>: Codable, Send
         case error
         case data
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.v = try c.decodeIfPresent(UInt32.self, forKey: .v) ?? 1
+        self.ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+        self.errorCode = try c.decodeIfPresent(String.self, forKey: .errorCode)
+        self.error = try c.decodeIfPresent(String.self, forKey: .error)
+        self.data = try c.decodeIfPresent(T.self, forKey: .data)
+    }
 }
 
-public enum PermissionProbeSource: String, Codable, Sendable, Equatable {
-    case watchdogOrInjectorProcess = "watchdog_or_injector_process"
-    case uiProcessHint = "ui_process_hint"
+public enum PermissionProbeSource: Codable, Sendable, Equatable {
+    case watchdog
+    case injectorProcess
+    case uiProcessHint
+    case unknown(String)
+
+    public var rawValue: String {
+        switch self {
+        case .watchdog:
+            return "watchdog"
+        case .injectorProcess:
+            return "injector_process"
+        case .uiProcessHint:
+            return "ui_process_hint"
+        case .unknown(let value):
+            return value
+        }
+    }
+
+    public var isAuthoritative: Bool {
+        switch self {
+        case .watchdog, .injectorProcess:
+            return true
+        case .uiProcessHint, .unknown:
+            return false
+        }
+    }
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "watchdog":
+            self = .watchdog
+        case "injector_process", "watchdog_or_injector_process":
+            self = .injectorProcess
+        case "ui_process_hint":
+            self = .uiProcessHint
+        default:
+            self = .unknown(rawValue)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        self.init(rawValue: raw)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 public struct PermissionStatusReport: Codable, Sendable, Equatable {
@@ -417,6 +495,10 @@ public struct PermissionStatusReport: Codable, Sendable, Equatable {
     public var allRequiredPermissionsGranted: Bool {
         screenCaptureGranted && accessibilityGranted
     }
+
+    public var canAuthorizeOsInput: Bool {
+        screenCaptureGranted && accessibilityGranted && probeSource.isAuthoritative
+    }
 }
 
 public struct InputEnabledAckPayload: Codable, Sendable, Equatable {
@@ -426,6 +508,7 @@ public struct InputEnabledAckPayload: Codable, Sendable, Equatable {
     public let accessibilityGranted: Bool?
     public let probeSource: String?
     public let reason: String?
+    public let releaseAll: String?
 
     enum CodingKeys: String, CodingKey {
         case enabled
@@ -434,6 +517,7 @@ public struct InputEnabledAckPayload: Codable, Sendable, Equatable {
         case accessibilityGranted = "accessibility_granted"
         case probeSource = "probe_source"
         case reason
+        case releaseAll = "release_all"
     }
 
     public init(
@@ -442,7 +526,8 @@ public struct InputEnabledAckPayload: Codable, Sendable, Equatable {
         screenCaptureGranted: Bool? = nil,
         accessibilityGranted: Bool? = nil,
         probeSource: String? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        releaseAll: String? = nil
     ) {
         self.enabled = enabled
         self.status = status
@@ -450,6 +535,7 @@ public struct InputEnabledAckPayload: Codable, Sendable, Equatable {
         self.accessibilityGranted = accessibilityGranted
         self.probeSource = probeSource
         self.reason = reason
+        self.releaseAll = releaseAll
     }
 }
 
@@ -470,6 +556,10 @@ public struct HudStatsPayload: Codable, Sendable, Equatable {
         case bitrateKbps = "bitrate_kbps"
     }
 
+    private static func sanitizeNonNegative(_ value: Double) -> Double {
+        (value.isFinite && value >= 0) ? value : 0
+    }
+
     public init(
         fps: Double = 0,
         decodeMs: Double = 0,
@@ -478,12 +568,25 @@ public struct HudStatsPayload: Codable, Sendable, Equatable {
         rttMs: Double = 0,
         bitrateKbps: UInt32 = 0
     ) {
-        self.fps = fps
-        self.decodeMs = decodeMs
+        self.fps = Self.sanitizeNonNegative(fps)
+        self.decodeMs = Self.sanitizeNonNegative(decodeMs)
         self.activeCodec = activeCodec
         self.transportMode = transportMode
-        self.rttMs = rttMs
+        self.rttMs = Self.sanitizeNonNegative(rttMs)
         self.bitrateKbps = bitrateKbps
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let rawFps = try c.decodeIfPresent(Double.self, forKey: .fps) ?? 0
+        let rawDecodeMs = try c.decodeIfPresent(Double.self, forKey: .decodeMs) ?? 0
+        let rawRttMs = try c.decodeIfPresent(Double.self, forKey: .rttMs) ?? 0
+        self.fps = Self.sanitizeNonNegative(rawFps)
+        self.decodeMs = Self.sanitizeNonNegative(rawDecodeMs)
+        self.activeCodec = try c.decodeIfPresent(String.self, forKey: .activeCodec) ?? ""
+        self.transportMode = try c.decodeIfPresent(String.self, forKey: .transportMode) ?? ""
+        self.rttMs = Self.sanitizeNonNegative(rawRttMs)
+        self.bitrateKbps = try c.decodeIfPresent(UInt32.self, forKey: .bitrateKbps) ?? 0
     }
 }
 
@@ -566,8 +669,9 @@ public struct FileTransferCompletePayload: Codable, Sendable, Equatable {
     }
 }
 
-/// Forward-compatible decoded bridge event: unknown `kind`/`type` values and unknown JSON fields
-/// are safely mapped to `.unknown(kind:)` without throwing or disconnecting.
+/// Forward-compatible decoded bridge event:
+/// - Unknown `kind`/`type` values or future envelope versions (`v > 1`) map to `.unknown(kind:)`.
+/// - Known `kind` values with malformed/missing payload fields map to `.malformed(kind:)`.
 public enum ParsedBridgeEvent: Sendable, Equatable {
     case permissionStatus(PermissionStatusReport)
     case inputEnabledAck(InputEnabledAckPayload)
@@ -576,6 +680,7 @@ public enum ParsedBridgeEvent: Sendable, Equatable {
     case videoQualityAck(VideoQualityAckPayload)
     case clipboardSyncStatus(ClipboardSyncStatusPayload)
     case fileTransferComplete(FileTransferCompletePayload)
+    case malformed(kind: String)
     case unknown(kind: String)
 
     private struct EventHeader: Decodable {
@@ -593,42 +698,45 @@ public enum ParsedBridgeEvent: Sendable, Equatable {
         let decoder = JSONDecoder()
         let header = try decoder.decode(EventHeader.self, from: data)
         let resolvedKind = header.kind ?? header.type ?? ""
+        if let envelopeV = header.v, envelopeV > 1 {
+            return .unknown(kind: resolvedKind)
+        }
         switch resolvedKind {
         case "permission_status":
             if let wrapped = try? decoder.decode(TypedEventWrapper<PermissionStatusReport>.self, from: data) {
                 return .permissionStatus(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
+            return .malformed(kind: resolvedKind)
         case "input_enabled_ack":
             if let wrapped = try? decoder.decode(TypedEventWrapper<InputEnabledAckPayload>.self, from: data) {
                 return .inputEnabledAck(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
+            return .malformed(kind: resolvedKind)
         case "hud_stats":
             if let wrapped = try? decoder.decode(TypedEventWrapper<HudStatsPayload>.self, from: data) {
                 return .hudStats(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
+            return .malformed(kind: resolvedKind)
         case "codec_ack":
             if let wrapped = try? decoder.decode(TypedEventWrapper<CodecAckPayload>.self, from: data) {
                 return .codecAck(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
+            return .malformed(kind: resolvedKind)
         case "video_quality_ack":
             if let wrapped = try? decoder.decode(TypedEventWrapper<VideoQualityAckPayload>.self, from: data) {
                 return .videoQualityAck(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
+            return .malformed(kind: resolvedKind)
         case "clipboard_sync_status":
             if let wrapped = try? decoder.decode(TypedEventWrapper<ClipboardSyncStatusPayload>.self, from: data) {
                 return .clipboardSyncStatus(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
-        case "FileTransferComplete":
+            return .malformed(kind: resolvedKind)
+        case "file_transfer_complete", "FileTransferComplete":
             if let wrapped = try? decoder.decode(TypedEventWrapper<FileTransferCompletePayload>.self, from: data) {
                 return .fileTransferComplete(wrapped.payload)
             }
-            return .unknown(kind: resolvedKind)
+            return .malformed(kind: resolvedKind)
         default:
             return .unknown(kind: resolvedKind)
         }

@@ -504,7 +504,8 @@ mod unix_impl {
                         }
                         WatchdogMsgType::Hello
                         | WatchdogMsgType::Ready
-                        | WatchdogMsgType::Released => {
+                        | WatchdogMsgType::Released
+                        | WatchdogMsgType::AxStatus => {
                             return DrainOutcome::EmergencyRelease("malformed_frame");
                         }
                     }
@@ -690,9 +691,16 @@ mod unix_impl {
         // All kqueue filters are now armed: announce Ready (with capability flags) to supervisor!
         let ready = WatchdogFrame::ready_with_flags(0, ready_flags).encode();
         write_all_best_effort(args.ack_fd, &ready);
+        let _ = set_nonblock(args.ack_fd);
 
         let mut exit_ok = true;
         let mut events = [make_ev(0, 0, 0, 0); 16];
+        let mut last_ax_report = Instant::now();
+        let mut last_ax_trusted = (ready_flags & WATCHDOG_READY_FLAG_AX_TRUSTED) != 0;
+        let poll_timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
         loop {
             let n = unsafe {
                 libc::kevent(
@@ -701,7 +709,7 @@ mod unix_impl {
                     0,
                     events.as_mut_ptr(),
                     events.len() as i32,
-                    std::ptr::null(),
+                    &poll_timeout,
                 )
             };
             if n < 0 {
@@ -711,6 +719,21 @@ mod unix_impl {
                 }
                 exit_ok = execute_emergency_release("malformed_frame", args, state, real_permit);
                 break;
+            }
+
+            if n == 0 || last_ax_report.elapsed() >= Duration::from_secs(1) {
+                last_ax_report = Instant::now();
+                let ax_now = is_accessibility_trusted();
+                let flags = if ax_now {
+                    WATCHDOG_READY_FLAG_AX_TRUSTED
+                } else {
+                    0
+                };
+                if ax_now != last_ax_trusted || n == 0 {
+                    last_ax_trusted = ax_now;
+                    let hb = WatchdogFrame::ax_status(state.last_seq, flags).encode();
+                    write_all_best_effort(args.ack_fd, &hb);
+                }
             }
 
             let mut saw_read = false;
@@ -871,6 +894,9 @@ mod unix_impl {
                 }
             }
         } else {
+            if is_accessibility_trusted() {
+                ready_flags |= WATCHDOG_READY_FLAG_AX_TRUSTED;
+            }
             None
         };
 

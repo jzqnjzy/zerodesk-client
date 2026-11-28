@@ -5,7 +5,7 @@
 
 ## 1. Stable C-ABI Contract (`include/zerodesk_v2.h`)
 
-- **ABI Version**: `zerodesk_v2_abi_version()` returns `1` (`ZERODESK_V2_ABI_VERSION`).
+- **ABI Version**: `zerodesk_v2_abi_version()` returns `1` (`ZERODESK_V2_ABI_VERSION` / `BRIDGE_ABI_VERSION` — C-ABI and JSON envelope `"v": 1`). Additive JSON-ABI v2 capabilities are advertised via `handshake` / `get_capabilities` / `BridgeSnapshot` with `"abi_version": 2` (`BRIDGE_JSON_ABI_V2`) and `"caps": [...]`.
 - **Opaque Handle Table**: `zerodesk_v2_create(&handle)` allocates a monotonically increasing `uint64_t` handle (`0` is always invalid). Double-destroy and use-after-destroy deterministically return `ZERODESK_ERR_INVALID_HANDLE (-2)` without undefined behavior.
 - **Panic Boundary**: Every `extern "C"` symbol is wrapped in `std::panic::catch_unwind` and returns `ZERODESK_ERR_PANIC (-10)` if a panic ever crosses the boundary.
 - **Length-Prefixed UTF-8**: All string inputs take `(const uint8_t *ptr, size_t len)` and are strictly validated as UTF-8 (`ZERODESK_ERR_INVALID_UTF8 (-3)` on bad UTF-8; embedded NUL bytes are never silently truncated).
@@ -47,7 +47,10 @@ Exposing a C-ABI (`include/zerodesk_v2.h`) does **not** weaken or bypass AGPL-3.
 - **Accessibility (`Accessibility`) & Real Input**:
   - Real OS HID injection is **triple-gated**: `cfg(target_os = "macos")` + opt-in Cargo feature `real-input` (never in `default`) + runtime `RealInputPermit` (`--real-os-input`) + `AXIsProcessTrusted()`.
   - Every new session starts in **View-Only** mode (`enable_os_input = false`, per-session only, never persisted). Enabling OS input requires BOTH Screen Recording and Accessibility permissions; otherwise all remote input is dropped immediately with stable status `"not_permitted"` and zero queuing/buffering.
-  - **macOS TCC Responsible-Process Semantics (Developer Note)**: macOS TCC attributes `AXIsProcessTrusted()` to the *responsible process* performing `CGEventPost`. When launched via `ZeroDesk.app`, the spawned `zerodesk-hid-watchdog` subprocess inherits the `ZeroDesk.app` bundle identity; during CLI/dev runs (`cargo test` / `swift run`), child processes inherit the launching terminal (e.g. Terminal.app / iTerm2 / IDE). Accordingly, `get_permissions` / `permission_status` reports `probe_source: "watchdog_or_injector_process"` when the active watchdog/injector subprocess evaluated `AXIsProcessTrusted()`, and `probe_source: "ui_process_hint"` when only the main UI process was probed (UI hint only).
+  - **macOS TCC Responsible-Process Semantics (Developer Note)**: macOS TCC attributes `AXIsProcessTrusted()` to the *responsible process* performing `CGEventPost`. When launched via `ZeroDesk.app`, the spawned `zerodesk-hid-watchdog` subprocess inherits the `ZeroDesk.app` bundle identity; during CLI/dev runs (`cargo test` / `swift run`), child processes inherit the launching terminal (e.g. Terminal.app / iTerm2 / IDE). Accordingly, `get_permissions` / `permission_status` reports canonical `probe_source` values with strict precedence:
+    1. `"watchdog"` (authoritative live probe from `zerodesk-hid-watchdog` subprocess, refreshed dynamically via IPC heartbeat and immediately reset to `false` on child exit),
+    2. `"injector_process"` (authoritative probe from an in-process HID injector; legacy alias `"watchdog_or_injector_process"` accepted for backward compatibility),
+    3. `"ui_process_hint"` (non-authoritative UI-process hint only; **fail-closed**: `ui_process_hint` can **NEVER** authorize `enable_os_input = true`, even when `accessibility_granted == true`).
   - `IsSecureEventInputEnabled()` is surfaced in `os-selftest` so UIs can warn when password/secure fields block synthetic input.
 - **Microphone (`Microphone` / Audio)**:
   - `cpal` requests 48 kHz / 2 ch / `f32` with a lock-free, allocation-free SPSC ring buffer inside the CoreAudio callback.

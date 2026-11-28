@@ -60,7 +60,7 @@ impl PermissionProbe for MockPermissionProbe {
         let probe_source = if watchdog_ax_override.is_some()
             || self.source_is_watchdog.load(Ordering::Acquire)
         {
-            PermissionProbeSource::WatchdogOrInjectorProcess
+            PermissionProbeSource::Watchdog
         } else {
             PermissionProbeSource::UiProcessHint
         };
@@ -169,11 +169,38 @@ fn golden_abi_v2_requests_and_events_round_trip_and_ignore_unknown_fields() {
         ParsedBridgeEvent::PermissionStatus(PermissionStatusReport {
             screen_capture_granted: true,
             accessibility_granted: false,
-            probe_source: PermissionProbeSource::WatchdogOrInjectorProcess,
+            probe_source: PermissionProbeSource::Watchdog,
             enable_os_input: false,
             secure_event_input_enabled: Some(false),
         })
     );
+
+    // Backward-compat alias `watchdog_or_injector_process` -> InjectorProcess, unknown -> Unknown(...)
+    let legacy_ps = parse_bridge_event_forward_compat(
+        r#"{"v":1,"seq":1,"kind":"permission_status","payload":{"screen_capture_granted":true,"accessibility_granted":true,"probe_source":"watchdog_or_injector_process","enable_os_input":false}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        legacy_ps,
+        ParsedBridgeEvent::PermissionStatus(PermissionStatusReport {
+            probe_source: PermissionProbeSource::InjectorProcess,
+            ..
+        })
+    ));
+    let unknown_ps = parse_bridge_event_forward_compat(
+        r#"{"v":1,"seq":2,"kind":"permission_status","payload":{"screen_capture_granted":true,"accessibility_granted":true,"probe_source":"future_xpc_daemon","enable_os_input":false}}"#,
+    )
+    .unwrap();
+    match unknown_ps {
+        ParsedBridgeEvent::PermissionStatus(rep) => {
+            assert_eq!(
+                rep.probe_source,
+                PermissionProbeSource::Unknown("future_xpc_daemon".into())
+            );
+            assert!(!rep.probe_source.is_authoritative());
+        }
+        other => panic!("expected PermissionStatus with Unknown probe_source, got {other:?}"),
+    }
 
     let ack_ev =
         parse_bridge_event_forward_compat(&read_golden("abi_v2_input_enabled_ack_event.json"))
@@ -187,6 +214,7 @@ fn golden_abi_v2_requests_and_events_round_trip_and_ignore_unknown_fields() {
             accessibility_granted: Some(false),
             probe_source: Some("ui_process_hint".into()),
             reason: None,
+            release_all: None,
         })
     );
 
@@ -231,16 +259,47 @@ fn golden_abi_v2_requests_and_events_round_trip_and_ignore_unknown_fields() {
         "abi_v2_file_transfer_complete_event.json",
     ))
     .unwrap();
+    let expected_ft = FileTransferCompletePayload {
+        transfer_id: 7,
+        rel_name: "report.pdf".into(),
+        bytes: 0,
+        sha256_hex: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        checksum_algo: Some("sha256".into()),
+        saved_path: Some("/tmp/report.pdf".into()),
+    };
+    assert_eq!(ft_ev, ParsedBridgeEvent::FileTransferComplete(expected_ft.clone()));
+    // Debug formatting MUST redact saved_path!
+    let ft_dbg = format!("{expected_ft:?}");
+    assert!(!ft_dbg.contains("/tmp/report.pdf"));
+    assert!(ft_dbg.contains("<redacted>"));
+
+    // Legacy PascalCase `"FileTransferComplete"` alias MUST still decode identically.
+    let legacy_ft = parse_bridge_event_forward_compat(
+        r#"{"v":1,"seq":48,"kind":"FileTransferComplete","payload":{"transfer_id":7,"rel_name":"report.pdf","bytes":0,"sha256_hex":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","checksum_algo":"sha256","saved_path":"/tmp/report.pdf"}}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy_ft, ParsedBridgeEvent::FileTransferComplete(expected_ft));
+
+    // Malformed known event kind MUST be distinguished from Unknown.
+    let malformed = parse_bridge_event_forward_compat(
+        r#"{"v":1,"seq":50,"kind":"codec_ack","payload":{"wrong_field":123}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        malformed,
+        ParsedBridgeEvent::Malformed { ref kind, .. } if kind == "codec_ack"
+    ));
+
+    // Future envelope version (`v > 1`) MUST map cleanly to Unknown.
+    let future_v = parse_bridge_event_forward_compat(
+        r#"{"v":99,"seq":51,"kind":"codec_ack","payload":{}}"#,
+    )
+    .unwrap();
     assert_eq!(
-        ft_ev,
-        ParsedBridgeEvent::FileTransferComplete(FileTransferCompletePayload {
-            transfer_id: 7,
-            rel_name: "report.pdf".into(),
-            bytes: 1_048_576,
-            sha256_hex: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
-            checksum_algo: Some("sha256".into()),
-            saved_path: Some("/tmp/report.pdf".into()),
-        })
+        future_v,
+        ParsedBridgeEvent::Unknown {
+            kind: "codec_ack".into()
+        }
     );
 
     // Unknown event kind + unknown top-level & nested fields MUST decode cleanly as Unknown without error!
@@ -268,7 +327,8 @@ fn runtime_permission_probe_and_secondary_enable_os_input_gate_fail_closed() {
     // 1. Default state is View-Only (`enable_os_input == false`).
     assert_eq!(rt.snapshot().enable_os_input, Some(false));
 
-    // 2. get_permissions returns structured report + emits permission_status event.
+    // 2. get_permissions returns structured report + emits permission_status event ONCE on change
+    //    (subsequent identical polls MUST NOT flood the critical queue!).
     let perm_reply: serde_json::Value =
         serde_json::from_str(&rt.exec_json(r#"{"v":1,"cmd":"get_permissions"}"#)).unwrap();
     assert_eq!(perm_reply["ok"], true);
@@ -279,9 +339,15 @@ fn runtime_permission_probe_and_secondary_enable_os_input_gate_fail_closed() {
 
     let ev_raw = rt
         .poll_event_json_timeout(Duration::from_millis(500))
-        .expect("permission_status event expected");
+        .expect("permission_status event expected on first probe");
     let parsed_ev = parse_bridge_event_forward_compat(&ev_raw).unwrap();
     assert!(matches!(parsed_ev, ParsedBridgeEvent::PermissionStatus(_)));
+
+    // Second identical get_permissions call must NOT push a duplicate permission_status event.
+    let perm_reply2: serde_json::Value =
+        serde_json::from_str(&rt.exec_json(r#"{"v":1,"cmd":"get_permissions"}"#)).unwrap();
+    assert_eq!(perm_reply2["ok"], true);
+    assert!(rt.poll_event_json().is_none());
 
     // 3. Attempting to enable OS input while Accessibility is missing MUST fail closed with "not_permitted"!
     let denied_reply: serde_json::Value = serde_json::from_str(
@@ -295,8 +361,7 @@ fn runtime_permission_probe_and_secondary_enable_os_input_gate_fail_closed() {
     let ack_raw = rt
         .poll_event_json_timeout(Duration::from_millis(500))
         .expect("input_enabled_ack event expected");
-    let ack_parsed = parse_bridge_event_forward_compat(&ack_raw).unwrap();
-    match ack_parsed {
+    match parse_bridge_event_forward_compat(&ack_raw).unwrap() {
         ParsedBridgeEvent::InputEnabledAck(ack) => {
             assert!(!ack.enabled);
             assert_eq!(ack.status, "not_permitted");
@@ -304,35 +369,55 @@ fn runtime_permission_probe_and_secondary_enable_os_input_gate_fail_closed() {
         other => panic!("expected InputEnabledAck, got {other:?}"),
     }
 
-    // 4. Grant Accessibility & switch probe source to watchdog_or_injector_process -> enable succeeds!
+    // 3b. ui_process_hint + ax=true + screen=true MUST STILL fail closed with "not_permitted"!
     probe.ax.store(true, Ordering::Release);
-    probe.source_is_watchdog.store(true, Ordering::Release);
-    let ok_reply: serde_json::Value = serde_json::from_str(
+    probe.source_is_watchdog.store(false, Ordering::Release);
+    let ui_hint_denied: serde_json::Value = serde_json::from_str(
         &rt.exec_json(r#"{"v":1,"cmd":"set_input_enabled","enabled":true}"#),
     )
     .unwrap();
-    assert_eq!(ok_reply["ok"], true);
-    assert_eq!(ok_reply["data"]["enabled"], true);
-    assert_eq!(rt.snapshot().enable_os_input, Some(true));
+    assert_eq!(ui_hint_denied["ok"], false);
+    assert_eq!(ui_hint_denied["error_code"], "not_permitted");
+    assert_eq!(rt.snapshot().enable_os_input, Some(false));
+    let _ = rt.poll_event_json_timeout(Duration::from_millis(200));
 
-    let ok_ack_raw = rt
-        .poll_event_json_timeout(Duration::from_millis(500))
-        .expect("input_enabled_ack ok event expected");
-    match parse_bridge_event_forward_compat(&ok_ack_raw).unwrap() {
-        ParsedBridgeEvent::InputEnabledAck(ack) => {
-            assert!(ack.enabled);
-            assert_eq!(ack.status, "ok");
-            assert_eq!(
-                ack.probe_source.as_deref(),
-                Some("watchdog_or_injector_process")
-            );
-        }
-        other => panic!("expected InputEnabledAck(ok), got {other:?}"),
+    // 3c. screen_capture=false + ax=true + watchdog MUST fail closed with "not_permitted"!
+    probe.screen.store(false, Ordering::Release);
+    probe.source_is_watchdog.store(true, Ordering::Release);
+    let no_screen_denied: serde_json::Value = serde_json::from_str(
+        &rt.exec_json(r#"{"v":1,"cmd":"set_input_enabled","enabled":true}"#),
+    )
+    .unwrap();
+    assert_eq!(no_screen_denied["ok"], false);
+    assert_eq!(no_screen_denied["error_code"], "not_permitted");
+    assert_eq!(rt.snapshot().enable_os_input, Some(false));
+    let _ = rt.poll_event_json_timeout(Duration::from_millis(200));
+
+    // 4. Even with authoritative watchdog + screen=true + ax=true, Idle (not Streaming) MUST fail closed!
+    probe.screen.store(true, Ordering::Release);
+    let idle_denied: serde_json::Value = serde_json::from_str(
+        &rt.exec_json(r#"{"v":1,"cmd":"set_input_enabled","enabled":true}"#),
+    )
+    .unwrap();
+    assert_eq!(idle_denied["ok"], false);
+    assert_eq!(idle_denied["error_code"], "IllegalStateTransition");
+    assert_eq!(rt.snapshot().enable_os_input, Some(false));
+    let _ = rt.poll_event_json_timeout(Duration::from_millis(200));
+
+    // 5. Missing `enabled` on `set_input_enabled` / `enable_os_input` MUST be rejected with InvalidArgument.
+    for cmd in ["set_input_enabled", "enable_os_input"] {
+        let missing: serde_json::Value = serde_json::from_str(
+            &rt.exec_json(&format!(r#"{{"v":1,"cmd":"{cmd}"}}"#)),
+        )
+        .unwrap();
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["error_code"], "InvalidArgument");
     }
 
-    // 5. Emergency escape release_all MUST reset enable_os_input = false and emit ack!
+    // 6. Emergency escape release_all works unconditionally (even with invalid buttons bitmask 0xFF)
+    //    and emits input_enabled_ack { enabled: false, reason: "emergency_escape" }!
     let esc_reply: serde_json::Value = serde_json::from_str(
-        &rt.exec_json(r#"{"v":1,"cmd":"release_all","reason":"emergencyEscapeHotkey"}"#),
+        &rt.exec_json(r#"{"v":1,"cmd":"release_all","emergency_escape":true,"buttons":255}"#),
     )
     .unwrap();
     assert_eq!(esc_reply["ok"], true);
@@ -350,7 +435,19 @@ fn runtime_permission_probe_and_secondary_enable_os_input_gate_fail_closed() {
         other => panic!("expected InputEnabledAck(disabled), got {other:?}"),
     }
 
-    // 6. Video quality & clipboard sync commands work and emit ack events.
+    // 7. Out-of-range set_video_quality inputs (`bitrate_kbps: -1`, `fps_cap: 0`, `v: 99`) MUST be rejected!
+    for bad in [
+        r#"{"v":1,"cmd":"set_video_quality","bitrate_kbps":-1,"fps_cap":60}"#,
+        r#"{"v":1,"cmd":"set_video_quality","bitrate_kbps":5000,"fps_cap":0}"#,
+        r#"{"v":99,"cmd":"set_video_quality","bitrate_kbps":5000,"fps_cap":60}"#,
+        r#"{"v":1,"cmd":"set_video_quality","bitrate_kbps":100,"fps_cap":60}"#,
+        r#"{"v":1,"cmd":"set_video_quality","bitrate_kbps":5000,"fps_cap":121}"#,
+    ] {
+        let bad_reply: serde_json::Value = serde_json::from_str(&rt.exec_json(bad)).unwrap();
+        assert_eq!(bad_reply["ok"], false, "expected rejection for {bad}");
+    }
+
+    // 8. Valid video quality & clipboard sync commands work and update snapshot.
     let q_reply: serde_json::Value = serde_json::from_str(
         &rt.exec_json(r#"{"v":1,"cmd":"set_video_quality","bitrate_kbps":5000,"fps_cap":60}"#),
     )
@@ -367,6 +464,16 @@ fn runtime_permission_probe_and_secondary_enable_os_input_gate_fail_closed() {
     .unwrap();
     assert_eq!(clip_reply["ok"], true);
     assert_eq!(rt.snapshot().clipboard_sync_enabled, Some(false));
+
+    // 9. Session non-persistence: recreating V2BridgeRuntime always starts with enable_os_input = false!
+    rt.destroy();
+    let rt2 = V2BridgeRuntime::with_options(V2BridgeRuntimeOptions {
+        permission_probe: Some(Arc::clone(&probe) as Arc<dyn PermissionProbe>),
+        ..V2BridgeRuntimeOptions::default()
+    })
+    .unwrap();
+    assert_eq!(rt2.snapshot().enable_os_input, Some(false));
+    rt2.destroy();
 }
 
 #[test]
@@ -407,7 +514,7 @@ fn unpermitted_or_disabled_os_input_injector_receives_zero_calls_and_returns_not
         client_ts_ms: 100,
     };
 
-    // Case A: enable_os_input=false, permissions=false -> 0 calls, not_permitted
+    // Case A: enable_os_input=false, permissions=false -> 0 calls, not_permitted; emergency_releaser bypasses gate!
     for _ in 0..10 {
         assert_eq!(gated.dispatch_key(&key), Err(OsInputGateError::NotPermitted));
         assert_eq!(
@@ -417,8 +524,10 @@ fn unpermitted_or_disabled_os_input_injector_receives_zero_calls_and_returns_not
     }
     assert_eq!(key_calls.load(Ordering::Acquire), 0);
     assert_eq!(mouse_calls.load(Ordering::Acquire), 0);
+    let _ = gated.emergency_releaser().release_all_keys();
+    assert_eq!(release_calls.load(Ordering::Acquire), 1);
 
-    // Case B: permissions=true, enable_os_input=false (View-Only) -> 0 calls, not_permitted
+    // Case B: permissions=true, enable_os_input=false (View-Only) -> 0 calls, not_permitted; emergency_releaser bypasses gate!
     screen_granted.store(true, Ordering::Release);
     ax_granted.store(true, Ordering::Release);
     assert_eq!(gated.dispatch_key(&key), Err(OsInputGateError::NotPermitted));
@@ -428,8 +537,10 @@ fn unpermitted_or_disabled_os_input_injector_receives_zero_calls_and_returns_not
     );
     assert_eq!(key_calls.load(Ordering::Acquire), 0);
     assert_eq!(mouse_calls.load(Ordering::Acquire), 0);
+    let _ = gated.emergency_releaser().release_all_keys();
+    assert_eq!(release_calls.load(Ordering::Acquire), 2);
 
-    // Case C: enable_os_input=true, one permission missing -> 0 calls, not_permitted
+    // Case C: enable_os_input=true, one permission missing -> 0 calls, not_permitted; emergency_releaser bypasses gate!
     enable_os_input.store(true, Ordering::Release);
     ax_granted.store(false, Ordering::Release);
     assert_eq!(gated.dispatch_key(&key), Err(OsInputGateError::NotPermitted));
@@ -439,6 +550,8 @@ fn unpermitted_or_disabled_os_input_injector_receives_zero_calls_and_returns_not
     );
     assert_eq!(key_calls.load(Ordering::Acquire), 0);
     assert_eq!(mouse_calls.load(Ordering::Acquire), 0);
+    let _ = gated.emergency_releaser().release_all_keys();
+    assert_eq!(release_calls.load(Ordering::Acquire), 3);
 
     // Case D: enable_os_input=true AND both permissions granted -> ONLY 1 new event dispatched (zero buffering!)
     ax_granted.store(true, Ordering::Release);
@@ -446,4 +559,22 @@ fn unpermitted_or_disabled_os_input_injector_receives_zero_calls_and_returns_not
     gated.dispatch_mouse(&mouse).unwrap();
     assert_eq!(key_calls.load(Ordering::Acquire), 1);
     assert_eq!(mouse_calls.load(Ordering::Acquire), 1);
+
+    // Case E: Mid-keypress TCC permission loss while `was_permitted == true` MUST auto-release all keys
+    //         BEFORE returning NotPermitted so no key can ever stick!
+    ax_granted.store(false, Ordering::Release);
+    assert_eq!(gated.dispatch_key(&key), Err(OsInputGateError::NotPermitted));
+    assert_eq!(
+        release_calls.load(Ordering::Acquire),
+        4,
+        "mid-keypress permission loss must auto-release held keys"
+    );
+    // Subsequent dropped events do not repeatedly spam emergency_releaser once was_permitted is cleared.
+    assert_eq!(gated.dispatch_key(&key), Err(OsInputGateError::NotPermitted));
+    assert_eq!(release_calls.load(Ordering::Acquire), 4);
+
+    // Case F: Drop of GatedOsHidSink unconditionally calls disable_and_release!
+    drop(gated);
+    assert!(!enable_os_input.load(Ordering::Acquire));
+    assert_eq!(release_calls.load(Ordering::Acquire), 5);
 }

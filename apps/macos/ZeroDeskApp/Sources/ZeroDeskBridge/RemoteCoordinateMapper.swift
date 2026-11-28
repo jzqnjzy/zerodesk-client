@@ -60,12 +60,14 @@ public enum DisplayScaleMode: String, Codable, Sendable, CaseIterable, Equatable
 /// Pure-value single-source viewport state shared by `RemoteCoordinateMapper`, `MetalVideoRenderer`,
 /// and `InputGate`.
 public struct ViewportState: Sendable, Equatable {
+    public static let maxDimensionPixels: Double = 16_384.0
+
     public let mode: DisplayScaleMode
     /// Backing pixel size of the rendering view (`bounds.size * backingScale` / `MTKView.drawableSize`).
     public let viewBackingSize: CGSize
     /// Decoded remote framebuffer pixel size (`width × height`).
     public let frameSize: CGSize
-    /// Top-left scroll offset in backing pixels (active in `.actual1to1` when frame exceeds view).
+    /// Top-left scroll offset in integer backing pixels (active in `.actual1to1` when frame exceeds view).
     public let scrollOffset: CGPoint
 
     public init(
@@ -77,7 +79,33 @@ public struct ViewportState: Sendable, Equatable {
         self.mode = mode
         self.viewBackingSize = viewBackingSize
         self.frameSize = frameSize
-        self.scrollOffset = scrollOffset
+        switch mode {
+        case .fit, .fill:
+            self.scrollOffset = .zero
+        case .actual1to1:
+            let rawX = Double(scrollOffset.x).isFinite ? Double(scrollOffset.x) : 0.0
+            let rawY = Double(scrollOffset.y).isFinite ? Double(scrollOffset.y) : 0.0
+            let vw = Double(viewBackingSize.width)
+            let vh = Double(viewBackingSize.height)
+            let fw = Double(frameSize.width)
+            let fh = Double(frameSize.height)
+            let validDims = vw.isFinite && vh.isFinite && fw.isFinite && fh.isFinite
+                && vw > 0 && vh > 0 && fw >= 1 && fh >= 1
+                && vw <= Self.maxDimensionPixels && vh <= Self.maxDimensionPixels
+                && fw <= Self.maxDimensionPixels && fh <= Self.maxDimensionPixels
+            if validDims {
+                let maxX = max(0.0, fw - vw)
+                let maxY = max(0.0, fh - vh)
+                let clampedX = min(max(rawX.rounded(), 0.0), maxX)
+                let clampedY = min(max(rawY.rounded(), 0.0), maxY)
+                self.scrollOffset = CGPoint(x: clampedX, y: clampedY)
+            } else {
+                self.scrollOffset = CGPoint(
+                    x: max(0.0, rawX.rounded()),
+                    y: max(0.0, rawY.rounded())
+                )
+            }
+        }
     }
 
     public var isValid: Bool {
@@ -87,6 +115,8 @@ public struct ViewportState: Sendable, Equatable {
         let fh = Double(frameSize.height)
         return vw.isFinite && vh.isFinite && fw.isFinite && fh.isFinite
             && vw > 0 && vh > 0 && fw >= 1 && fh >= 1
+            && vw <= Self.maxDimensionPixels && vh <= Self.maxDimensionPixels
+            && fw <= Self.maxDimensionPixels && fh <= Self.maxDimensionPixels
     }
 }
 
@@ -247,12 +277,15 @@ public struct RemoteCoordinateMapper: Sendable {
 
     /// Maps a point in backing pixels to remote desktop pixel coordinates `[0, fw-1] × [0, fh-1]`.
     ///
-    /// - Strictly returns `nil` for letterbox/pillarbox regions in `.fit` (or non-overflow `.actual1to1`),
-    ///   and for points outside `[0, viewW] × [0, viewH]` — NEVER dispatches or clamps to edge.
+    /// - When `clampOutOfBounds == false` (default): strictly returns `nil` for letterbox/pillarbox
+    ///   regions in `.fit` (or non-overflow `.actual1to1`), and for points outside `[0, viewW] × [0, viewH]`.
+    /// - When `clampOutOfBounds == true` (drag gestures): clamps continuous frame coordinates to
+    ///   `[0, fw-1] × [0, fh-1]` using the exact same geometry transform.
     public static func mapBackingPoint(
         _ backingPoint: CGPoint,
         in viewport: ViewportState,
-        origin: CoordinateOrigin = .bottomLeft
+        origin: CoordinateOrigin = .bottomLeft,
+        clampOutOfBounds: Bool = false
     ) -> RemotePoint? {
         guard backingPoint.x.isFinite, backingPoint.y.isFinite,
               let geo = computeGeometry(for: viewport) else {
@@ -276,19 +309,21 @@ public struct RemoteCoordinateMapper: Sendable {
             ty = vh - Double(backingPoint.y)
         }
 
-        // Point must lie inside both the visible view bounds AND the rendered video rect.
-        let visMinX = Double(geo.visibleBackingRect.minX)
-        let visMaxX = Double(geo.visibleBackingRect.maxX)
-        let visMinY = Double(geo.visibleBackingRect.minY)
-        let visMaxY = Double(geo.visibleBackingRect.maxY)
+        if !clampOutOfBounds {
+            // Point must lie inside both the visible view bounds AND the rendered video rect.
+            let visMinX = Double(geo.visibleBackingRect.minX)
+            let visMaxX = Double(geo.visibleBackingRect.maxX)
+            let visMinY = Double(geo.visibleBackingRect.minY)
+            let visMaxY = Double(geo.visibleBackingRect.maxY)
 
-        let insideView = tx >= -boundaryEps && tx <= (vw + boundaryEps)
-            && ty >= -boundaryEps && ty <= (vh + boundaryEps)
-        let insideVisibleFrame = tx >= (visMinX - boundaryEps) && tx <= (visMaxX + boundaryEps)
-            && ty >= (visMinY - boundaryEps) && ty <= (visMaxY + boundaryEps)
+            let insideView = tx >= -boundaryEps && tx <= (vw + boundaryEps)
+                && ty >= -boundaryEps && ty <= (vh + boundaryEps)
+            let insideVisibleFrame = tx >= (visMinX - boundaryEps) && tx <= (visMaxX + boundaryEps)
+                && ty >= (visMinY - boundaryEps) && ty <= (visMaxY + boundaryEps)
 
-        guard insideView && insideVisibleFrame else {
-            return nil
+            guard insideView && insideVisibleFrame else {
+                return nil
+            }
         }
 
         let originX = Double(geo.renderedFrameRect.minX)
@@ -307,7 +342,8 @@ public struct RemoteCoordinateMapper: Sendable {
         _ viewPoint: CGPoint,
         backingScale: CGFloat,
         in viewport: ViewportState,
-        origin: CoordinateOrigin = .bottomLeft
+        origin: CoordinateOrigin = .bottomLeft,
+        clampOutOfBounds: Bool = false
     ) -> RemotePoint? {
         guard backingScale.isFinite, backingScale > 0,
               viewPoint.x.isFinite, viewPoint.y.isFinite else {
@@ -318,7 +354,12 @@ public struct RemoteCoordinateMapper: Sendable {
             x: Double(viewPoint.x) * scaleD,
             y: Double(viewPoint.y) * scaleD
         )
-        return mapBackingPoint(backingPt, in: viewport, origin: origin)
+        return mapBackingPoint(
+            backingPt,
+            in: viewport,
+            origin: origin,
+            clampOutOfBounds: clampOutOfBounds
+        )
     }
 
     /// Inverse transform: maps a remote desktop pixel center `(x + 0.5, y + 0.5)` into local view
@@ -415,25 +456,11 @@ public struct RemoteCoordinateMapper: Sendable {
             viewBackingSize: viewSize,
             frameSize: remoteSize.cgSize
         )
-        if !isDragging {
-            return mapBackingPoint(viewPoint, in: vp, origin: origin)
-        }
-        guard let geo = computeGeometry(for: vp) else {
-            return nil
-        }
-        let tx = Double(viewPoint.x)
-        let ty: Double
-        switch origin {
-        case .topLeft:
-            ty = Double(viewPoint.y)
-        case .bottomLeft:
-            ty = Double(viewSize.height) - Double(viewPoint.y)
-        }
-        let relX = (tx - Double(geo.renderedFrameRect.minX)) / geo.scale
-        let relY = (ty - Double(geo.renderedFrameRect.minY)) / geo.scale
-        return RemotePoint(
-            x: roundAndClampPixel(relX, maxIndex: remoteSize.width - 1),
-            y: roundAndClampPixel(relY, maxIndex: remoteSize.height - 1)
+        return mapBackingPoint(
+            viewPoint,
+            in: vp,
+            origin: origin,
+            clampOutOfBounds: isDragging
         )
     }
 

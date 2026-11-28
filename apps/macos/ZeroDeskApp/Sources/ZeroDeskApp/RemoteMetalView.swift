@@ -144,7 +144,11 @@ public final class InteractiveMetalNSView: MTKView {
 
     public override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        _inputGate?.releaseAll(reason: .mouseExitedView)
+        if NSEvent.pressedMouseButtons != 0 {
+            _inputGate?.releaseKeysAndModifiersOnly(reason: .mouseExitedView)
+        } else {
+            _inputGate?.releaseAll(reason: .mouseExitedView)
+        }
         scrollQuantizer.reset()
     }
 
@@ -190,25 +194,35 @@ public final class InteractiveMetalNSView: MTKView {
         _isSessionActive = false
     }
 
+    private var unifiedBackingMetrics: (backingSize: CGSize, scale: CGFloat) {
+        let fallbackScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
+        let safeFallback: CGFloat = (fallbackScale.isFinite && fallbackScale > 0) ? fallbackScale : 1.0
+        if drawableSize.width >= 1 && drawableSize.height >= 1 {
+            if bounds.size.width > 0 && bounds.size.height > 0 {
+                let sx = drawableSize.width / bounds.size.width
+                let sy = drawableSize.height / bounds.size.height
+                if sx.isFinite && sy.isFinite && sx > 0 && sy > 0 {
+                    return (drawableSize, (sx + sy) * 0.5)
+                }
+            }
+            return (drawableSize, safeFallback)
+        }
+        let backingSize = CGSize(
+            width: bounds.size.width * safeFallback,
+            height: bounds.size.height * safeFallback
+        )
+        return (backingSize, safeFallback)
+    }
+
     private var effectiveBackingScale: CGFloat {
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
-        return scale > 0 ? scale : 1.0
+        unifiedBackingMetrics.scale
     }
 
     private func computeCurrentViewport() -> ViewportState {
-        let scale = effectiveBackingScale
-        let backingSize: CGSize
-        if drawableSize.width >= 1 && drawableSize.height >= 1 {
-            backingSize = drawableSize
-        } else {
-            backingSize = CGSize(
-                width: bounds.size.width * scale,
-                height: bounds.size.height * scale
-            )
-        }
+        let metrics = unifiedBackingMetrics
         return ViewportState(
             mode: _displayScaleMode,
-            viewBackingSize: backingSize,
+            viewBackingSize: metrics.backingSize,
             frameSize: _remoteSize.cgSize,
             scrollOffset: _scrollOffset
         )
@@ -308,7 +322,7 @@ public final class InteractiveMetalNSView: MTKView {
 
         switch event.type {
         case .keyDown:
-            switch gate.handleKeyDown(usageId: usageId, modifiers: mods) {
+            switch gate.handleKeyDown(usageId: usageId, modifiers: mods, isARepeat: event.isARepeat) {
             case .forwarded:
                 return true
             case .emergencyEscapeTriggered:
@@ -447,8 +461,8 @@ public final class InteractiveMetalNSView: MTKView {
             let scale = Double(effectiveBackingScale)
             let dx = Double(event.scrollingDeltaX) * (event.hasPreciseScrollingDeltas ? scale : 18.0 * scale)
             let dy = Double(event.scrollingDeltaY) * (event.hasPreciseScrollingDeltas ? scale : 18.0 * scale)
-            let nextX = min(max(Double(_scrollOffset.x) - dx, 0.0), geo.maxScrollX)
-            let nextY = min(max(Double(_scrollOffset.y) - dy, 0.0), geo.maxScrollY)
+            let nextX = min(max((Double(_scrollOffset.x) - dx).rounded(), 0.0), geo.maxScrollX)
+            let nextY = min(max((Double(_scrollOffset.y) - dy).rounded(), 0.0), geo.maxScrollY)
             let nextOffset = CGPoint(x: nextX, y: nextY)
             if nextOffset != _scrollOffset {
                 gate.releaseAll(reason: .viewportChanged)

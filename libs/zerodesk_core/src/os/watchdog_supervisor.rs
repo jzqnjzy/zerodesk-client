@@ -394,14 +394,20 @@ mod unix_impl {
         }
     }
 
+    struct AckReaderState {
+        fd: Option<i32>,
+        buf: [u8; WATCHDOG_FRAME_LEN],
+        filled: usize,
+    }
+
     pub struct HidWatchdogSupervisor {
         gate: Mutex<HidGateState>,
         child_pid: Mutex<Option<i32>>,
-        ack_read_fd: Mutex<Option<i32>>,
+        ack_read: Mutex<AckReaderState>,
         lock_file_path: Option<PathBuf>,
         shutdown_timeout: Duration,
         owns_child: bool,
-        watchdog_ax_trusted: std::sync::atomic::AtomicBool,
+        watchdog_ax_trusted: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl HidWatchdogSupervisor {
@@ -532,11 +538,15 @@ mod unix_impl {
                     cmd_write_fd: Some(cmd_write),
                 }),
                 child_pid: Mutex::new(Some(child_pid)),
-                ack_read_fd: Mutex::new(Some(ack_read)),
+                ack_read: Mutex::new(AckReaderState {
+                    fd: Some(ack_read),
+                    buf: [0u8; WATCHDOG_FRAME_LEN],
+                    filled: 0,
+                }),
                 lock_file_path: Some(lock_file),
                 shutdown_timeout: cfg.shutdown_timeout,
                 owns_child: true,
-                watchdog_ax_trusted: std::sync::atomic::AtomicBool::new(false),
+                watchdog_ax_trusted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
 
             // Handshake: send Hello(parent_pid, nonce) and wait for Ready within handshake_timeout.
@@ -562,6 +572,13 @@ mod unix_impl {
                     return Err(e);
                 }
             };
+            // Switch ack_read to non-blocking so live AxStatus heartbeats can be drained safely.
+            unsafe {
+                let flags = libc::fcntl(ack_read, libc::F_GETFL);
+                if flags >= 0 {
+                    let _ = libc::fcntl(ack_read, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
             let ax_trusted = (ready_flags & WATCHDOG_READY_FLAG_AX_TRUSTED) != 0;
             sup.watchdog_ax_trusted
                 .store(ax_trusted, Ordering::Release);
@@ -591,17 +608,89 @@ mod unix_impl {
                     cmd_write_fd: Some(cmd_write_fd),
                 }),
                 child_pid: Mutex::new(None),
-                ack_read_fd: Mutex::new(None),
+                ack_read: Mutex::new(AckReaderState {
+                    fd: None,
+                    buf: [0u8; WATCHDOG_FRAME_LEN],
+                    filled: 0,
+                }),
                 lock_file_path: None,
                 shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
                 owns_child: false,
-                watchdog_ax_trusted: std::sync::atomic::AtomicBool::new(false),
+                watchdog_ax_trusted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         }
 
-        /// Reports whether the independent `zerodesk-hid-watchdog` child process reported
-        /// `AXIsProcessTrusted() == true` during its startup handshake.
+        /// Returns a shared atomic handle reflecting the watchdog child's live `AXIsProcessTrusted()`
+        /// state (flipped to `false` immediately if the watchdog exits or revokes trust).
+        pub fn accessibility_trusted_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            Arc::clone(&self.watchdog_ax_trusted)
+        }
+
+        /// Drains any queued `AxStatus` IPC heartbeats from the watchdog ack pipe without blocking.
+        /// Immediately stores `false` if the watchdog child exited (pipe EOF or error).
+        pub fn poll_ax_status(&self) {
+            let mut st = self.ack_read.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(fd) = st.fd else {
+                if self.owns_child {
+                    self.watchdog_ax_trusted.store(false, Ordering::Release);
+                }
+                return;
+            };
+            loop {
+                let start = st.filled;
+                let n = unsafe {
+                    libc::read(
+                        fd,
+                        st.buf[start..].as_mut_ptr() as *mut libc::c_void,
+                        WATCHDOG_FRAME_LEN - start,
+                    )
+                };
+                if n > 0 {
+                    st.filled += n as usize;
+                    if st.filled == WATCHDOG_FRAME_LEN {
+                        st.filled = 0;
+                        if let Ok(frame) = WatchdogFrame::decode(&st.buf) {
+                            match frame.msg_type {
+                                WatchdogMsgType::AxStatus | WatchdogMsgType::Ready => {
+                                    let trusted =
+                                        (frame.flags & WATCHDOG_READY_FLAG_AX_TRUSTED) != 0;
+                                    self.watchdog_ax_trusted.store(trusted, Ordering::Release);
+                                }
+                                WatchdogMsgType::Released => {
+                                    self.watchdog_ax_trusted.store(false, Ordering::Release);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if n == 0 {
+                    // Watchdog closed ack pipe (exited) -> immediately fail closed!
+                    self.watchdog_ax_trusted.store(false, Ordering::Release);
+                    if let Some(dead_fd) = st.fd.take() {
+                        close_fd(dead_fd);
+                    }
+                    break;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EAGAIN) => break,
+                        _ => {
+                            self.watchdog_ax_trusted.store(false, Ordering::Release);
+                            if let Some(dead_fd) = st.fd.take() {
+                                close_fd(dead_fd);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Reports the watchdog child's live `AXIsProcessTrusted()` status after draining any
+        /// pending heartbeat updates from the ack pipe.
         pub fn accessibility_trusted(&self) -> bool {
+            self.poll_ax_status();
             self.watchdog_ax_trusted.load(Ordering::Acquire)
         }
 
@@ -636,6 +725,7 @@ mod unix_impl {
         }
 
         fn force_kill_and_cleanup(&self) {
+            self.watchdog_ax_trusted.store(false, Ordering::Release);
             {
                 let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 g.phase = HidGatePhase::Closed;
@@ -644,9 +734,10 @@ mod unix_impl {
                 }
             }
             if let Some(fd) = self
-                .ack_read_fd
+                .ack_read
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .fd
                 .take()
             {
                 close_fd(fd);
@@ -673,10 +764,12 @@ mod unix_impl {
         /// Non-blocking reap + resource cleanup invoked after detecting a broken pipe (`EPIPE`)
         /// so a dead watchdog never lingers as a zombie while the supervisor is still alive.
         fn try_reap_dead_child_nonblock(&self) {
+            self.watchdog_ax_trusted.store(false, Ordering::Release);
             if let Some(fd) = self
-                .ack_read_fd
+                .ack_read
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .fd
                 .take()
             {
                 close_fd(fd);
@@ -997,6 +1090,7 @@ mod unix_impl {
         /// `ACTIVE_WATCHDOG_CHILDREN` even if `HidGate` already transitioned to `Closed`
         /// via `EPIPE` or repeated `EAGAIN` (idempotent via `.take()`).
         pub fn shutdown(&self, local_releaser: Option<&dyn EmergencyKeyReleaser>) {
+            self.watchdog_ax_trusted.store(false, Ordering::Release);
             let was_open = {
                 let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 if g.phase == HidGatePhase::Open {
@@ -1030,9 +1124,10 @@ mod unix_impl {
             }
 
             if let Some(fd) = self
-                .ack_read_fd
+                .ack_read
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .fd
                 .take()
             {
                 close_fd(fd);
@@ -1101,6 +1196,12 @@ mod non_unix_stub {
         pub fn accessibility_trusted(&self) -> bool {
             false
         }
+
+        pub fn accessibility_trusted_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        }
+
+        pub fn poll_ax_status(&self) {}
 
         pub fn before_key_down(
             &self,

@@ -37,6 +37,7 @@ pub enum WatchdogMsgType {
     GracefulExit = 3,
     Ready = 4,
     Released = 5,
+    AxStatus = 6,
 }
 
 impl WatchdogMsgType {
@@ -47,6 +48,7 @@ impl WatchdogMsgType {
             3 => Some(Self::GracefulExit),
             4 => Some(Self::Ready),
             5 => Some(Self::Released),
+            6 => Some(Self::AxStatus),
             _ => None,
         }
     }
@@ -174,6 +176,17 @@ impl WatchdogFrame {
     pub fn released(seq: u64, flags: u8) -> Self {
         Self {
             msg_type: WatchdogMsgType::Released,
+            flags,
+            seq,
+            payload: [0u8; 32],
+            buttons: 0,
+            mods: 0,
+        }
+    }
+
+    pub fn ax_status(seq: u64, flags: u8) -> Self {
+        Self {
+            msg_type: WatchdogMsgType::AxStatus,
             flags,
             seq,
             payload: [0u8; 32],

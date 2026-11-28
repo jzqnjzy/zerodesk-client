@@ -232,22 +232,33 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
     }
 
     public func updateViewport(mode: DisplayScaleMode, scrollOffset: CGPoint) {
+        let sanitizedOffset: CGPoint
+        switch mode {
+        case .fit, .fill:
+            sanitizedOffset = .zero
+        case .actual1to1:
+            let x = Double(scrollOffset.x).isFinite ? max(0.0, Double(scrollOffset.x).rounded()) : 0.0
+            let y = Double(scrollOffset.y).isFinite ? max(0.0, Double(scrollOffset.y).rounded()) : 0.0
+            sanitizedOffset = CGPoint(x: x, y: y)
+        }
         stateLock.lock()
         _displayScaleMode = mode
-        _scrollOffset = scrollOffset
+        _scrollOffset = sanitizedOffset
         stateLock.unlock()
     }
 
-    public var currentDisplayScaleMode: DisplayScaleMode {
+    public func currentViewport() -> (mode: DisplayScaleMode, scrollOffset: CGPoint) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return _displayScaleMode
+        return (_displayScaleMode, _scrollOffset)
+    }
+
+    public var currentDisplayScaleMode: DisplayScaleMode {
+        currentViewport().mode
     }
 
     public var currentScrollOffset: CGPoint {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return _scrollOffset
+        currentViewport().scrollOffset
     }
 
     /// Submits a newly fetched BGRA frame for GPU upload on the next draw tick.
@@ -414,12 +425,15 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
         waitUntilCompleted: Bool = false
     ) -> (rendered: Bool, elapsedMs: Double) {
         let startNs = DispatchTime.now().uptimeNanoseconds
+        let (mode, scrollOffset) = currentViewport()
 
         renderLock.lock()
         defer { renderLock.unlock() }
 
         if frame.seq == lastRenderedFrameSeq
             && drawableSize == lastRenderedDrawableSize
+            && mode == lastRenderedViewportMode
+            && scrollOffset == lastRenderedScrollOffset
             && activeTexture != nil
         {
             recordIdleSkip()
@@ -446,8 +460,8 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
             renderPassDescriptor: passDesc,
             sourceTexture: sourceTexture,
             drawableSize: drawableSize,
-            mode: currentDisplayScaleMode,
-            scrollOffset: currentScrollOffset
+            mode: mode,
+            scrollOffset: scrollOffset
         )
         cmdBuf.commit()
         if waitUntilCompleted {
@@ -456,6 +470,8 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
 
         lastRenderedFrameSeq = lastUploadedFrameSeq
         lastRenderedDrawableSize = drawableSize
+        lastRenderedViewportMode = mode
+        lastRenderedScrollOffset = scrollOffset
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
         stateLock.lock()

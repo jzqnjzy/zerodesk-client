@@ -24,19 +24,23 @@ public struct SystemPermissionGuideView: View {
     }
 
     private var screenGranted: Bool {
-        vm.permissionStatus?.screenCaptureGranted ?? vm.selftest?.screenRecording.granted ?? false
+        vm.effectivePermissionStatus?.screenCaptureGranted ?? false
     }
 
     private var accessibilityGranted: Bool {
-        vm.permissionStatus?.accessibilityGranted ?? vm.selftest?.accessibility.granted ?? false
+        vm.effectivePermissionStatus?.accessibilityGranted ?? false
     }
 
     private var probeSourceLabel: String {
-        switch vm.permissionStatus?.probeSource {
-        case .watchdogOrInjectorProcess:
-            return "Watchdog / Injector Process (Authoritative)"
+        switch vm.effectivePermissionStatus?.probeSource {
+        case .watchdog:
+            return "Watchdog Process (Authoritative)"
+        case .injectorProcess:
+            return "Injector Process (Authoritative)"
         case .uiProcessHint, .none:
             return "UI Process Hint (TCC evaluates active injector process)"
+        case .unknown(let raw):
+            return "Unknown (\(raw))"
         }
     }
 
@@ -62,11 +66,11 @@ public struct SystemPermissionGuideView: View {
                 guidance: "Required to capture and stream the display via ScreenCaptureKit. If revoked mid-session, capture stops immediately.",
                 primaryButtonTitle: "Open Screen Recording Settings",
                 primaryAction: {
-                    _ = SystemPermissionLinks.openSettings(for: .screenRecording)
+                    vm.openPermissionSettings(for: .screenRecording)
                 },
                 secondaryButtonTitle: screenGranted ? nil : "Request Permission",
                 secondaryAction: {
-                    _ = SystemPermissionLinks.requestScreenCaptureAccessExplicitly()
+                    _ = SystemPermissionLinks.requestScreenCaptureAccessExplicitly(UserInitiatedPermissionAction())
                     vm.refreshPermissions()
                 }
             )
@@ -77,7 +81,7 @@ public struct SystemPermissionGuideView: View {
                 guidance: "Required for OS keyboard and mouse control. Accessibility cannot be auto-granted: open System Settings and manually toggle the ZeroDesk checkbox ON.",
                 primaryButtonTitle: "Open Accessibility Settings",
                 primaryAction: {
-                    _ = SystemPermissionLinks.openSettings(for: .accessibility)
+                    vm.openPermissionSettings(for: .accessibility)
                 },
                 secondaryButtonTitle: nil,
                 secondaryAction: nil

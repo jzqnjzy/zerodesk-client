@@ -83,6 +83,8 @@ pub struct RuntimeCommandEnvelope {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
+    pub emergency_escape: Option<bool>,
+    #[serde(default)]
     pub bitrate_kbps: Option<u32>,
     #[serde(default)]
     pub fps_cap: Option<u32>,
@@ -126,6 +128,7 @@ impl fmt::Debug for RuntimeCommandEnvelope {
             .field("download_dir", &self.download_dir)
             .field("ring_timeout_ms", &self.ring_timeout_ms)
             .field("enabled", &self.enabled)
+            .field("emergency_escape", &self.emergency_escape)
             .field("bitrate_kbps", &self.bitrate_kbps)
             .field("fps_cap", &self.fps_cap)
             .finish()
@@ -299,6 +302,12 @@ pub fn parse_and_validate_command(raw: &str) -> Result<RuntimeCommandEnvelope, R
             ));
         }
     }
+    if matches!(env.cmd.as_str(), "set_input_enabled" | "enable_os_input") && env.enabled.is_none() {
+        return Err(RuntimeReplyEnvelope::err(
+            "InvalidArgument",
+            format!("{} requires explicit boolean 'enabled'", env.cmd),
+        ));
+    }
     if let Some(bps) = env.bitrate_kbps {
         if bps != 0 && !(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS).contains(&bps) {
             return Err(RuntimeReplyEnvelope::err(
@@ -340,17 +349,42 @@ pub struct InputEnabledAckPayload {
     pub probe_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_all: Option<String>,
+}
+
+fn sanitize_non_negative_f64(v: f64) -> f64 {
+    if v.is_finite() && v >= 0.0 {
+        v
+    } else {
+        0.0
+    }
 }
 
 /// 1 Hz telemetry HUD payload emitted on `hud_stats` events.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HudStatsPayload {
+    #[serde(default)]
     pub fps: f64,
+    #[serde(default)]
     pub decode_ms: f64,
+    #[serde(default)]
     pub active_codec: String,
+    #[serde(default)]
     pub transport_mode: String,
+    #[serde(default)]
     pub rtt_ms: f64,
+    #[serde(default)]
     pub bitrate_kbps: u32,
+}
+
+impl HudStatsPayload {
+    pub fn sanitized(mut self) -> Self {
+        self.fps = sanitize_non_negative_f64(self.fps);
+        self.decode_ms = sanitize_non_negative_f64(self.decode_ms);
+        self.rtt_ms = sanitize_non_negative_f64(self.rtt_ms);
+        self
+    }
 }
 
 /// Codec acknowledgment payload emitted on `codec_ack` events.
@@ -378,8 +412,8 @@ pub struct ClipboardSyncStatusPayload {
     pub code: Option<String>,
 }
 
-/// File transfer completion payload emitted on `FileTransferComplete` events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// File transfer completion payload emitted on `file_transfer_complete` / `FileTransferComplete` events.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTransferCompletePayload {
     pub transfer_id: u64,
     pub rel_name: String,
@@ -391,9 +425,26 @@ pub struct FileTransferCompletePayload {
     pub saved_path: Option<String>,
 }
 
+impl fmt::Debug for FileTransferCompletePayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileTransferCompletePayload")
+            .field("transfer_id", &self.transfer_id)
+            .field("rel_name", &self.rel_name)
+            .field("bytes", &self.bytes)
+            .field("sha256_hex", &self.sha256_hex)
+            .field("checksum_algo", &self.checksum_algo)
+            .field(
+                "saved_path",
+                &self.saved_path.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// Forward-compatible parsed representation of a JSON-ABI `BridgeEvent`.
-/// Unknown `kind`/`type` values or unknown JSON fields are safely mapped to `Unknown`
-/// without failing or disconnecting.
+/// Unknown `kind`/`type` values or future envelope versions (`ev.v > BRIDGE_ABI_VERSION`) map to
+/// `Unknown`; known kinds with malformed payloads map to `Malformed` without disconnecting.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedBridgeEvent {
     PermissionStatus(PermissionStatusReport),
@@ -403,35 +454,70 @@ pub enum ParsedBridgeEvent {
     VideoQualityAck(VideoQualityAckPayload),
     ClipboardSyncStatus(ClipboardSyncStatusPayload),
     FileTransferComplete(FileTransferCompletePayload),
+    Malformed { kind: String, error: String },
     Unknown { kind: String },
 }
 
 /// Parses a `BridgeEvent` JSON string in a strictly forward-compatible manner:
-/// unknown `kind` / `type` values and unknown extra fields are safely ignored.
+/// - Future envelope versions (`ev.v > BRIDGE_ABI_VERSION`) and unknown kinds map to `Unknown`.
+/// - Known kinds with invalid/missing payload fields map to `Malformed { kind, error }`.
+/// - Unknown extra fields inside payloads are safely ignored.
 pub fn parse_bridge_event_forward_compat(raw: &str) -> Result<ParsedBridgeEvent, serde_json::Error> {
     let ev: BridgeEvent = serde_json::from_str(raw)?;
+    if ev.v > BRIDGE_ABI_VERSION {
+        return Ok(ParsedBridgeEvent::Unknown { kind: ev.kind });
+    }
     Ok(match ev.kind.as_str() {
-        "permission_status" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::PermissionStatus)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
-        "input_enabled_ack" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::InputEnabledAck)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
-        "hud_stats" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::HudStats)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
-        "codec_ack" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::CodecAck)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
-        "video_quality_ack" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::VideoQualityAck)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
-        "clipboard_sync_status" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::ClipboardSyncStatus)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
-        "FileTransferComplete" => serde_json::from_value(ev.payload)
-            .map(ParsedBridgeEvent::FileTransferComplete)
-            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "permission_status" => match serde_json::from_value(ev.payload) {
+            Ok(v) => ParsedBridgeEvent::PermissionStatus(v),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
+        "input_enabled_ack" => match serde_json::from_value(ev.payload) {
+            Ok(v) => ParsedBridgeEvent::InputEnabledAck(v),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
+        "hud_stats" => match serde_json::from_value::<HudStatsPayload>(ev.payload) {
+            Ok(v) => ParsedBridgeEvent::HudStats(v.sanitized()),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
+        "codec_ack" => match serde_json::from_value(ev.payload) {
+            Ok(v) => ParsedBridgeEvent::CodecAck(v),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
+        "video_quality_ack" => match serde_json::from_value(ev.payload) {
+            Ok(v) => ParsedBridgeEvent::VideoQualityAck(v),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
+        "clipboard_sync_status" => match serde_json::from_value(ev.payload) {
+            Ok(v) => ParsedBridgeEvent::ClipboardSyncStatus(v),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
+        "file_transfer_complete" | "FileTransferComplete" => match serde_json::from_value(ev.payload)
+        {
+            Ok(v) => ParsedBridgeEvent::FileTransferComplete(v),
+            Err(e) => ParsedBridgeEvent::Malformed {
+                kind: ev.kind,
+                error: e.to_string(),
+            },
+        },
         _ => ParsedBridgeEvent::Unknown { kind: ev.kind },
     })
 }

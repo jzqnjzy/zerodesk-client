@@ -86,12 +86,19 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
         private var pressedKeyCodes: Set<UInt16> = []
         private var modifierMask: UInt8 = 0
         private var mouseButtons: UInt8 = 0
+        private var explicitModifierUsages: Set<UInt16>?
 
-        func setState(keyCodes: Set<UInt16>, modifiers: UInt8, mouseButtons: UInt8) {
+        func setState(
+            keyCodes: Set<UInt16>,
+            modifiers: UInt8,
+            mouseButtons: UInt8,
+            explicitModifierUsages: Set<UInt16>? = nil
+        ) {
             lock.lock()
             self.pressedKeyCodes = keyCodes
             self.modifierMask = modifiers
             self.mouseButtons = mouseButtons
+            self.explicitModifierUsages = explicitModifierUsages
             lock.unlock()
         }
 
@@ -111,6 +118,20 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return mouseButtons
+        }
+
+        func isModifierPressed(hidUsageId: UInt16) -> Bool {
+            lock.lock()
+            let explicit = explicitModifierUsages
+            lock.unlock()
+            if let explicit {
+                return explicit.contains(hidUsageId)
+            }
+            let bitDown = MacHidKeyMap.modifierBit(forUsageId: hidUsageId)
+                .map { (currentModifierMask() & $0) != 0 } ?? false
+            let keyDown = MacHidKeyMap.macKeyCode(forHidUsage: hidUsageId)
+                .map { isKeyPressed(macKeyCode: $0) } ?? bitDown
+            return bitDown && keyDown
         }
     }
 
@@ -273,13 +294,83 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
         XCTAssertEqual(midPixel, RemotePoint(x: 750, y: 450))
     }
 
+    func testExactAbsoluteCoordinatesCrossOriginYFlipAndInvalidDimensionGuards() {
+        // 16:9 remote (1920x1080) inside 4:3 view (1024x768) in .fit:
+        // scale = 1024 / 1920 = 8/15; renderedH = 1080 * 8/15 = 576; top bar = (768 - 576)/2 = 96px exact!
+        let lb = ViewportState(
+            mode: .fit,
+            viewBackingSize: CGSize(width: 1024, height: 768),
+            frameSize: CGSize(width: 1920, height: 1080),
+            scrollOffset: CGPoint(x: 99, y: 99) // must be forced to .zero for .fit!
+        )
+        XCTAssertEqual(lb.scrollOffset, .zero)
+        let geo = RemoteCoordinateMapper.computeGeometry(for: lb)!
+        XCTAssertEqual(geo.renderedFrameRect.minX, 0.0, accuracy: 1e-9)
+        XCTAssertEqual(geo.renderedFrameRect.minY, 96.0, accuracy: 1e-9)
+        XCTAssertEqual(geo.renderedFrameRect.height, 576.0, accuracy: 1e-9)
+        // Exact top-left remote pixel (0, 0) lies at backing (0, 96) in topLeft origin:
+        XCTAssertEqual(
+            RemoteCoordinateMapper.mapBackingPoint(CGPoint(x: 0.0, y: 96.0), in: lb, origin: .topLeft),
+            RemotePoint(x: 0, y: 0)
+        )
+        // Cross-origin Y-flip: y_tl + y_bl == viewBackingHeight (768.0) maps to the exact same remote pixel!
+        let ptTL = CGPoint(x: 512.0, y: 240.0)
+        let ptBL = CGPoint(x: 512.0, y: 768.0 - 240.0)
+        XCTAssertEqual(
+            RemoteCoordinateMapper.mapBackingPoint(ptTL, in: lb, origin: .topLeft),
+            RemoteCoordinateMapper.mapBackingPoint(ptBL, in: lb, origin: .bottomLeft)
+        )
+
+        // Pillarbox: 4:3 remote (1024x768) inside 16:9 view (1920x1080) in .fit:
+        // scale = 1080 / 768 = 1.40625; renderedW = 1440; left bar = (1920 - 1440)/2 = 240px exact!
+        let pb = ViewportState(
+            mode: .fit,
+            viewBackingSize: CGSize(width: 1920, height: 1080),
+            frameSize: CGSize(width: 1024, height: 768)
+        )
+        let geoP = RemoteCoordinateMapper.computeGeometry(for: pb)!
+        XCTAssertEqual(geoP.renderedFrameRect.minX, 240.0, accuracy: 1e-9)
+        XCTAssertEqual(
+            RemoteCoordinateMapper.mapBackingPoint(CGPoint(x: 240.0, y: 0.0), in: pb, origin: .topLeft),
+            RemotePoint(x: 0, y: 0)
+        )
+
+        // Invalid dimensions (zero, NaN, Inf, > 16384) return nil cleanly with zero Int(NaN) trap!
+        let invalidViewports = [
+            ViewportState(mode: .fit, viewBackingSize: .zero, frameSize: CGSize(width: 1920, height: 1080)),
+            ViewportState(mode: .fit, viewBackingSize: CGSize(width: CGFloat.nan, height: 1080), frameSize: CGSize(width: 1920, height: 1080)),
+            ViewportState(mode: .fit, viewBackingSize: CGSize(width: 20_000, height: 1080), frameSize: CGSize(width: 1920, height: 1080)),
+            ViewportState(mode: .actual1to1, viewBackingSize: CGSize(width: 1000, height: 1000), frameSize: CGSize(width: 1920, height: 20_000)),
+        ]
+        for bad in invalidViewports {
+            XCTAssertFalse(bad.isValid)
+            XCTAssertNil(RemoteCoordinateMapper.computeGeometry(for: bad))
+            XCTAssertNil(RemoteCoordinateMapper.mapBackingPoint(CGPoint(x: 10, y: 10), in: bad))
+        }
+
+        // 1:1 non-finite scrollOffset sanitizes to 0 and fractional offsets round to integer pixels.
+        let san = ViewportState(
+            mode: .actual1to1,
+            viewBackingSize: CGSize(width: 800, height: 600),
+            frameSize: CGSize(width: 1600, height: 1200),
+            scrollOffset: CGPoint(x: CGFloat.nan, y: 120.7)
+        )
+        XCTAssertEqual(san.scrollOffset, CGPoint(x: 0, y: 121))
+    }
+
     // MARK: - 2. Unified InputGate Event-Sequence & Trigger Tests
 
     func testInputGateHoldKeyModifierMouseThenOpenDrawerFilePickerOrSwitchViewportEmitsReleaseAll() {
         let sink = MockSink()
         let mockOs = MockOsInputStateProvider()
-        let gate = InputGate(sink: sink, osStateProvider: mockOs, initialInputEnabled: true)
+        let gate = InputGate(
+            sink: sink,
+            osStateProvider: mockOs,
+            observeAppFocusNotifications: false
+        )
         defer { gate.stop() }
+        XCTAssertFalse(gate.isInputEnabled, "InputGate must default to View-Only (false)")
+        gate.setInputEnabledFromAck(true)
 
         let fitVP = ViewportState(
             mode: .fit,
@@ -385,10 +476,11 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
         let gate = InputGate(
             sink: sink,
             osStateProvider: mockOs,
-            initialInputEnabled: true,
-            reconciliationIntervalMs: 50
+            reconciliationIntervalMs: 50,
+            observeAppFocusNotifications: false
         )
         defer { gate.stop() }
+        gate.setInputEnabledFromAck(true)
 
         gate.updateViewport(
             ViewportState(
@@ -438,14 +530,142 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
         XCTAssertTrue(sink.mice.contains(.init(kind: .buttonUp, x: 400, y: 400, buttons: 0, wheelDx: 0, wheelDy: 0)))
     }
 
+    func testRightSideModifiers0xE4To0xE7Survive200msReconciliationAndReleaseCleanly() {
+        let sink = MockSink()
+        let mockOs = MockOsInputStateProvider()
+        let rightModifiers: [(UInt16, UInt8)] = [
+            (MacHidKeyMap.rightControlUsageId, HidModifierMask.ctrl),
+            (MacHidKeyMap.rightShiftUsageId, HidModifierMask.shift),
+            (MacHidKeyMap.rightAltUsageId, HidModifierMask.alt),
+            (MacHidKeyMap.rightMetaUsageId, HidModifierMask.meta),
+        ]
+
+        // Simulate macOS CGEventSource.keyState returning false for right modifiers while NX flags
+        // (`isModifierPressed(hidUsageId:)`) accurately report all 4 right-side modifiers held!
+        let allRightSet = Set(rightModifiers.map(\.0))
+        mockOs.setState(
+            keyCodes: [],
+            modifiers: HidModifierMask.validMask,
+            mouseButtons: 0,
+            explicitModifierUsages: allRightSet
+        )
+
+        let gate = InputGate(
+            sink: sink,
+            osStateProvider: mockOs,
+            reconciliationIntervalMs: 50,
+            observeAppFocusNotifications: false
+        )
+        defer { gate.stop() }
+        gate.setInputEnabledFromAck(true)
+
+        for (usage, bit) in rightModifiers {
+            gate.handleFlagsChanged(modifierUsageId: usage, isPressed: true, modifiers: bit)
+        }
+        XCTAssertEqual(gate.pressedSnapshot().pressedModifiers, allRightSet)
+
+        // Reconciliation MUST NOT falsely release held right-side modifiers!
+        let r0 = gate.reconcileWithOsState()
+        XCTAssertTrue(r0.releasedModifiers.isEmpty)
+        XCTAssertEqual(gate.pressedSnapshot().pressedModifiers, allRightSet)
+
+        // Once OS releases RightShift (0xE5) and RightCmd (0xE7), ONLY those two are synthesized up!
+        mockOs.setState(
+            keyCodes: [],
+            modifiers: HidModifierMask.ctrl | HidModifierMask.alt,
+            mouseButtons: 0,
+            explicitModifierUsages: [MacHidKeyMap.rightControlUsageId, MacHidKeyMap.rightAltUsageId]
+        )
+        let r1 = gate.reconcileWithOsState()
+        XCTAssertEqual(r1.releasedModifiers, [MacHidKeyMap.rightShiftUsageId, MacHidKeyMap.rightMetaUsageId])
+        XCTAssertEqual(
+            gate.pressedSnapshot().pressedModifiers,
+            [MacHidKeyMap.rightControlUsageId, MacHidKeyMap.rightAltUsageId]
+        )
+    }
+
+    func testInputGateRepeatDedupDragSafeKeyReleaseAndEmitReleaseOrdering() {
+        let sink = MockSink()
+        let mockOs = MockOsInputStateProvider()
+        let gate = InputGate(
+            sink: sink,
+            osStateProvider: mockOs,
+            observeAppFocusNotifications: false
+        )
+        defer { gate.stop() }
+        gate.setInputEnabledFromAck(true)
+        gate.updateViewport(
+            ViewportState(
+                mode: .fit,
+                viewBackingSize: CGSize(width: 1000, height: 1000),
+                frameSize: CGSize(width: 1000, height: 1000)
+            )
+        )
+
+        // Repeat keyDown is deduplicated (never double-emits down).
+        XCTAssertEqual(gate.handleKeyDown(usageId: 0x04, modifiers: 0, isARepeat: false), .forwarded)
+        XCTAssertEqual(gate.handleKeyDown(usageId: 0x04, modifiers: 0, isARepeat: true), .ignored)
+        XCTAssertEqual(sink.keys.count, 1)
+
+        // Stray mouseUp for an unpressed button is dropped (zero spurious buttonUp).
+        XCTAssertNil(
+            gate.handleMouseUp(
+                button: HidMouseButtonMask.right,
+                viewPoint: CGPoint(x: 100, y: 100),
+                backingScale: 1.0,
+                origin: .topLeft
+            )
+        )
+        XCTAssertTrue(sink.mice.isEmpty)
+
+        // Active drag + held key: releaseKeysAndModifiersOnly releases key 'A' while preserving left drag button!
+        _ = gate.handleMouseDown(
+            button: HidMouseButtonMask.left,
+            viewPoint: CGPoint(x: 100, y: 100),
+            backingScale: 1.0,
+            origin: .topLeft
+        )
+        let partial = gate.releaseKeysAndModifiersOnly(reason: .mouseExitedView)
+        XCTAssertNotNil(partial)
+        XCTAssertEqual(partial?.keys, [0x04])
+        XCTAssertEqual(partial?.mouseButtons, 0)
+        XCTAssertTrue(gate.pressedSnapshot().pressedKeys.isEmpty)
+        XCTAssertEqual(gate.pressedSnapshot().pressedMouseButtons, [HidMouseButtonMask.left])
+
+        // Concurrent emit vs releaseAll under DispatchGroup exercises emitLock -> lock ordering cleanly (TSan safe).
+        let group = DispatchGroup()
+        let q1 = DispatchQueue(label: "zd.test.emit1", attributes: .concurrent)
+        for _ in 0..<25 {
+            group.enter()
+            q1.async {
+                _ = gate.handleKeyDown(usageId: 0x05, modifiers: 0)
+                group.leave()
+            }
+            group.enter()
+            q1.async {
+                _ = gate.releaseAll(reason: .uiOverlayOpened)
+                group.leave()
+            }
+        }
+        group.wait()
+        gate.releaseAll(reason: .sessionLeftConnected)
+        XCTAssertTrue(gate.pressedSnapshot().isEmpty)
+    }
+
     // MARK: - 4. SystemPermissionGuide Deep Links, Debouncer & Clipboard Anti-Echo Tests
 
+    @MainActor
     func testSystemPermissionDeepLinkFallbackOrderingAndNeverAutoRequests() {
+        var promptSpyCalls = 0
         for kind in MacSystemPermissionKind.allCases {
-            let urls = SystemPermissionLinks.candidateURLs(for: kind)
+            let urls = SystemPermissionLinks.candidateURLs(for: kind, isMacOS13OrLater: true)
             XCTAssertEqual(urls.count, 4)
             XCTAssertTrue(urls[0].absoluteString.contains("PrivacySecurity.extension?Privacy_"))
             XCTAssertTrue(urls[1].absoluteString.contains("preference.security?Privacy_"))
+
+            // Legacy macOS (< 13) prioritizes legacy preference URL first.
+            let legacyUrls = SystemPermissionLinks.candidateURLs(for: kind, isMacOS13OrLater: false)
+            XCTAssertTrue(legacyUrls[0].absoluteString.contains("preference.security?Privacy_"))
 
             // Simulate macOS 13+ deep link failing, legacy deep link failing -> falls back to pane!
             var attempted: [URL] = []
@@ -456,6 +676,19 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
             XCTAssertEqual(attempted.count, 3)
             XCTAssertEqual(opened, urls[2])
         }
+
+        // Building candidate URLs and opening System Settings NEVER invokes CGRequestScreenCaptureAccess!
+        XCTAssertEqual(promptSpyCalls, 0)
+
+        // Only an explicit UserInitiatedPermissionAction triggers the requester closure!
+        let granted = SystemPermissionLinks.requestScreenCaptureAccessExplicitly(
+            UserInitiatedPermissionAction()
+        ) {
+            promptSpyCalls += 1
+            return true
+        }
+        XCTAssertTrue(granted)
+        XCTAssertEqual(promptSpyCalls, 1)
     }
 
     func testQualityControlDebouncerCoalescesRapidChanges() {
@@ -487,17 +720,25 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
                 exp.fulfill()
             }
         }
+        XCTAssertTrue(debouncer.isPending)
         wait(for: [exp], timeout: 1.0)
         Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertFalse(debouncer.isPending)
         XCTAssertEqual(box.snapshot(), [20000], "rapid UI changes must coalesce to latest value only")
     }
 
     func testClipboardSyncGuardAntiEchoAndZeroContentLogging() {
         let guardObj = ClipboardSyncGuard()
         XCTAssertFalse(guardObj.shouldSuppressEcho(currentChangeCount: 10))
-        guardObj.recordLocalWrite(changeCount: 10)
-        XCTAssertTrue(guardObj.shouldSuppressEcho(currentChangeCount: 10))
-        XCTAssertFalse(guardObj.shouldSuppressEcho(currentChangeCount: 11))
+        guardObj.beginLocalWrite(changeCountBefore: 10)
+        // Simulate clearContents() (+1 -> 11) and setString() (+1 -> 12).
+        guardObj.endLocalWrite(changeCountAfter: 12)
+        // Own write range (10 < current <= 12) is suppressed!
+        XCTAssertFalse(guardObj.shouldSuppressEcho(currentChangeCount: 10))
+        XCTAssertTrue(guardObj.shouldSuppressEcho(currentChangeCount: 11))
+        XCTAssertTrue(guardObj.shouldSuppressEcho(currentChangeCount: 12))
+        // Concurrent/subsequent external user copy (changeCount == 13) is NOT suppressed!
+        XCTAssertFalse(guardObj.shouldSuppressEcho(currentChangeCount: 13))
 
         let secretText = "SUPER_SECRET_CLIPBOARD_PASSWORD_12345"
         let logLine = ClipboardSyncGuard.redactedSyncLogLine(byteCount: secretText.utf8.count)

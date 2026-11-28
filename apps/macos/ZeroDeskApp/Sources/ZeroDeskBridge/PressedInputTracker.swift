@@ -24,6 +24,8 @@ public enum ReleaseReason: String, Sendable, CaseIterable, Equatable {
     case mouseExitedView
     case viewportChanged
     case inputDisabled
+    case sheetPresented
+    case stopped
 }
 
 /// Snapshot of held inputs atomically cleared by a single `releaseAll(reason:)` invocation.

@@ -198,11 +198,16 @@ public final class MacHidKeyMap: @unchecked Sendable {
     }
 
     /// Reverse lookup table: USB HID Usage Page `0x07` ID -> macOS virtual keyCode (`CGKeyCode`).
+    /// Deterministic on any collision: always selects the minimum macOS keyCode.
     public static let hidUsageToMacKeyCode: [UInt16: UInt16] = {
         var reverse: [UInt16: UInt16] = [:]
         reverse.reserveCapacity(keyCodeToHidUsage.count)
         for (macCode, usage) in keyCodeToHidUsage {
-            reverse[usage] = macCode
+            if let existing = reverse[usage] {
+                reverse[usage] = min(existing, macCode)
+            } else {
+                reverse[usage] = macCode
+            }
         }
         return reverse
     }()

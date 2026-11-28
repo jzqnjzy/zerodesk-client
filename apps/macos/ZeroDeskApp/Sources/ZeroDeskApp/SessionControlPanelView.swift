@@ -6,6 +6,32 @@ import SwiftUI
 import UniformTypeIdentifiers
 import ZeroDeskBridge
 
+/// Isolated 1 Hz Telemetry HUD observing ONLY `HudStatsStore` so 1 Hz ticks never invalidate
+/// `ContentView`, `SessionControlOverlayView`, or `RemoteMetalView`.
+private struct TelemetryHudView: View {
+    @ObservedObject var store: HudStatsStore
+
+    var body: some View {
+        let stats = store.stats
+        HStack(spacing: 10) {
+            Text(stats.activeCodec.uppercased())
+                .fontWeight(.bold)
+            Text(String(format: "%.1f FPS", stats.fps))
+            Text(String(format: "Dec %.1fms", stats.decodeMs))
+            Text(stats.transportMode.uppercased())
+            Text(String(format: "RTT %.0fms", stats.rttMs))
+            Text("\(stats.bitrateKbps) kbps")
+        }
+        .font(.caption.monospaced())
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color.black.opacity(0.70))
+        .foregroundColor(.white)
+        .cornerRadius(6)
+        .allowsHitTesting(false)
+    }
+}
+
 /// Collapsible floating session toolbar, 1 Hz Telemetry HUD, and side control drawer overlaid
 /// on top of `RemoteMetalView`.
 ///
@@ -15,6 +41,8 @@ public struct SessionControlOverlayView: View {
     @ObservedObject var vm: ZeroDeskViewModel
     @State private var isToolbarExpanded: Bool = true
     @State private var isDropTargeted: Bool = false
+    @State private var clipboardDraft: String = ""
+    @FocusState private var isClipboardFieldFocused: Bool
 
     public init(vm: ZeroDeskViewModel) {
         self.vm = vm
@@ -26,8 +54,27 @@ public struct SessionControlOverlayView: View {
                 HStack(alignment: .top, spacing: 8) {
                     floatingToolbar
                     Spacer()
-                    telemetryHud
+                    TelemetryHudView(store: vm.hudStore)
                 }
+
+                if let revoked = vm.inputRevokedNotice {
+                    HStack(spacing: 8) {
+                        Image(systemName: "lock.trianglebadge.exclamationmark.fill")
+                            .foregroundColor(.orange)
+                        Text(revoked)
+                            .font(.caption.bold())
+                            .foregroundColor(.white)
+                        Button("Permissions...") {
+                            vm.openPermissionGuide()
+                        }
+                        .controlSize(.mini)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.85))
+                    .cornerRadius(8)
+                }
+
                 if let toast = vm.toastNotice {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -61,6 +108,11 @@ public struct SessionControlOverlayView: View {
                     .transition(.move(edge: .trailing))
             }
         }
+        .onChange(of: isClipboardFieldFocused) { focused in
+            if focused {
+                vm.notifyOverlayOpened()
+            }
+        }
     }
 
     // MARK: - Floating Collapsible Toolbar
@@ -77,10 +129,10 @@ public struct SessionControlOverlayView: View {
             .buttonStyle(.plain)
             .help(isToolbarExpanded ? "Collapse Toolbar" : "Expand Session Controls")
 
-            if isToolbarExpanded {
-                // Secondary per-session `enable_os_input` gate (strictly Rust-acknowledged state!).
-                inputControlButton
+            // View-Only / Control ON status + Emergency Escape badge ALWAYS stay visible even when collapsed!
+            inputControlButton
 
+            if isToolbarExpanded {
                 Divider()
                     .frame(height: 16)
                     .background(Color.white.opacity(0.3))
@@ -125,7 +177,7 @@ public struct SessionControlOverlayView: View {
 
     private var inputControlButton: some View {
         let canToggle = vm.hasCapability("input_enable_gate")
-        let permsOk = vm.permissionStatus?.allRequiredPermissionsGranted ?? false
+        let permsOk = vm.effectivePermissionStatus?.allRequiredPermissionsGranted ?? false
         return HStack(spacing: 6) {
             Button {
                 if !vm.isOsInputEnabled && !permsOk {
@@ -159,27 +211,6 @@ public struct SessionControlOverlayView: View {
                 .foregroundColor(.white.opacity(0.85))
                 .help("Emergency Escape (Ctrl+Opt+Cmd+Escape): release all keys and return to View-Only mode")
         }
-    }
-
-    // MARK: - Live 1 Hz Telemetry HUD (strictly updated from Rust 1 Hz `hud_stats`!)
-
-    private var telemetryHud: some View {
-        HStack(spacing: 10) {
-            Text(vm.hudStats.activeCodec.uppercased())
-                .fontWeight(.bold)
-            Text(String(format: "%.1f FPS", vm.hudStats.fps))
-            Text(String(format: "Dec %.1fms", vm.hudStats.decodeMs))
-            Text(vm.hudStats.transportMode.uppercased())
-            Text(String(format: "RTT %.0fms", vm.hudStats.rttMs))
-            Text("\(vm.hudStats.bitrateKbps) kbps")
-        }
-        .font(.caption.monospaced())
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(Color.black.opacity(0.70))
-        .foregroundColor(.white)
-        .cornerRadius(6)
-        .allowsHitTesting(false)
     }
 
     // MARK: - Side Control Drawer
@@ -281,7 +312,10 @@ public struct SessionControlOverlayView: View {
                         HStack {
                             Toggle("Sync Enabled", isOn: Binding(
                                 get: { vm.clipboardSyncEnabled },
-                                set: { vm.setClipboardSyncEnabled($0) }
+                                set: {
+                                    vm.notifyOverlayOpened()
+                                    vm.setClipboardSyncEnabled($0)
+                                }
                             ))
                             .font(.caption)
                             .disabled(!vm.hasCapability("clipboard_sync"))
@@ -290,14 +324,19 @@ public struct SessionControlOverlayView: View {
                         }
 
                         HStack(spacing: 6) {
-                            TextField("Text to send", text: $vm.outboundClipboardText)
+                            TextField("Text to send", text: $clipboardDraft)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.caption)
+                                .autocorrectionDisabled(true)
+                                .focused($isClipboardFieldFocused)
                             Button("Send") {
-                                vm.sendClipboardText()
+                                vm.notifyOverlayOpened()
+                                let payload = clipboardDraft
+                                clipboardDraft = ""
+                                vm.sendClipboardText(payload)
                             }
                             .controlSize(.small)
-                            .disabled(!vm.hasCapability("clipboard_sync") || vm.outboundClipboardText.isEmpty)
+                            .disabled(!vm.hasCapability("clipboard_sync") || clipboardDraft.isEmpty)
                         }
                     }
                     .padding(4)
@@ -350,6 +389,7 @@ public struct SessionControlOverlayView: View {
             .padding(12)
         }
         .frame(width: 310)
+        .frame(maxHeight: 520, alignment: .top)
         .background(.regularMaterial)
         .cornerRadius(10)
         .shadow(radius: 8)
@@ -393,7 +433,7 @@ public struct SessionControlOverlayView: View {
                 }
             }
             if item.isInFlight {
-                ProgressView(value: item.progressFraction)
+                ProgressView(value: min(max(item.progressFraction, 0.0), 1.0))
                     .controlSize(.small)
             }
             HStack {

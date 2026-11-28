@@ -27,7 +27,9 @@ public struct ContentView: View {
         .sheet(isPresented: $vm.isSettingsPresented) {
             SettingsSheetView(vm: vm)
         }
-        .sheet(isPresented: $vm.isPermissionGuidePresented) {
+        .sheet(isPresented: $vm.isPermissionGuidePresented, onDismiss: {
+            vm.refreshPermissions()
+        }) {
             SystemPermissionGuideView(vm: vm) {
                 vm.closePermissionGuide()
             }
@@ -93,9 +95,16 @@ public struct ContentView: View {
             VStack(alignment: .leading, spacing: 16) {
                 GroupBox("OS Permissions & Preflight") {
                     VStack(alignment: .leading, spacing: 6) {
-                        if let st = vm.selftest {
+                        if let perms = vm.effectivePermissionStatus {
+                            permissionStatusRow("Screen Recording", granted: perms.screenCaptureGranted)
+                            permissionStatusRow("Accessibility", granted: perms.accessibilityGranted)
+                        } else if let st = vm.selftest {
                             preflightRow("Screen Recording", outcome: st.screenRecording)
                             preflightRow("Accessibility", outcome: st.accessibility)
+                        } else {
+                            Text("Preflight pending...").font(.caption).foregroundColor(.secondary)
+                        }
+                        if let st = vm.selftest {
                             HStack {
                                 Text("Audio Devices")
                                     .font(.caption)
@@ -112,8 +121,6 @@ public struct ContentView: View {
                                     .font(.caption)
                                     .foregroundColor(st.clipboardReadonlyAvailable ? .green : .orange)
                             }
-                        } else {
-                            Text("Preflight pending...").font(.caption).foregroundColor(.secondary)
                         }
                         HStack(spacing: 8) {
                             Button("Refresh", action: vm.refreshPermissions)
@@ -257,6 +264,16 @@ public struct ContentView: View {
             .background(enabled ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
             .foregroundColor(enabled ? .green : .red)
             .clipShape(Capsule())
+    }
+
+    private func permissionStatusRow(_ label: String, granted: Bool) -> some View {
+        HStack {
+            Text(label).font(.caption)
+            Spacer()
+            Text(granted ? "granted" : "required")
+                .font(.caption.bold())
+                .foregroundColor(granted ? .green : .orange)
+        }
     }
 
     private func preflightRow(_ label: String, outcome: ProbeOutcome) -> some View {

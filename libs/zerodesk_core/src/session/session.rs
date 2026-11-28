@@ -20,6 +20,8 @@ use v2_transport::{
 pub const PENDING_VIDEO_QUEUE_CAP: usize = 8;
 pub const CTRL_MSG_SESSION_CLOSE: u8 = 0x04;
 pub const CTRL_MSG_REQUEST_IDR: u8 = 0x10;
+pub const CTRL_MSG_CODEC_SWITCH_REQ: u8 = 0x12;
+pub const CTRL_MSG_CODEC_SWITCH_ACK: u8 = 0x13;
 
 pub fn parse_session_close(ctrl: &ControlFrame) -> Option<u16> {
     if ctrl.msg_type != CTRL_MSG_SESSION_CLOSE {
@@ -46,6 +48,22 @@ pub fn parse_request_idr(ctrl: &ControlFrame) -> Option<u32> {
     } else {
         None
     }
+}
+
+pub fn parse_codec_switch_req(ctrl: &ControlFrame) -> Option<VideoCodec> {
+    if ctrl.msg_type != CTRL_MSG_CODEC_SWITCH_REQ || ctrl.payload.len() != 1 {
+        return None;
+    }
+    VideoCodec::from_codec_id(ctrl.payload[0]).ok()
+}
+
+pub fn parse_codec_switch_ack(ctrl: &ControlFrame) -> Option<(bool, VideoCodec)> {
+    if ctrl.msg_type != CTRL_MSG_CODEC_SWITCH_ACK || ctrl.payload.len() != 2 {
+        return None;
+    }
+    let accepted = ctrl.payload[0] != 0;
+    let codec = VideoCodec::from_codec_id(ctrl.payload[1]).ok()?;
+    Some((accepted, codec))
 }
 
 #[derive(Debug)]
@@ -154,6 +172,14 @@ impl DesktopHostSession {
         if let Ok(mut guard) = self.encoder.lock() {
             guard.force_next_idr();
         }
+    }
+
+    pub fn set_bitrate(&self, bitrate_bps: u32) -> Result<(), VideoError> {
+        let mut guard = self
+            .encoder
+            .lock()
+            .map_err(|_| VideoError::Encoder("video encoder mutex poisoned".into()))?;
+        guard.set_bitrate(bitrate_bps)
     }
 
     /// Replaces the active encoder while keeping `frame_id` strictly monotonic across codec switches.

@@ -84,6 +84,9 @@ impl BridgeEventHub {
     /// evicting critical events and without racing against `QoeTelemetry`.
     pub fn set_hud_stats(&self, payload: serde_json::Value) {
         let mut g = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return;
+        }
         let seq = g.next_seq();
         g.hud_latest = Some(BridgeEvent {
             v: BRIDGE_ABI_VERSION,

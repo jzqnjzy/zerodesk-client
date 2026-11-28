@@ -205,11 +205,15 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
     }
 
     /// Executes the Phase 8A startup handshake returning `abi_version` and `caps`.
+    /// Validates `abi_version` is in supported range `1...2` (fails closed with `.unsupportedAbi`).
     public func handshake() throws -> HandshakeCapabilitiesData {
         let raw = try execRawJSON(#"{"v":1,"cmd":"handshake"}"#)
         let decoded = try JSONDecoder().decode(BridgeTypedReply<HandshakeCapabilitiesData>.self, from: raw)
         guard decoded.ok, let data = decoded.data else {
             throw ZeroDeskBridgeError.protocolError(decoded.error ?? decoded.errorCode ?? "handshake failed")
+        }
+        guard (1...2).contains(data.abiVersion) else {
+            throw ZeroDeskBridgeError.unsupportedAbi(data.abiVersion)
         }
         return data
     }
@@ -266,12 +270,12 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         ])
     }
 
-    /// Cancels an in-flight file transfer by ID.
+    /// Cancels an in-flight file transfer by ID (passes `UInt64` safely via `NSNumber` without overflow).
     @discardableResult
     public func cancelFile(transferId: UInt64) throws -> BridgeCommandReply {
         try execCommand([
             "cmd": "cancel_file",
-            "transfer_id": Int(transferId),
+            "transfer_id": NSNumber(value: transferId),
         ])
     }
 
@@ -329,12 +333,15 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         timeoutMs: UInt32 = PressedInputTracker.defaultReleaseTimeoutMs
     ) throws -> BridgeCommandReply {
         let boundedTimeout = min(max(timeoutMs, 1), PressedInputTracker.maxReleaseTimeoutMs)
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "cmd": "release_all",
             "keys": keys.map { Int($0) },
             "buttons": Int(buttons & HidMouseButtonMask.validMask),
             "reason": reason.rawValue,
         ]
+        if reason == .emergencyEscapeHotkey {
+            payload["emergency_escape"] = true
+        }
         return try execCommand(payload, timeoutMs: boundedTimeout)
     }
 

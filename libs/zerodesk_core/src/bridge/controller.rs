@@ -25,13 +25,20 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::sync::Notify;
 use v2_client::{ActiveTransportMode, EdgeEndpointConfig, SignalingDeviceCert};
 
+/// C-ABI / JSON wire envelope version (`"v": 1`) carried by all commands, replies,
+/// snapshots, and event envelopes.
 pub const BRIDGE_ABI_VERSION: u32 = 1;
+/// JSON-ABI capability generation (`"abi_version": 2`) advertised additively in `handshake`,
+/// `get_capabilities`, and `BridgeSnapshot.abi_version` alongside `caps`.
 pub const BRIDGE_JSON_ABI_V2: u32 = 2;
 pub const BRIDGE_V2_CAPABILITIES: &[&str] = &[
     "permissions_probe",
@@ -367,7 +374,9 @@ pub fn normalize_codec_setting(raw: &str) -> Result<String, V2ConfigError> {
     let norm = raw.trim().to_ascii_lowercase();
     match norm.as_str() {
         "" | "auto" => Ok("auto".to_string()),
-        "hevc" | "h264" | "vp9" | "av1" => Ok(norm),
+        "h264" | "avc1" => Ok("h264".to_string()),
+        "hevc" | "h265" => Ok("hevc".to_string()),
+        "vp9" | "av1" => Ok(norm),
         other => Err(V2ConfigError::InvalidValue(format!(
             "unsupported codec '{other}' (expected auto, hevc, h264, vp9, or av1)"
         ))),
@@ -460,6 +469,11 @@ struct BridgeInner {
     transport_mode: TransportMode,
     active_transport_mode: Option<ActiveTransportMode>,
     audio_muted: bool,
+    enable_os_input: AtomicBool,
+    clipboard_sync_enabled: AtomicBool,
+    active_codec: Option<String>,
+    bitrate_kbps: Option<u32>,
+    fps_cap: Option<u32>,
     local_device_id_hex: Option<String>,
     local_tenant_id_hex: Option<String>,
     active_session_id_hex: Option<String>,
@@ -484,6 +498,11 @@ impl BridgeInner {
             transport_mode: TransportMode::Auto,
             active_transport_mode: None,
             audio_muted: false,
+            enable_os_input: AtomicBool::new(false),
+            clipboard_sync_enabled: AtomicBool::new(true),
+            active_codec: None,
+            bitrate_kbps: None,
+            fps_cap: None,
             local_device_id_hex: None,
             local_tenant_id_hex: None,
             active_session_id_hex: None,
@@ -499,6 +518,12 @@ impl BridgeInner {
             event_seq: 0,
             events: VecDeque::with_capacity(64),
         }
+    }
+
+    fn current_codec(&self) -> Option<String> {
+        self.active_codec
+            .clone()
+            .or_else(|| self.config.as_ref().map(|c| c.codec.clone()))
     }
 
     fn allows_config_mutation(&self) -> bool {
@@ -536,11 +561,13 @@ impl BridgeInner {
                     .map(|c| (*c).to_string())
                     .collect(),
             ),
-            enable_os_input: Some(false),
-            active_codec: self.config.as_ref().map(|c| c.codec.clone()),
-            bitrate_kbps: self.config.as_ref().map(|c| c.bw_cap_kbps),
-            fps_cap: self.config.as_ref().map(|c| c.fps),
-            clipboard_sync_enabled: Some(true),
+            enable_os_input: Some(self.enable_os_input.load(Ordering::Acquire)),
+            active_codec: self.current_codec(),
+            bitrate_kbps: self
+                .bitrate_kbps
+                .or_else(|| self.config.as_ref().map(|c| c.bw_cap_kbps)),
+            fps_cap: self.fps_cap.or_else(|| self.config.as_ref().map(|c| c.fps)),
+            clipboard_sync_enabled: Some(self.clipboard_sync_enabled.load(Ordering::Acquire)),
             local_device_id_hex: self.local_device_id_hex.clone(),
             local_tenant_id_hex: self.local_tenant_id_hex.clone(),
             active_session_id_hex: self.active_session_id_hex.clone(),
@@ -595,6 +622,43 @@ impl V2BridgeController {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot()
+    }
+
+    /// Updates live per-session `enable_os_input` state reflected in `snapshot()` (never persisted).
+    pub fn set_enable_os_input(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enable_os_input
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Updates live `clipboard_sync_enabled` state reflected in `snapshot()`.
+    pub fn set_clipboard_sync_enabled(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clipboard_sync_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Updates live negotiated/acknowledged `active_codec` reflected in `snapshot()`.
+    pub fn set_active_codec(&self, codec: Option<String>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_codec = codec;
+    }
+
+    /// Updates live `bitrate_kbps` and `fps_cap` reflected in `snapshot()`.
+    pub fn set_video_quality(&self, bitrate_kbps: Option<u32>, fps_cap: Option<u32>) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bps) = bitrate_kbps {
+            g.bitrate_kbps = Some(bps);
+        }
+        if let Some(fps) = fps_cap {
+            g.fps_cap = Some(fps);
+        }
     }
 
     /// Drains all queued bridge events without holding the lock across caller handling.
@@ -774,6 +838,7 @@ impl V2BridgeController {
                 ));
             }
             g.state = BridgeState::Streaming;
+            g.enable_os_input.store(false, Ordering::Release);
             g.active_session_id_hex = Some(sid_hex.clone());
             g.pending_incoming_session_id_hex = None;
             g.incoming_accepted = false;
@@ -815,6 +880,8 @@ impl V2BridgeController {
             g.incoming_accepted = false;
             g.verified_caller = None;
             g.active_transport_mode = None;
+            g.enable_os_input.store(false, Ordering::Release);
+            g.active_codec = None;
             g.fault_reason = None;
             g.active_file_transfers.clear();
             let st = g.state;
@@ -830,6 +897,8 @@ impl V2BridgeController {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.state = BridgeState::Faulted;
+            g.enable_os_input.store(false, Ordering::Release);
+            g.active_codec = None;
             g.fault_reason = Some(reason_s.clone());
             g.push_event("faulted", serde_json::json!({ "reason": reason_s }));
         }
@@ -880,6 +949,13 @@ impl V2BridgeController {
 
     fn dispatch_command(&self, env: BridgeCommandEnvelope) -> (BridgeResponseEnvelope, bool) {
         match env.cmd.as_str() {
+            "handshake" | "get_capabilities" => (
+                BridgeResponseEnvelope::ok(serde_json::json!({
+                    "abi_version": BRIDGE_JSON_ABI_V2,
+                    "caps": BRIDGE_V2_CAPABILITIES,
+                })),
+                false,
+            ),
             "snapshot" => {
                 let snap = self.snapshot();
                 match serde_json::to_value(&snap) {
@@ -1042,6 +1118,7 @@ impl V2BridgeController {
                     );
                 }
                 g.state = BridgeState::Closing;
+                g.enable_os_input.store(false, Ordering::Release);
                 g.incoming_accepted = false;
                 g.active_file_transfers.clear();
                 g.push_event(
@@ -1115,6 +1192,7 @@ impl V2BridgeController {
                 }
                 let reason = env.reason.unwrap_or_else(|| "user_disconnect".into());
                 g.state = BridgeState::Closing;
+                g.enable_os_input.store(false, Ordering::Release);
                 g.incoming_accepted = false;
                 g.active_file_transfers.clear();
                 g.push_event(
