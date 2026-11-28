@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod ffi_abi;
 pub mod frame;
 pub mod os;
+pub mod qoe;
 pub mod session;
 
 pub use bridge::{
@@ -34,4 +35,12 @@ pub use os::{
     OsInputInjector, OsPermission, OsScreenCaptureAdapter, OsSelftestReport, ScreenCapturer,
     UnixHidWatchdogBackend, HW_DECODER_FAILED_RENEGOTIATE_EVENT,
     HW_ENCODER_FAILED_RENEGOTIATE_EVENT,
+};
+pub use qoe::{
+    compute_fec_wait_ms, AdaptiveFecController, BandwidthStep, CcState, CcTransitionEvent,
+    CongestionConfig, CongestionController, DelaySignal, EncoderTarget, FastStartController,
+    FastStartDirective, FastStartPhase, FecDecision, FecError, FecGroupOutcome, FecReceiverStats,
+    FecReorderBuffer, FeedbackSample, InlineOutcome, LossModel, PacerDecision,
+    ParameterSetInliner, QoeConfig, QoeDiagnosticsSnapshot, QoeEngine, RsCodec, WanBenchMetrics,
+    WanScenario, WanSimulator, ZeroBufferPacer, RESOLUTION_LADDER,
 };

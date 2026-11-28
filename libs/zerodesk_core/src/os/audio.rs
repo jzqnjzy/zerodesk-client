@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
-use super::{OsAudioCapture, OsAudioPlayback, OsError};
+#[cfg(feature = "os-audio")]
+use super::OsError;
+use super::{OsAudioCapture, OsAudioPlayback};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "os-audio")]
+use std::sync::atomic::AtomicBool;
 use std::{
     cell::UnsafeCell,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
