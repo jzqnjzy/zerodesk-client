@@ -652,6 +652,38 @@ final class Phase8AViewportAndInputGateTests: XCTestCase {
         XCTAssertTrue(gate.pressedSnapshot().isEmpty)
     }
 
+    func testEmergencyEscapeRepeatIsIdempotentAfterAlreadyDisabled() {
+        let sink = MockSink()
+        let mockOs = MockOsInputStateProvider()
+        let gate = InputGate(
+            sink: sink,
+            osStateProvider: mockOs,
+            observeAppFocusNotifications: false
+        )
+        defer { gate.stop() }
+        gate.setInputEnabledFromAck(true)
+
+        let escMods = HidModifierMask.ctrl | HidModifierMask.alt | HidModifierMask.meta
+
+        // Holding Escape (isARepeat: true) while enabled STILL triggers emergency escape once!
+        XCTAssertEqual(
+            gate.handleKeyDown(usageId: MacHidKeyMap.escapeUsageId, modifiers: escMods, isARepeat: true),
+            .emergencyEscapeTriggered
+        )
+        XCTAssertFalse(gate.isInputEnabled)
+        XCTAssertEqual(sink.releases.count, 1)
+        XCTAssertEqual(sink.releases[0].reason, .emergencyEscapeHotkey)
+
+        // Subsequent OS key repeats while already disabled & empty MUST NOT spam release_all!
+        for _ in 0..<5 {
+            XCTAssertEqual(
+                gate.handleKeyDown(usageId: MacHidKeyMap.escapeUsageId, modifiers: escMods, isARepeat: true),
+                .ignored
+            )
+        }
+        XCTAssertEqual(sink.releases.count, 1, "repeated Emergency Escape key repeats after disable must emit only once")
+    }
+
     // MARK: - 4. SystemPermissionGuide Deep Links, Debouncer & Clipboard Anti-Echo Tests
 
     @MainActor

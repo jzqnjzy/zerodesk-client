@@ -2683,7 +2683,6 @@ impl BridgeActor {
         if enabled {
             if let Some(pol) = &self.effective_policy {
                 if !pol.allow_clipboard() {
-                    self.clipboard_sync_enabled.store(false, Ordering::Release);
                     self.controller.set_clipboard_sync_enabled(false);
                     self.sync_snapshot();
                     self.events.push_critical(
@@ -3711,6 +3710,10 @@ impl BridgeActor {
                         }
                         return;
                     }
+                    self.controller.set_clipboard_sync_enabled(
+                        self.clipboard_sync_enabled.load(Ordering::Acquire)
+                            && policy.allow_clipboard(),
+                    );
                     self.drain_controller_events_to_hub();
                     self.sync_snapshot();
                 }
@@ -5404,7 +5407,7 @@ async fn run_active_host_session(
     adapters: &HostTaskAdapters,
 ) -> String {
     let mut effective_policy = accepted.effective_policy.clone();
-    let allow_clip_flag = Arc::new(AtomicBool::new(
+    let poller_allow_clip = Arc::new(AtomicBool::new(
         effective_policy.allow_clipboard() && adapters.clipboard_sync_enabled.load(Ordering::Acquire),
     ));
     let mut audio_gate = AudioChannelGate::from_policy(&effective_policy);
@@ -5610,7 +5613,7 @@ async fn run_active_host_session(
     } else {
         Box::new(adapters.mem_clip.clone())
     };
-    let mut clip_poller = ClipboardPoller::new(clip_backend, Arc::clone(&allow_clip_flag));
+    let mut clip_poller = ClipboardPoller::new(clip_backend, poller_allow_clip);
     let mut clip_receiver = ClipboardReceiver::new(effective_policy.clone());
     let mut clip_err_counter = ChannelFramingErrorCounter::new();
     let mut next_clip_id: u64 = 1;
@@ -5628,7 +5631,9 @@ async fn run_active_host_session(
     let (pol_tx, mut pol_rx) =
         mpsc::channel::<(u64, Result<(EffectiveTenantPolicy, bool), String>)>(4);
 
-    let mut frame_period = Duration::from_micros(1_000_000 / u64::from(cfg.fps.max(1)));
+    let initial_fps = cfg.fps.clamp(1, 120);
+    let mut frame_period =
+        Duration::from_micros(1_000_000 / u64::from(initial_fps)).max(Duration::from_micros(1));
     let mut video_tick = tokio::time::interval(frame_period);
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut audio_tick = tokio::time::interval(Duration::from_millis(20));
@@ -5766,16 +5771,19 @@ async fn run_active_host_session(
                             audio_gate.set_muted(m);
                         }
                         SessionAction::SetClipboardSync(enabled) => {
-                            let allowed = enabled && effective_policy.allow_clipboard();
-                            allow_clip_flag.store(allowed, Ordering::Release);
-                            clip_poller.set_policy_allowed(allowed);
+                            adapters.clipboard_sync_enabled.store(enabled, Ordering::Release);
+                            clip_poller
+                                .set_policy_allowed(enabled && effective_policy.allow_clipboard());
                         }
                         SessionAction::SetVideoQuality {
                             bitrate_kbps,
                             fps_cap,
                         } => {
-                            let clamped_fps = fps_cap.clamp(1, cfg.fps.max(1));
-                            frame_period = Duration::from_micros(1_000_000 / u64::from(clamped_fps));
+                            let clamped_fps = fps_cap.clamp(1, cfg.fps.clamp(1, 120));
+                            frame_period = Duration::from_micros(
+                                1_000_000 / u64::from(clamped_fps),
+                            )
+                            .max(Duration::from_micros(1));
                             video_tick = tokio::time::interval(frame_period);
                             video_tick
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5796,19 +5804,19 @@ async fn run_active_host_session(
                         SessionAction::RequestCodec(requested) => {
                             let current = host_sess.encoder_codec().name().to_string();
                             let accepted_now = requested == current;
-                            let _ = actor_tx
-                                .send(ActorMessage::InternalEvent {
-                                    session_gen: gen,
-                                    event: ActorEvent::CodecAck {
-                                        active_codec: current,
-                                        requested_codec: Some(requested),
-                                        accepted: accepted_now,
-                                    },
-                                })
-                                .await;
+                            let _ = actor_tx.try_send(ActorMessage::InternalEvent {
+                                session_gen: gen,
+                                event: ActorEvent::CodecAck {
+                                    active_codec: current,
+                                    requested_codec: Some(requested),
+                                    accepted: accepted_now,
+                                },
+                            });
                         }
                         SessionAction::SendClipboard { mime_kind, bytes } => {
-                            if allow_clip_flag.load(Ordering::Acquire) {
+                            if adapters.clipboard_sync_enabled.load(Ordering::Acquire)
+                                && effective_policy.allow_clipboard()
+                            {
                                 let cid = next_clip_id;
                                 next_clip_id += 1;
                                 let paused = host_sess.session().is_bulk_paused();
@@ -6344,7 +6352,7 @@ async fn run_controller_lifecycle_task(
 
     let (action_tx, mut action_rx) = mpsc::channel::<SessionAction>(SESSION_ACTION_CAP);
     let mut effective_policy = connected.effective_policy.clone();
-    let allow_clip_flag = Arc::new(AtomicBool::new(
+    let poller_allow_clip = Arc::new(AtomicBool::new(
         effective_policy.allow_clipboard() && clipboard_sync_enabled.load(Ordering::Acquire),
     ));
     let mut audio_muted = false;
@@ -6425,7 +6433,7 @@ async fn run_controller_lifecycle_task(
     } else {
         Box::new(mem_clip.clone())
     };
-    let mut clip_poller = ClipboardPoller::new(clip_backend, Arc::clone(&allow_clip_flag));
+    let mut clip_poller = ClipboardPoller::new(clip_backend, poller_allow_clip);
     let mut clip_receiver = ClipboardReceiver::new(effective_policy.clone());
     let mut clip_err_counter = ChannelFramingErrorCounter::new();
     let mut next_clip_id: u64 = 1;
@@ -6638,7 +6646,6 @@ async fn run_controller_lifecycle_task(
                                     effective_policy = new_pol.clone();
                                     let clip_ok = effective_policy.allow_clipboard()
                                         && clipboard_sync_enabled.load(Ordering::Acquire);
-                                    allow_clip_flag.store(clip_ok, Ordering::Release);
                                     clip_poller.set_policy_allowed(clip_ok);
                                     clip_receiver.update_policy(effective_policy.clone());
                                     file_receiver.update_policy(effective_policy.clone());
@@ -6693,15 +6700,15 @@ async fn run_controller_lifecycle_task(
                     match action {
                         SessionAction::SetAudioMute(m) => { audio_muted = m; }
                         SessionAction::SetClipboardSync(enabled) => {
-                            let allowed = enabled && effective_policy.allow_clipboard();
-                            allow_clip_flag.store(allowed, Ordering::Release);
-                            clip_poller.set_policy_allowed(allowed);
+                            clipboard_sync_enabled.store(enabled, Ordering::Release);
+                            clip_poller
+                                .set_policy_allowed(enabled && effective_policy.allow_clipboard());
                         }
                         SessionAction::SetVideoQuality {
                             bitrate_kbps,
                             fps_cap,
                         } => {
-                            let clamped_fps = fps_cap.clamp(1, cfg.fps.max(1));
+                            let clamped_fps = fps_cap.clamp(1, cfg.fps.clamp(1, 120));
                             eprintln!(
                                 "[video-quality] controller recorded target bitrate_kbps={bitrate_kbps} fps_cap={clamped_fps} (applied on host encoder)"
                             );
@@ -6722,16 +6729,14 @@ async fn run_controller_lifecycle_task(
                             };
                             if target_codec == Some(decoder.codec()) {
                                 pending_codec_req = None;
-                                let _ = actor_tx
-                                    .send(ActorMessage::InternalEvent {
-                                        session_gen: gen,
-                                        event: ActorEvent::CodecAck {
-                                            active_codec: current,
-                                            requested_codec: Some(requested),
-                                            accepted: true,
-                                        },
-                                    })
-                                    .await;
+                                let _ = actor_tx.try_send(ActorMessage::InternalEvent {
+                                    session_gen: gen,
+                                    event: ActorEvent::CodecAck {
+                                        active_codec: current,
+                                        requested_codec: Some(requested),
+                                        accepted: true,
+                                    },
+                                });
                             } else if let Some(target) = target_codec {
                                 let common_caps =
                                     local_v2_cap_bits() & connected.peer_cert.cap_bits;
@@ -6749,29 +6754,25 @@ async fn run_controller_lifecycle_task(
                                     pending_codec_req = Some((requested, Instant::now()));
                                 } else {
                                     pending_codec_req = None;
-                                    let _ = actor_tx
-                                        .send(ActorMessage::InternalEvent {
-                                            session_gen: gen,
-                                            event: ActorEvent::CodecAck {
-                                                active_codec: current,
-                                                requested_codec: Some(requested),
-                                                accepted: false,
-                                            },
-                                        })
-                                        .await;
-                                }
-                            } else {
-                                pending_codec_req = None;
-                                let _ = actor_tx
-                                    .send(ActorMessage::InternalEvent {
+                                    let _ = actor_tx.try_send(ActorMessage::InternalEvent {
                                         session_gen: gen,
                                         event: ActorEvent::CodecAck {
                                             active_codec: current,
                                             requested_codec: Some(requested),
                                             accepted: false,
                                         },
-                                    })
-                                    .await;
+                                    });
+                                }
+                            } else {
+                                pending_codec_req = None;
+                                let _ = actor_tx.try_send(ActorMessage::InternalEvent {
+                                    session_gen: gen,
+                                    event: ActorEvent::CodecAck {
+                                        active_codec: current,
+                                        requested_codec: Some(requested),
+                                        accepted: false,
+                                    },
+                                });
                             }
                         }
                         SessionAction::SendHid(payload) => {
@@ -6800,7 +6801,10 @@ async fn run_controller_lifecycle_task(
                             }
                         }
                         SessionAction::SendClipboard { mime_kind, bytes } => {
-                            if !is_blackholed() && allow_clip_flag.load(Ordering::Acquire) {
+                            if !is_blackholed()
+                                && clipboard_sync_enabled.load(Ordering::Acquire)
+                                && effective_policy.allow_clipboard()
+                            {
                                 let cid = next_clip_id;
                                 next_clip_id += 1;
                                 let paused = ctrl_sess.is_bulk_paused();

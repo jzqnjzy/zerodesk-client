@@ -58,44 +58,54 @@ public struct MacOsInputStateProvider: OsInputStateProvider {
         let flags = CGEventSource.flagsState(.hidSystemState)
         let raw = flags.rawValue
         let deviceMask: UInt64
+        let oppositeDeviceMask: UInt64
         let genericFlag: CGEventFlags
         switch hidUsageId {
         case 0xE0:
             deviceMask = Self.nxDeviceLCtlMask
+            oppositeDeviceMask = Self.nxDeviceRCtlMask
             genericFlag = .maskControl
         case 0xE1:
             deviceMask = Self.nxDeviceLShiftMask
+            oppositeDeviceMask = Self.nxDeviceRShiftMask
             genericFlag = .maskShift
         case 0xE2:
             deviceMask = Self.nxDeviceLAltMask
+            oppositeDeviceMask = Self.nxDeviceRAltMask
             genericFlag = .maskAlternate
         case 0xE3:
             deviceMask = Self.nxDeviceLCmdMask
+            oppositeDeviceMask = Self.nxDeviceRCmdMask
             genericFlag = .maskCommand
         case 0xE4:
             deviceMask = Self.nxDeviceRCtlMask
+            oppositeDeviceMask = Self.nxDeviceLCtlMask
             genericFlag = .maskControl
         case 0xE5:
             deviceMask = Self.nxDeviceRShiftMask
+            oppositeDeviceMask = Self.nxDeviceLShiftMask
             genericFlag = .maskShift
         case 0xE6:
             deviceMask = Self.nxDeviceRAltMask
+            oppositeDeviceMask = Self.nxDeviceLAltMask
             genericFlag = .maskAlternate
         case 0xE7:
             deviceMask = Self.nxDeviceRCmdMask
+            oppositeDeviceMask = Self.nxDeviceLCmdMask
             genericFlag = .maskCommand
         default:
             return false
         }
-        if (raw & deviceMask) != 0 {
-            return true
+        // Fail-safe AND semantics: BOTH CGEventSource flags AND keyState must confirm pressed;
+        // if either reports released, treat as released so stuck modifiers are always reconciled.
+        let flagDown = (raw & deviceMask) != 0
+            || (flags.contains(genericFlag) && (raw & oppositeDeviceMask) == 0)
+        guard flagDown,
+              let macCode = MacHidKeyMap.macKeyCode(forHidUsage: hidUsageId)
+        else {
+            return false
         }
-        if flags.contains(genericFlag),
-           let macCode = MacHidKeyMap.macKeyCode(forHidUsage: hidUsageId)
-        {
-            return isKeyPressed(macKeyCode: macCode)
-        }
-        return false
+        return isKeyPressed(macKeyCode: macCode)
     }
 
     public func currentPressedMouseButtons() -> UInt8 {
@@ -218,7 +228,8 @@ public final class InputGate: @unchecked Sendable {
     }
 
     /// Releases any held inputs with `.stopped`, detaches focus observers, cancels any active
-    /// 200ms reconciliation timer, and latches the gate stopped so subsequent events are ignored.
+    /// 200ms reconciliation timer, flushes final `releaseAll` under `emitLock`, and then latches
+    /// `isStopped = true` so subsequent events are ignored.
     public func stop() {
         emitLock.lock()
         defer { emitLock.unlock() }
@@ -235,7 +246,6 @@ public final class InputGate: @unchecked Sendable {
         }
 
         let releasePayload = takeReleaseAllPayloadLocked(reason: .stopped, forceEmit: false)
-        isStopped = true
         isInputEnabledFlag = false
         let timer = releasePayload?.timer ?? reconcileTimer
         reconcileTimer = nil
@@ -256,6 +266,10 @@ public final class InputGate: @unchecked Sendable {
                 timeoutMs: releaseTimeoutMs
             )
         }
+
+        lock.lock()
+        isStopped = true
+        lock.unlock()
     }
 
     public var isInputEnabled: Bool {
@@ -882,25 +896,29 @@ public final class InputGate: @unchecked Sendable {
             return .ignored
         }
 
-        // Emergency escape (`Ctrl+Opt+Cmd+Escape`) is evaluated BEFORE whitelist & input-enabled checks!
+        // Emergency escape (`Ctrl+Opt+Cmd+Escape`) is evaluated BEFORE whitelist & repeat checks
+        // (so holding Escape then adding modifiers still triggers!), while keeping side-effects
+        // idempotent across OS key repeats once already disabled with no held inputs.
         let combinedMods = (maskedMods | derivedModifierMaskLocked()) & HidModifierMask.validMask
         if let usageId, MacHidKeyMap.isEmergencyEscapeCombo(usageId: usageId, modifiers: combinedMods) {
+            let wasEnabled = isInputEnabledFlag
             isInputEnabledFlag = false
             let releasePayload = takeReleaseAllPayloadLocked(
                 reason: .emergencyEscapeHotkey,
-                forceEmit: true
+                forceEmit: wasEnabled || !isARepeat
             )
             lock.unlock()
 
-            if let payload = releasePayload {
-                payload.timer?.cancel()
-                sink.flushReleaseAll(
-                    keys: payload.keys,
-                    buttons: payload.buttons,
-                    reason: .emergencyEscapeHotkey,
-                    timeoutMs: releaseTimeoutMs
-                )
+            guard let payload = releasePayload else {
+                return .ignored
             }
+            payload.timer?.cancel()
+            sink.flushReleaseAll(
+                keys: payload.keys,
+                buttons: payload.buttons,
+                reason: .emergencyEscapeHotkey,
+                timeoutMs: releaseTimeoutMs
+            )
             return .emergencyEscapeTriggered
         }
 

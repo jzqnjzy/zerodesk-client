@@ -46,6 +46,7 @@ public final class HudStatsStore: ObservableObject {
 @MainActor
 public final class ZeroDeskViewModel: ObservableObject {
     private static let defaultMaxDropFileBytes: UInt64 = 512 * 1024 * 1024 // 512 MiB hard UI cap
+    private static let hidKeyMap = MacHidKeyMap()
 
     private final class AppMonitorCleanupBox: @unchecked Sendable {
         private let lock = NSLock()
@@ -253,7 +254,7 @@ public final class ZeroDeskViewModel: ObservableObject {
                 if flags.contains(.control) { hidMods |= HidModifierMask.ctrl }
                 if flags.contains(.option) { hidMods |= HidModifierMask.alt }
                 if flags.contains(.command) { hidMods |= HidModifierMask.meta }
-                let usage = MacHidKeyMap().lookup(event.keyCode)
+                let usage = Self.hidKeyMap.lookup(event.keyCode)
                 guard let usage,
                       MacHidKeyMap.isEmergencyEscapeCombo(usageId: usage, modifiers: hidMods)
                 else {
@@ -341,10 +342,12 @@ public final class ZeroDeskViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard let self, !Task.isCancelled, self.isInputTogglePending else { return }
             self.isInputTogglePending = false
+            self.forceDisableInputAndSync(reason: "input_toggle_timeout")
             if enabled {
-                self.applyAcknowledgedInputEnabled(false)
+                self.showToast("OS input enable timed out (3s); remaining in View-Only mode.")
+            } else {
+                self.showToast("OS input disable timed out (3s); forced View-Only fail-closed.")
             }
-            self.showToast("OS input toggle timed out (3s); remaining in View-Only mode.")
         }
         do {
             let reply = try client.setInputEnabled(enabled, reason: reason)
@@ -368,7 +371,7 @@ public final class ZeroDeskViewModel: ObservableObject {
 
     private func applyAcknowledgedInputEnabled(_ enabled: Bool) {
         inputToggleTimeoutTask?.cancel()
-        let screenOk = effectivePermissionStatus?.screenCaptureGranted ?? true
+        let screenOk = effectivePermissionStatus?.screenCaptureGranted ?? false
         let effectiveEnabled = enabled && screenOk
         isOsInputEnabled = effectiveEnabled
         isInputTogglePending = false
