@@ -1,0 +1,510 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 ZeroDesk Contributors
+#
+# ZeroDesk 3-Platform CI Pipeline (Linux, Windows, macOS) + Honest L2/L3 Verification
+#
+# Security & Branch Policy:
+#   - Triggers ONLY on zerodesk/main (push / pull_request) and workflow_dispatch.
+#   - Minimal permissions: contents: read only; persist-credentials: false everywhere.
+#   - Every third-party Action is pinned to an immutable 40-char commit SHA.
+#   - CI verification scripts run in `--mode ci` and are code-level forbidden from emitting PASS.
+
+name: ZeroDesk 3-Platform CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - zerodesk/main
+  pull_request:
+    branches:
+      - zerodesk/main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zerodesk-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_PINNED_COMMIT: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  LIBYUV_PINNED_COMMIT: 0faf8dd0e004520a61a603a4d2996d5ecc80dc3f
+
+jobs:
+  compliance-linux:
+    name: Compliance & Linux Native L2 (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install minimal Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            clang \
+            libclang-dev \
+            cmake \
+            nasm \
+            libsodium-dev \
+            libyuv-dev \
+            libvpx-dev \
+            libaom-dev \
+            libopus-dev \
+            libasound2-dev \
+            libssl-dev \
+            libv4l-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-shm0-dev \
+            libxcb-randr0-dev \
+            libxcb-xfixes0-dev \
+            libxfixes-dev \
+            libwayland-dev
+
+      - name: Ensure pkg-config metadata for libyuv
+        run: |
+          if ! pkg-config --exists libyuv; then
+            mkdir -p "$RUNNER_TEMP/zd-pkgconfig"
+            cat >"$RUNNER_TEMP/zd-pkgconfig/libyuv.pc" <<'EOF'
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=/usr/lib/x86_64-linux-gnu
+          includedir=/usr/include
+
+          Name: libyuv
+          Description: YUV scaling and conversion library
+          Version: 0.0.0
+          Libs: -L${libdir} -lyuv
+          Cflags: -I${includedir}
+          EOF
+            echo "PKG_CONFIG_PATH=$RUNNER_TEMP/zd-pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          fi
+          echo "SODIUM_USE_PKG_CONFIG=1" >> "$GITHUB_ENV"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "libs/zerodesk_core -> target"
+
+      - name: Run ZeroDesk 5/5 compliance gate
+        run: ./scripts/check-compliance.sh
+
+      - name: Verify 11 Phase 8A ABI golden snapshots integrity
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib, json, os, sys
+
+          EXPECTED = {
+              "abi_v2_clipboard_sync_status_event.json": "540cd986a939a11e479b0a782b40ea18cc24cfb9e949a64f2c9ea7f29b39c4aa",
+              "abi_v2_codec_ack_event.json": "1d8e7a97a8851b1f01ec99780c1653ed91b26c19741303e43f058a71574d2d60",
+              "abi_v2_file_transfer_complete_event.json": "8476e87aabbab2f902798eb10f6ffce474729a3752df6c9410b67b7fad6f4727",
+              "abi_v2_get_permissions_req.json": "2d2cf2a05068df8524e60c31677d50818da12765ff68c0986054874b87af1c01",
+              "abi_v2_handshake_reply.json": "c1c8c1394cba2c80c472cbc994704bda5889212c7579442acfd1dd767428bdaa",
+              "abi_v2_hud_stats_event.json": "f473802d40b9ab8cc78841e9e86508d18c50bc637248f6764916582995d6830b",
+              "abi_v2_input_enabled_ack_event.json": "d833f21f1a423b23bede55d546d115b65aafbb8d56a8f534fb03647c8b748c12",
+              "abi_v2_permission_status_event.json": "dc55caf141201a7cb84597e8944ad456bfa22fd1663ad9990da4aa91bb08cfea",
+              "abi_v2_set_input_enabled_req.json": "61eac745666e7e36ef9378b445bbb7176537ed8e8fdf3f8895cc177a62713b89",
+              "abi_v2_set_video_quality_req.json": "21550c8ef0c748adb2406e45570a7b8d8e8d328a74a5ef0f0ee968b1bebccf2a",
+              "abi_v2_unknown_event_and_fields.json": "453aaf89961f1111a98135c96d4cd3c1ff4a9147d86ea2481a3f860f38af94ea",
+          }
+          golden_dir = "libs/zerodesk_core/tests/golden"
+          actual = sorted(f for f in os.listdir(golden_dir) if f.endswith(".json"))
+          if actual != sorted(EXPECTED.keys()):
+              sys.exit(f"FAIL: golden file set mismatch: {actual}")
+          for name, want in EXPECTED.items():
+              path = os.path.join(golden_dir, name)
+              raw = open(path, "rb").read()
+              json.loads(raw.decode("utf-8"))
+              got = hashlib.sha256(raw).hexdigest()
+              if got != want:
+                  sys.exit(f"FAIL: golden SHA-256 mismatch on {name}: got {got} want {want}")
+          print(f"OK: all {len(EXPECTED)} Phase 8A ABI golden snapshots verified byte-for-byte.")
+          PYEOF
+
+      - name: Clippy zerodesk_core (Linux native)
+        run: |
+          cargo clippy --manifest-path libs/zerodesk_core/Cargo.toml \
+            --features scrap/linux-pkg-config \
+            --all-targets --locked -- -D warnings
+
+      - name: Test zerodesk_core (Linux native)
+        run: |
+          cargo test --manifest-path libs/zerodesk_core/Cargo.toml \
+            --features scrap/linux-pkg-config \
+            --all-targets --locked
+
+      - name: Build zerodesk-linux-diag and zerodesk-hid-watchdog
+        run: |
+          cargo build --manifest-path libs/zerodesk_core/Cargo.toml \
+            --features scrap/linux-pkg-config \
+            --release --bin zerodesk-linux-diag --bin zerodesk-hid-watchdog --locked
+
+      - name: Run Linux L2/L3 verification harness (CI mode)
+        run: |
+          ./scripts/verify-linux-l3.sh \
+            --mode ci \
+            --output "$RUNNER_TEMP/linux-l3-report.json" \
+            --diag-bin libs/zerodesk_core/target/release/zerodesk-linux-diag \
+            --watchdog-bin libs/zerodesk_core/target/release/zerodesk-hid-watchdog
+
+      - name: Validate Linux L2/L3 JSON report against schema
+        run: |
+          python3 - scripts/l3-report-schema.json "$RUNNER_TEMP/linux-l3-report.json" <<'PYEOF'
+          import json, re, sys
+
+          schema = json.load(open(sys.argv[1], encoding="utf-8"))
+          report = json.load(open(sys.argv[2], encoding="utf-8"))
+          valid_statuses = set(schema["$defs"]["verificationStatus"]["enum"])
+
+          assert report["schema_version"] == 1
+          assert report["mode"] == "ci"
+          assert report["platform"] == "linux"
+          assert isinstance(report["ci_runner"], bool)
+          assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", report["started_at_utc"])
+          items = report["items"]
+          assert len(items) == 12
+          ids = [it["id"] for it in items]
+          assert ids == [f"LIN-L3-{i:02d}" for i in range(1, 13)], f"bad ids: {ids}"
+          for it in items:
+              assert it["status"] in valid_statuses
+              assert it["status"] != "PASS", f"CI anti-forgery breach on {it['id']}"
+              assert it["duration_ms"] >= 0
+          assert report["summary"]["pass"] == 0
+          assert report["summary"]["fail"] == 0
+          assert sum(report["summary"].values()) == 12
+          raw = json.dumps(report).lower()
+          assert "/home/" not in raw and "/root/" not in raw
+          print("OK: Linux CI L2/L3 report matches schema v1:", json.dumps(report["summary"]))
+          PYEOF
+
+      - name: Upload sanitized Linux L2/L3 report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zerodesk-linux-l2-report
+          path: ${{ runner.temp }}/linux-l3-report.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  windows-native:
+    name: Windows Native MSVC & L2 (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VCPKG_ROOT: C:\zerodesk-vcpkg
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "libs/zerodesk_core -> target"
+
+      - name: Cache pinned vcpkg static libraries (x64-windows-static)
+        id: vcpkg-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\zerodesk-vcpkg\installed\x64-windows-static
+          key: zd-vcpkg-x64-windows-static-${{ env.VCPKG_PINNED_COMMIT }}-${{ hashFiles('res/vcpkg/**') }}
+
+      - name: Build pinned vcpkg static codecs & libsodium on cache miss
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path "$env:VCPKG_ROOT\.git")) {
+            git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          }
+          Push-Location "$env:VCPKG_ROOT"
+          git fetch --depth 1 origin "$env:VCPKG_PINNED_COMMIT"
+          git checkout --force "$env:VCPKG_PINNED_COMMIT"
+          .\bootstrap-vcpkg.bat -disableMetrics
+          Pop-Location
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            --overlay-ports=".\res\vcpkg" `
+            --triplet x64-windows-static `
+            libvpx aom libyuv opus libsodium
+
+      - name: Configure Windows static codec & libclang environment
+        shell: pwsh
+        run: |
+          $prefix = "$env:VCPKG_ROOT\installed\x64-windows-static"
+          "ZERODESK_LIBOPUS_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SODIUM_LIB_DIR=$prefix\lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SODIUM_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Clippy zerodesk_core (Windows native MSVC)
+        shell: pwsh
+        run: |
+          cargo clippy --manifest-path libs/zerodesk_core/Cargo.toml `
+            --all-targets --locked -- -D warnings
+
+      - name: Test zerodesk_core (Windows native MSVC)
+        shell: pwsh
+        run: |
+          cargo test --manifest-path libs/zerodesk_core/Cargo.toml --locked
+
+      - name: Build zerodesk-win-diag and zerodesk-hid-watchdog
+        shell: pwsh
+        run: |
+          cargo build --manifest-path libs/zerodesk_core/Cargo.toml `
+            --release --bin zerodesk-win-diag --bin zerodesk-hid-watchdog --locked
+
+      - name: Run Windows L2/L3 verification harness (CI mode)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-l3.ps1 `
+            -Mode ci `
+            -Output "$env:RUNNER_TEMP\windows-l3-report.json" `
+            -DiagBin "libs\zerodesk_core\target\release\zerodesk-win-diag.exe"
+
+      - name: Validate Windows L2/L3 JSON report against schema
+        shell: pwsh
+        run: |
+          $validator = @'
+          import json, re, sys
+
+          schema = json.load(open(sys.argv[1], encoding="utf-8"))
+          report = json.load(open(sys.argv[2], encoding="utf-8"))
+          valid_statuses = set(schema["$defs"]["verificationStatus"]["enum"])
+
+          assert report["schema_version"] == 1
+          assert report["mode"] == "ci"
+          assert report["platform"] == "windows"
+          assert isinstance(report["ci_runner"], bool)
+          assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", report["started_at_utc"])
+          items = report["items"]
+          assert len(items) == 12
+          ids = [it["id"] for it in items]
+          assert ids == [f"WIN-L3-{i:02d}" for i in range(1, 13)], f"bad ids: {ids}"
+          for it in items:
+              assert it["status"] in valid_statuses
+              assert it["status"] != "PASS", f"CI anti-forgery breach on {it['id']}"
+              assert it["duration_ms"] >= 0
+          assert report["summary"]["pass"] == 0
+          assert report["summary"]["fail"] == 0
+          assert sum(report["summary"].values()) == 12
+          raw = json.dumps(report).lower()
+          assert "c:\\\\users\\\\" not in raw and "c:/users/" not in raw
+          print("OK: Windows CI L2/L3 report matches schema v1:", json.dumps(report["summary"]))
+          '@
+          $validator | python - scripts/l3-report-schema.json "$env:RUNNER_TEMP\windows-l3-report.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload sanitized Windows L2/L3 report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zerodesk-windows-l2-report
+          path: ${{ runner.temp }}/windows-l3-report.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  macos-native:
+    name: macOS Native App & Swift TSan (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      ZERODESK_LIBYUV_PREFIX: ${{ runner.temp }}/zerodesk-libyuv
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "libs/zerodesk_core -> target"
+
+      - name: Install Homebrew codec & crypto dependencies
+        run: |
+          brew install libsodium libvpx aom opus cmake pkg-config
+          echo "SODIUM_USE_PKG_CONFIG=1" >> "$GITHUB_ENV"
+
+      - name: Cache pinned static libyuv prefix
+        id: libyuv-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/zerodesk-libyuv
+          key: zd-macos-arm64-libyuv-${{ env.LIBYUV_PINNED_COMMIT }}
+
+      - name: Build pinned static libyuv on cache miss
+        if: steps.libyuv-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/libyuv-src" "$ZERODESK_LIBYUV_PREFIX"
+          git clone https://chromium.googlesource.com/libyuv/libyuv "$RUNNER_TEMP/libyuv-src"
+          git -C "$RUNNER_TEMP/libyuv-src" checkout --force "$LIBYUV_PINNED_COMMIT"
+          cmake -S "$RUNNER_TEMP/libyuv-src" -B "$RUNNER_TEMP/libyuv-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DCMAKE_INSTALL_PREFIX="$ZERODESK_LIBYUV_PREFIX" \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build "$RUNNER_TEMP/libyuv-build" --target yuv -j"$(sysctl -n hw.ncpu)"
+          mkdir -p "$ZERODESK_LIBYUV_PREFIX/lib" "$ZERODESK_LIBYUV_PREFIX/include"
+          cp "$RUNNER_TEMP/libyuv-build/libyuv.a" "$ZERODESK_LIBYUV_PREFIX/lib/libyuv.a"
+          cp -R "$RUNNER_TEMP/libyuv-src/include/." "$ZERODESK_LIBYUV_PREFIX/include/"
+          test -f "$ZERODESK_LIBYUV_PREFIX/lib/libyuv.a"
+          test -f "$ZERODESK_LIBYUV_PREFIX/include/libyuv.h"
+
+      - name: Clippy zerodesk_core (macOS native)
+        run: |
+          cargo clippy --manifest-path libs/zerodesk_core/Cargo.toml \
+            --all-targets --locked -- -D warnings
+
+      - name: Test zerodesk_core (macOS native)
+        run: |
+          cargo test --manifest-path libs/zerodesk_core/Cargo.toml \
+            --all-targets --locked
+
+      - name: Build ZeroDesk.app bundle and verify codesign
+        id: build-app
+        run: |
+          ./scripts/build-macos-app.sh
+          codesign --verify --deep --strict --verbose=2 apps/macos/ZeroDeskApp/dist/ZeroDesk.app
+
+      - name: Run Swift ThreadSanitizer test suite
+        id: swift-tsan
+        working-directory: apps/macos/ZeroDeskApp
+        run: swift test --sanitize=thread
+
+      - name: Emit sanitized macOS verification summary
+        if: always()
+        env:
+          BUILD_APP_OUTCOME: ${{ steps.build-app.outcome }}
+          SWIFT_TSAN_OUTCOME: ${{ steps.swift-tsan.outcome }}
+        run: |
+          python3 - "$RUNNER_TEMP/macos-verification-summary.json" <<'PYEOF'
+          import datetime, json, os, sys
+
+          build_ok = os.environ.get("BUILD_APP_OUTCOME") == "success"
+          tsan_ok = os.environ.get("SWIFT_TSAN_OUTCOME") == "success"
+          summary = {
+              "schema_version": 1,
+              "platform": "macos",
+              "ci_runner": True,
+              "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "app_bundle_built": build_ok,
+              "codesign_strict_verified": build_ok,
+              "swift_tsan_passed": tsan_ok,
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              json.dump(summary, fh, indent=2)
+              fh.write("\n")
+          PYEOF
+
+      - name: Upload sanitized macOS verification summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zerodesk-macos-summary
+          path: ${{ runner.temp }}/macos-verification-summary.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  collect-artifacts:
+    name: Collect Verification Summary
+    runs-on: ubuntu-24.04
+    needs: [compliance-linux, windows-native, macos-native]
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - name: Download verification artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/collected-artifacts
+
+      - name: Publish GitHub Job Summary and enforce job results
+        env:
+          LINUX_RESULT: ${{ needs.compliance-linux.result }}
+          WINDOWS_RESULT: ${{ needs.windows-native.result }}
+          MACOS_RESULT: ${{ needs.macos-native.result }}
+        run: |
+          python3 - "$RUNNER_TEMP/collected-artifacts" <<'PYEOF'
+          import json, os, sys
+
+          root = sys.argv[1]
+          linux_res = os.environ.get("LINUX_RESULT", "unknown")
+          win_res = os.environ.get("WINDOWS_RESULT", "unknown")
+          mac_res = os.environ.get("MACOS_RESULT", "unknown")
+
+          def load_summary(rel):
+              p = os.path.join(root, rel)
+              if not os.path.isfile(p):
+                  return None
+              try:
+                  return json.load(open(p, encoding="utf-8"))
+              except Exception:
+                  return None
+
+          lin_rep = load_summary("zerodesk-linux-l2-report/linux-l3-report.json")
+          win_rep = load_summary("zerodesk-windows-l2-report/windows-l3-report.json")
+          mac_rep = load_summary("zerodesk-macos-summary/macos-verification-summary.json")
+
+          def fmt_counts(rep):
+              if not rep or "summary" not in rep:
+                  return "report unavailable"
+              s = rep["summary"]
+              return (
+                  f"L2_NATIVE_PASS={s['l2_native_pass']}, "
+                  f"PENDING_PHYSICAL_L3={s['pending_physical_l3']}, "
+                  f"FAIL={s['fail']}, PASS={s['pass']} (CI-forbids-PASS)"
+              )
+
+          lines = [
+              "## ZeroDesk 3-Platform CI & Honest L2/L3 Verification Summary",
+              "",
+              "| Job | Result | Verification Details |",
+              "|---|---|---|",
+              f"| `compliance-linux` | `{linux_res}` | {fmt_counts(lin_rep)} |",
+              f"| `windows-native` | `{win_res}` | {fmt_counts(win_rep)} |",
+              f"| `macos-native` | `{mac_res}` | app_bundle_built={mac_rep.get('app_bundle_built') if mac_rep else 'n/a'}, swift_tsan_passed={mac_rep.get('swift_tsan_passed') if mac_rep else 'n/a'} |",
+              "",
+              "> **Release Gate Reminder**: Headless CI runners only validate L2 native probes (`L2_NATIVE_PASS`). Physical GPU/display/input L3 acceptance (`--strict-l3` 12/12 `PASS`) remains mandatory before any Windows or Linux release.",
+          ]
+          summary_text = "\n".join(lines) + "\n"
+          print(summary_text)
+          gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if gh_summary:
+              with open(gh_summary, "a", encoding="utf-8") as fh:
+                  fh.write(summary_text)
+
+          if any(r != "success" for r in (linux_res, win_res, mac_res)):
+              sys.exit(
+                  f"Upstream CI job failed: linux={linux_res}, windows={win_res}, macos={mac_res}"
+              )
+          PYEOF

@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zerodesk.local/schemas/l3-report-v1.schema.json",
+  "$comment": "SPDX-License-Identifier: AGPL-3.0-only | Copyright (c) 2026 ZeroDesk Contributors",
+  "title": "ZeroDesk L2/L3 Platform Verification Report (v1)",
+  "description": "Strict schema for ZeroDesk Windows (WIN-L3-01..12) and Linux (LIN-L3-01..12) verification reports. Enforces the 6-state honest status enum and forbids CI mode from ever emitting PASS.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "ci_runner",
+    "platform",
+    "started_at_utc",
+    "items",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["ci", "strict-l3"]
+    },
+    "ci_runner": {
+      "type": "boolean"
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["windows", "linux"]
+    },
+    "started_at_utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "items": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "items": {
+        "$ref": "#/$defs/verificationItem"
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summaryCounts"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": { "const": "ci" }
+        },
+        "required": ["mode"]
+      },
+      "then": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "pass": { "const": 0 }
+            }
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "status": {
+                  "not": { "const": "PASS" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "platform": { "const": "windows" }
+        },
+        "required": ["platform"]
+      },
+      "then": {
+        "properties": {
+          "items": {
+            "items": {
+              "properties": {
+                "id": { "pattern": "^WIN-L3-(0[1-9]|1[0-2])$" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "platform": { "const": "linux" }
+        },
+        "required": ["platform"]
+      },
+      "then": {
+        "properties": {
+          "items": {
+            "items": {
+              "properties": {
+                "id": { "pattern": "^LIN-L3-(0[1-9]|1[0-2])$" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "verificationStatus": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "FAIL",
+        "L2_NATIVE_PASS",
+        "PENDING_PHYSICAL_L3",
+        "SKIPPED_NO_HARDWARE",
+        "SKIPPED_UNSUPPORTED_PLATFORM"
+      ]
+    },
+    "verificationItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "status",
+        "evidence",
+        "duration_ms",
+        "requires_hardware",
+        "requires_elevation"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^(WIN|LIN)-L3-(0[1-9]|1[0-2])$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/verificationStatus"
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requires_hardware": {
+          "type": "boolean"
+        },
+        "requires_elevation": {
+          "type": "boolean"
+        },
+        "hardware_fingerprint": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{8}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "PASS" }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["hardware_fingerprint"],
+            "properties": {
+              "hardware_fingerprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "summaryCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pass",
+        "l2_native_pass",
+        "pending_physical_l3",
+        "skipped_no_hardware",
+        "skipped_unsupported_platform",
+        "fail"
+      ],
+      "properties": {
+        "pass": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12
+        },
+        "l2_native_pass": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12
+        },
+        "pending_physical_l3": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12
+        },
+        "skipped_no_hardware": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12
+        },
+        "skipped_unsupported_platform": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12
+        },
+        "fail": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 12
+        }
+      }
+    }
+  }
+}
