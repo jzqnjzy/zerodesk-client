@@ -28,6 +28,8 @@ pub const FEC_WAIT_MAX_MS: u64 = 40;
 pub const FEC_REORDER_MAX_GROUPS: usize = 64;
 /// Maximum retained extra-delay samples inside `FecReceiverStats` (bounded memory).
 pub const FEC_EXTRA_DELAY_MAX_SAMPLES: usize = 1_024;
+/// Maximum retained pending eviction/corruption outcomes in `FecReorderBuffer`.
+pub const FEC_PENDING_OUTCOMES_MAX: usize = 1_024;
 
 const fn build_gf256_tables() -> ([u8; 512], [u8; 256]) {
     let mut exp = [0u8; 512];
@@ -771,6 +773,7 @@ pub struct FecReceiverStats {
     pub fec_timeout_groups: u64,
     pub duplicate_shards_ignored: u64,
     pub late_shards_ignored: u64,
+    #[serde(default)]
     pub invalid_shards: u64,
     pub fec_extra_delay_ms_samples: VecDeque<u64>,
 }
@@ -894,8 +897,7 @@ impl FecReorderBuffer {
                 if let Some(evicted) = self.groups.remove(&oldest_id) {
                     self.mark_finished(oldest_id, now_ms);
                     self.stats.fec_timeout_groups = self.stats.fec_timeout_groups.saturating_add(1);
-                    self.pending_outcomes
-                        .push_back(Self::build_timeout_outcome(oldest_id, &evicted));
+                    self.push_pending_outcome(Self::build_timeout_outcome(oldest_id, &evicted));
                 }
             }
         }
@@ -1016,8 +1018,7 @@ impl FecReorderBuffer {
                         self.mark_finished(group_id, now_ms);
                         self.stats.fec_timeout_groups =
                             self.stats.fec_timeout_groups.saturating_add(1);
-                        self.pending_outcomes
-                            .push_back(Self::build_timeout_outcome(group_id, &poisoned));
+                        self.push_pending_outcome(Self::build_timeout_outcome(group_id, &poisoned));
                     }
                     return Ok(None);
                 }
@@ -1071,6 +1072,13 @@ impl FecReorderBuffer {
         self.stats
             .fec_extra_delay_ms_samples
             .push_back(extra_delay_ms);
+    }
+
+    fn push_pending_outcome(&mut self, outcome: FecGroupOutcome) {
+        while self.pending_outcomes.len() >= FEC_PENDING_OUTCOMES_MAX {
+            self.pending_outcomes.pop_front();
+        }
+        self.pending_outcomes.push_back(outcome);
     }
 
     fn mark_finished(&mut self, group_id: u64, now_ms: u64) {
@@ -1482,5 +1490,23 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(buf.stats().late_shards_ignored, 1);
+
+        // Verify pending_outcomes stays bounded at <= FEC_PENDING_OUTCOMES_MAX (1024) under burst eviction.
+        let mut flood_buf = FecReorderBuffer::new();
+        for gid in 1..=(FEC_REORDER_MAX_GROUPS as u64 + FEC_PENDING_OUTCOMES_MAX as u64 + 50) {
+            let _ = flood_buf
+                .push_shard(gid, 4, 1, false, 0, b"x".to_vec(), gid, 5.0, 30)
+                .unwrap();
+        }
+        assert_eq!(
+            flood_buf.drain_pending_outcomes().len(),
+            FEC_PENDING_OUTCOMES_MAX
+        );
+
+        // Verify #[serde(default)] allows deserializing FecReceiverStats without invalid_shards.
+        let legacy_json = r#"{"direct_complete_groups":1,"fec_recovered_groups":2,"fec_recovered_packets":3,"fec_timeout_groups":0,"duplicate_shards_ignored":0,"late_shards_ignored":0,"fec_extra_delay_ms_samples":[4]}"#;
+        let parsed: FecReceiverStats = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.invalid_shards, 0);
+        assert_eq!(parsed.fec_recovered_packets, 3);
     }
 }

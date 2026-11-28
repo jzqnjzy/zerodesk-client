@@ -108,18 +108,18 @@ impl FastStartController {
 
     /// Records an encoded frame. First 3 frames remain capped at the lightweight probe bitrate.
     pub fn on_frame_encoded(&mut self, is_idr: bool) -> FastStartDirective {
+        if is_idr {
+            self.initial_idr_pending = false;
+        }
         if self.phase != FastStartPhase::Probing {
             return FastStartDirective {
                 phase: self.phase,
-                force_idr: false,
+                force_idr: self.phase == FastStartPhase::HandedOff && self.initial_idr_pending,
                 probe_bitrate_kbps: None,
                 handed_off_now: false,
             };
         }
 
-        if is_idr {
-            self.initial_idr_pending = false;
-        }
         self.frames_encoded = self.frames_encoded.saturating_add(1);
 
         if self.frames_encoded >= self.probe_frame_limit && self.first_feedback_at_ms.is_some() {
@@ -655,6 +655,36 @@ mod tests {
         assert!(t2.handed_off_now);
         assert_eq!(t2.probe_bitrate_kbps, None);
         assert!(t2.force_idr);
+    }
+
+    #[test]
+    fn post_watchdog_handoff_clears_initial_idr_pending_once_idr_is_encoded() {
+        let mut fs = FastStartController::new();
+        fs.on_session_connected(0);
+
+        // Watchdog hands off at 2000ms before the first IDR is encoded.
+        let t_handoff = fs.on_tick(2_000);
+        assert_eq!(t_handoff.phase, FastStartPhase::HandedOff);
+        assert_eq!(t_handoff.probe_bitrate_kbps, None);
+        assert!(t_handoff.force_idr);
+
+        // Non-IDR encoded after handoff keeps requesting force_idr without probe bitrate.
+        let f_non_idr = fs.on_frame_encoded(false);
+        assert_eq!(f_non_idr.phase, FastStartPhase::HandedOff);
+        assert_eq!(f_non_idr.probe_bitrate_kbps, None);
+        assert!(f_non_idr.force_idr);
+
+        // Once an IDR is encoded after handoff, initial_idr_pending MUST clear!
+        let f_idr = fs.on_frame_encoded(true);
+        assert_eq!(f_idr.phase, FastStartPhase::HandedOff);
+        assert_eq!(f_idr.probe_bitrate_kbps, None);
+        assert!(!f_idr.force_idr);
+
+        // Subsequent ticks and feedback must NOT keep requesting force_idr.
+        let t_after = fs.on_tick(2_500);
+        assert!(!t_after.force_idr);
+        let fb_after = fs.on_feedback(2_600);
+        assert!(!fb_after.force_idr);
     }
 
     #[test]
