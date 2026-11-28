@@ -5286,6 +5286,7 @@ dependencies = [
  "v2_client",
  "v2_identity",
  "v2_transport",
+ "windows 0.54.0",
  "zeroize",
 ]
 

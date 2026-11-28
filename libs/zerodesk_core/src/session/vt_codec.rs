@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
-use super::video::{BgraFrame, I420Frame, VideoCodec, VideoError, CODEC_ID_H264, CODEC_ID_HEVC};
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+#[cfg(target_os = "macos")]
+use super::video::{CODEC_ID_H264, CODEC_ID_HEVC};
+use super::video::{BgraFrame, I420Frame, VideoCodec, VideoError};
+#[cfg(any(target_os = "macos", test))]
+use std::{collections::VecDeque, time::Instant};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
 use v2_transport::{CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW};
 
 #[cfg(target_os = "macos")]
@@ -26,12 +28,14 @@ pub struct AnnexbParseSummary {
     pub total_param_bytes: usize,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Default)]
 pub(crate) struct VtRebuildTracker {
     rebuild_times: VecDeque<Instant>,
     total_rebuilds: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl VtRebuildTracker {
     pub(crate) fn record_and_allow(&mut self, now: Instant) -> bool {
         while let Some(&oldest) = self.rebuild_times.front() {
@@ -1091,20 +1095,20 @@ impl VtDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::session::{
         capture::{detect_visual_marker, overlay_visual_marker},
         video::{
             compute_y_psnr, compute_y_ssim, generate_animated_i420, generate_desktop_scene_i420,
-            local_v2_cap_bits, local_v2_cap_bits_with_vt_disable, negotiate_video_codec,
-            read_desktop_scene_frame_idx, DecodedVideoFrame, V2VideoDecoder, V2VideoEncoder,
-            DEFAULT_H264_1080P_BITRATE_BPS, DEFAULT_HEVC_1080P_BITRATE_BPS,
+            local_v2_cap_bits, read_desktop_scene_frame_idx, DecodedVideoFrame, V2VideoDecoder,
+            V2VideoEncoder, DEFAULT_H264_1080P_BITRATE_BPS, DEFAULT_HEVC_1080P_BITRATE_BPS,
             MAX_CONSECUTIVE_DECODE_FAILURES,
         },
     };
-    use v2_transport::{
-        VideoReassembler, VideoSlice, CAP_CODEC_AV1, CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW,
-        CAP_CODEC_VP9,
-    };
+    use crate::session::video::{local_v2_cap_bits_with_vt_disable, negotiate_video_codec};
+    #[cfg(target_os = "macos")]
+    use v2_transport::{VideoReassembler, VideoSlice};
+    use v2_transport::{CAP_CODEC_AV1, CAP_CODEC_H264, CAP_CODEC_HEVC_OS_HW, CAP_CODEC_VP9};
 
     #[test]
     fn capability_negotiation_priority_and_explicit_preference_fail_closed() {
@@ -1540,12 +1544,14 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     struct BitWriter {
         bytes: Vec<u8>,
         cur: u8,
         bits_used: u8,
     }
 
+    #[cfg(target_os = "macos")]
     impl BitWriter {
         fn new() -> Self {
             Self {
@@ -1596,6 +1602,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn build_h264_baseline_sps(width_mbs: u32, height_mbs: u32) -> Vec<u8> {
         let mut bw = BitWriter::new();
         bw.push_bits(66, 8); // profile_idc = Baseline
@@ -1726,6 +1733,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn run_annexb_fuzz_iterations(iterations: usize) {
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let next_u64 = |s: &mut u64| -> u64 {

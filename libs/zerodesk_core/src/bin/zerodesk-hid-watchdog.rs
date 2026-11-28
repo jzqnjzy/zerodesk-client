@@ -37,23 +37,30 @@ pub extern "C" fn BackingScaleFactor(display: u32) -> f32 {
     }
 }
 
+#[cfg(unix)]
+use std::{path::Path, time::Duration};
 use std::{
     env,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::ExitCode,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use zerodesk_core::os::{
-    input::{emergency_release_real_os_keys, is_accessibility_trusted, RealInputPermit},
+    input::RealInputPermit,
     watchdog_proto::{
-        bitmap_collect_keys, WatchdogFrame, WatchdogMsgType, WatchdogReleaseReport,
-        ALL_MODIFIER_HID_USAGES, WATCHDOG_FRAME_LEN, WATCHDOG_READY_FLAG_AX_TRUSTED,
+        WatchdogFrame, WatchdogReleaseReport, ALL_MODIFIER_HID_USAGES, WATCHDOG_FRAME_LEN,
         WATCHDOG_READY_FLAG_REAL_OS_INPUT, WATCHDOG_RELEASED_FLAG_EMERGENCY_FAILED,
         WATCHDOG_RELEASED_FLAG_EMERGENCY_OK, WATCHDOG_RELEASED_FLAG_GRACEFUL,
         WATCHDOG_REPORT_SCHEMA_VERSION,
     },
 };
+#[cfg(unix)]
+use zerodesk_core::os::{
+    input::{emergency_release_real_os_keys, is_accessibility_trusted},
+    watchdog_proto::{bitmap_collect_keys, WatchdogMsgType, WATCHDOG_READY_FLAG_AX_TRUSTED},
+};
 
+#[cfg(unix)]
 struct WatchdogArgs {
     parent_pid: u32,
     nonce: [u8; 8],
@@ -64,6 +71,7 @@ struct WatchdogArgs {
     real_os_input: bool,
 }
 
+#[cfg(unix)]
 fn parse_args(args: &[String]) -> Result<WatchdogArgs, String> {
     let mut parent_pid: Option<u32> = None;
     let mut nonce: Option<[u8; 8]> = None;
@@ -924,20 +932,441 @@ mod unix_impl {
     }
 }
 
+#[cfg(windows)]
+mod windows_impl {
+    use super::*;
+    use std::{
+        fs,
+        sync::mpsc,
+        thread,
+    };
+    use windows::Win32::{
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Storage::FileSystem::{ReadFile, WriteFile},
+        System::Threading::{
+            CreateEventW, OpenProcess, SetEvent, WaitForMultipleObjects,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        },
+    };
+    use zerodesk_core::os::{
+        win_input::execute_atomic_release_batch,
+        win_watchdog::query_process_creation_time,
+        win_watchdog_logic::{
+            is_same_process_instance, ProcessIdentity, WinInputEventDesc, WinWatchdogAction,
+            WinWatchdogLoopState, DEFAULT_WIN_HEARTBEAT_TIMEOUT_MS,
+        },
+    };
+
+    struct WinWatchdogArgs {
+        parent_pid: u32,
+        parent_creation_time_100ns: u64,
+        nonce: [u8; 8],
+        cmd_handle: usize,
+        ack_handle: usize,
+        heartbeat_timeout_ms: u64,
+        dry_run_journal: Option<PathBuf>,
+        real_os_input: bool,
+    }
+
+    fn parse_win_args(args: &[String]) -> Result<WinWatchdogArgs, String> {
+        let mut parent_pid: Option<u32> = None;
+        let mut parent_creation_time_100ns: Option<u64> = None;
+        let mut nonce: Option<[u8; 8]> = None;
+        let mut cmd_handle: Option<usize> = None;
+        let mut ack_handle: Option<usize> = None;
+        let mut heartbeat_timeout_ms = DEFAULT_WIN_HEARTBEAT_TIMEOUT_MS;
+        let mut dry_run_journal: Option<PathBuf> = None;
+        let mut real_os_input = false;
+
+        let mut i = 0usize;
+        while i < args.len() {
+            let flag = args[i].as_str();
+            let next_val = |idx: &mut usize, name: &str| -> Result<String, String> {
+                if *idx + 1 >= args.len() {
+                    return Err(format!("{name} requires a value"));
+                }
+                *idx += 2;
+                Ok(args[*idx - 1].clone())
+            };
+            match flag {
+                "--parent-pid" => {
+                    let raw = next_val(&mut i, "--parent-pid")?;
+                    let pid: u32 = raw
+                        .parse()
+                        .map_err(|_| format!("invalid --parent-pid: {raw}"))?;
+                    if pid == 0 {
+                        return Err("--parent-pid must be > 0".into());
+                    }
+                    parent_pid = Some(pid);
+                }
+                "--parent-creation-time" => {
+                    let raw = next_val(&mut i, "--parent-creation-time")?;
+                    let ct: u64 = raw
+                        .parse()
+                        .map_err(|_| format!("invalid --parent-creation-time: {raw}"))?;
+                    if ct == 0 {
+                        return Err("--parent-creation-time must be > 0".into());
+                    }
+                    parent_creation_time_100ns = Some(ct);
+                }
+                "--nonce-hex" => {
+                    let raw = next_val(&mut i, "--nonce-hex")?;
+                    let bytes = hex::decode(&raw).map_err(|_| "invalid --nonce-hex".to_string())?;
+                    if bytes.len() != 8 {
+                        return Err("--nonce-hex must be 16 hex chars (8 bytes)".into());
+                    }
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&bytes);
+                    nonce = Some(arr);
+                }
+                "--cmd-handle" => {
+                    let raw = next_val(&mut i, "--cmd-handle")?;
+                    let h: usize = raw
+                        .parse()
+                        .map_err(|_| format!("invalid --cmd-handle: {raw}"))?;
+                    cmd_handle = Some(h);
+                }
+                "--ack-handle" => {
+                    let raw = next_val(&mut i, "--ack-handle")?;
+                    let h: usize = raw
+                        .parse()
+                        .map_err(|_| format!("invalid --ack-handle: {raw}"))?;
+                    ack_handle = Some(h);
+                }
+                "--heartbeat-timeout-ms" => {
+                    let raw = next_val(&mut i, "--heartbeat-timeout-ms")?;
+                    heartbeat_timeout_ms = raw
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --heartbeat-timeout-ms: {raw}"))?
+                        .max(100);
+                }
+                "--dry-run-journal" => {
+                    let raw = next_val(&mut i, "--dry-run-journal")?;
+                    if raw.is_empty() {
+                        return Err("--dry-run-journal must be non-empty".into());
+                    }
+                    dry_run_journal = Some(PathBuf::from(raw));
+                }
+                "--real-os-input" => {
+                    real_os_input = true;
+                    i += 1;
+                }
+                other => return Err(format!("unknown flag: {other}")),
+            }
+        }
+
+        let cmd_handle = cmd_handle.ok_or_else(|| "missing --cmd-handle".to_string())?;
+        let ack_handle = ack_handle.ok_or_else(|| "missing --ack-handle".to_string())?;
+        if cmd_handle == 0 || ack_handle == 0 || cmd_handle == ack_handle {
+            return Err("--cmd-handle and --ack-handle must be valid distinct handles".into());
+        }
+        if real_os_input && dry_run_journal.is_some() {
+            return Err("--real-os-input cannot be combined with --dry-run-journal".into());
+        }
+
+        Ok(WinWatchdogArgs {
+            parent_pid: parent_pid.ok_or_else(|| "missing --parent-pid".to_string())?,
+            parent_creation_time_100ns: parent_creation_time_100ns
+                .ok_or_else(|| "missing --parent-creation-time".to_string())?,
+            nonce: nonce.ok_or_else(|| "missing --nonce-hex".to_string())?,
+            cmd_handle,
+            ack_handle,
+            heartbeat_timeout_ms,
+            dry_run_journal,
+            real_os_input,
+        })
+    }
+
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() && self.0 .0 != 0 {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    enum PipeEvent {
+        Frame(WatchdogFrame),
+        Malformed,
+        Eof,
+    }
+
+    fn write_best_effort(handle: HANDLE, data: &[u8]) {
+        let mut written_total = 0usize;
+        while written_total < data.len() {
+            let mut written = 0u32;
+            if unsafe { WriteFile(handle, Some(&data[written_total..]), Some(&mut written), None) }
+                .is_err()
+                || written == 0
+            {
+                break;
+            }
+            written_total += written as usize;
+        }
+    }
+
+    fn read_exact_frame(handle: HANDLE) -> Result<WatchdogFrame, PipeEvent> {
+        let mut buf = [0u8; WATCHDOG_FRAME_LEN];
+        let mut filled = 0usize;
+        while filled < WATCHDOG_FRAME_LEN {
+            let mut n = 0u32;
+            let res = unsafe { ReadFile(handle, Some(&mut buf[filled..]), Some(&mut n), None) };
+            if res.is_err() || n == 0 {
+                return Err(PipeEvent::Eof);
+            }
+            filled += n as usize;
+        }
+        WatchdogFrame::decode(&buf).map_err(|_| PipeEvent::Malformed)
+    }
+
+    struct WinReleaseRequest<'a> {
+        trigger: &'a str,
+        keys: &'a [u16],
+        buttons: u8,
+        batch: &'a [WinInputEventDesc],
+        last_seq: u64,
+    }
+
+    fn execute_release(
+        req: &WinReleaseRequest<'_>,
+        args: &WinWatchdogArgs,
+        real_permit: Option<&RealInputPermit>,
+        ack_handle: HANDLE,
+    ) -> bool {
+        let start = Instant::now();
+        let (release_ok, release_error) = if let Some(_permit) = real_permit {
+            match execute_atomic_release_batch(req.batch) {
+                Ok(rep) => {
+                    if rep.residual_keys == 0 && rep.residual_buttons == 0 {
+                        (true, None)
+                    } else {
+                        (
+                            false,
+                            Some(format!(
+                                "SendInput residual keys={} buttons={} (UIPI/desktop restriction)",
+                                rep.residual_keys, rep.residual_buttons
+                            )),
+                        )
+                    }
+                }
+                Err(e) => (false, Some(e.to_string())),
+            }
+        } else {
+            (true, None)
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if let Some(report_path) = &args.dry_run_journal {
+            let report = WatchdogReleaseReport {
+                schema_version: WATCHDOG_REPORT_SCHEMA_VERSION,
+                trigger: req.trigger.to_string(),
+                parent_pid: args.parent_pid,
+                watchdog_pid: std::process::id(),
+                released_keys: req.keys.to_vec(),
+                released_buttons: req.buttons,
+                released_modifiers: ALL_MODIFIER_HID_USAGES.to_vec(),
+                release_ok,
+                release_error,
+                release_elapsed_ms: elapsed_ms,
+                timestamp_epoch_ms: now_epoch_ms(),
+            };
+            if let Ok(json) = serde_json::to_vec_pretty(&report) {
+                let _ = fs::write(report_path, json);
+            }
+        }
+
+        let flag = if release_ok {
+            WATCHDOG_RELEASED_FLAG_EMERGENCY_OK
+        } else {
+            WATCHDOG_RELEASED_FLAG_EMERGENCY_FAILED
+        };
+        let ack = WatchdogFrame::released(req.last_seq, flag).encode();
+        write_best_effort(ack_handle, &ack);
+        release_ok
+    }
+
+    pub fn run(raw_args: &[String]) -> ExitCode {
+        let args = match parse_win_args(raw_args) {
+            Ok(a) => a,
+            Err(_) => return ExitCode::from(2),
+        };
+        let cmd_handle = HANDLE(args.cmd_handle as isize);
+        let ack_handle = HANDLE(args.ack_handle as isize);
+
+        // 1. Validate optional real-input permit.
+        let mut ready_flags = 0u8;
+        let real_permit = if args.real_os_input {
+            match RealInputPermit::from_explicit_opt_in(true) {
+                Ok(p) => {
+                    ready_flags |= WATCHDOG_READY_FLAG_REAL_OS_INPUT;
+                    Some(p)
+                }
+                Err(_) => return ExitCode::FAILURE,
+            }
+        } else {
+            None
+        };
+
+        // 2. Open parent process handle & verify GetProcessTimes creation time against PID reuse!
+        let parent_handle = match unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                args.parent_pid,
+            )
+        } {
+            Ok(h) => HandleGuard(h),
+            Err(_) => return ExitCode::FAILURE,
+        };
+        let Ok(observed_ct) = query_process_creation_time(parent_handle.0) else {
+            return ExitCode::FAILURE;
+        };
+        let expected_id = ProcessIdentity::new(args.parent_pid, args.parent_creation_time_100ns);
+        let observed_id = ProcessIdentity::new(args.parent_pid, observed_ct);
+        if !is_same_process_instance(expected_id, observed_id) {
+            // PID was already reused by another process -> exit WITHOUT releasing keys!
+            return ExitCode::FAILURE;
+        }
+
+        // 3. Handshake: read Hello and verify (parent_pid, nonce).
+        let hello = match read_exact_frame(cmd_handle) {
+            Ok(f) => f,
+            Err(_) => return ExitCode::FAILURE,
+        };
+        if hello.parse_hello() != Some((args.parent_pid, args.nonce)) {
+            return ExitCode::FAILURE;
+        }
+
+        // 4. Create wakeup event and pipe reader thread so WaitForMultipleObjects monitors
+        //    [parent_handle, pipe_event] simultaneously with bounded heartbeat timeout.
+        let Ok(pipe_event_raw) = (unsafe { CreateEventW(None, false, false, None) }) else {
+            return ExitCode::FAILURE;
+        };
+        let pipe_event = HandleGuard(pipe_event_raw);
+
+        let ready = WatchdogFrame::ready_with_flags(0, ready_flags).encode();
+        write_best_effort(ack_handle, &ready);
+
+        let (tx, rx) = mpsc::channel::<PipeEvent>();
+        let cmd_raw = args.cmd_handle;
+        let ev_raw = pipe_event.0 .0 as usize;
+        let _reader = thread::spawn(move || {
+            let h_cmd = HANDLE(cmd_raw as isize);
+            let h_ev = HANDLE(ev_raw as isize);
+            loop {
+                match read_exact_frame(h_cmd) {
+                    Ok(frame) => {
+                        let _ = tx.send(PipeEvent::Frame(frame));
+                        unsafe {
+                            let _ = SetEvent(h_ev);
+                        }
+                    }
+                    Err(ev) => {
+                        let _ = tx.send(ev);
+                        unsafe {
+                            let _ = SetEvent(h_ev);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let boot = Instant::now();
+        let mut loop_state = WinWatchdogLoopState::new(0, args.heartbeat_timeout_ms);
+        let handles = [parent_handle.0, pipe_event.0];
+
+        loop {
+            let now_ms = boot.elapsed().as_millis() as u64;
+            let rem_ms = loop_state
+                .heartbeat()
+                .remaining_ms(now_ms)
+                .clamp(1, u32::MAX as u64) as u32;
+
+            let wait = unsafe { WaitForMultipleObjects(&handles, false, rem_ms) };
+            let now_ms = boot.elapsed().as_millis() as u64;
+
+            // Always drain pending pipe frames first so a GracefulExit sent right before
+            // parent exit is never misclassified as a crash.
+            let mut action = WinWatchdogAction::Continue;
+            while let Ok(ev) = rx.try_recv() {
+                action = match ev {
+                    PipeEvent::Frame(frame) => loop_state.on_frame(frame, now_ms),
+                    PipeEvent::Malformed => loop_state.on_malformed_frame(),
+                    PipeEvent::Eof => loop_state.on_pipe_eof(),
+                };
+                if !matches!(action, WinWatchdogAction::Continue) {
+                    break;
+                }
+            }
+
+            if matches!(action, WinWatchdogAction::Continue) {
+                if wait == WAIT_OBJECT_0 {
+                    action = loop_state.on_parent_process_exit();
+                } else if wait == WAIT_TIMEOUT {
+                    action = loop_state.on_tick(now_ms);
+                }
+            }
+
+            match action {
+                WinWatchdogAction::Continue => continue,
+                WinWatchdogAction::GracefulExit { seq } => {
+                    let ack =
+                        WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL).encode();
+                    write_best_effort(ack_handle, &ack);
+                    return ExitCode::SUCCESS;
+                }
+                WinWatchdogAction::EmergencyRelease {
+                    trigger,
+                    keys,
+                    buttons,
+                    batch,
+                    ..
+                } => {
+                    let ok = execute_release(
+                        &WinReleaseRequest {
+                            trigger,
+                            keys: &keys,
+                            buttons,
+                            batch: &batch,
+                            last_seq: loop_state.last_seq(),
+                        },
+                        &args,
+                        real_permit.as_ref(),
+                        ack_handle,
+                    );
+                    return if ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    };
+                }
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
-    let args = match parse_args(&raw_args) {
-        Ok(a) => a,
-        Err(_) => return ExitCode::from(2),
-    };
 
     #[cfg(unix)]
     {
+        let args = match parse_args(&raw_args) {
+            Ok(a) => a,
+            Err(_) => return ExitCode::from(2),
+        };
         unix_impl::run(args)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = args;
+        windows_impl::run(&raw_args)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = raw_args;
         ExitCode::FAILURE
     }
 }

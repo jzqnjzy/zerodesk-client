@@ -12,19 +12,23 @@
 //!   release local keys, report degradation, and fail closed immediately.
 //! - On `KeyUp` / `MouseUp`: inject into `OsHidSink` FIRST, then update snapshot.
 
+#[cfg(unix)]
 use super::{
     watchdog_proto::{
         bitmap_clear_key, bitmap_set_key, WatchdogFrame, WatchdogMsgType, WATCHDOG_FRAME_LEN,
         WATCHDOG_READY_FLAG_AX_TRUSTED, WATCHDOG_READY_FLAG_REAL_OS_INPUT,
     },
-    EmergencyKeyReleaser, OsError, OsHidSink, OsPermission, ReleaseReport,
+    OsPermission,
 };
+use super::{EmergencyKeyReleaser, OsError, OsHidSink, ReleaseReport};
 use crate::session::hid::{KeyEvent, MouseEvent, MouseKind};
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };

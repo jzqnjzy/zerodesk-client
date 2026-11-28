@@ -6,9 +6,11 @@ use super::{
     video::VideoCodec,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::fs::File;
 use std::{
     fmt,
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::{self, DirBuilder, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},

@@ -8,9 +8,11 @@ use super::config::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, test))]
+use std::fs;
 use std::{
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
 };
 use v2_client::{
@@ -92,7 +94,7 @@ impl IdentityDirLock {
         {
             // Phase 4A targets Unix (macOS/Linux); Windows cross-process LockFileEx enforcement
             // is required before Windows production release.
-            let _ = (File::open, OpenOptions::new, IDENTITY_LOCK_FILE_NAME);
+            let _ = (File::open::<&Path>, OpenOptions::new, IDENTITY_LOCK_FILE_NAME);
             Ok(Self {})
         }
     }

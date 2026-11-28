@@ -26,6 +26,10 @@ path = "src/bin/zerodesk-desktop.rs"
 name = "zerodesk-hid-watchdog"
 path = "src/bin/zerodesk-hid-watchdog.rs"
 
+[[bin]]
+name = "zerodesk-win-diag"
+path = "src/bin/zerodesk-win-diag.rs"
+
 [features]
 default = ["os-capture", "os-sck", "os-audio", "os-clipboard"]
 os-capture = ["dep:core-graphics", "dep:core-foundation"]
@@ -62,6 +66,26 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.9", optional = true }
 core-graphics = { version = "0.23", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 cc = "1.0"

@@ -8,22 +8,25 @@
 //! (`ingest_sck_bgra_frame` / `SckVideoSlot`), and staleness checks are compiled on all
 //! platforms and 100% unit-testable without OS permissions or display hardware.
 
+#[cfg(any(all(target_os = "macos", feature = "os-sck"), test))]
+use super::audio::{create_spsc_audio_ring, OS_AUDIO_FRAME_SAMPLES};
+#[cfg(all(target_os = "macos", feature = "os-sck"))]
+use super::{audio::SpscAudioConsumer, OsAudioCapture, OsScreenCapture};
 use super::{
-    audio::{
-        create_spsc_audio_ring, SpscAudioConsumer, SpscAudioProducer, OS_AUDIO_CHANNELS,
-        OS_AUDIO_FRAME_SAMPLES, OS_AUDIO_SAMPLE_RATE,
-    },
+    audio::{SpscAudioProducer, OS_AUDIO_CHANNELS, OS_AUDIO_SAMPLE_RATE},
     capture::convert_captured_stride_to_i420,
-    OsAudioCapture, OsCapturePair, OsError, OsPermission, OsScreenCapture, RawCapturedFrame,
+    OsCapturePair, OsError, OsPermission, RawCapturedFrame,
 };
 use crate::{
     frame::{checked_frame_byte_len, PixelFormat},
     session::video::I420Frame,
 };
+#[cfg(all(target_os = "macos", feature = "os-sck"))]
+use std::sync::Arc;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        Condvar, Mutex,
     },
     time::{Duration, Instant},
 };

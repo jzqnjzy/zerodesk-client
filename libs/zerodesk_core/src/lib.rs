@@ -26,5 +26,11 @@ pub use os::{
         GatedOsHidSink, OsInputGateError, PermissionProbe, PermissionProbeSource,
         PermissionStatusReport, SystemPermissionProbe,
     },
-    os_selftest, OsError, OsPermission, OsSelftestReport,
+    os_selftest, CaptureError, CapturedFrame, CapturedSurface, CursorMetadata, CursorShapeKind,
+    D3d11SurfaceFormat, HardwareCodec, HardwareCodecEvent, HardwareCodecKind, HardwareCodecState,
+    HardwareEncodedPacket, HardwareVideoDecoder, HardwareVideoEncoder, HidWatchdogBackend,
+    InputPrivilegeStatus, MacVtHardwareDecoder, MacVtHardwareEncoder, OsError, OsHidSinkInjector,
+    OsInputInjector, OsPermission, OsScreenCaptureAdapter, OsSelftestReport, ScreenCapturer,
+    UnixHidWatchdogBackend, HW_DECODER_FAILED_RENEGOTIATE_EVENT,
+    HW_ENCODER_FAILED_RENEGOTIATE_EVENT,
 };
