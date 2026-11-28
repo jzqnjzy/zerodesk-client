@@ -24,9 +24,10 @@ use super::{
     linux_dl::DynLib,
     linux_vaapi_logic::{
         clamp_vaapi_bitrate_bps, classify_vaapi_vendor_string, select_vaapi_encode_profile,
-        validate_and_clamp_rate_control, VaapiCodec, VaapiCodecCapabilities, VaapiDriverClass,
-        VaapiHwEncoderStateMachine, VaapiProfileEntrypoint, VAAPI_MAX_DIM,
-        VA_ENTRYPOINT_ENC_SLICE, VA_ENTRYPOINT_ENC_SLICE_LP, VA_STATUS_SUCCESS,
+        validate_and_clamp_rate_control, validate_vaapi_enum_counts, VaapiCodec,
+        VaapiCodecCapabilities, VaapiDriverClass, VaapiHwEncoderStateMachine,
+        VaapiProfileEntrypoint, VAAPI_MAX_DIM, VA_ENTRYPOINT_ENC_SLICE, VA_ENTRYPOINT_ENC_SLICE_LP,
+        VA_STATUS_SUCCESS,
     },
     traits::{
         CapturedFrame, HardwareCodec, HardwareCodecEvent, HardwareCodecKind, HardwareCodecState,
@@ -48,9 +49,6 @@ type VaProfile = c_int;
 type VaEntrypoint = c_int;
 type VaConfigId = c_uint;
 type VaContextId = c_uint;
-
-/// Hard safety cap on profile/entrypoint counts returned by untrusted VA-API drivers.
-const MAX_VAAPI_ENUM_CAP: usize = 1024;
 
 struct VaApis {
     va_get_display_drm: unsafe extern "C" fn(c_int) -> VaDisplay,
@@ -208,11 +206,11 @@ impl OwnedDrmVaSession {
     fn query_capabilities(&self) -> Result<VaapiCodecCapabilities, VideoError> {
         let raw_max_profiles = unsafe { (self.apis.va_max_num_profiles)(self.display) };
         let raw_max_entrypoints = unsafe { (self.apis.va_max_num_entrypoints)(self.display) };
-        if raw_max_profiles <= 0 || raw_max_entrypoints <= 0 {
+        let Some((max_profiles, max_entrypoints)) =
+            validate_vaapi_enum_counts(raw_max_profiles, raw_max_entrypoints)?
+        else {
             return Ok(VaapiCodecCapabilities::default());
-        }
-        let max_profiles = (raw_max_profiles as usize).min(MAX_VAAPI_ENUM_CAP);
-        let max_entrypoints = (raw_max_entrypoints as usize).min(MAX_VAAPI_ENUM_CAP);
+        };
 
         let mut profiles = vec![0 as VaProfile; max_profiles];
         let mut num_profiles: c_int = 0;
@@ -475,7 +473,7 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
     fn encode_frame(
         &mut self,
         frame: &CapturedFrame,
-        force_idr: bool,
+        _force_idr: bool,
     ) -> Result<Vec<HardwareEncodedPacket>, VideoError> {
         self.state.ensure_not_terminal()?;
         if frame.width != self.width || frame.height != self.height {
@@ -484,10 +482,10 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
                 frame.width, frame.height, self.width, self.height
             )));
         }
-        self.force_idr_pending |= force_idr;
         // Honest L1/L2 boundary: VA-API surface upload + coded-buffer bitstream submission
         // is pending physical Linux Intel/AMD GPU bringup (LIN-L3-04..06). Return
-        // HardwareUnavailable explicitly without burning reinit budget or falling back to SW.
+        // HardwareUnavailable explicitly without mutating encoder state, burning reinit
+        // budget, or falling back to software.
         Err(VideoError::HardwareUnavailable(
             "VA-API bitstream submission pending physical Linux Intel/AMD GPU bringup (LIN-L3-04..06)"
                 .into(),
@@ -498,7 +496,7 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
         &mut self,
         frame: &I420Frame,
         _pts_us: i64,
-        force_idr: bool,
+        _force_idr: bool,
     ) -> Result<Vec<HardwareEncodedPacket>, VideoError> {
         self.state.ensure_not_terminal()?;
         if frame.width as u32 != self.width || frame.height as u32 != self.height {
@@ -507,7 +505,6 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
                 frame.width, frame.height, self.width, self.height
             )));
         }
-        self.force_idr_pending |= force_idr;
         Err(VideoError::HardwareUnavailable(
             "VA-API bitstream submission pending physical Linux Intel/AMD GPU bringup (LIN-L3-04..06)"
                 .into(),

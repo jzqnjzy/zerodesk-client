@@ -40,6 +40,34 @@ pub const VAAPI_MAX_FPS: u32 = 120;
 pub const VAAPI_MIN_DIM: u32 = 64;
 pub const VAAPI_MAX_DIM: u32 = 7_680;
 
+/// Hard safety ceiling on profile/entrypoint counts returned by VA-API drivers.
+/// Counts above this limit are rejected cleanly rather than allocating a truncated buffer.
+pub const MAX_VAAPI_ENUM_CAP: usize = 1024;
+
+/// Validates driver-reported `vaMaxNumProfiles` and `vaMaxNumEntrypoints` before
+/// allocating buffers for `vaQueryConfigProfiles` / `vaQueryConfigEntrypoints`.
+///
+/// - Returns `Ok(None)` if either count is `<= 0` (driver exposes no configs).
+/// - Returns `Err(VideoError::HardwareUnavailable)` if either count exceeds
+///   `MAX_VAAPI_ENUM_CAP` (NEVER truncates the allocation and passes an undersized
+///   buffer to libva!).
+pub fn validate_vaapi_enum_counts(
+    raw_max_profiles: i32,
+    raw_max_entrypoints: i32,
+) -> Result<Option<(usize, usize)>, VideoError> {
+    if raw_max_profiles <= 0 || raw_max_entrypoints <= 0 {
+        return Ok(None);
+    }
+    let max_profiles = raw_max_profiles as usize;
+    let max_entrypoints = raw_max_entrypoints as usize;
+    if max_profiles > MAX_VAAPI_ENUM_CAP || max_entrypoints > MAX_VAAPI_ENUM_CAP {
+        return Err(VideoError::HardwareUnavailable(format!(
+            "VA-API driver reported excessive enum counts (profiles={max_profiles}, entrypoints={max_entrypoints}, cap={MAX_VAAPI_ENUM_CAP}); refusing unsafe allocation"
+        )));
+    }
+    Ok(Some((max_profiles, max_entrypoints)))
+}
+
 // Clean-room VA-API numeric ABI status codes (matching libva 1.x/2.x stable C ABI).
 pub const VA_STATUS_SUCCESS: i32 = 0x0000_0000;
 pub const VA_STATUS_ERROR_OPERATION_FAILED: i32 = 0x0000_0001;
@@ -796,5 +824,28 @@ mod tests {
         sm.on_encoded_packet(true, 2048);
         assert_eq!(sm.state(), HardwareCodecState::HardwareReady);
         assert!(sm.mark_initialized().is_err());
+    }
+
+    #[test]
+    fn vaapi_enum_counts_rejects_excessive_driver_values_instead_of_truncating() {
+        assert_eq!(validate_vaapi_enum_counts(0, 16).unwrap(), None);
+        assert_eq!(validate_vaapi_enum_counts(16, -1).unwrap(), None);
+        assert_eq!(
+            validate_vaapi_enum_counts(64, 16).unwrap(),
+            Some((64, 16))
+        );
+        assert_eq!(
+            validate_vaapi_enum_counts(MAX_VAAPI_ENUM_CAP as i32, MAX_VAAPI_ENUM_CAP as i32)
+                .unwrap(),
+            Some((MAX_VAAPI_ENUM_CAP, MAX_VAAPI_ENUM_CAP))
+        );
+        assert!(matches!(
+            validate_vaapi_enum_counts((MAX_VAAPI_ENUM_CAP + 1) as i32, 16),
+            Err(VideoError::HardwareUnavailable(_))
+        ));
+        assert!(matches!(
+            validate_vaapi_enum_counts(16, (MAX_VAAPI_ENUM_CAP + 1) as i32),
+            Err(VideoError::HardwareUnavailable(_))
+        ));
     }
 }

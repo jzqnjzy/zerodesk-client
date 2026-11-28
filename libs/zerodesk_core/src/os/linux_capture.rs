@@ -16,9 +16,10 @@ use super::{
     linux_capture_logic::{
         convert_xfixes_argb_to_cursor_metadata, copy_shm_frame_rows, detect_linux_session_kind,
         normalize_packed_to_bgra_in_place, LinuxSessionKind, PackedFrame, PipeWireBufferKind,
-        PipeWireFrameArrival, PipeWireStreamParams, WaylandPortalCaptureStateMachine,
-        X11CaptureDecision, X11CaptureErrorKind, X11CaptureStateMachine, X11MonitorTopology,
-        X11OutputDescriptor, XFixesCursorInput, MAX_XFIXES_CURSOR_DIM,
+        PipeWireFrameArrival, PipeWirePixelFormat, PipeWireStreamParams,
+        WaylandPortalCaptureStateMachine, X11CaptureDecision, X11CaptureErrorKind,
+        X11CaptureStateMachine, X11MonitorTopology, X11OutputDescriptor, XFixesCursorInput,
+        MAX_XFIXES_CURSOR_DIM,
     },
     linux_dl::DynLib,
     traits::{CaptureError, CapturedFrame, CapturedSurface, CursorMetadata, ScreenCapturer},
@@ -28,7 +29,10 @@ use std::{
     ffi::{c_char, c_int, c_uint, c_ulong, c_ushort, c_void, CStr},
     path::Path,
     ptr,
-    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+        Once,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -110,11 +114,110 @@ type XIOErrorHandler = unsafe extern "C" fn(*mut XDisplay) -> c_int;
 const X_ZPIXMAP: c_int = 2;
 const X_ALL_PLANES: c_ulong = !0;
 
-/// Process-wide Xlib error/IO-error latches installed via `XSetErrorHandler` and
-/// `XSetIOErrorHandler` so protocol errors (`BadMatch`) and display disconnects
-/// are observed cleanly instead of triggering Xlib's default `exit(1)`.
-static X11_DISPLAY_DEAD: AtomicBool = AtomicBool::new(false);
-static X11_LAST_ERROR_CODE: AtomicI32 = AtomicI32::new(0);
+/// Lock-free, signal/reentrancy-safe per-`Display*` Xlib error & IO-error table.
+/// Prevents cross-contamination between concurrent `X11ShmCapturer` instances and
+/// chains cleanly to previously installed handlers for unregistered `Display*`s.
+const MAX_X11_DISPLAY_SLOTS: usize = 16;
+
+struct DisplayErrorSlot {
+    display_ptr: AtomicUsize,
+    dead: AtomicBool,
+    last_error: AtomicI32,
+}
+
+impl DisplayErrorSlot {
+    const fn new() -> Self {
+        Self {
+            display_ptr: AtomicUsize::new(0),
+            dead: AtomicBool::new(false),
+            last_error: AtomicI32::new(0),
+        }
+    }
+}
+
+static X11_DISPLAY_SLOTS: [DisplayErrorSlot; MAX_X11_DISPLAY_SLOTS] =
+    [const { DisplayErrorSlot::new() }; MAX_X11_DISPLAY_SLOTS];
+static X11_HANDLERS_INSTALLED: Once = Once::new();
+static PREV_X11_ERROR_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static PREV_X11_IO_ERROR_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+fn find_x11_display_slot(display: *mut XDisplay) -> Option<usize> {
+    let key = display as usize;
+    if key == 0 {
+        return None;
+    }
+    for (idx, slot) in X11_DISPLAY_SLOTS.iter().enumerate() {
+        if slot.display_ptr.load(Ordering::Acquire) == key {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+struct RegisteredDisplayGuard {
+    display: *mut XDisplay,
+    slot: Option<usize>,
+}
+
+// SAFETY: Only tracks an integer pointer key + slot index inside the lock-free table.
+unsafe impl Send for RegisteredDisplayGuard {}
+
+impl RegisteredDisplayGuard {
+    fn register(display: *mut XDisplay) -> Self {
+        let key = display as usize;
+        let mut claimed = None;
+        if key != 0 {
+            for (idx, slot) in X11_DISPLAY_SLOTS.iter().enumerate() {
+                if slot
+                    .display_ptr
+                    .compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    slot.dead.store(false, Ordering::Release);
+                    slot.last_error.store(0, Ordering::Release);
+                    claimed = Some(idx);
+                    break;
+                }
+            }
+        }
+        Self {
+            display,
+            slot: claimed,
+        }
+    }
+
+    fn is_dead(&self) -> bool {
+        self.slot
+            .map(|idx| X11_DISPLAY_SLOTS[idx].dead.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn clear_last_error(&self) {
+        if let Some(idx) = self.slot {
+            X11_DISPLAY_SLOTS[idx].last_error.store(0, Ordering::Release);
+        }
+    }
+
+    fn last_error(&self) -> i32 {
+        self.slot
+            .map(|idx| X11_DISPLAY_SLOTS[idx].last_error.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+}
+
+impl Drop for RegisteredDisplayGuard {
+    fn drop(&mut self) {
+        if let Some(idx) = self.slot.take() {
+            let key = self.display as usize;
+            let slot = &X11_DISPLAY_SLOTS[idx];
+            slot.dead.store(false, Ordering::Release);
+            slot.last_error.store(0, Ordering::Release);
+            let _ = slot
+                .display_ptr
+                .compare_exchange(key, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
 
 #[repr(C)]
 struct XErrorEvent {
@@ -128,17 +231,35 @@ struct XErrorEvent {
 }
 
 unsafe extern "C" fn zerodesk_x11_error_handler(
-    _display: *mut XDisplay,
+    display: *mut XDisplay,
     err: *mut XErrorEvent,
 ) -> c_int {
-    if !err.is_null() {
-        X11_LAST_ERROR_CODE.store(i32::from((*err).error_code), Ordering::Release);
+    if let Some(idx) = find_x11_display_slot(display) {
+        if !err.is_null() {
+            X11_DISPLAY_SLOTS[idx]
+                .last_error
+                .store(i32::from((*err).error_code), Ordering::Release);
+        }
+        return 0;
+    }
+    let prev_addr = PREV_X11_ERROR_HANDLER.load(Ordering::Acquire);
+    if prev_addr != 0 {
+        let prev: XErrorHandler = std::mem::transmute(prev_addr);
+        return prev(display, err);
     }
     0
 }
 
-unsafe extern "C" fn zerodesk_x11_io_error_handler(_display: *mut XDisplay) -> c_int {
-    X11_DISPLAY_DEAD.store(true, Ordering::Release);
+unsafe extern "C" fn zerodesk_x11_io_error_handler(display: *mut XDisplay) -> c_int {
+    if let Some(idx) = find_x11_display_slot(display) {
+        X11_DISPLAY_SLOTS[idx].dead.store(true, Ordering::Release);
+        return 0;
+    }
+    let prev_addr = PREV_X11_IO_ERROR_HANDLER.load(Ordering::Acquire);
+    if prev_addr != 0 {
+        let prev: XIOErrorHandler = std::mem::transmute(prev_addr);
+        return prev(display);
+    }
     0
 }
 
@@ -326,13 +447,19 @@ impl X11Apis {
         }
     }
 
-    fn install_error_handlers(&self) {
-        X11_DISPLAY_DEAD.store(false, Ordering::Release);
-        X11_LAST_ERROR_CODE.store(0, Ordering::Release);
-        unsafe {
-            let _ = (self.x_set_error_handler)(Some(zerodesk_x11_error_handler));
-            let _ = (self.x_set_io_error_handler)(Some(zerodesk_x11_io_error_handler));
-        }
+    fn install_error_handlers_once(&self) {
+        X11_HANDLERS_INSTALLED.call_once(|| unsafe {
+            if let Some(prev) = (self.x_set_error_handler)(Some(zerodesk_x11_error_handler)) {
+                if prev as usize != zerodesk_x11_error_handler as usize {
+                    PREV_X11_ERROR_HANDLER.store(prev as usize, Ordering::Release);
+                }
+            }
+            if let Some(prev) = (self.x_set_io_error_handler)(Some(zerodesk_x11_io_error_handler)) {
+                if prev as usize != zerodesk_x11_io_error_handler as usize {
+                    PREV_X11_IO_ERROR_HANDLER.store(prev as usize, Ordering::Release);
+                }
+            }
+        });
     }
 }
 
@@ -340,13 +467,14 @@ impl X11Apis {
 /// dimensions when `libXrandr.so.2` is unavailable).
 pub fn enumerate_x11_monitors() -> Result<Vec<X11OutputDescriptor>, CaptureError> {
     let apis = X11Apis::load()?;
-    apis.install_error_handlers();
+    apis.install_error_handlers_once();
     let display = unsafe { (apis.x_open_display)(ptr::null()) };
     if display.is_null() {
         return Err(CaptureError::Fatal(
             "XOpenDisplay(NULL) failed; check DISPLAY / Xauthority".into(),
         ));
     }
+    let _guard = RegisteredDisplayGuard::register(display);
     let res = enumerate_x11_monitors_on_display(&apis, display);
     unsafe {
         (apis.x_close_display)(display);
@@ -443,6 +571,7 @@ struct AttachedShm {
 pub struct X11ShmCapturer {
     apis: X11Apis,
     display: *mut XDisplay,
+    display_guard: RegisteredDisplayGuard,
     root: XWindow,
     screen: c_int,
     topology: X11MonitorTopology,
@@ -458,17 +587,19 @@ unsafe impl Send for X11ShmCapturer {}
 impl X11ShmCapturer {
     pub fn open(requested_monitor_id: Option<u32>) -> Result<Self, CaptureError> {
         let apis = X11Apis::load()?;
-        apis.install_error_handlers();
+        apis.install_error_handlers_once();
         let display = unsafe { (apis.x_open_display)(ptr::null()) };
         if display.is_null() {
             return Err(CaptureError::Fatal(
                 "XOpenDisplay(NULL) failed; check DISPLAY".into(),
             ));
         }
+        let display_guard = RegisteredDisplayGuard::register(display);
         if unsafe { (apis.x_shm_query_extension)(display) } == 0 {
             unsafe {
                 (apis.x_close_display)(display);
             }
+            drop(display_guard);
             return Err(CaptureError::Fatal(
                 "X11 MIT-SHM (XShm) extension is unavailable on active X server".into(),
             ));
@@ -481,6 +612,7 @@ impl X11ShmCapturer {
                 unsafe {
                     (apis.x_close_display)(display);
                 }
+                drop(display_guard);
                 return Err(e);
             }
         };
@@ -490,6 +622,7 @@ impl X11ShmCapturer {
                 unsafe {
                     (apis.x_close_display)(display);
                 }
+                drop(display_guard);
                 return Err(e);
             }
         };
@@ -497,12 +630,14 @@ impl X11ShmCapturer {
             unsafe {
                 (apis.x_close_display)(display);
             }
+            drop(display_guard);
             return Err(CaptureError::Fatal("no X11 monitor selected".into()));
         };
 
         let mut cap = Self {
             apis,
             display,
+            display_guard,
             root,
             screen,
             topology,
@@ -572,12 +707,13 @@ impl X11ShmCapturer {
                 "XShmCreateImage returned NULL".into(),
             ));
         }
-        let (stride, img_h, bpp, red_mask, blue_mask) = unsafe {
+        let (stride, img_h, bpp, red_mask, green_mask, blue_mask) = unsafe {
             (
                 (*img).bytes_per_line,
                 (*img).height,
                 (*img).bits_per_pixel,
                 (*img).red_mask,
+                (*img).green_mask,
                 (*img).blue_mask,
             )
         };
@@ -590,13 +726,17 @@ impl X11ShmCapturer {
             ));
         }
         // Fail closed unless the X11 server delivers 32-bit BGRX/BGRA pixel layout
-        // (R=0x00FF0000, B=0x000000FF on little-endian x86_64/aarch64 Linux).
-        if bpp != 32 || red_mask != 0x00FF_0000 || blue_mask != 0x0000_00FF {
+        // (R=0x00FF0000, G=0x0000FF00, B=0x000000FF on little-endian Linux).
+        if bpp != 32
+            || red_mask != 0x00FF_0000
+            || green_mask != 0x0000_FF00
+            || blue_mask != 0x0000_00FF
+        {
             unsafe {
                 let _ = (self.apis.x_free)(img.cast());
             }
             return Err(CaptureError::ReinitRequired(format!(
-                "unsupported X11 XShm pixel format: bpp={bpp}, red_mask={red_mask:#x}, blue_mask={blue_mask:#x} (expected 32-bit BGRA/BGRX)"
+                "unsupported X11 XShm pixel format: bpp={bpp}, masks=({red_mask:#x}, {green_mask:#x}, {blue_mask:#x}) (expected 32-bit BGRA/BGRX)"
             )));
         }
         let byte_len = (stride as usize)
@@ -718,8 +858,8 @@ impl ScreenCapturer for X11ShmCapturer {
     }
 
     fn capture_next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
-        // Check Xlib IO error latch before making any further X11 requests.
-        if X11_DISPLAY_DEAD.load(Ordering::Acquire) {
+        // Check THIS display's Xlib IO error latch before making any further X11 requests.
+        if self.display_guard.is_dead() {
             return match self.state.on_error(
                 X11CaptureErrorKind::DisplayDisconnected,
                 "X11 IO error handler observed display disconnect",
@@ -775,7 +915,7 @@ impl ScreenCapturer for X11ShmCapturer {
             ));
         };
 
-        X11_LAST_ERROR_CODE.store(0, Ordering::Release);
+        self.display_guard.clear_last_error();
         let ok = unsafe {
             (self.apis.x_shm_get_image)(
                 self.display,
@@ -786,7 +926,7 @@ impl ScreenCapturer for X11ShmCapturer {
                 X_ALL_PLANES,
             )
         };
-        if X11_DISPLAY_DEAD.load(Ordering::Acquire) {
+        if self.display_guard.is_dead() {
             return match self.state.on_error(
                 X11CaptureErrorKind::DisplayDisconnected,
                 "X11 display disconnected during XShmGetImage",
@@ -795,7 +935,7 @@ impl ScreenCapturer for X11ShmCapturer {
                 _ => Err(CaptureError::Fatal("X11 display disconnected".into())),
             };
         }
-        let proto_err = X11_LAST_ERROR_CODE.load(Ordering::Acquire);
+        let proto_err = self.display_guard.last_error();
         if ok == 0 || proto_err != 0 {
             let decision = self.state.on_error(
                 X11CaptureErrorKind::BadMatch,
@@ -922,10 +1062,6 @@ impl WaylandPipeWireCapturer {
         &self.state
     }
 
-    pub fn state_machine_mut(&mut self) -> &mut WaylandPortalCaptureStateMachine {
-        &mut self.state
-    }
-
     /// Applies PipeWire stream negotiation and synchronously clears any queued
     /// stale frames from the previous stream geometry.
     pub fn on_pipewire_negotiated(
@@ -1007,7 +1143,7 @@ impl WaylandPipeWireCapturer {
             width: params.width,
             height: params.height,
             stride: dst_stride as u32,
-            format: params.format,
+            format: PipeWirePixelFormat::Bgra8,
             pts_us,
         };
         frame.validate_bgra_bounds()?;
@@ -1034,26 +1170,30 @@ impl ScreenCapturer for WaylandPipeWireCapturer {
     }
 
     fn capture_next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
-        if self.state.negotiated_stream().is_none() {
+        let Some(stream) = self.state.negotiated_stream().cloned() else {
             self.pending_frames.clear();
             return Err(CaptureError::ReinitRequired(
                 "Wayland PipeWire stream not yet negotiated with xdg-desktop-portal".into(),
             ));
-        }
-        let Some(frame) = self.pending_frames.pop_front() else {
-            return Err(CaptureError::Timeout);
         };
-        let _ = self.state.frame_ring_mut().pop();
-        frame.validate_bgra_bounds()?;
-        Ok(CapturedFrame {
-            width: frame.width,
-            height: frame.height,
-            stride: frame.stride,
-            surface: CapturedSurface::Bgra8 { data: frame.data },
-            timestamp_us: frame.pts_us,
-            monitor_id: self.monitor_id,
-            cursor: None,
-        })
+        while let Some(frame) = self.pending_frames.pop_front() {
+            let _ = self.state.frame_ring_mut().pop();
+            if frame.width != stream.width || frame.height != stream.height {
+                // Discard stale frame whose geometry no longer matches the negotiated stream.
+                continue;
+            }
+            frame.validate_bgra_bounds()?;
+            return Ok(CapturedFrame {
+                width: frame.width,
+                height: frame.height,
+                stride: frame.stride,
+                surface: CapturedSurface::Bgra8 { data: frame.data },
+                timestamp_us: frame.pts_us,
+                monitor_id: self.monitor_id,
+                cursor: None,
+            });
+        }
+        Err(CaptureError::Timeout)
     }
 }
 
