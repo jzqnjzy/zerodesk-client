@@ -128,6 +128,12 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
     private var lastUploadedFrameSeq: UInt64 = 0
     private var lastRenderedFrameSeq: UInt64 = 0
     private var lastRenderedDrawableSize: CGSize = .zero
+    private var lastRenderedViewportMode: DisplayScaleMode = .fit
+    private var lastRenderedScrollOffset: CGPoint = .zero
+
+    // Viewport state protected by stateLock.
+    private var _displayScaleMode: DisplayScaleMode = .fit
+    private var _scrollOffset: CGPoint = .zero
 
     // Telemetry counters protected by stateLock.
     private var _lastUploadAndDrawMs: Double = 0
@@ -225,6 +231,25 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
         telemetry.idleFramesSkipped
     }
 
+    public func updateViewport(mode: DisplayScaleMode, scrollOffset: CGPoint) {
+        stateLock.lock()
+        _displayScaleMode = mode
+        _scrollOffset = scrollOffset
+        stateLock.unlock()
+    }
+
+    public var currentDisplayScaleMode: DisplayScaleMode {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _displayScaleMode
+    }
+
+    public var currentScrollOffset: CGPoint {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _scrollOffset
+    }
+
     /// Submits a newly fetched BGRA frame for GPU upload on the next draw tick.
     public func submitFrame(_ frame: CapturedBGRAFrame) {
         stateLock.lock()
@@ -282,6 +307,8 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
         let active = hasActiveFrame
         let shouldClear = needsClearToBlack
         let submittedSeq = latestSubmittedSeq
+        let mode = _displayScaleMode
+        let scrollOffset = _scrollOffset
         stateLock.unlock()
 
         renderLock.lock()
@@ -303,6 +330,8 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
             cmdBuf.commit()
 
             lastRenderedDrawableSize = drawableSize
+            lastRenderedViewportMode = mode
+            lastRenderedScrollOffset = scrollOffset
             stateLock.lock()
             needsClearToBlack = false
             _framesRendered &+= 1
@@ -311,9 +340,11 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
             return
         }
 
-        // Zero GPU work when idle: unchanged frameSeq AND unchanged viewport size.
+        // Zero GPU work when idle: unchanged frameSeq, drawableSize, scale mode, and scroll offset.
         if submittedSeq == lastRenderedFrameSeq
             && drawableSize == lastRenderedDrawableSize
+            && mode == lastRenderedViewportMode
+            && scrollOffset == lastRenderedScrollOffset
             && activeTexture != nil
         {
             recordIdleSkip()
@@ -341,13 +372,17 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
             commandBuffer: cmdBuf,
             renderPassDescriptor: passDesc,
             sourceTexture: texture,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            mode: mode,
+            scrollOffset: scrollOffset
         )
         cmdBuf.present(drawable)
         cmdBuf.commit()
 
         lastRenderedFrameSeq = lastUploadedFrameSeq
         lastRenderedDrawableSize = drawableSize
+        lastRenderedViewportMode = mode
+        lastRenderedScrollOffset = scrollOffset
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
         stateLock.lock()
@@ -410,7 +445,9 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
             commandBuffer: cmdBuf,
             renderPassDescriptor: passDesc,
             sourceTexture: sourceTexture,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            mode: currentDisplayScaleMode,
+            scrollOffset: currentScrollOffset
         )
         cmdBuf.commit()
         if waitUntilCompleted {
@@ -499,19 +536,26 @@ public final class MetalVideoRenderer: NSObject, MTKViewDelegate, @unchecked Sen
         commandBuffer: MTLCommandBuffer,
         renderPassDescriptor: MTLRenderPassDescriptor,
         sourceTexture: MTLTexture,
-        drawableSize: CGSize
+        drawableSize: CGSize,
+        mode: DisplayScaleMode,
+        scrollOffset: CGPoint
     ) {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
             return
         }
 
-        let remoteSize = RemoteSize(width: sourceTexture.width, height: sourceTexture.height)
-        let layout = RemoteCoordinateMapper.computeLayout(viewSize: drawableSize, remoteSize: remoteSize)
+        let viewport = ViewportState(
+            mode: mode,
+            viewBackingSize: drawableSize,
+            frameSize: CGSize(width: sourceTexture.width, height: sourceTexture.height),
+            scrollOffset: scrollOffset
+        )
+        let geo = RemoteCoordinateMapper.computeGeometry(for: viewport)
         var uniforms = LetterboxUniforms(
-            scaleX: layout?.ndcScaleX ?? 1.0,
-            scaleY: layout?.ndcScaleY ?? 1.0,
-            offsetX: 0.0,
-            offsetY: 0.0
+            scaleX: geo?.ndcScaleX ?? 1.0,
+            scaleY: geo?.ndcScaleY ?? 1.0,
+            offsetX: geo?.ndcOffsetX ?? 0.0,
+            offsetY: geo?.ndcOffsetY ?? 0.0
         )
 
         encoder.setRenderPipelineState(pipelineState)

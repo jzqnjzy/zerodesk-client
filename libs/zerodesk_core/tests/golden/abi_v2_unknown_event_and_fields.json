@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "seq": 99,
+  "kind": "future_phase9_event_type",
+  "type": "future_phase9_event_type",
+  "unknown_top_level_field": {
+    "nested": [1, 2, 3]
+  },
+  "payload": {
+    "future_flag": true,
+    "future_note": "must be ignored safely"
+  }
+}

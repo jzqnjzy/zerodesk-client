@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "seq": 43,
+  "kind": "input_enabled_ack",
+  "payload": {
+    "enabled": false,
+    "status": "not_permitted",
+    "screen_capture_granted": true,
+    "accessibility_granted": false,
+    "probe_source": "ui_process_hint"
+  }
+}

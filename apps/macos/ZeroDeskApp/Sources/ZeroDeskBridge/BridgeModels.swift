@@ -171,6 +171,13 @@ public struct BridgeSnapshot: Codable, Sendable, Equatable {
     public let activeTransportMode: String?
     public let audioMuted: Bool
     public let realInputEnabled: Bool?
+    public let abiVersion: UInt32?
+    public let caps: [String]?
+    public let enableOsInput: Bool?
+    public let activeCodec: String?
+    public let bitrateKbps: UInt32?
+    public let fpsCap: UInt32?
+    public let clipboardSyncEnabled: Bool?
     public let localDeviceIdHex: String?
     public let localTenantIdHex: String?
     public let activeSessionIdHex: String?
@@ -188,6 +195,13 @@ public struct BridgeSnapshot: Codable, Sendable, Equatable {
         case activeTransportMode = "active_transport_mode"
         case audioMuted = "audio_muted"
         case realInputEnabled = "real_input_enabled"
+        case abiVersion = "abi_version"
+        case caps
+        case enableOsInput = "enable_os_input"
+        case activeCodec = "active_codec"
+        case bitrateKbps = "bitrate_kbps"
+        case fpsCap = "fps_cap"
+        case clipboardSyncEnabled = "clipboard_sync_enabled"
         case localDeviceIdHex = "local_device_id_hex"
         case localTenantIdHex = "local_tenant_id_hex"
         case activeSessionIdHex = "active_session_id_hex"
@@ -330,5 +344,339 @@ public struct CapturedBGRAFrame: Sendable {
         self.ptsMs = ptsMs
         self.droppedUiFrames = droppedUiFrames
         self.data = data
+    }
+}
+
+// MARK: - Phase 8A Additive JSON-ABI v2 Models
+
+public struct HandshakeCapabilitiesData: Codable, Sendable, Equatable {
+    public let abiVersion: UInt32
+    public let caps: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case abiVersion = "abi_version"
+        case caps
+    }
+
+    public init(abiVersion: UInt32, caps: [String]) {
+        self.abiVersion = abiVersion
+        self.caps = caps
+    }
+}
+
+public struct BridgeTypedReply<T: Codable & Sendable & Equatable>: Codable, Sendable, Equatable {
+    public let v: UInt32
+    public let ok: Bool
+    public let errorCode: String?
+    public let error: String?
+    public let data: T?
+
+    enum CodingKeys: String, CodingKey {
+        case v
+        case ok
+        case errorCode = "error_code"
+        case error
+        case data
+    }
+}
+
+public enum PermissionProbeSource: String, Codable, Sendable, Equatable {
+    case watchdogOrInjectorProcess = "watchdog_or_injector_process"
+    case uiProcessHint = "ui_process_hint"
+}
+
+public struct PermissionStatusReport: Codable, Sendable, Equatable {
+    public let screenCaptureGranted: Bool
+    public let accessibilityGranted: Bool
+    public let probeSource: PermissionProbeSource
+    public let enableOsInput: Bool
+    public let secureEventInputEnabled: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case screenCaptureGranted = "screen_capture_granted"
+        case accessibilityGranted = "accessibility_granted"
+        case probeSource = "probe_source"
+        case enableOsInput = "enable_os_input"
+        case secureEventInputEnabled = "secure_event_input_enabled"
+    }
+
+    public init(
+        screenCaptureGranted: Bool,
+        accessibilityGranted: Bool,
+        probeSource: PermissionProbeSource,
+        enableOsInput: Bool,
+        secureEventInputEnabled: Bool? = nil
+    ) {
+        self.screenCaptureGranted = screenCaptureGranted
+        self.accessibilityGranted = accessibilityGranted
+        self.probeSource = probeSource
+        self.enableOsInput = enableOsInput
+        self.secureEventInputEnabled = secureEventInputEnabled
+    }
+
+    public var allRequiredPermissionsGranted: Bool {
+        screenCaptureGranted && accessibilityGranted
+    }
+}
+
+public struct InputEnabledAckPayload: Codable, Sendable, Equatable {
+    public let enabled: Bool
+    public let status: String
+    public let screenCaptureGranted: Bool?
+    public let accessibilityGranted: Bool?
+    public let probeSource: String?
+    public let reason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case status
+        case screenCaptureGranted = "screen_capture_granted"
+        case accessibilityGranted = "accessibility_granted"
+        case probeSource = "probe_source"
+        case reason
+    }
+
+    public init(
+        enabled: Bool,
+        status: String,
+        screenCaptureGranted: Bool? = nil,
+        accessibilityGranted: Bool? = nil,
+        probeSource: String? = nil,
+        reason: String? = nil
+    ) {
+        self.enabled = enabled
+        self.status = status
+        self.screenCaptureGranted = screenCaptureGranted
+        self.accessibilityGranted = accessibilityGranted
+        self.probeSource = probeSource
+        self.reason = reason
+    }
+}
+
+public struct HudStatsPayload: Codable, Sendable, Equatable {
+    public let fps: Double
+    public let decodeMs: Double
+    public let activeCodec: String
+    public let transportMode: String
+    public let rttMs: Double
+    public let bitrateKbps: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case fps
+        case decodeMs = "decode_ms"
+        case activeCodec = "active_codec"
+        case transportMode = "transport_mode"
+        case rttMs = "rtt_ms"
+        case bitrateKbps = "bitrate_kbps"
+    }
+
+    public init(
+        fps: Double = 0,
+        decodeMs: Double = 0,
+        activeCodec: String = "auto",
+        transportMode: String = "udp",
+        rttMs: Double = 0,
+        bitrateKbps: UInt32 = 0
+    ) {
+        self.fps = fps
+        self.decodeMs = decodeMs
+        self.activeCodec = activeCodec
+        self.transportMode = transportMode
+        self.rttMs = rttMs
+        self.bitrateKbps = bitrateKbps
+    }
+}
+
+public struct CodecAckPayload: Codable, Sendable, Equatable {
+    public let activeCodec: String
+    public let requestedCodec: String?
+    public let accepted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case activeCodec = "active_codec"
+        case requestedCodec = "requested_codec"
+        case accepted
+    }
+
+    public init(activeCodec: String, requestedCodec: String? = nil, accepted: Bool) {
+        self.activeCodec = activeCodec
+        self.requestedCodec = requestedCodec
+        self.accepted = accepted
+    }
+}
+
+public struct VideoQualityAckPayload: Codable, Sendable, Equatable {
+    public let bitrateKbps: UInt32
+    public let fpsCap: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case bitrateKbps = "bitrate_kbps"
+        case fpsCap = "fps_cap"
+    }
+
+    public init(bitrateKbps: UInt32, fpsCap: UInt32) {
+        self.bitrateKbps = bitrateKbps
+        self.fpsCap = fpsCap
+    }
+}
+
+public struct ClipboardSyncStatusPayload: Codable, Sendable, Equatable {
+    public let enabled: Bool
+    public let status: String
+    public let code: String?
+
+    public init(enabled: Bool, status: String, code: String? = nil) {
+        self.enabled = enabled
+        self.status = status
+        self.code = code
+    }
+}
+
+public struct FileTransferCompletePayload: Codable, Sendable, Equatable {
+    public let transferId: UInt64
+    public let relName: String
+    public let bytes: UInt64
+    public let sha256Hex: String
+    public let checksumAlgo: String?
+    public let savedPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case transferId = "transfer_id"
+        case relName = "rel_name"
+        case bytes
+        case sha256Hex = "sha256_hex"
+        case checksumAlgo = "checksum_algo"
+        case savedPath = "saved_path"
+    }
+
+    public init(
+        transferId: UInt64,
+        relName: String,
+        bytes: UInt64,
+        sha256Hex: String,
+        checksumAlgo: String? = nil,
+        savedPath: String? = nil
+    ) {
+        self.transferId = transferId
+        self.relName = relName
+        self.bytes = bytes
+        self.sha256Hex = sha256Hex
+        self.checksumAlgo = checksumAlgo
+        self.savedPath = savedPath
+    }
+}
+
+/// Forward-compatible decoded bridge event: unknown `kind`/`type` values and unknown JSON fields
+/// are safely mapped to `.unknown(kind:)` without throwing or disconnecting.
+public enum ParsedBridgeEvent: Sendable, Equatable {
+    case permissionStatus(PermissionStatusReport)
+    case inputEnabledAck(InputEnabledAckPayload)
+    case hudStats(HudStatsPayload)
+    case codecAck(CodecAckPayload)
+    case videoQualityAck(VideoQualityAckPayload)
+    case clipboardSyncStatus(ClipboardSyncStatusPayload)
+    case fileTransferComplete(FileTransferCompletePayload)
+    case unknown(kind: String)
+
+    private struct EventHeader: Decodable {
+        let v: UInt32?
+        let seq: UInt64?
+        let kind: String?
+        let type: String?
+    }
+
+    private struct TypedEventWrapper<P: Decodable>: Decodable {
+        let payload: P
+    }
+
+    public static func decodeForwardCompat(from data: Data) throws -> ParsedBridgeEvent {
+        let decoder = JSONDecoder()
+        let header = try decoder.decode(EventHeader.self, from: data)
+        let resolvedKind = header.kind ?? header.type ?? ""
+        switch resolvedKind {
+        case "permission_status":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<PermissionStatusReport>.self, from: data) {
+                return .permissionStatus(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        case "input_enabled_ack":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<InputEnabledAckPayload>.self, from: data) {
+                return .inputEnabledAck(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        case "hud_stats":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<HudStatsPayload>.self, from: data) {
+                return .hudStats(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        case "codec_ack":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<CodecAckPayload>.self, from: data) {
+                return .codecAck(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        case "video_quality_ack":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<VideoQualityAckPayload>.self, from: data) {
+                return .videoQualityAck(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        case "clipboard_sync_status":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<ClipboardSyncStatusPayload>.self, from: data) {
+                return .clipboardSyncStatus(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        case "FileTransferComplete":
+            if let wrapped = try? decoder.decode(TypedEventWrapper<FileTransferCompletePayload>.self, from: data) {
+                return .fileTransferComplete(wrapped.payload)
+            }
+            return .unknown(kind: resolvedKind)
+        default:
+            return .unknown(kind: resolvedKind)
+        }
+    }
+}
+
+/// Typed ABI v2 command request payloads for golden round-trip parity verification.
+public struct SetInputEnabledRequest: Codable, Sendable, Equatable {
+    public let v: UInt32
+    public let cmd: String
+    public let enabled: Bool
+    public let reason: String?
+
+    public init(v: UInt32 = 1, enabled: Bool, reason: String? = nil) {
+        self.v = v
+        self.cmd = "set_input_enabled"
+        self.enabled = enabled
+        self.reason = reason
+    }
+}
+
+public struct GetPermissionsRequest: Codable, Sendable, Equatable {
+    public let v: UInt32
+    public let cmd: String
+
+    public init(v: UInt32 = 1) {
+        self.v = v
+        self.cmd = "get_permissions"
+    }
+}
+
+public struct SetVideoQualityRequest: Codable, Sendable, Equatable {
+    public let v: UInt32
+    public let cmd: String
+    public let bitrateKbps: UInt32
+    public let fpsCap: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case v
+        case cmd
+        case bitrateKbps = "bitrate_kbps"
+        case fpsCap = "fps_cap"
+    }
+
+    public init(v: UInt32 = 1, bitrateKbps: UInt32, fpsCap: UInt32) {
+        self.v = v
+        self.cmd = "set_video_quality"
+        self.bitrateKbps = bitrateKbps
+        self.fpsCap = fpsCap
     }
 }

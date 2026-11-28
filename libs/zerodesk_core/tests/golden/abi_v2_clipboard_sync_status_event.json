@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "seq": 46,
+  "kind": "clipboard_sync_status",
+  "payload": {
+    "enabled": false,
+    "status": "policy_denied",
+    "code": "policy_denied"
+  }
+}

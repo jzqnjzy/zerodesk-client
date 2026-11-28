@@ -9,12 +9,15 @@ pub mod runtime;
 pub use controller::{
     load_config_json, save_config_json, BridgeEvent, BridgePersistedConfig, BridgeResponseEnvelope,
     BridgeSnapshot, BridgeState, PolicySummary, RedactedConfigView, V2BridgeController,
-    VerifiedCallerDisplay, BRIDGE_ABI_VERSION, BRIDGE_EVENT_QUEUE_CAP,
+    VerifiedCallerDisplay, BRIDGE_ABI_VERSION, BRIDGE_EVENT_QUEUE_CAP, BRIDGE_JSON_ABI_V2,
+    BRIDGE_V2_CAPABILITIES,
 };
 pub use events::{BridgeEventHub, CRITICAL_EVENT_QUEUE_CAP};
 pub use json_abi::{
-    parse_and_validate_command, scan_json_for_secret_canaries, RuntimeCommandEnvelope,
-    RuntimeReplyEnvelope,
+    parse_and_validate_command, parse_bridge_event_forward_compat, scan_json_for_secret_canaries,
+    ClipboardSyncStatusPayload, CodecAckPayload, FileTransferCompletePayload,
+    HandshakeCapabilitiesData, HudStatsPayload, InputEnabledAckPayload, ParsedBridgeEvent,
+    RuntimeCommandEnvelope, RuntimeReplyEnvelope, VideoQualityAckPayload,
 };
 pub use runtime::{
     V2BridgeRuntime, V2BridgeRuntimeOptions, DEFAULT_RING_TIMEOUT, SYNC_CMD_TIMEOUT,

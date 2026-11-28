@@ -1,0 +1,6 @@
+{
+  "v": 1,
+  "cmd": "set_input_enabled",
+  "enabled": true,
+  "reason": "user_toggle"
+}

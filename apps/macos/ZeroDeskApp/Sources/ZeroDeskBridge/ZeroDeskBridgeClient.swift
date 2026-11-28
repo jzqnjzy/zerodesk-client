@@ -204,6 +204,77 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
         }
     }
 
+    /// Executes the Phase 8A startup handshake returning `abi_version` and `caps`.
+    public func handshake() throws -> HandshakeCapabilitiesData {
+        let raw = try execRawJSON(#"{"v":1,"cmd":"handshake"}"#)
+        let decoded = try JSONDecoder().decode(BridgeTypedReply<HandshakeCapabilitiesData>.self, from: raw)
+        guard decoded.ok, let data = decoded.data else {
+            throw ZeroDeskBridgeError.protocolError(decoded.error ?? decoded.errorCode ?? "handshake failed")
+        }
+        return data
+    }
+
+    /// Queries structured macOS permission status (`screen_capture_granted`, `accessibility_granted`,
+    /// `probe_source`, `enable_os_input`) from Rust without popping any OS permission dialog.
+    public func getPermissions() throws -> PermissionStatusReport {
+        let raw = try execRawJSON(#"{"v":1,"cmd":"get_permissions"}"#)
+        let decoded = try JSONDecoder().decode(BridgeTypedReply<PermissionStatusReport>.self, from: raw)
+        guard decoded.ok, let data = decoded.data else {
+            throw ZeroDeskBridgeError.protocolError(decoded.error ?? decoded.errorCode ?? "get_permissions failed")
+        }
+        return data
+    }
+
+    /// Requests toggling the per-session `enable_os_input` gate via JSON-ABI (UI MUST await Rust ack).
+    @discardableResult
+    public func setInputEnabled(_ enabled: Bool, reason: String? = nil) throws -> BridgeCommandReply {
+        var payload: [String: Any] = [
+            "cmd": "set_input_enabled",
+            "enabled": enabled,
+        ]
+        if let reason {
+            payload["reason"] = reason
+        }
+        return try execCommand(payload)
+    }
+
+    /// Requests bitrate tier (`0` = Auto, or kbps) & FPS cap (`30`/`60`) update via JSON-ABI.
+    @discardableResult
+    public func setVideoQuality(bitrateKbps: UInt32, fpsCap: UInt32) throws -> BridgeCommandReply {
+        try execCommand([
+            "cmd": "set_video_quality",
+            "bitrate_kbps": Int(bitrateKbps),
+            "fps_cap": Int(fpsCap),
+        ])
+    }
+
+    /// Toggles clipboard synchronization via JSON-ABI.
+    @discardableResult
+    public func setClipboardSync(_ enabled: Bool) throws -> BridgeCommandReply {
+        try execCommand([
+            "cmd": "set_clipboard_sync",
+            "enabled": enabled,
+        ])
+    }
+
+    /// Requests a codec selection (`auto` / `h264` / `hevc` / `vp9` / `av1`) via JSON-ABI.
+    @discardableResult
+    public func setCodec(_ codec: String) throws -> BridgeCommandReply {
+        try execCommand([
+            "cmd": "set_codec",
+            "codec": codec,
+        ])
+    }
+
+    /// Cancels an in-flight file transfer by ID.
+    @discardableResult
+    public func cancelFile(transferId: UInt64) throws -> BridgeCommandReply {
+        try execCommand([
+            "cmd": "cancel_file",
+            "transfer_id": Int(transferId),
+        ])
+    }
+
     /// Sends a mouse HID event (`move_abs`, `button_down`, `button_up`, `wheel`).
     @discardableResult
     public func sendMouse(
@@ -641,7 +712,7 @@ public final class ZeroDeskBridgeClient: @unchecked Sendable {
     private static func decodeEventEnvelope(from data: Data) -> BridgeEventEnvelope? {
         let raw = String(decoding: data, as: UTF8.self)
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let kind = obj["kind"] as? String else {
+              let kind = (obj["kind"] as? String) ?? (obj["type"] as? String) else {
             return nil
         }
         let v = (obj["v"] as? NSNumber)?.uint32Value ?? 1

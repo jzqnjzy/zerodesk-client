@@ -401,6 +401,7 @@ mod unix_impl {
         lock_file_path: Option<PathBuf>,
         shutdown_timeout: Duration,
         owns_child: bool,
+        watchdog_ax_trusted: std::sync::atomic::AtomicBool,
     }
 
     impl HidWatchdogSupervisor {
@@ -535,6 +536,7 @@ mod unix_impl {
                 lock_file_path: Some(lock_file),
                 shutdown_timeout: cfg.shutdown_timeout,
                 owns_child: true,
+                watchdog_ax_trusted: std::sync::atomic::AtomicBool::new(false),
             };
 
             // Handshake: send Hello(parent_pid, nonce) and wait for Ready within handshake_timeout.
@@ -560,6 +562,9 @@ mod unix_impl {
                     return Err(e);
                 }
             };
+            let ax_trusted = (ready_flags & WATCHDOG_READY_FLAG_AX_TRUSTED) != 0;
+            sup.watchdog_ax_trusted
+                .store(ax_trusted, Ordering::Release);
             if cfg.real_os_input {
                 let required = WATCHDOG_READY_FLAG_REAL_OS_INPUT | WATCHDOG_READY_FLAG_AX_TRUSTED;
                 if (ready_flags & required) != required {
@@ -590,7 +595,14 @@ mod unix_impl {
                 lock_file_path: None,
                 shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
                 owns_child: false,
+                watchdog_ax_trusted: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        /// Reports whether the independent `zerodesk-hid-watchdog` child process reported
+        /// `AXIsProcessTrusted() == true` during its startup handshake.
+        pub fn accessibility_trusted(&self) -> bool {
+            self.watchdog_ax_trusted.load(Ordering::Acquire)
         }
 
         pub fn child_pid(&self) -> Option<u32> {
@@ -1083,6 +1095,10 @@ mod non_unix_stub {
         }
 
         pub fn is_open(&self) -> bool {
+            false
+        }
+
+        pub fn accessibility_trusted(&self) -> bool {
             false
         }
 

@@ -20,12 +20,17 @@ public struct ContentView: View {
                 sidebar
                     .frame(minWidth: 280, idealWidth: 310, maxWidth: 360)
                 mainCanvasArea
-                    .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(minWidth: 880, minHeight: 580)
+        .frame(minWidth: 920, minHeight: 620)
         .sheet(isPresented: $vm.isSettingsPresented) {
             SettingsSheetView(vm: vm)
+        }
+        .sheet(isPresented: $vm.isPermissionGuidePresented) {
+            SystemPermissionGuideView(vm: vm) {
+                vm.closePermissionGuide()
+            }
         }
         .sheet(item: $vm.incomingCall) { call in
             IncomingCallSheetView(call: call, onAccept: vm.acceptIncoming, onReject: vm.rejectIncoming)
@@ -62,13 +67,21 @@ public struct ContentView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
 
+            Button {
+                vm.openPermissionGuide()
+            } label: {
+                Label("Permissions", systemImage: "lock.shield")
+                    .font(.caption)
+            }
+            .help("Open macOS Screen Recording & Accessibility Permission Guide")
+
             Button(action: vm.toggleMute) {
                 Image(systemName: (vm.snapshot?.audioMuted ?? false) ? "speaker.slash.fill" : "speaker.wave.2.fill")
             }
             .help("Toggle Audio Mute")
 
             Button("Settings") {
-                vm.isSettingsPresented = true
+                vm.openSettingsSheet()
             }
         }
         .padding(.horizontal, 14)
@@ -78,7 +91,7 @@ public struct ContentView: View {
     private var sidebar: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                GroupBox("OS Preflight (Zero-Write)") {
+                GroupBox("OS Permissions & Preflight") {
                     VStack(alignment: .leading, spacing: 6) {
                         if let st = vm.selftest {
                             preflightRow("Screen Recording", outcome: st.screenRecording)
@@ -102,8 +115,12 @@ public struct ContentView: View {
                         } else {
                             Text("Preflight pending...").font(.caption).foregroundColor(.secondary)
                         }
-                        Button("Refresh Preflight", action: vm.refreshSelftest)
-                            .controlSize(.small)
+                        HStack(spacing: 8) {
+                            Button("Refresh", action: vm.refreshPermissions)
+                                .controlSize(.small)
+                            Button("Permission Guide...", action: vm.openPermissionGuide)
+                                .controlSize(.small)
+                        }
                     }
                     .padding(4)
                 }
@@ -148,20 +165,18 @@ public struct ContentView: View {
                     .padding(4)
                 }
 
-                GroupBox("Clipboard & File") {
+                GroupBox("Quick File Path") {
                     VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            TextField("Text to send", text: $vm.outboundClipboardText)
-                                .textFieldStyle(.roundedBorder)
-                            Button("Send", action: vm.sendClipboardText)
-                                .controlSize(.small)
-                        }
                         HStack {
                             TextField("File path", text: $vm.outboundFilePath)
                                 .textFieldStyle(.roundedBorder)
-                            Button("Send File", action: vm.sendFile)
+                            Button("Send", action: vm.sendFile)
                                 .controlSize(.small)
+                                .disabled(!vm.hasCapability("file_transfer"))
                         }
+                        Button("Choose File...", action: vm.presentFilePickerAndSend)
+                            .controlSize(.small)
+                            .disabled(!vm.hasCapability("file_transfer"))
                     }
                     .padding(4)
                 }
@@ -177,10 +192,13 @@ public struct ContentView: View {
                 if let renderer = vm.metalRenderer {
                     RemoteMetalView(
                         renderer: renderer,
-                        inputTracker: vm.inputTracker,
+                        inputGate: vm.inputGate,
                         isSessionActive: vm.isSessionStreaming,
                         remoteSize: vm.remoteSize,
-                        onEmergencyEscape: vm.handleEmergencyEscapeTriggered
+                        displayScaleMode: vm.displayScaleMode,
+                        scrollOffset: vm.scrollOffset,
+                        onEmergencyEscape: vm.handleEmergencyEscapeTriggered,
+                        onLocalScrollChanged: vm.updateLocalScrollOffset
                     )
                 }
                 if !vm.hasVideoFrame {
@@ -190,36 +208,20 @@ public struct ContentView: View {
                             .foregroundColor(.secondary)
                         Text("No Active Video Stream")
                             .foregroundColor(.secondary)
+                        Text("Sessions start in View-Only mode. Press Ctrl+Opt+Cmd+Escape for Emergency Escape.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                     .allowsHitTesting(false)
                 }
-                VStack {
-                    HStack {
-                        Spacer()
-                        HStack(spacing: 10) {
-                            Text("Codec: \(vm.activeCodecLabel.uppercased())")
-                            Text(String(format: "%.1f FPS", vm.renderFps))
-                            Text(String(format: "Metal: %.2f ms", vm.metalRenderMs))
-                            Text("Frame #\(vm.frameCounter)")
-                        }
-                        .font(.caption.monospaced())
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(Color.black.opacity(0.65))
-                        .foregroundColor(.white)
-                        .cornerRadius(6)
-                    }
-                    Spacer()
-                }
-                .padding(10)
-                .allowsHitTesting(false)
+                SessionControlOverlayView(vm: vm)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Activity Log")
+                Text("Activity Log (Redacted)")
                     .font(.caption.bold())
                     .foregroundColor(.secondary)
                 ScrollView {

@@ -32,6 +32,17 @@ use tokio::sync::Notify;
 use v2_client::{ActiveTransportMode, EdgeEndpointConfig, SignalingDeviceCert};
 
 pub const BRIDGE_ABI_VERSION: u32 = 1;
+pub const BRIDGE_JSON_ABI_V2: u32 = 2;
+pub const BRIDGE_V2_CAPABILITIES: &[&str] = &[
+    "permissions_probe",
+    "input_enable_gate",
+    "hud_stats_1hz",
+    "codec_switch",
+    "bitrate_fps_control",
+    "clipboard_sync",
+    "file_transfer",
+    "viewport_scale_modes",
+];
 pub const BRIDGE_EVENT_QUEUE_CAP: usize = 256;
 pub const BRIDGE_MAX_CMD_JSON_BYTES: usize = 512 * 1024;
 pub const BRIDGE_MAX_CLIP_B64_BYTES: usize = 360 * 1024;
@@ -235,6 +246,20 @@ pub struct BridgeSnapshot {
     pub audio_muted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub real_input_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_os_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_sync_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_device_id_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -504,6 +529,18 @@ impl BridgeInner {
             active_transport_mode: self.active_transport_mode,
             audio_muted: self.audio_muted,
             real_input_enabled: None,
+            abi_version: Some(BRIDGE_JSON_ABI_V2),
+            caps: Some(
+                BRIDGE_V2_CAPABILITIES
+                    .iter()
+                    .map(|c| (*c).to_string())
+                    .collect(),
+            ),
+            enable_os_input: Some(false),
+            active_codec: self.config.as_ref().map(|c| c.codec.clone()),
+            bitrate_kbps: self.config.as_ref().map(|c| c.bw_cap_kbps),
+            fps_cap: self.config.as_ref().map(|c| c.fps),
+            clipboard_sync_enabled: Some(true),
             local_device_id_hex: self.local_device_id_hex.clone(),
             local_tenant_id_hex: self.local_tenant_id_hex.clone(),
             active_session_id_hex: self.active_session_id_hex.clone(),

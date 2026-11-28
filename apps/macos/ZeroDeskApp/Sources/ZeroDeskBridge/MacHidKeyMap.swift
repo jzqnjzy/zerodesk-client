@@ -197,6 +197,21 @@ public final class MacHidKeyMap: @unchecked Sendable {
         keyCodeToHidUsage[keyCode]
     }
 
+    /// Reverse lookup table: USB HID Usage Page `0x07` ID -> macOS virtual keyCode (`CGKeyCode`).
+    public static let hidUsageToMacKeyCode: [UInt16: UInt16] = {
+        var reverse: [UInt16: UInt16] = [:]
+        reverse.reserveCapacity(keyCodeToHidUsage.count)
+        for (macCode, usage) in keyCodeToHidUsage {
+            reverse[usage] = macCode
+        }
+        return reverse
+    }()
+
+    /// Pure reverse lookup from USB HID usage ID to macOS virtual keyCode (used by OS reconciliation).
+    public static func macKeyCode(forHidUsage usageId: UInt16) -> UInt16? {
+        hidUsageToMacKeyCode[usageId]
+    }
+
     /// Returns the required `spec/04` §6.1.2 `modifiers` bitmap bit when pressing a physical
     /// modifier key (`0xE0..=0xE7`), or `nil` for non-modifier usages.
     public static func modifierBit(forUsageId usageId: UInt16) -> UInt8? {

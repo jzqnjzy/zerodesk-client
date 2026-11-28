@@ -8,13 +8,23 @@ pub mod os;
 pub mod session;
 
 pub use bridge::{
-    load_config_json, save_config_json, BridgeEvent, BridgeEventHub, BridgePersistedConfig,
-    BridgeResponseEnvelope, BridgeSnapshot, BridgeState, PolicySummary, RedactedConfigView,
-    RuntimeCommandEnvelope, RuntimeReplyEnvelope, V2BridgeController, V2BridgeRuntime,
-    V2BridgeRuntimeOptions, VerifiedCallerDisplay, BRIDGE_ABI_VERSION, BRIDGE_EVENT_QUEUE_CAP,
+    load_config_json, parse_bridge_event_forward_compat, save_config_json, BridgeEvent,
+    BridgeEventHub, BridgePersistedConfig, BridgeResponseEnvelope, BridgeSnapshot, BridgeState,
+    ClipboardSyncStatusPayload, CodecAckPayload, FileTransferCompletePayload,
+    HandshakeCapabilitiesData, HudStatsPayload, InputEnabledAckPayload, ParsedBridgeEvent,
+    PolicySummary, RedactedConfigView, RuntimeCommandEnvelope, RuntimeReplyEnvelope,
+    V2BridgeController, V2BridgeRuntime, V2BridgeRuntimeOptions, VerifiedCallerDisplay,
+    VideoQualityAckPayload, BRIDGE_ABI_VERSION, BRIDGE_EVENT_QUEUE_CAP, BRIDGE_JSON_ABI_V2,
+    BRIDGE_V2_CAPABILITIES,
 };
 pub use frame::{
     checked_frame_byte_len, DecodedFrame, FrameError, FrameInfo, FrameMailbox, FramePool,
     PixelFormat,
 };
-pub use os::{os_selftest, OsError, OsPermission, OsSelftestReport};
+pub use os::{
+    input::{
+        GatedOsHidSink, OsInputGateError, PermissionProbe, PermissionProbeSource,
+        PermissionStatusReport, SystemPermissionProbe,
+    },
+    os_selftest, OsError, OsPermission, OsSelftestReport,
+};

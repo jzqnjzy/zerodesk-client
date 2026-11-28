@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "seq": 45,
+  "kind": "codec_ack",
+  "payload": {
+    "active_codec": "hevc",
+    "requested_codec": "hevc",
+    "accepted": true
+  }
+}

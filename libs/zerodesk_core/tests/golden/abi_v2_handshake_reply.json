@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "ok": true,
+  "data": {
+    "abi_version": 2,
+    "caps": [
+      "permissions_probe",
+      "input_enable_gate",
+      "hud_stats_1hz",
+      "codec_switch",
+      "bitrate_fps_control",
+      "clipboard_sync",
+      "file_transfer",
+      "viewport_scale_modes"
+    ]
+  }
+}

@@ -5,15 +5,22 @@ use super::{
     controller::{
         load_config_json, normalize_codec_setting, BridgePersistedConfig, BridgeSnapshot,
         BridgeState, PolicySummary, RedactedConfigView, V2BridgeController, VerifiedCallerDisplay,
+        BRIDGE_JSON_ABI_V2, BRIDGE_V2_CAPABILITIES,
     },
     events::BridgeEventHub,
-    json_abi::{parse_and_validate_command, RuntimeCommandEnvelope, RuntimeReplyEnvelope},
+    json_abi::{
+        parse_and_validate_command, HandshakeCapabilitiesData, HudStatsPayload,
+        RuntimeCommandEnvelope, RuntimeReplyEnvelope,
+    },
 };
 use crate::{
     frame::{FrameError, FrameInfo, FrameMailbox, PixelFormat},
     os::{
         audio::{open_os_audio_capture, open_os_audio_playback, AudioStatusChanged},
-        capture::{convert_captured_stride_to_i420, create_os_screen_capture_with_policy},
+        capture::{
+            convert_captured_stride_to_i420, create_os_screen_capture_with_policy,
+            preflight_screen_capture_permission,
+        },
         clipboard::{
             create_os_clipboard_backend, validate_clipboard_png_bytes, ClipboardPoller,
         },
@@ -21,11 +28,15 @@ use crate::{
             raw_captured_to_i420, DryRunHidJournal, DryRunHidSink, MemoryClipboardBackend,
             SilentAudioCapture, SilentAudioPlayback, SyntheticScreenSource,
         },
-        input::{create_real_os_hid_sink, RealInputPermit},
+        input::{
+            create_real_os_hid_sink, GatedOsHidSink, PermissionProbe, PermissionStatusReport,
+            RealInputPermit, SystemPermissionProbe,
+        },
         watchdog_supervisor::{
             HidWatchdogConfig, HidWatchdogSupervisor, WatchdogSupervisedHidSink,
         },
-        EmergencyKeyReleaser, OsAudioCapture, OsAudioPlayback, OsHidSink, OsScreenCapture,
+        EmergencyKeyReleaser, OsAudioCapture, OsAudioPlayback, OsError, OsHidSink, OsPermission,
+        OsScreenCapture,
     },
     session::{
         audio::{
@@ -127,6 +138,7 @@ pub struct V2BridgeRuntimeOptions {
     pub watchdog_report_path: Option<PathBuf>,
     pub watchdog_bin_path: Option<PathBuf>,
     pub real_input_permit: Option<Arc<RealInputPermit>>,
+    pub permission_probe: Option<Arc<dyn PermissionProbe>>,
     pub dryrun_journal: DryRunHidJournal,
     pub memory_clipboard: MemoryClipboardBackend,
     pub download_dir: Option<PathBuf>,
@@ -150,6 +162,7 @@ impl Default for V2BridgeRuntimeOptions {
             watchdog_report_path: None,
             watchdog_bin_path: None,
             real_input_permit: None,
+            permission_probe: None,
             dryrun_journal: DryRunHidJournal::new(),
             memory_clipboard: MemoryClipboardBackend::new(),
             download_dir: None,
@@ -302,6 +315,12 @@ enum SessionAction {
         transfer_id: u64,
     },
     SetAudioMute(bool),
+    SetClipboardSync(bool),
+    SetVideoQuality {
+        bitrate_kbps: u32,
+        fps_cap: u32,
+    },
+    RequestCodec(String),
     RefreshPolicy {
         cmd_id: u64,
     },
@@ -348,6 +367,12 @@ enum ActorEvent {
         capability: String,
         reason: String,
     },
+    CodecAck {
+        active_codec: String,
+        requested_codec: Option<String>,
+        accepted: bool,
+    },
+    PermissionStatusChanged(PermissionStatusReport),
     WatchdogTriggered {
         released_keys: usize,
         released_buttons: usize,
@@ -610,6 +635,12 @@ impl V2BridgeRuntime {
                             pending_incoming: None,
                             active_session_tx: None,
                             shutting_down: false,
+                            enable_os_input: Arc::new(AtomicBool::new(false)),
+                            active_watchdog_ax_probe: Arc::new(Mutex::new(None)),
+                            clipboard_sync_enabled: Arc::new(AtomicBool::new(true)),
+                            bitrate_kbps: 0,
+                            fps_cap: 30,
+                            active_codec: None,
                         };
                         actor.run(actor_rx, shutdown_bg).await;
                     });
@@ -1019,6 +1050,12 @@ struct BridgeActor {
     pending_incoming: Option<PendingIncoming>,
     active_session_tx: Option<mpsc::Sender<SessionAction>>,
     shutting_down: bool,
+    enable_os_input: Arc<AtomicBool>,
+    active_watchdog_ax_probe: Arc<Mutex<Option<bool>>>,
+    clipboard_sync_enabled: Arc<AtomicBool>,
+    bitrate_kbps: u32,
+    fps_cap: u32,
+    active_codec: Option<String>,
 }
 
 fn validate_download_dir(path: &Path) -> Result<PathBuf, RuntimeReplyEnvelope> {
@@ -1156,9 +1193,37 @@ impl BridgeActor {
         id
     }
 
+    fn probe_permissions(&self) -> PermissionStatusReport {
+        let wd_ax = *self
+            .active_watchdog_ax_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let enabled = self.enable_os_input.load(Ordering::Acquire);
+        if let Some(probe) = &self.options.permission_probe {
+            probe.probe(wd_ax, enabled)
+        } else {
+            SystemPermissionProbe.probe(wd_ax, enabled)
+        }
+    }
+
     fn sync_snapshot(&self) {
         let mut snap = self.controller.snapshot();
         snap.real_input_enabled = Some(self.options.real_input_permit.is_some());
+        snap.abi_version = Some(BRIDGE_JSON_ABI_V2);
+        snap.caps = Some(
+            BRIDGE_V2_CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+        );
+        snap.enable_os_input = Some(self.enable_os_input.load(Ordering::Acquire));
+        snap.active_codec = self
+            .active_codec
+            .clone()
+            .or_else(|| self.loaded_config.as_ref().map(|c| c.codec.clone()));
+        snap.bitrate_kbps = Some(self.bitrate_kbps);
+        snap.fps_cap = Some(self.fps_cap);
+        snap.clipboard_sync_enabled = Some(self.clipboard_sync_enabled.load(Ordering::Acquire));
         *self
             .snapshot_cache
             .write()
@@ -1192,6 +1257,12 @@ impl BridgeActor {
     }
 
     async fn unified_shutdown_session(&mut self, return_to_listening: bool) {
+        // Every session teardown unconditionally resets per-session `enable_os_input = false`.
+        self.enable_os_input.store(false, Ordering::Release);
+        *self
+            .active_watchdog_ax_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.clear_pending_incoming("session_shutdown");
         let active_tx = self.active_session_tx.take();
 
@@ -1579,6 +1650,32 @@ impl BridgeActor {
                     )
                 }
             }
+            "handshake" | "get_capabilities" => {
+                let data = HandshakeCapabilitiesData {
+                    abi_version: BRIDGE_JSON_ABI_V2,
+                    caps: BRIDGE_V2_CAPABILITIES
+                        .iter()
+                        .map(|c| (*c).to_string())
+                        .collect(),
+                };
+                match serde_json::to_value(data) {
+                    Ok(v) => RuntimeReplyEnvelope::ok(v),
+                    Err(e) => RuntimeReplyEnvelope::err("Internal", e.to_string()),
+                }
+            }
+            "get_permissions" => {
+                let perms = self.probe_permissions();
+                match serde_json::to_value(&perms) {
+                    Ok(val) => {
+                        self.events.push_critical("permission_status", val.clone());
+                        RuntimeReplyEnvelope::ok(val)
+                    }
+                    Err(e) => RuntimeReplyEnvelope::err("Internal", e.to_string()),
+                }
+            }
+            "set_input_enabled" => self.handle_set_input_enabled(env).await,
+            "set_video_quality" => self.handle_set_video_quality(env),
+            "set_clipboard_sync" => self.handle_set_clipboard_sync(env),
             "set_codec" => {
                 let Some(codec_str) = env.codec.as_deref() else {
                     return RuntimeReplyEnvelope::err(
@@ -1592,6 +1689,23 @@ impl BridgeActor {
                         return RuntimeReplyEnvelope::err("InvalidArgument", e.to_string());
                     }
                 };
+                if self.controller.state() == BridgeState::Streaming {
+                    if let Some(tx) = &self.active_session_tx {
+                        if tx
+                            .try_send(SessionAction::RequestCodec(norm.clone()))
+                            .is_err()
+                        {
+                            return RuntimeReplyEnvelope::err(
+                                "Busy",
+                                "session action queue full or closed",
+                            );
+                        }
+                    }
+                    return RuntimeReplyEnvelope::ok(serde_json::json!({
+                        "requested_codec": norm,
+                        "active_codec": self.active_codec,
+                    }));
+                }
                 let cmd = serde_json::json!({
                     "v": 1,
                     "cmd": "set_codec",
@@ -1601,8 +1715,9 @@ impl BridgeActor {
                 let parsed: serde_json::Value = serde_json::from_str(&resp_raw).unwrap_or_default();
                 if parsed["ok"].as_bool() == Some(true) {
                     if let Some(cfg) = self.loaded_config.as_mut() {
-                        cfg.codec = norm;
+                        cfg.codec = norm.clone();
                     }
+                    self.active_codec = Some(norm);
                     self.drain_controller_events_to_hub();
                     self.sync_snapshot();
                     RuntimeReplyEnvelope::ok(parsed["data"].clone())
@@ -1857,6 +1972,10 @@ impl BridgeActor {
         let synth_w = self.options.synthetic_width;
         let synth_h = self.options.synthetic_height;
         let real_input_permit = self.options.real_input_permit.clone();
+        let permission_probe = self.options.permission_probe.clone();
+        let enable_os_input = Arc::clone(&self.enable_os_input);
+        let active_watchdog_ax_probe = Arc::clone(&self.active_watchdog_ax_probe);
+        let clipboard_sync_enabled = Arc::clone(&self.clipboard_sync_enabled);
 
         let h = tokio::spawn(async move {
             let _guard = TaskCountGuard::enter(&active_tasks, &total_tasks);
@@ -1879,6 +1998,10 @@ impl BridgeActor {
                     watchdog_report_path,
                     watchdog_bin_path,
                     real_input_permit,
+                    permission_probe,
+                    enable_os_input,
+                    active_watchdog_ax_probe,
+                    clipboard_sync_enabled,
                     dryrun_journal,
                     mem_clip,
                     download_dir,
@@ -2000,6 +2123,7 @@ impl BridgeActor {
         let use_os_audio = self.options.use_os_audio;
         let use_os_clipboard = self.options.use_os_clipboard;
         let mem_clip = self.options.memory_clipboard.clone();
+        let clipboard_sync_enabled = Arc::clone(&self.clipboard_sync_enabled);
         #[cfg(feature = "e2e-fault-injection")]
         let silent_blackhole = self.options.silent_peer_blackhole.clone();
 
@@ -2019,6 +2143,7 @@ impl BridgeActor {
                 use_os_audio,
                 use_os_clipboard,
                 mem_clip,
+                clipboard_sync_enabled,
                 download_dir,
                 #[cfg(feature = "e2e-fault-injection")]
                 silent_blackhole,
@@ -2122,6 +2247,193 @@ impl BridgeActor {
         }))
     }
 
+    async fn handle_set_input_enabled(
+        &mut self,
+        env: RuntimeCommandEnvelope,
+    ) -> RuntimeReplyEnvelope {
+        let Some(requested_enabled) = env.enabled else {
+            return RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                "set_input_enabled requires boolean 'enabled'",
+            );
+        };
+        let perms = self.probe_permissions();
+        if requested_enabled {
+            if !perms.screen_capture_granted || !perms.accessibility_granted {
+                self.enable_os_input.store(false, Ordering::Release);
+                self.sync_snapshot();
+                self.events.push_critical(
+                    "input_enabled_ack",
+                    serde_json::json!({
+                        "enabled": false,
+                        "status": "not_permitted",
+                        "screen_capture_granted": perms.screen_capture_granted,
+                        "accessibility_granted": perms.accessibility_granted,
+                        "probe_source": perms.probe_source.as_str(),
+                    }),
+                );
+                return RuntimeReplyEnvelope::err(
+                    "not_permitted",
+                    "enabling OS input requires both Screen Recording and Accessibility permissions",
+                );
+            }
+            self.enable_os_input.store(true, Ordering::Release);
+            self.sync_snapshot();
+            self.events.push_critical(
+                "input_enabled_ack",
+                serde_json::json!({
+                    "enabled": true,
+                    "status": "ok",
+                    "screen_capture_granted": true,
+                    "accessibility_granted": true,
+                    "probe_source": perms.probe_source.as_str(),
+                }),
+            );
+            return RuntimeReplyEnvelope::ok(serde_json::json!({
+                "enabled": true,
+                "status": "ok",
+            }));
+        }
+
+        // Turning OFF input: disable immediately and flush release_all synchronously.
+        self.enable_os_input.store(false, Ordering::Release);
+        let reason_str = env.reason.clone().unwrap_or_else(|| "user_disabled".into());
+        let rel_env = RuntimeCommandEnvelope {
+            v: 1,
+            cmd: "release_all".into(),
+            path: None,
+            config: None,
+            target_device_id_hex: None,
+            incoming_id: None,
+            session_id_hex: None,
+            reason: Some(reason_str.clone()),
+            muted: None,
+            mode: None,
+            codec: None,
+            mime_kind: None,
+            payload_b64: None,
+            text: None,
+            rel_name: None,
+            file_size: None,
+            transfer_id: None,
+            down: None,
+            modifiers: None,
+            usb_hid_usage: None,
+            unicode_scalar: None,
+            keys: None,
+            mouse_kind: None,
+            x: None,
+            y: None,
+            dx: None,
+            dy: None,
+            buttons: None,
+            wheel_x: None,
+            wheel_y: None,
+            download_dir: None,
+            ring_timeout_ms: None,
+            enabled: None,
+            bitrate_kbps: None,
+            fps_cap: None,
+        };
+        let _ = self.handle_release_all_inner(rel_env, false).await;
+        self.sync_snapshot();
+        self.events.push_critical(
+            "input_enabled_ack",
+            serde_json::json!({
+                "enabled": false,
+                "status": "disabled",
+                "screen_capture_granted": perms.screen_capture_granted,
+                "accessibility_granted": perms.accessibility_granted,
+                "probe_source": perms.probe_source.as_str(),
+                "reason": reason_str,
+            }),
+        );
+        RuntimeReplyEnvelope::ok(serde_json::json!({
+            "enabled": false,
+            "status": "disabled",
+        }))
+    }
+
+    fn handle_set_video_quality(&mut self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        if env.bitrate_kbps.is_none() && env.fps_cap.is_none() {
+            return RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                "set_video_quality requires 'bitrate_kbps' and/or 'fps_cap'",
+            );
+        }
+        let mut next_bitrate = env.bitrate_kbps.unwrap_or(self.bitrate_kbps);
+        let next_fps = env.fps_cap.unwrap_or(self.fps_cap);
+        if let Some(pol) = &self.effective_policy {
+            let max_bw = pol.max_bw_kbps();
+            if max_bw > 0 && next_bitrate > max_bw {
+                next_bitrate = max_bw;
+            }
+        }
+        self.bitrate_kbps = next_bitrate;
+        self.fps_cap = next_fps;
+        if let Some(cfg) = self.loaded_config.as_mut() {
+            if next_bitrate > 0 {
+                cfg.bw_cap_kbps = next_bitrate;
+            }
+            cfg.fps = next_fps;
+        }
+        if let Some(tx) = &self.active_session_tx {
+            let _ = tx.try_send(SessionAction::SetVideoQuality {
+                bitrate_kbps: next_bitrate,
+                fps_cap: next_fps,
+            });
+        }
+        self.sync_snapshot();
+        let payload = serde_json::json!({
+            "bitrate_kbps": next_bitrate,
+            "fps_cap": next_fps,
+        });
+        self.events.push_critical("video_quality_ack", payload.clone());
+        RuntimeReplyEnvelope::ok(payload)
+    }
+
+    fn handle_set_clipboard_sync(&mut self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        let Some(enabled) = env.enabled else {
+            return RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                "set_clipboard_sync requires boolean 'enabled'",
+            );
+        };
+        if enabled {
+            if let Some(pol) = &self.effective_policy {
+                if !pol.allow_clipboard() {
+                    self.clipboard_sync_enabled.store(false, Ordering::Release);
+                    self.sync_snapshot();
+                    self.events.push_critical(
+                        "clipboard_sync_status",
+                        serde_json::json!({
+                            "enabled": false,
+                            "status": "policy_denied",
+                            "code": "policy_denied",
+                        }),
+                    );
+                    return RuntimeReplyEnvelope::err(
+                        "policy_denied",
+                        "clipboard denied by policy",
+                    );
+                }
+            }
+        }
+        self.clipboard_sync_enabled.store(enabled, Ordering::Release);
+        if let Some(tx) = &self.active_session_tx {
+            let _ = tx.try_send(SessionAction::SetClipboardSync(enabled));
+        }
+        self.sync_snapshot();
+        let status = if enabled { "enabled" } else { "disabled" };
+        let payload = serde_json::json!({
+            "enabled": enabled,
+            "status": status,
+        });
+        self.events
+            .push_critical("clipboard_sync_status", payload.clone());
+        RuntimeReplyEnvelope::ok(payload)
+    }
+
     fn handle_send_hid_key(
         &self,
         env: RuntimeCommandEnvelope,
@@ -2131,6 +2443,16 @@ impl BridgeActor {
             return RuntimeReplyEnvelope::err(
                 "IllegalStateTransition",
                 "send_hid_key requires active Streaming session",
+            );
+        }
+        let perms = self.probe_permissions();
+        if !self.enable_os_input.load(Ordering::Acquire)
+            || !perms.screen_capture_granted
+            || !perms.accessibility_granted
+        {
+            return RuntimeReplyEnvelope::err(
+                "not_permitted",
+                "remote input dropped: enable_os_input is off or permissions missing",
             );
         }
         if self.effective_policy.is_none() {
@@ -2182,6 +2504,16 @@ impl BridgeActor {
             return RuntimeReplyEnvelope::err(
                 "IllegalStateTransition",
                 "send_hid_mouse requires active Streaming session",
+            );
+        }
+        let perms = self.probe_permissions();
+        if !self.enable_os_input.load(Ordering::Acquire)
+            || !perms.screen_capture_granted
+            || !perms.accessibility_granted
+        {
+            return RuntimeReplyEnvelope::err(
+                "not_permitted",
+                "remote input dropped: enable_os_input is off or permissions missing",
             );
         }
         if self.effective_policy.is_none() {
@@ -2254,12 +2586,38 @@ impl BridgeActor {
     }
 
     async fn handle_release_all(&self, env: RuntimeCommandEnvelope) -> RuntimeReplyEnvelope {
+        self.handle_release_all_inner(env, true).await
+    }
+
+    async fn handle_release_all_inner(
+        &self,
+        env: RuntimeCommandEnvelope,
+        emit_escape_ack: bool,
+    ) -> RuntimeReplyEnvelope {
         let buttons = env.buttons.unwrap_or(0);
         if buttons & !MOUSE_BUTTONS_VALID_MASK != 0 {
             return RuntimeReplyEnvelope::err(
                 "InvalidArgument",
                 "mouse buttons bitmask must fit within 0x1F",
             );
+        }
+        let is_emergency_escape = matches!(
+            env.reason.as_deref(),
+            Some("emergencyEscapeHotkey" | "emergency_escape")
+        );
+        if is_emergency_escape {
+            self.enable_os_input.store(false, Ordering::Release);
+            self.sync_snapshot();
+            if emit_escape_ack {
+                self.events.push_critical(
+                    "input_enabled_ack",
+                    serde_json::json!({
+                        "enabled": false,
+                        "status": "disabled",
+                        "reason": "emergency_escape",
+                    }),
+                );
+            }
         }
         if self.role == ActiveRole::Host {
             let releaser_opt = self
@@ -2336,7 +2694,11 @@ impl BridgeActor {
             if !pol.allow_clipboard() {
                 self.events.push_critical(
                     "PolicyDenied",
-                    serde_json::json!({ "channel": "clipboard", "reason": "clipboard_disabled" }),
+                    serde_json::json!({
+                        "channel": "clipboard",
+                        "code": "policy_denied",
+                        "reason": "clipboard_disabled",
+                    }),
                 );
                 return RuntimeReplyEnvelope::err(
                     "PolicyDenied",
@@ -2346,7 +2708,11 @@ impl BridgeActor {
             if text.len() > max_allowed {
                 self.events.push_critical(
                     "PolicyDenied",
-                    serde_json::json!({ "channel": "clipboard", "reason": "size_limit_exceeded" }),
+                    serde_json::json!({
+                        "channel": "clipboard",
+                        "code": "policy_denied",
+                        "reason": "size_limit_exceeded",
+                    }),
                 );
                 return RuntimeReplyEnvelope::err(
                     "PolicyDenied",
@@ -2358,7 +2724,11 @@ impl BridgeActor {
             if !pol.allow_clipboard() {
                 self.events.push_critical(
                     "PolicyDenied",
-                    serde_json::json!({ "channel": "clipboard", "reason": "clipboard_disabled" }),
+                    serde_json::json!({
+                        "channel": "clipboard",
+                        "code": "policy_denied",
+                        "reason": "clipboard_disabled",
+                    }),
                 );
                 return RuntimeReplyEnvelope::err(
                     "PolicyDenied",
@@ -2369,7 +2739,11 @@ impl BridgeActor {
             if est_decoded > max_allowed {
                 self.events.push_critical(
                     "PolicyDenied",
-                    serde_json::json!({ "channel": "clipboard", "reason": "size_limit_exceeded" }),
+                    serde_json::json!({
+                        "channel": "clipboard",
+                        "code": "policy_denied",
+                        "reason": "size_limit_exceeded",
+                    }),
                 );
                 return RuntimeReplyEnvelope::err(
                     "PolicyDenied",
@@ -2421,7 +2795,11 @@ impl BridgeActor {
         if let Err(status) = check_clipboard_policy_for_sync(pol, mime_kind, len_u32) {
             self.events.push_critical(
                 "PolicyDenied",
-                serde_json::json!({ "channel": "clipboard", "status": status }),
+                serde_json::json!({
+                    "channel": "clipboard",
+                    "code": "policy_denied",
+                    "status": status,
+                }),
             );
             return RuntimeReplyEnvelope::err(
                 "PolicyDenied",
@@ -2494,7 +2872,11 @@ impl BridgeActor {
         if let Err(e) = check_file_policy(pol, meta.len()) {
             self.events.push_critical(
                 "PolicyDenied",
-                serde_json::json!({ "channel": "file_transfer", "reason": e.to_string() }),
+                serde_json::json!({
+                    "channel": "file_transfer",
+                    "code": "policy_denied",
+                    "reason": e.to_string(),
+                }),
             );
             return RuntimeReplyEnvelope::err("PolicyDenied", e.to_string());
         }
@@ -2824,11 +3206,21 @@ impl BridgeActor {
                     }
                     return;
                 }
+                // Every new session starts in View-Only mode (`enable_os_input = false`).
+                self.enable_os_input.store(false, Ordering::Release);
                 self.mailbox.reset_for_session(ev_gen);
                 self.effective_policy = Some(policy.clone());
                 self.active_session_tx = Some(action_tx);
                 self.drain_controller_events_to_hub();
                 self.sync_snapshot();
+                self.events.push_critical(
+                    "input_enabled_ack",
+                    serde_json::json!({
+                        "enabled": false,
+                        "status": "disabled",
+                        "reason": "new_session_view_only",
+                    }),
+                );
                 self.emit_policy_event(&policy);
                 self.events.push_critical(
                     "TransportModeChanged",
@@ -2972,6 +3364,31 @@ impl BridgeActor {
                     }),
                 );
             }
+            ActorEvent::CodecAck {
+                active_codec,
+                requested_codec,
+                accepted,
+            } => {
+                self.active_codec = Some(active_codec.clone());
+                self.sync_snapshot();
+                self.events.push_critical(
+                    "codec_ack",
+                    serde_json::json!({
+                        "active_codec": active_codec,
+                        "requested_codec": requested_codec,
+                        "accepted": accepted,
+                    }),
+                );
+            }
+            ActorEvent::PermissionStatusChanged(report) => {
+                if !report.screen_capture_granted || !report.accessibility_granted {
+                    self.enable_os_input.store(false, Ordering::Release);
+                    self.sync_snapshot();
+                }
+                if let Ok(val) = serde_json::to_value(&report) {
+                    self.events.push_critical("permission_status", val);
+                }
+            }
             ActorEvent::WatchdogTriggered {
                 released_keys,
                 released_buttons,
@@ -3027,6 +3444,7 @@ impl BridgeActor {
                         "rel_name": rel_name,
                         "bytes": bytes,
                         "sha256_hex": sha256_hex,
+                        "checksum_algo": "sha256",
                         "saved_path": saved_path,
                     }),
                 );
@@ -3067,6 +3485,11 @@ impl BridgeActor {
                 return_to_listening,
                 reason,
             } => {
+                self.enable_os_input.store(false, Ordering::Release);
+                *self
+                    .active_watchdog_ax_probe
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
                 self.active_session_tx = None;
                 self.clear_pending_incoming(&reason);
                 self.mailbox.clear();
@@ -3973,6 +4396,7 @@ impl OutboundFileManager {
                     "rel_name": st.rel_name,
                     "bytes": st.total_bytes,
                     "sha256_hex": sha_hex,
+                    "checksum_algo": "sha256",
                 })),
             )
             .await;
@@ -4353,11 +4777,25 @@ struct HostTaskAdapters {
     watchdog_report_path: Option<PathBuf>,
     watchdog_bin_path: Option<PathBuf>,
     real_input_permit: Option<Arc<RealInputPermit>>,
+    permission_probe: Option<Arc<dyn PermissionProbe>>,
+    enable_os_input: Arc<AtomicBool>,
+    active_watchdog_ax_probe: Arc<Mutex<Option<bool>>>,
+    clipboard_sync_enabled: Arc<AtomicBool>,
     dryrun_journal: DryRunHidJournal,
     mem_clip: MemoryClipboardBackend,
     download_dir: PathBuf,
     synth_w: u32,
     synth_h: u32,
+}
+
+struct WatchdogAxProbeGuard {
+    slot: Arc<Mutex<Option<bool>>>,
+}
+
+impl Drop for WatchdogAxProbeGuard {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4516,7 +4954,9 @@ async fn run_active_host_session(
     adapters: &HostTaskAdapters,
 ) -> String {
     let mut effective_policy = accepted.effective_policy.clone();
-    let allow_clip_flag = Arc::new(AtomicBool::new(effective_policy.allow_clipboard()));
+    let allow_clip_flag = Arc::new(AtomicBool::new(
+        effective_policy.allow_clipboard() && adapters.clipboard_sync_enabled.load(Ordering::Acquire),
+    ));
     let mut audio_gate = AudioChannelGate::from_policy(&effective_policy);
     let mut audio_muted = false;
 
@@ -4548,7 +4988,10 @@ async fn run_active_host_session(
     } else {
         Box::new(DryRunHidSink::with_journal(adapters.dryrun_journal.clone()))
     };
-    let mut hid_sink: Box<dyn OsHidSink> = if adapters.enable_hid_watchdog_subprocess {
+    let _wd_ax_guard = WatchdogAxProbeGuard {
+        slot: Arc::clone(&adapters.active_watchdog_ax_probe),
+    };
+    let inner_hid_sink: Box<dyn OsHidSink> = if adapters.enable_hid_watchdog_subprocess {
         let wd_cfg = HidWatchdogConfig {
             binary_path: adapters.watchdog_bin_path.clone(),
             dry_run_report_path: adapters.watchdog_report_path.clone(),
@@ -4557,6 +5000,10 @@ async fn run_active_host_session(
         };
         match HidWatchdogSupervisor::spawn(wd_cfg) {
             Ok(sup) => {
+                *adapters
+                    .active_watchdog_ax_probe
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(sup.accessibility_trusted());
                 let tx_deg = actor_tx.clone();
                 let on_degraded = Arc::new(move |reason: String| {
                     let _ = tx_deg.try_send(ActorMessage::InternalEvent {
@@ -4595,6 +5042,23 @@ async fn run_active_host_session(
     } else {
         base_hid_sink
     };
+    let perm_probe_for_sink = adapters.permission_probe.clone();
+    let wd_slot_for_sink = Arc::clone(&adapters.active_watchdog_ax_probe);
+    let enable_for_sink = Arc::clone(&adapters.enable_os_input);
+    let mut hid_sink = GatedOsHidSink::new(
+        inner_hid_sink,
+        Arc::clone(&adapters.enable_os_input),
+        Arc::new(move || {
+            let wd_ax = *wd_slot_for_sink.lock().unwrap_or_else(|e| e.into_inner());
+            let enabled = enable_for_sink.load(Ordering::Acquire);
+            let rep = if let Some(p) = &perm_probe_for_sink {
+                p.probe(wd_ax, enabled)
+            } else {
+                SystemPermissionProbe.probe(wd_ax, enabled)
+            };
+            rep.screen_capture_granted && rep.accessibility_granted
+        }),
+    );
     let releaser = hid_sink.emergency_releaser();
     let _releaser_guard = ReleaserDropGuard::arm(Arc::clone(&releaser), releaser_slot);
 
@@ -4697,7 +5161,7 @@ async fn run_active_host_session(
     let (pol_tx, mut pol_rx) =
         mpsc::channel::<(u64, Result<(EffectiveTenantPolicy, bool), String>)>(4);
 
-    let frame_period =
+    let mut frame_period =
         Duration::from_millis((1000 / cfg.fps.max(1)) as u64).max(Duration::from_millis(16));
     let mut video_tick = tokio::time::interval(frame_period);
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4822,6 +5286,23 @@ async fn run_active_host_session(
                             audio_muted = m;
                             audio_gate.set_muted(m);
                         }
+                        SessionAction::SetClipboardSync(enabled) => {
+                            clip_poller.set_policy_allowed(
+                                enabled && effective_policy.allow_clipboard(),
+                            );
+                        }
+                        SessionAction::SetVideoQuality {
+                            bitrate_kbps,
+                            fps_cap,
+                        } => {
+                            let _ = bitrate_kbps;
+                            frame_period = Duration::from_millis((1000 / fps_cap.max(1)) as u64)
+                                .max(Duration::from_millis(16));
+                            video_tick = tokio::time::interval(frame_period);
+                            video_tick
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        }
+                        SessionAction::RequestCodec(_) => {}
                         SessionAction::SendClipboard { mime_kind, bytes } => {
                             let cid = next_clip_id;
                             next_clip_id += 1;
@@ -4884,22 +5365,88 @@ async fn run_active_host_session(
                     }
                 }
                 _ = video_tick.tick() => {
-                    if let Ok(raw) = capture.capture_frame() {
-                        let i420_res = if adapters.use_os_capture {
-                            convert_captured_stride_to_i420(&raw)
-                        } else {
-                            raw_captured_to_i420(&raw)
-                        };
-                        if let Ok(i420) = i420_res {
-                            pts_ms += frame_period.as_millis() as i64;
-                            if let Err(SessionError::Video(
-                                e @ (VideoError::CodecFailed { .. }
-                                | VideoError::HardwareUnavailable(_)),
-                            )) = host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await
-                            {
-                                break format!("video_codec_failed: {e}");
+                    match capture.capture_frame() {
+                        Ok(raw) => {
+                            let i420_res = if adapters.use_os_capture {
+                                convert_captured_stride_to_i420(&raw)
+                            } else {
+                                raw_captured_to_i420(&raw)
+                            };
+                            if let Ok(i420) = i420_res {
+                                pts_ms += frame_period.as_millis() as i64;
+                                if let Err(SessionError::Video(
+                                    e @ (VideoError::CodecFailed { .. }
+                                    | VideoError::HardwareUnavailable(_)),
+                                )) = host_sess.publish_i420_frame(Arc::new(i420), pts_ms).await
+                                {
+                                    break format!("video_codec_failed: {e}");
+                                }
                             }
                         }
+                        Err(OsError::PermissionDenied(OsPermission::ScreenRecording)) => {
+                            let _ = hid_sink.disable_and_release();
+                            let wd_ax = *adapters
+                                .active_watchdog_ax_probe
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let mut rep = if let Some(p) = &adapters.permission_probe {
+                                p.probe(wd_ax, false)
+                            } else {
+                                SystemPermissionProbe.probe(wd_ax, false)
+                            };
+                            rep.screen_capture_granted = false;
+                            let _ = actor_tx
+                                .send(ActorMessage::InternalEvent {
+                                    session_gen: gen,
+                                    event: ActorEvent::PermissionStatusChanged(rep),
+                                })
+                                .await;
+                            let _ = actor_tx
+                                .send(ActorMessage::InternalEvent {
+                                    session_gen: gen,
+                                    event: ActorEvent::HostCapabilityDegraded {
+                                        capability: "screen_recording_revoked".into(),
+                                        reason: "Screen Recording permission revoked mid-session"
+                                            .into(),
+                                    },
+                                })
+                                .await;
+                            break "screen_recording_revoked".into();
+                        }
+                        Err(OsError::CaptureFailed(msg)) if adapters.use_os_capture => {
+                            if !preflight_screen_capture_permission().unwrap_or(false) {
+                                let _ = hid_sink.disable_and_release();
+                                let wd_ax = *adapters
+                                    .active_watchdog_ax_probe
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let mut rep = if let Some(p) = &adapters.permission_probe {
+                                    p.probe(wd_ax, false)
+                                } else {
+                                    SystemPermissionProbe.probe(wd_ax, false)
+                                };
+                                rep.screen_capture_granted = false;
+                                let _ = actor_tx
+                                    .send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::PermissionStatusChanged(rep),
+                                    })
+                                    .await;
+                                let _ = actor_tx
+                                    .send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::HostCapabilityDegraded {
+                                            capability: "screen_recording_revoked".into(),
+                                            reason: format!(
+                                                "Screen Recording capture stopped (permission revoked): {msg}"
+                                            ),
+                                        },
+                                    })
+                                    .await;
+                                break "screen_recording_revoked".into();
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
                 _ = audio_tick.tick() => {
@@ -4962,8 +5509,12 @@ async fn run_active_host_session(
                                 V2RecvEvent::Transport(TransportEvent::Hid(frame)) => {
                                     if let Ok(payload) = decode_hid_frame(&frame) {
                                         match payload {
-                                            HidPayload::Key(k) => { let _ = hid_sink.send_key(&k); }
-                                            HidPayload::Mouse(m) => { let _ = hid_sink.send_mouse(&m); }
+                                            HidPayload::Key(k) => {
+                                                let _ = hid_sink.dispatch_key(&k);
+                                            }
+                                            HidPayload::Mouse(m) => {
+                                                let _ = hid_sink.dispatch_mouse(&m);
+                                            }
                                             HidPayload::EchoAck(_) => {}
                                         }
                                     }
@@ -5063,6 +5614,7 @@ async fn run_controller_lifecycle_task(
     use_os_audio: bool,
     use_os_clipboard: bool,
     mem_clip: MemoryClipboardBackend,
+    clipboard_sync_enabled: Arc<AtomicBool>,
     download_dir: PathBuf,
     #[cfg(feature = "e2e-fault-injection")] silent_blackhole: Option<Arc<AtomicBool>>,
 ) {
@@ -5106,7 +5658,9 @@ async fn run_controller_lifecycle_task(
 
     let (action_tx, mut action_rx) = mpsc::channel::<SessionAction>(SESSION_ACTION_CAP);
     let mut effective_policy = connected.effective_policy.clone();
-    let allow_clip_flag = Arc::new(AtomicBool::new(effective_policy.allow_clipboard()));
+    let allow_clip_flag = Arc::new(AtomicBool::new(
+        effective_policy.allow_clipboard() && clipboard_sync_enabled.load(Ordering::Acquire),
+    ));
     let mut audio_muted = false;
 
     // P0-1: Check StreamingStarted delivery — never start a headless zombie controller loop!
@@ -5206,13 +5760,32 @@ async fn run_controller_lifecycle_task(
     clip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut qoe_tick = tokio::time::interval(Duration::from_millis(500));
     qoe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut hud_tick = tokio::time::interval(Duration::from_secs(1));
+    hud_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut file_tick = tokio::time::interval(Duration::from_millis(2));
     file_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut lease_expired_rx = connected.lease_renewal.subscribe_expired();
     let mut video_frames_decoded: u64 = 0;
+    let mut hud_window_frames: u32 = 0;
+    let mut hud_window_bytes: u64 = 0;
+    let mut hud_window_started = Instant::now();
+    let mut last_decode_ms: f64 = 0.0;
+    let mut last_rtt_ms: f64 = 0.0;
     let mut last_idr_req_at: Option<Instant> = None;
     let mut hid_state = ControllerHidState::default();
+
+    // Emit initial negotiated active codec ack so UI reflects peer-acknowledged codec.
+    let _ = actor_tx
+        .send(ActorMessage::InternalEvent {
+            session_gen: gen,
+            event: ActorEvent::CodecAck {
+                active_codec: decoder.codec().name().to_string(),
+                requested_codec: None,
+                accepted: true,
+            },
+        })
+        .await;
 
     let is_blackholed = || -> bool {
         #[cfg(feature = "e2e-fault-injection")]
@@ -5261,7 +5834,35 @@ async fn run_controller_lifecycle_task(
                 }
                 _ = ka_tick.tick() => {
                     if !is_blackholed() {
-                        let _ = ctrl_sess.ping_keepalive(Duration::from_millis(500)).await;
+                        let ping_started = Instant::now();
+                        if ctrl_sess.ping_keepalive(Duration::from_millis(500)).await.is_ok() {
+                            last_rtt_ms = ping_started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                    }
+                }
+                _ = hud_tick.tick() => {
+                    let elapsed_secs = hud_window_started.elapsed().as_secs_f64().max(0.001);
+                    let fps = f64::from(hud_window_frames) / elapsed_secs;
+                    let bitrate_kbps = ((hud_window_bytes as f64 * 8.0) / (elapsed_secs * 1000.0))
+                        .round()
+                        .clamp(0.0, u32::MAX as f64) as u32;
+                    hud_window_frames = 0;
+                    hud_window_bytes = 0;
+                    hud_window_started = Instant::now();
+                    let transport_mode = match ctrl_sess.active_transport_mode() {
+                        ActiveTransportMode::DualTls443 => "tls443",
+                        ActiveTransportMode::Udp => "udp",
+                    };
+                    let hud = HudStatsPayload {
+                        fps: (fps * 10.0).round() / 10.0,
+                        decode_ms: (last_decode_ms * 100.0).round() / 100.0,
+                        active_codec: decoder.codec().name().to_string(),
+                        transport_mode: transport_mode.to_string(),
+                        rtt_ms: (last_rtt_ms * 10.0).round() / 10.0,
+                        bitrate_kbps,
+                    };
+                    if let Ok(val) = serde_json::to_value(&hud) {
+                        events.set_hud_stats(val);
                     }
                 }
                 _ = qoe_tick.tick() => {
@@ -5355,6 +5956,27 @@ async fn run_controller_lifecycle_task(
                     };
                     match action {
                         SessionAction::SetAudioMute(m) => { audio_muted = m; }
+                        SessionAction::SetClipboardSync(enabled) => {
+                            clip_poller.set_policy_allowed(
+                                enabled && effective_policy.allow_clipboard(),
+                            );
+                        }
+                        SessionAction::SetVideoQuality { .. } => {}
+                        SessionAction::RequestCodec(requested) => {
+                            let current = decoder.codec().name().to_string();
+                            if requested == "auto" || requested == current {
+                                let _ = actor_tx
+                                    .send(ActorMessage::InternalEvent {
+                                        session_gen: gen,
+                                        event: ActorEvent::CodecAck {
+                                            active_codec: current,
+                                            requested_codec: Some(requested),
+                                            accepted: true,
+                                        },
+                                    })
+                                    .await;
+                            }
+                        }
                         SessionAction::SendHid(payload) => {
                             hid_state.record_outbound(&payload);
                             if !is_blackholed() {
@@ -5438,8 +6060,12 @@ async fn run_controller_lifecycle_task(
                 recv_res = ctrl_sess.recv_v124_event(Duration::from_millis(25)) => {
                     match recv_res {
                         Ok(V2RecvEvent::Transport(TransportEvent::VideoFrame(vf))) => {
+                            hud_window_bytes = hud_window_bytes.saturating_add(vf.data.len() as u64);
+                            let decode_started = Instant::now();
                             match decoder.decode_raw_frame(&vf.data) {
                                 Ok(DecodedVideoFrame::Bgra(bgra)) => {
+                                    last_decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+                                    hud_window_frames = hud_window_frames.saturating_add(1);
                                     video_frames_decoded += 1;
                                     if mailbox
                                         .publish_raw_for_session(
@@ -5457,6 +6083,8 @@ async fn run_controller_lifecycle_task(
                                     }
                                 }
                                 Ok(DecodedVideoFrame::I420(i420)) => {
+                                    last_decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+                                    hud_window_frames = hud_window_frames.saturating_add(1);
                                     video_frames_decoded += 1;
                                     if mailbox
                                         .publish_i420_for_session(

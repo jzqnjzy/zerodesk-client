@@ -2,13 +2,18 @@
 // Copyright (c) 2026 ZeroDesk Contributors
 
 use super::controller::{
-    BridgePersistedConfig, BRIDGE_ABI_VERSION, BRIDGE_MAX_CMD_JSON_BYTES,
+    BridgeEvent, BridgePersistedConfig, BRIDGE_ABI_VERSION, BRIDGE_MAX_CMD_JSON_BYTES,
 };
+use crate::os::input::PermissionStatusReport;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const MIN_RING_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_RING_TIMEOUT_MS: u64 = 120_000;
+pub const MIN_BITRATE_KBPS: u32 = 500;
+pub const MAX_BITRATE_KBPS: u32 = 50_000;
+pub const MIN_FPS_CAP: u32 = 1;
+pub const MAX_FPS_CAP: u32 = 120;
 
 /// Parsed, validated command request accepted by `V2BridgeRuntime::exec_json`.
 #[derive(Clone, Deserialize)]
@@ -75,6 +80,12 @@ pub struct RuntimeCommandEnvelope {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub ring_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+    #[serde(default)]
+    pub fps_cap: Option<u32>,
 }
 
 impl fmt::Debug for RuntimeCommandEnvelope {
@@ -114,6 +125,9 @@ impl fmt::Debug for RuntimeCommandEnvelope {
             .field("mouse_kind", &self.mouse_kind)
             .field("download_dir", &self.download_dir)
             .field("ring_timeout_ms", &self.ring_timeout_ms)
+            .field("enabled", &self.enabled)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("fps_cap", &self.fps_cap)
             .finish()
     }
 }
@@ -285,7 +299,141 @@ pub fn parse_and_validate_command(raw: &str) -> Result<RuntimeCommandEnvelope, R
             ));
         }
     }
+    if let Some(bps) = env.bitrate_kbps {
+        if bps != 0 && !(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS).contains(&bps) {
+            return Err(RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                format!(
+                    "bitrate_kbps {bps} must be 0 (auto) or within [{MIN_BITRATE_KBPS}, {MAX_BITRATE_KBPS}]"
+                ),
+            ));
+        }
+    }
+    if let Some(fps) = env.fps_cap {
+        if !(MIN_FPS_CAP..=MAX_FPS_CAP).contains(&fps) {
+            return Err(RuntimeReplyEnvelope::err(
+                "InvalidArgument",
+                format!("fps_cap {fps} outside [{MIN_FPS_CAP}, {MAX_FPS_CAP}]"),
+            ));
+        }
+    }
     Ok(env)
+}
+
+/// Startup handshake capability payload (`abi_version` + `caps`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeCapabilitiesData {
+    pub abi_version: u32,
+    pub caps: Vec<String>,
+}
+
+/// Acknowledgment payload emitted on `input_enabled_ack` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputEnabledAckPayload {
+    pub enabled: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_capture_granted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessibility_granted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// 1 Hz telemetry HUD payload emitted on `hud_stats` events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HudStatsPayload {
+    pub fps: f64,
+    pub decode_ms: f64,
+    pub active_codec: String,
+    pub transport_mode: String,
+    pub rtt_ms: f64,
+    pub bitrate_kbps: u32,
+}
+
+/// Codec acknowledgment payload emitted on `codec_ack` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodecAckPayload {
+    pub active_codec: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_codec: Option<String>,
+    pub accepted: bool,
+}
+
+/// Video quality acknowledgment payload emitted on `video_quality_ack` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoQualityAckPayload {
+    pub bitrate_kbps: u32,
+    pub fps_cap: u32,
+}
+
+/// Clipboard sync status payload emitted on `clipboard_sync_status` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardSyncStatusPayload {
+    pub enabled: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// File transfer completion payload emitted on `FileTransferComplete` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferCompletePayload {
+    pub transfer_id: u64,
+    pub rel_name: String,
+    pub bytes: u64,
+    pub sha256_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_algo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+}
+
+/// Forward-compatible parsed representation of a JSON-ABI `BridgeEvent`.
+/// Unknown `kind`/`type` values or unknown JSON fields are safely mapped to `Unknown`
+/// without failing or disconnecting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedBridgeEvent {
+    PermissionStatus(PermissionStatusReport),
+    InputEnabledAck(InputEnabledAckPayload),
+    HudStats(HudStatsPayload),
+    CodecAck(CodecAckPayload),
+    VideoQualityAck(VideoQualityAckPayload),
+    ClipboardSyncStatus(ClipboardSyncStatusPayload),
+    FileTransferComplete(FileTransferCompletePayload),
+    Unknown { kind: String },
+}
+
+/// Parses a `BridgeEvent` JSON string in a strictly forward-compatible manner:
+/// unknown `kind` / `type` values and unknown extra fields are safely ignored.
+pub fn parse_bridge_event_forward_compat(raw: &str) -> Result<ParsedBridgeEvent, serde_json::Error> {
+    let ev: BridgeEvent = serde_json::from_str(raw)?;
+    Ok(match ev.kind.as_str() {
+        "permission_status" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::PermissionStatus)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "input_enabled_ack" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::InputEnabledAck)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "hud_stats" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::HudStats)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "codec_ack" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::CodecAck)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "video_quality_ack" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::VideoQualityAck)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "clipboard_sync_status" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::ClipboardSyncStatus)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        "FileTransferComplete" => serde_json::from_value(ev.payload)
+            .map(ParsedBridgeEvent::FileTransferComplete)
+            .unwrap_or_else(|_| ParsedBridgeEvent::Unknown { kind: ev.kind }),
+        _ => ParsedBridgeEvent::Unknown { kind: ev.kind },
+    })
 }
 
 /// Scans a serialized snapshot or event JSON string for forbidden canary secrets.

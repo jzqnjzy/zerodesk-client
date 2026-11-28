@@ -1,0 +1,6 @@
+{
+  "v": 1,
+  "cmd": "set_video_quality",
+  "bitrate_kbps": 10000,
+  "fps_cap": 60
+}

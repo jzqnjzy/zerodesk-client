@@ -7,12 +7,14 @@ import MetalKit
 import SwiftUI
 import ZeroDeskBridge
 
-/// Interactive Metal `MTKView` capturing mouse, wheel, and keyboard input (including `Cmd+key`
-/// `keyUp` via local event monitor) with 5-trigger anti-stuck-key `releaseAll` safety.
+/// Interactive Metal `MTKView` capturing mouse, wheel, and keyboard input through the single
+/// unified `InputGate` with full Phase 7B + Phase 8A anti-stuck-key release triggers and
+/// 3-mode `ViewportState` (`Fit` / `1:1` / `Fill`) coordinate mapping.
+///
+/// NOTE: Drag-and-drop file dropzones MUST NEVER be attached to this view (they belong strictly
+/// on the Session Control Toolbar / Drawer).
 @MainActor
 public final class InteractiveMetalNSView: MTKView {
-    // Device-dependent NX modifier masks from <IOKit/hidsystem/IOLLEvent.h> to distinguish
-    // left vs right Shift/Ctrl/Alt/Cmd on `flagsChanged` without merging left & right modifiers.
     private static let nxDeviceLControlMask: UInt = 0x00000001
     private static let nxDeviceLShiftMask: UInt = 0x00000002
     private static let nxDeviceRShiftMask: UInt = 0x00000004
@@ -27,12 +29,14 @@ public final class InteractiveMetalNSView: MTKView {
     private var scrollQuantizer = ScrollQuantizer()
     private var trackingAreaRef: NSTrackingArea?
 
-    private var _inputTracker: PressedInputTracker?
+    private var _inputGate: InputGate?
     private var _isSessionActive: Bool = false
     private var _remoteSize: RemoteSize = RemoteSize(width: 0, height: 0)
+    private var _displayScaleMode: DisplayScaleMode = .fit
+    private var _scrollOffset: CGPoint = .zero
     private var onEmergencyEscape: (() -> Void)?
+    private var onLocalScrollChanged: ((CGPoint) -> Void)?
 
-    // Stored in a Sendable box so teardown in `deinit` stays Swift 6 concurrency-warning-free.
     private final class MonitorCleanupBox: @unchecked Sendable {
         private let lock = NSLock()
         private var keyMonitor: Any?
@@ -90,14 +94,25 @@ public final class InteractiveMetalNSView: MTKView {
 
     public override func resignFirstResponder() -> Bool {
         let ok = super.resignFirstResponder()
-        _inputTracker?.releaseAll(reason: .windowResignedKey)
+        _inputGate?.releaseAll(reason: .focusLost)
         scrollQuantizer.reset()
         return ok
+    }
+
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        syncViewportState()
+    }
+
+    public override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        syncViewportState()
     }
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         installLifecycleObservers()
+        syncViewportState()
         if window != nil && _isSessionActive {
             installKeyMonitor()
         }
@@ -105,7 +120,7 @@ public final class InteractiveMetalNSView: MTKView {
 
     public override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
-            _inputTracker?.releaseAll(reason: .viewTeardownOrTerminate)
+            _inputGate?.releaseAll(reason: .viewTeardownOrTerminate)
             scrollQuantizer.reset()
             cleanupBox.teardownAll()
         }
@@ -119,7 +134,7 @@ public final class InteractiveMetalNSView: MTKView {
         }
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -127,38 +142,83 @@ public final class InteractiveMetalNSView: MTKView {
         trackingAreaRef = area
     }
 
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        _inputGate?.releaseAll(reason: .mouseExitedView)
+        scrollQuantizer.reset()
+    }
+
     public func updateSessionBinding(
-        inputTracker: PressedInputTracker?,
+        inputGate: InputGate?,
         isSessionActive: Bool,
         remoteSize: RemoteSize,
-        onEmergencyEscape: (() -> Void)?
+        displayScaleMode: DisplayScaleMode,
+        scrollOffset: CGPoint,
+        onEmergencyEscape: (() -> Void)?,
+        onLocalScrollChanged: ((CGPoint) -> Void)?
     ) {
         let wasActive = _isSessionActive
-        let oldTracker = _inputTracker
+        let oldGate = _inputGate
 
-        _inputTracker = inputTracker
+        _inputGate = inputGate
         _isSessionActive = isSessionActive
         _remoteSize = remoteSize
+        _displayScaleMode = displayScaleMode
+        _scrollOffset = scrollOffset
         self.onEmergencyEscape = onEmergencyEscape
+        self.onLocalScrollChanged = onLocalScrollChanged
 
         if wasActive && !isSessionActive {
-            oldTracker?.releaseAll(reason: .sessionLeftConnected)
-            inputTracker?.releaseAll(reason: .sessionLeftConnected)
+            oldGate?.releaseAll(reason: .sessionLeftConnected)
+            inputGate?.releaseAll(reason: .sessionLeftConnected)
             scrollQuantizer.reset()
             cleanupBox.replaceKeyMonitor(nil)
         } else if !wasActive && isSessionActive {
             installKeyMonitor()
-        } else if isSessionActive && oldTracker !== inputTracker {
-            oldTracker?.releaseAll(reason: .sessionLeftConnected)
+        } else if isSessionActive && oldGate !== inputGate {
+            oldGate?.releaseAll(reason: .sessionLeftConnected)
             installKeyMonitor()
         }
+
+        syncViewportState()
     }
 
     public func teardown() {
-        _inputTracker?.releaseAll(reason: .viewTeardownOrTerminate)
+        _inputGate?.releaseAll(reason: .viewTeardownOrTerminate)
         scrollQuantizer.reset()
         cleanupBox.teardownAll()
         _isSessionActive = false
+    }
+
+    private var effectiveBackingScale: CGFloat {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
+        return scale > 0 ? scale : 1.0
+    }
+
+    private func computeCurrentViewport() -> ViewportState {
+        let scale = effectiveBackingScale
+        let backingSize: CGSize
+        if drawableSize.width >= 1 && drawableSize.height >= 1 {
+            backingSize = drawableSize
+        } else {
+            backingSize = CGSize(
+                width: bounds.size.width * scale,
+                height: bounds.size.height * scale
+            )
+        }
+        return ViewportState(
+            mode: _displayScaleMode,
+            viewBackingSize: backingSize,
+            frameSize: _remoteSize.cgSize,
+            scrollOffset: _scrollOffset
+        )
+    }
+
+    private func syncViewportState() {
+        let vp = computeCurrentViewport()
+        // Always release held inputs BEFORE recomputing viewport geometry!
+        _inputGate?.updateViewport(vp)
+        videoRenderer.updateViewport(mode: vp.mode, scrollOffset: vp.scrollOffset)
     }
 
     private func installLifecycleObservers() {
@@ -173,7 +233,19 @@ public final class InteractiveMetalNSView: MTKView {
                     queue: .main
                 ) { [weak self] _ in
                     MainActor.assumeIsolated {
-                        self?._inputTracker?.releaseAll(reason: .windowResignedKey)
+                        self?._inputGate?.releaseAll(reason: .windowResignedKey)
+                        self?.scrollQuantizer.reset()
+                    }
+                }
+            )
+            next.append(
+                nc.addObserver(
+                    forName: NSWindow.didResignMainNotification,
+                    object: win,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?._inputGate?.releaseAll(reason: .windowResignedKey)
                         self?.scrollQuantizer.reset()
                     }
                 }
@@ -187,7 +259,7 @@ public final class InteractiveMetalNSView: MTKView {
                 queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    self?._inputTracker?.releaseAll(reason: .appResignedActiveOrHidden)
+                    self?._inputGate?.releaseAll(reason: .appResignedActiveOrHidden)
                     self?.scrollQuantizer.reset()
                 }
             }
@@ -200,7 +272,7 @@ public final class InteractiveMetalNSView: MTKView {
                 queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    self?._inputTracker?.releaseAll(reason: .appResignedActiveOrHidden)
+                    self?._inputGate?.releaseAll(reason: .appResignedActiveOrHidden)
                     self?.scrollQuantizer.reset()
                 }
             }
@@ -222,10 +294,9 @@ public final class InteractiveMetalNSView: MTKView {
         cleanupBox.replaceKeyMonitor(monitor)
     }
 
-    /// Returns `true` when the event was consumed (should be swallowed locally), `false` to pass through.
     private func handleMonitoredKeyEvent(_ event: NSEvent) -> Bool {
         guard _isSessionActive,
-              let tracker = _inputTracker,
+              let gate = _inputGate,
               let win = window,
               win.isKeyWindow,
               win.firstResponder === self else {
@@ -237,11 +308,10 @@ public final class InteractiveMetalNSView: MTKView {
 
         switch event.type {
         case .keyDown:
-            switch tracker.handleKeyDownEvent(usageId: usageId, modifiers: mods) {
+            switch gate.handleKeyDown(usageId: usageId, modifiers: mods) {
             case .forwarded:
                 return true
             case .emergencyEscapeTriggered:
-                // Emergency escape combo (Ctrl+Opt+Cmd+Escape) intercepted locally.
                 scrollQuantizer.reset()
                 onEmergencyEscape?()
                 return true
@@ -251,13 +321,14 @@ public final class InteractiveMetalNSView: MTKView {
 
         case .keyUp:
             guard let usageId else { return false }
-            tracker.handleKeyUp(usageId: usageId, modifiers: mods)
+            guard gate.isInputEnabled || gate.hasAnyPressedInput else { return false }
+            gate.handleKeyUp(usageId: usageId, modifiers: mods)
             return true
 
         case .flagsChanged:
             guard let usageId else { return false }
             let isDown = Self.isModifierKeyDown(keyCode: event.keyCode, flags: event.modifierFlags)
-            tracker.handleFlagsChanged(modifierUsageId: usageId, isPressed: isDown, modifiers: mods)
+            gate.handleFlagsChanged(modifierUsageId: usageId, isPressed: isDown, modifiers: mods)
             return false
 
         default:
@@ -265,34 +336,16 @@ public final class InteractiveMetalNSView: MTKView {
         }
     }
 
-    private func mappedPoint(for event: NSEvent, isDragging: Bool) -> RemotePoint? {
-        guard _isSessionActive, _remoteSize.isValid else {
-            return nil
-        }
-        let localPoint = convert(event.locationInWindow, from: nil)
-        return RemoteCoordinateMapper.mapPoint(
-            localPoint,
-            viewSize: bounds.size,
-            remoteSize: _remoteSize,
-            origin: .bottomLeft,
-            isDragging: isDragging
-        )
-    }
-
     public override func mouseMoved(with event: NSEvent) {
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: tracker.hasPressedMouseButtons) else {
-            return
-        }
-        tracker.handleMouseMove(x: pt.x, y: pt.y)
+        guard _isSessionActive, let gate = _inputGate else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseMove(viewPoint: localPoint, backingScale: effectiveBackingScale, origin: .bottomLeft)
     }
 
     public override func mouseDragged(with event: NSEvent) {
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: true) else {
-            return
-        }
-        tracker.handleMouseMove(x: pt.x, y: pt.y)
+        guard _isSessionActive, let gate = _inputGate else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseMove(viewPoint: localPoint, backingScale: effectiveBackingScale, origin: .bottomLeft)
     }
 
     public override func rightMouseDragged(with event: NSEvent) {
@@ -305,60 +358,108 @@ public final class InteractiveMetalNSView: MTKView {
 
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: false) else {
-            return
-        }
-        tracker.handleMouseDown(button: HidMouseButtonMask.left, x: pt.x, y: pt.y)
+        guard _isSessionActive, let gate = _inputGate else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseDown(
+            button: HidMouseButtonMask.left,
+            viewPoint: localPoint,
+            backingScale: effectiveBackingScale,
+            origin: .bottomLeft
+        )
     }
 
     public override func mouseUp(with event: NSEvent) {
-        guard _isSessionActive, let tracker = _inputTracker else {
-            return
-        }
-        tracker.handleMouseUp(button: HidMouseButtonMask.left, point: mappedPoint(for: event, isDragging: true))
+        guard _isSessionActive, let gate = _inputGate else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseUp(
+            button: HidMouseButtonMask.left,
+            viewPoint: localPoint,
+            backingScale: effectiveBackingScale,
+            origin: .bottomLeft
+        )
     }
 
     public override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: false) else {
-            return
-        }
-        tracker.handleMouseDown(button: HidMouseButtonMask.right, x: pt.x, y: pt.y)
+        guard _isSessionActive, let gate = _inputGate else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseDown(
+            button: HidMouseButtonMask.right,
+            viewPoint: localPoint,
+            backingScale: effectiveBackingScale,
+            origin: .bottomLeft
+        )
     }
 
     public override func rightMouseUp(with event: NSEvent) {
-        guard _isSessionActive, let tracker = _inputTracker else {
-            return
-        }
-        tracker.handleMouseUp(button: HidMouseButtonMask.right, point: mappedPoint(for: event, isDragging: true))
+        guard _isSessionActive, let gate = _inputGate else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseUp(
+            button: HidMouseButtonMask.right,
+            viewPoint: localPoint,
+            backingScale: effectiveBackingScale,
+            origin: .bottomLeft
+        )
     }
 
     public override func otherMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        guard let tracker = _inputTracker,
-              let bit = Self.otherMouseButtonMask(event.buttonNumber),
-              let pt = mappedPoint(for: event, isDragging: false) else {
+        guard _isSessionActive,
+              let gate = _inputGate,
+              let bit = Self.otherMouseButtonMask(event.buttonNumber) else {
             return
         }
-        tracker.handleMouseDown(button: bit, x: pt.x, y: pt.y)
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseDown(
+            button: bit,
+            viewPoint: localPoint,
+            backingScale: effectiveBackingScale,
+            origin: .bottomLeft
+        )
     }
 
     public override func otherMouseUp(with event: NSEvent) {
         guard _isSessionActive,
-              let tracker = _inputTracker,
+              let gate = _inputGate,
               let bit = Self.otherMouseButtonMask(event.buttonNumber) else {
             return
         }
-        tracker.handleMouseUp(button: bit, point: mappedPoint(for: event, isDragging: true))
+        let localPoint = convert(event.locationInWindow, from: nil)
+        gate.handleMouseUp(
+            button: bit,
+            viewPoint: localPoint,
+            backingScale: effectiveBackingScale,
+            origin: .bottomLeft
+        )
     }
 
     public override func scrollWheel(with event: NSEvent) {
-        guard let tracker = _inputTracker,
-              let pt = mappedPoint(for: event, isDragging: tracker.hasPressedMouseButtons) else {
+        guard _isSessionActive, let gate = _inputGate else { return }
+
+        // In 1:1 mode when frame exceeds view backing size:
+        // - Default scroll pans the local viewport (`scrollOffset`);
+        // - Cmd + scroll forwards scroll events to the remote host!
+        let vp = computeCurrentViewport()
+        if let geo = RemoteCoordinateMapper.computeGeometry(for: vp),
+           geo.canScrollLocally,
+           !event.modifierFlags.contains(.command)
+        {
+            let scale = Double(effectiveBackingScale)
+            let dx = Double(event.scrollingDeltaX) * (event.hasPreciseScrollingDeltas ? scale : 18.0 * scale)
+            let dy = Double(event.scrollingDeltaY) * (event.hasPreciseScrollingDeltas ? scale : 18.0 * scale)
+            let nextX = min(max(Double(_scrollOffset.x) - dx, 0.0), geo.maxScrollX)
+            let nextY = min(max(Double(_scrollOffset.y) - dy, 0.0), geo.maxScrollY)
+            let nextOffset = CGPoint(x: nextX, y: nextY)
+            if nextOffset != _scrollOffset {
+                gate.releaseAll(reason: .viewportChanged)
+                _scrollOffset = nextOffset
+                syncViewportState()
+                onLocalScrollChanged?(nextOffset)
+            }
             return
         }
+
+        let localPoint = convert(event.locationInWindow, from: nil)
         if let step = scrollQuantizer.process(
             deltaX: Double(event.scrollingDeltaX),
             deltaY: Double(event.scrollingDeltaY),
@@ -367,11 +468,12 @@ public final class InteractiveMetalNSView: MTKView {
             isDirectionInvertedFromDevice: event.isDirectionInvertedFromDevice,
             phaseRaw: event.phase.rawValue
         ) {
-            tracker.handleMouseWheel(
+            gate.handleMouseWheel(
                 wheelDx: step.wheelDx,
                 wheelDy: step.wheelDy,
-                x: pt.x,
-                y: pt.y
+                viewPoint: localPoint,
+                backingScale: effectiveBackingScale,
+                origin: .bottomLeft
             )
         }
     }
@@ -397,21 +499,21 @@ public final class InteractiveMetalNSView: MTKView {
     private static func isModifierKeyDown(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
         let raw = flags.rawValue
         switch keyCode {
-        case 0x3B: // kVK_Control (Left)
+        case 0x3B:
             return (raw & nxDeviceLControlMask) != 0 || (flags.contains(.control) && (raw & nxDeviceRControlMask) == 0)
-        case 0x3E: // kVK_RightControl
+        case 0x3E:
             return (raw & nxDeviceRControlMask) != 0
-        case 0x38: // kVK_Shift (Left)
+        case 0x38:
             return (raw & nxDeviceLShiftMask) != 0 || (flags.contains(.shift) && (raw & nxDeviceRShiftMask) == 0)
-        case 0x3C: // kVK_RightShift
+        case 0x3C:
             return (raw & nxDeviceRShiftMask) != 0
-        case 0x3A: // kVK_Option (Left)
+        case 0x3A:
             return (raw & nxDeviceLAltMask) != 0 || (flags.contains(.option) && (raw & nxDeviceRAltMask) == 0)
-        case 0x3D: // kVK_RightOption
+        case 0x3D:
             return (raw & nxDeviceRAltMask) != 0
-        case 0x37: // kVK_Command (Left)
+        case 0x37:
             return (raw & nxDeviceLCmdMask) != 0 || (flags.contains(.command) && (raw & nxDeviceRCmdMask) == 0)
-        case 0x36: // kVK_RightCommand
+        case 0x36:
             return (raw & nxDeviceRCmdMask) != 0
         default:
             return false
@@ -419,45 +521,60 @@ public final class InteractiveMetalNSView: MTKView {
     }
 }
 
-/// SwiftUI wrapper over `InteractiveMetalNSView` (zero `CGImage` allocation).
+/// SwiftUI wrapper over `InteractiveMetalNSView` (zero `CGImage` allocation, zero file dropzone).
 public struct RemoteMetalView: NSViewRepresentable {
     public let renderer: MetalVideoRenderer
-    public let inputTracker: PressedInputTracker?
+    public let inputGate: InputGate?
     public let isSessionActive: Bool
     public let remoteSize: RemoteSize
+    public let displayScaleMode: DisplayScaleMode
+    public let scrollOffset: CGPoint
     public let onEmergencyEscape: (() -> Void)?
+    public let onLocalScrollChanged: ((CGPoint) -> Void)?
 
     public init(
         renderer: MetalVideoRenderer,
-        inputTracker: PressedInputTracker?,
+        inputGate: InputGate?,
         isSessionActive: Bool,
         remoteSize: RemoteSize,
-        onEmergencyEscape: (() -> Void)? = nil
+        displayScaleMode: DisplayScaleMode = .fit,
+        scrollOffset: CGPoint = .zero,
+        onEmergencyEscape: (() -> Void)? = nil,
+        onLocalScrollChanged: ((CGPoint) -> Void)? = nil
     ) {
         self.renderer = renderer
-        self.inputTracker = inputTracker
+        self.inputGate = inputGate
         self.isSessionActive = isSessionActive
         self.remoteSize = remoteSize
+        self.displayScaleMode = displayScaleMode
+        self.scrollOffset = scrollOffset
         self.onEmergencyEscape = onEmergencyEscape
+        self.onLocalScrollChanged = onLocalScrollChanged
     }
 
     public func makeNSView(context: Context) -> InteractiveMetalNSView {
         let view = InteractiveMetalNSView(renderer: renderer)
         view.updateSessionBinding(
-            inputTracker: inputTracker,
+            inputGate: inputGate,
             isSessionActive: isSessionActive,
             remoteSize: remoteSize,
-            onEmergencyEscape: onEmergencyEscape
+            displayScaleMode: displayScaleMode,
+            scrollOffset: scrollOffset,
+            onEmergencyEscape: onEmergencyEscape,
+            onLocalScrollChanged: onLocalScrollChanged
         )
         return view
     }
 
     public func updateNSView(_ nsView: InteractiveMetalNSView, context: Context) {
         nsView.updateSessionBinding(
-            inputTracker: inputTracker,
+            inputGate: inputGate,
             isSessionActive: isSessionActive,
             remoteSize: remoteSize,
-            onEmergencyEscape: onEmergencyEscape
+            displayScaleMode: displayScaleMode,
+            scrollOffset: scrollOffset,
+            onEmergencyEscape: onEmergencyEscape,
+            onLocalScrollChanged: onLocalScrollChanged
         )
     }
 

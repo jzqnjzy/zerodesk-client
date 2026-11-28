@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 ZeroDesk Contributors
 
-#[cfg(all(target_os = "macos", feature = "real-input"))]
-use super::{EmergencyKeyReleaser, ReleaseReport};
-use super::{OsError, OsHidSink};
+use super::{EmergencyKeyReleaser, OsError, OsHidSink, OsPermission, ReleaseReport};
+use crate::session::hid::{KeyEvent, MouseEvent};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 /// All 8 USB HID modifier usages (Left/Right Ctrl, Shift, Alt, Meta), released unconditionally
@@ -660,9 +664,246 @@ pub fn emergency_release_real_os_keys(
     }
 }
 
+/// Identifies which OS process evaluated `AXIsProcessTrusted()`.
+///
+/// macOS TCC responsible-process semantics:
+/// - `AXIsProcessTrusted()` is attributed to the responsible process performing `CGEventPost`.
+/// - When launched via `ZeroDesk.app`, the child `zerodesk-hid-watchdog` inherits the app bundle's
+///   TCC identity; in dev CLI runs, it inherits Terminal / the launching host process.
+/// - When the watchdog/injector process is active, `accessibility_granted` reflects its live probe
+///   (`watchdog_or_injector_process`). Otherwise, the UI process probe is clearly marked as a
+///   non-authoritative hint (`ui_process_hint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProbeSource {
+    WatchdogOrInjectorProcess,
+    UiProcessHint,
+}
+
+impl PermissionProbeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WatchdogOrInjectorProcess => "watchdog_or_injector_process",
+            Self::UiProcessHint => "ui_process_hint",
+        }
+    }
+}
+
+/// Structured OS permission & per-session `enable_os_input` status exposed over JSON-ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionStatusReport {
+    pub screen_capture_granted: bool,
+    pub accessibility_granted: bool,
+    pub probe_source: PermissionProbeSource,
+    pub enable_os_input: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_event_input_enabled: Option<bool>,
+}
+
+/// Injectable OS permission probe allowing deterministic unit tests without host TCC state.
+pub trait PermissionProbe: Send + Sync {
+    fn probe(&self, watchdog_ax_override: Option<bool>, enable_os_input: bool)
+        -> PermissionStatusReport;
+}
+
+/// Production macOS permission probe (strictly non-interactive: uses
+/// `CGPreflightScreenCaptureAccess()` and `AXIsProcessTrusted()`, NEVER pops system dialogs).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemPermissionProbe;
+
+impl PermissionProbe for SystemPermissionProbe {
+    fn probe(
+        &self,
+        watchdog_ax_override: Option<bool>,
+        enable_os_input: bool,
+    ) -> PermissionStatusReport {
+        let screen_capture_granted = super::capture::preflight_screen_capture_permission()
+            .unwrap_or(false);
+        let (accessibility_granted, probe_source) = match watchdog_ax_override {
+            Some(ax) => (ax, PermissionProbeSource::WatchdogOrInjectorProcess),
+            None => (
+                is_accessibility_trusted(),
+                PermissionProbeSource::UiProcessHint,
+            ),
+        };
+        PermissionStatusReport {
+            screen_capture_granted,
+            accessibility_granted,
+            probe_source,
+            enable_os_input,
+            secure_event_input_enabled: Some(is_secure_event_input_enabled()),
+        }
+    }
+}
+
+/// Error returned by `GatedOsHidSink` when dispatching remote HID events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OsInputGateError {
+    /// Permissions are missing OR per-session `enable_os_input == false`.
+    /// Input was dropped immediately with ZERO queuing/buffering and ZERO calls to inner sink.
+    NotPermitted,
+    Os(OsError),
+}
+
+impl OsInputGateError {
+    pub fn status_code(&self) -> &'static str {
+        match self {
+            Self::NotPermitted => "not_permitted",
+            Self::Os(_) => "os_error",
+        }
+    }
+}
+
+impl fmt::Display for OsInputGateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPermitted => write!(f, "not_permitted"),
+            Self::Os(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for OsInputGateError {}
+
+/// Fail-closed `OsHidSink` gate enforcing BOTH per-session `enable_os_input == true` (default OFF,
+/// never persisted) AND live Screen Recording + Accessibility permissions before ANY event can
+/// reach the underlying OS HID injector.
+///
+/// When unpermitted or disabled, every event is dropped immediately with ZERO queuing/buffering
+/// and ZERO calls to the inner injector, returning `OsInputGateError::NotPermitted` (`"not_permitted"`).
+pub struct GatedOsHidSink {
+    inner: Box<dyn OsHidSink>,
+    enable_os_input: Arc<AtomicBool>,
+    permissions_ok: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl GatedOsHidSink {
+    pub fn new(
+        inner: Box<dyn OsHidSink>,
+        enable_os_input: Arc<AtomicBool>,
+        permissions_ok: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner,
+            enable_os_input,
+            permissions_ok,
+        }
+    }
+
+    pub fn is_permitted(&self) -> bool {
+        self.enable_os_input.load(Ordering::Acquire) && (self.permissions_ok)()
+    }
+
+    pub fn dispatch_key(&mut self, ev: &KeyEvent) -> Result<(), OsInputGateError> {
+        if !self.is_permitted() {
+            return Err(OsInputGateError::NotPermitted);
+        }
+        self.inner.send_key(ev).map_err(OsInputGateError::Os)
+    }
+
+    pub fn dispatch_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsInputGateError> {
+        if !self.is_permitted() {
+            return Err(OsInputGateError::NotPermitted);
+        }
+        self.inner.send_mouse(ev).map_err(OsInputGateError::Os)
+    }
+
+    /// Disables `enable_os_input` immediately and releases all held keys/buttons via the
+    /// underlying emergency releaser.
+    pub fn disable_and_release(&self) -> ReleaseReport {
+        self.enable_os_input.store(false, Ordering::Release);
+        self.inner.emergency_releaser().release_all_keys()
+    }
+}
+
+impl OsHidSink for GatedOsHidSink {
+    fn send_key(&mut self, ev: &KeyEvent) -> Result<(), OsError> {
+        match self.dispatch_key(ev) {
+            Ok(()) => Ok(()),
+            Err(OsInputGateError::NotPermitted) => {
+                Err(OsError::PermissionDenied(OsPermission::Accessibility))
+            }
+            Err(OsInputGateError::Os(e)) => Err(e),
+        }
+    }
+
+    fn send_mouse(&mut self, ev: &MouseEvent) -> Result<(), OsError> {
+        match self.dispatch_mouse(ev) {
+            Ok(()) => Ok(()),
+            Err(OsInputGateError::NotPermitted) => {
+                Err(OsError::PermissionDenied(OsPermission::Accessibility))
+            }
+            Err(OsInputGateError::Os(e)) => Err(e),
+        }
+    }
+
+    fn emergency_releaser(&self) -> Arc<dyn EmergencyKeyReleaser> {
+        self.inner.emergency_releaser()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::hid::MouseKind;
+    use std::sync::atomic::AtomicUsize;
+
+    struct CountingHidSink {
+        key_calls: Arc<AtomicUsize>,
+        mouse_calls: Arc<AtomicUsize>,
+        release_calls: Arc<AtomicUsize>,
+    }
+
+    struct CountingReleaser {
+        release_calls: Arc<AtomicUsize>,
+    }
+
+    impl EmergencyKeyReleaser for CountingReleaser {
+        fn release_all_keys(&self) -> ReleaseReport {
+            self.release_calls.fetch_add(1, Ordering::AcqRel);
+            ReleaseReport::default()
+        }
+    }
+
+    impl OsHidSink for CountingHidSink {
+        fn send_key(&mut self, _ev: &KeyEvent) -> Result<(), OsError> {
+            self.key_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn send_mouse(&mut self, _ev: &MouseEvent) -> Result<(), OsError> {
+            self.mouse_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn emergency_releaser(&self) -> Arc<dyn EmergencyKeyReleaser> {
+            Arc::new(CountingReleaser {
+                release_calls: Arc::clone(&self.release_calls),
+            })
+        }
+    }
+
+    fn sample_key_down() -> KeyEvent {
+        KeyEvent {
+            down: true,
+            modifiers: 0,
+            usb_hid_usage: 0x04,
+            unicode_scalar: 0,
+            client_ts_ms: 1,
+        }
+    }
+
+    fn sample_mouse_down() -> MouseEvent {
+        MouseEvent {
+            kind: MouseKind::Down,
+            buttons: 1,
+            x_or_dx: 100,
+            y_or_dy: 200,
+            wheel_dx: 0,
+            wheel_dy: 0,
+            client_ts_ms: 1,
+        }
+    }
 
     #[test]
     fn hid_usage_to_macos_keycode_pure_allowlist_mapping() {
@@ -691,5 +932,84 @@ mod tests {
         assert!(RealInputPermit::from_explicit_opt_in(true).is_err());
         #[cfg(feature = "real-input")]
         assert!(RealInputPermit::from_explicit_opt_in(true).is_ok());
+    }
+
+    #[test]
+    fn gated_os_hid_sink_fails_closed_with_zero_injector_calls_when_unpermitted_or_disabled() {
+        let key_calls = Arc::new(AtomicUsize::new(0));
+        let mouse_calls = Arc::new(AtomicUsize::new(0));
+        let release_calls = Arc::new(AtomicUsize::new(0));
+        let enable_os_input = Arc::new(AtomicBool::new(false));
+        let screen_ok = Arc::new(AtomicBool::new(true));
+        let ax_ok = Arc::new(AtomicBool::new(true));
+
+        let screen_c = Arc::clone(&screen_ok);
+        let ax_c = Arc::clone(&ax_ok);
+        let mut gate = GatedOsHidSink::new(
+            Box::new(CountingHidSink {
+                key_calls: Arc::clone(&key_calls),
+                mouse_calls: Arc::clone(&mouse_calls),
+                release_calls: Arc::clone(&release_calls),
+            }),
+            Arc::clone(&enable_os_input),
+            Arc::new(move || screen_c.load(Ordering::Acquire) && ax_c.load(Ordering::Acquire)),
+        );
+
+        // 1. Default OFF (enable_os_input == false) even with both permissions granted -> 0 calls, not_permitted.
+        let k_err = gate.dispatch_key(&sample_key_down()).unwrap_err();
+        let m_err = gate.dispatch_mouse(&sample_mouse_down()).unwrap_err();
+        assert_eq!(k_err, OsInputGateError::NotPermitted);
+        assert_eq!(k_err.status_code(), "not_permitted");
+        assert_eq!(m_err, OsInputGateError::NotPermitted);
+        assert_eq!(key_calls.load(Ordering::Acquire), 0);
+        assert_eq!(mouse_calls.load(Ordering::Acquire), 0);
+
+        // 2. enable_os_input == true but Screen Recording missing -> 0 calls, not_permitted.
+        enable_os_input.store(true, Ordering::Release);
+        screen_ok.store(false, Ordering::Release);
+        assert_eq!(
+            gate.dispatch_key(&sample_key_down()),
+            Err(OsInputGateError::NotPermitted)
+        );
+        assert_eq!(
+            gate.dispatch_mouse(&sample_mouse_down()),
+            Err(OsInputGateError::NotPermitted)
+        );
+        assert_eq!(key_calls.load(Ordering::Acquire), 0);
+        assert_eq!(mouse_calls.load(Ordering::Acquire), 0);
+
+        // 3. enable_os_input == true, Screen Recording granted, Accessibility missing -> 0 calls, not_permitted.
+        screen_ok.store(true, Ordering::Release);
+        ax_ok.store(false, Ordering::Release);
+        assert_eq!(
+            gate.dispatch_key(&sample_key_down()),
+            Err(OsInputGateError::NotPermitted)
+        );
+        assert_eq!(
+            gate.dispatch_mouse(&sample_mouse_down()),
+            Err(OsInputGateError::NotPermitted)
+        );
+        assert_eq!(key_calls.load(Ordering::Acquire), 0);
+        assert_eq!(mouse_calls.load(Ordering::Acquire), 0);
+
+        // 4. Both permissions granted + enable_os_input == true -> ONLY the newly sent event reaches
+        //    the injector (proving ZERO queuing/buffering of previously dropped events!).
+        ax_ok.store(true, Ordering::Release);
+        gate.dispatch_key(&sample_key_down()).unwrap();
+        gate.dispatch_mouse(&sample_mouse_down()).unwrap();
+        assert_eq!(key_calls.load(Ordering::Acquire), 1);
+        assert_eq!(mouse_calls.load(Ordering::Acquire), 1);
+
+        // 5. Emergency disable_and_release immediately flips enable_os_input = false, calls releaser,
+        //    and blocks subsequent events with 0 additional injector calls.
+        let _ = gate.disable_and_release();
+        assert!(!enable_os_input.load(Ordering::Acquire));
+        assert_eq!(release_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            gate.dispatch_key(&sample_key_down()),
+            Err(OsInputGateError::NotPermitted)
+        );
+        assert_eq!(key_calls.load(Ordering::Acquire), 1);
+        assert_eq!(mouse_calls.load(Ordering::Acquire), 1);
     }
 }

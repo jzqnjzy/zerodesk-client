@@ -12,13 +12,18 @@ public enum RemoteMouseKind: String, Sendable, Equatable {
     case wheel = "wheel"
 }
 
-/// All 5 GLM-5.4 anti-stuck-key `releaseAll` triggers.
+/// All anti-stuck-key `releaseAll` triggers (Phase 7B + Phase 8A UI triggers).
 public enum ReleaseReason: String, Sendable, CaseIterable, Equatable {
     case windowResignedKey
     case appResignedActiveOrHidden
     case sessionLeftConnected
     case emergencyEscapeHotkey
     case viewTeardownOrTerminate
+    case focusLost
+    case uiOverlayOpened
+    case mouseExitedView
+    case viewportChanged
+    case inputDisabled
 }
 
 /// Snapshot of held inputs atomically cleared by a single `releaseAll(reason:)` invocation.

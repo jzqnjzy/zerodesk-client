@@ -16,6 +16,7 @@ struct EventQueues {
     seq: u64,
     critical: VecDeque<BridgeEvent>,
     dropped_critical: u64,
+    hud_latest: Option<BridgeEvent>,
     telemetry_latest: Option<BridgeEvent>,
     last_notified_frame_seq: u64,
     closed: bool,
@@ -49,6 +50,7 @@ impl BridgeEventHub {
                 seq: 0,
                 critical: VecDeque::with_capacity(64),
                 dropped_critical: 0,
+                hud_latest: None,
                 telemetry_latest: None,
                 last_notified_frame_seq: 0,
                 closed: false,
@@ -73,6 +75,20 @@ impl BridgeEventHub {
             v: BRIDGE_ABI_VERSION,
             seq,
             kind: kind.to_string(),
+            payload,
+        });
+        self.cvar.notify_all();
+    }
+
+    /// Overwrites the droppable 1 Hz HUD telemetry slot (`hud_stats`) without blocking or
+    /// evicting critical events and without racing against `QoeTelemetry`.
+    pub fn set_hud_stats(&self, payload: serde_json::Value) {
+        let mut g = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = g.next_seq();
+        g.hud_latest = Some(BridgeEvent {
+            v: BRIDGE_ABI_VERSION,
+            seq,
+            kind: "hud_stats".to_string(),
             payload,
         });
         self.cvar.notify_all();
@@ -195,7 +211,11 @@ impl BridgeEventHub {
                 }
             }
         }
-        // 3. Droppable overwrite telemetry slot last.
+        // 3. Dedicated 1 Hz HUD stats slot (never collides with QoeTelemetry).
+        if let Some(ev) = g.hud_latest.take() {
+            return Ok(ev);
+        }
+        // 4. Droppable overwrite telemetry slot last.
         if let Some(ev) = g.telemetry_latest.take() {
             return Ok(ev);
         }

@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "seq": 42,
+  "kind": "permission_status",
+  "payload": {
+    "screen_capture_granted": true,
+    "accessibility_granted": false,
+    "probe_source": "watchdog_or_injector_process",
+    "enable_os_input": false,
+    "secure_event_input_enabled": false
+  }
+}
