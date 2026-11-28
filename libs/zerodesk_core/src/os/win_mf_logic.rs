@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MF_MAX_REINIT_RETRIES: u8 = 2;
 pub const DEFAULT_MF_MAX_FRAMES_BEFORE_FIRST_IDR: u32 = 15;
+pub const STABLE_FRAMES_TO_RESET_REINIT: u32 = 30;
 
 /// Well-known Windows Media Foundation & DXGI HRESULT values.
 pub const MF_E_TRANSFORM_NEED_MORE_INPUT: i32 = 0xC00D_6D72u32 as i32;
@@ -312,6 +313,7 @@ pub struct MfHwEncoderStateMachine {
     max_reinit_retries: u8,
     frames_since_wait_idr: u32,
     max_frames_before_first_idr: u32,
+    stable_frames_since_ready: u32,
     idr_frames_encoded: u64,
     total_frames_encoded: u64,
     events: Vec<HardwareCodecEvent>,
@@ -327,6 +329,7 @@ impl MfHwEncoderStateMachine {
             max_reinit_retries: DEFAULT_MF_MAX_REINIT_RETRIES,
             frames_since_wait_idr: 0,
             max_frames_before_first_idr: DEFAULT_MF_MAX_FRAMES_BEFORE_FIRST_IDR,
+            stable_frames_since_ready: 0,
             idr_frames_encoded: 0,
             total_frames_encoded: 0,
             events: Vec::new(),
@@ -375,6 +378,10 @@ impl MfHwEncoderStateMachine {
         self.frames_since_wait_idr
     }
 
+    pub fn stable_frames_since_ready(&self) -> u32 {
+        self.stable_frames_since_ready
+    }
+
     pub fn idr_frames_encoded(&self) -> u64 {
         self.idr_frames_encoded
     }
@@ -414,6 +421,7 @@ impl MfHwEncoderStateMachine {
         if matches!(self.state, MfHwEncoderState::Initialized) {
             self.state = MfHwEncoderState::WaitingFirstIdr;
             self.frames_since_wait_idr = 0;
+            self.stable_frames_since_ready = 0;
             Ok(())
         } else {
             Err(VideoError::Encoder(format!(
@@ -447,8 +455,10 @@ impl MfHwEncoderStateMachine {
     ///
     /// Contract: transitions to `HardwareReady` ONLY when `is_idr == true` AND
     /// `byte_len > 0` while in `WaitingFirstIdr`. Resets `reinit_attempts = 0`
-    /// on healthy transition to `HardwareReady`. Non-IDR, empty, or post-terminal
-    /// samples NEVER promote the encoder to `HardwareReady`.
+    /// ONLY once `HardwareReady` has sustained `STABLE_FRAMES_TO_RESET_REINIT`
+    /// consecutive non-empty frames so flapping hardware encoders cannot loop
+    /// forever. Non-IDR, empty, or post-terminal samples NEVER promote the
+    /// encoder to `HardwareReady`.
     pub fn on_sample_encoded(&mut self, is_idr: bool, byte_len: usize) -> bool {
         if byte_len == 0 || self.needs_renegotiation() {
             return false;
@@ -459,13 +469,19 @@ impl MfHwEncoderStateMachine {
         }
         if matches!(self.state, MfHwEncoderState::WaitingFirstIdr) && is_idr {
             self.state = MfHwEncoderState::HardwareReady;
-            self.reinit_attempts = 0;
             self.frames_since_wait_idr = 0;
+            self.stable_frames_since_ready = 0;
             self.events.push(HardwareCodecEvent::HardwareReady {
                 codec: self.codec.to_hardware_codec_kind(),
                 backend: format!("windows_mf_hw:{}", self.mft_name),
             });
             return true;
+        }
+        if matches!(self.state, MfHwEncoderState::HardwareReady) {
+            self.stable_frames_since_ready = self.stable_frames_since_ready.saturating_add(1);
+            if self.stable_frames_since_ready >= STABLE_FRAMES_TO_RESET_REINIT {
+                self.reinit_attempts = 0;
+            }
         }
         false
     }
@@ -490,6 +506,7 @@ impl MfHwEncoderStateMachine {
             };
         }
         let reason_str = reason.into();
+        self.stable_frames_since_ready = 0;
         if self.reinit_attempts < self.max_reinit_retries {
             self.reinit_attempts = self.reinit_attempts.saturating_add(1);
             let attempt = self.reinit_attempts;
@@ -524,6 +541,7 @@ impl MfHwEncoderStateMachine {
         if matches!(self.state, MfHwEncoderState::ReinitRetry(_)) {
             self.state = MfHwEncoderState::WaitingFirstIdr;
             self.frames_since_wait_idr = 0;
+            self.stable_frames_since_ready = 0;
             Ok(())
         } else {
             Err(VideoError::Encoder(format!(
@@ -906,9 +924,14 @@ mod tests {
         assert!(!sm.on_first_idr_encoded(0));
         assert!(!sm.is_hardware_ready());
 
-        // First real IDR keyframe promotes to HardwareReady AND resets reinit_attempts to 0!
+        // First real IDR keyframe promotes to HardwareReady, while reinit_attempts
+        // remains non-zero until STABLE_FRAMES_TO_RESET_REINIT good frames complete.
         assert!(sm.on_first_idr_encoded(12_345));
         assert!(sm.is_hardware_ready());
+        assert_eq!(sm.reinit_attempts(), 1);
+        for _ in 0..STABLE_FRAMES_TO_RESET_REINIT {
+            assert!(!sm.on_sample_encoded(false, 2048));
+        }
         assert_eq!(sm.reinit_attempts(), 0);
         let _ = sm.drain_events();
 
@@ -950,6 +973,82 @@ mod tests {
         assert!(sm.drain_events().is_empty());
         assert!(!sm.on_first_idr_encoded(4096));
         assert!(sm.needs_renegotiation());
+    }
+
+    #[test]
+    fn flapping_encoder_exhausts_retry_budget_and_reaches_failed_needs_renegotiation() {
+        let mut sm = MfHwEncoderStateMachine::new(MfHwCodec::H264, "NVIDIA H.264 Encoder MFT")
+            .with_max_reinit_retries(2);
+        sm.on_initialized().unwrap();
+        sm.on_streaming_started().unwrap();
+
+        // Fail #1 -> reinit -> 1 IDR -> immediate fail before stability window
+        assert_eq!(
+            sm.on_hw_error("flap 1"),
+            MfErrorDecision::RetryReinit { attempt: 1 }
+        );
+        sm.on_reinit_succeeded().unwrap();
+        assert!(sm.on_first_idr_encoded(8192));
+        assert!(sm.is_hardware_ready());
+        assert_eq!(sm.reinit_attempts(), 1);
+
+        // Fail #2 -> reinit -> 1 IDR -> immediate fail before stability window
+        assert_eq!(
+            sm.on_hw_error("flap 2"),
+            MfErrorDecision::RetryReinit { attempt: 2 }
+        );
+        sm.on_reinit_succeeded().unwrap();
+        assert!(sm.on_first_idr_encoded(8192));
+        assert!(sm.is_hardware_ready());
+        assert_eq!(sm.reinit_attempts(), 2);
+
+        // Fail #3 -> retry budget exhausted, transitions to terminal FailedNeedsRenegotiation
+        assert_eq!(
+            sm.on_hw_error("flap 3"),
+            MfErrorDecision::FailedNeedsRenegotiation {
+                event_code: HW_ENCODER_FAILED_RENEGOTIATE_EVENT,
+                reason: "flap 3".into(),
+            }
+        );
+        assert!(sm.needs_renegotiation());
+    }
+
+    #[test]
+    fn stable_recovery_resets_reinit_attempts_after_stability_window() {
+        let mut sm = MfHwEncoderStateMachine::new(MfHwCodec::Av1, "Intel AV1 Encoder MFT")
+            .with_max_reinit_retries(2);
+        sm.on_initialized().unwrap();
+        sm.on_streaming_started().unwrap();
+
+        assert_eq!(
+            sm.on_hw_error("transient 1"),
+            MfErrorDecision::RetryReinit { attempt: 1 }
+        );
+        sm.on_reinit_succeeded().unwrap();
+        assert!(sm.on_first_idr_encoded(16_384));
+        assert!(sm.is_hardware_ready());
+        assert_eq!(sm.reinit_attempts(), 1);
+        assert_eq!(sm.stable_frames_since_ready(), 0);
+
+        // 29 good frames + an empty frame MUST NOT reset reinit_attempts yet.
+        for _ in 0..(STABLE_FRAMES_TO_RESET_REINIT - 1) {
+            assert!(!sm.on_sample_encoded(false, 1024));
+        }
+        assert!(!sm.on_sample_encoded(false, 0));
+        assert_eq!(sm.stable_frames_since_ready(), STABLE_FRAMES_TO_RESET_REINIT - 1);
+        assert_eq!(sm.reinit_attempts(), 1);
+
+        // 30th good frame completes the stability window and resets reinit_attempts to 0.
+        assert!(!sm.on_sample_encoded(false, 1024));
+        assert_eq!(sm.stable_frames_since_ready(), STABLE_FRAMES_TO_RESET_REINIT);
+        assert_eq!(sm.reinit_attempts(), 0);
+
+        // A later transient failure receives a fresh retry budget (attempt: 1).
+        assert_eq!(
+            sm.on_hw_error("transient 2"),
+            MfErrorDecision::RetryReinit { attempt: 1 }
+        );
+        assert_eq!(sm.stable_frames_since_ready(), 0);
     }
 
     #[test]

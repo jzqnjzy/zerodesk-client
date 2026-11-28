@@ -41,7 +41,7 @@ use std::{
 use windows::{
     core::{Interface, GUID, PWSTR, VARIANT},
     Win32::{
-        Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK},
+        Foundation::{E_NOINTERFACE, RPC_E_CHANGED_MODE, S_FALSE, S_OK},
         Graphics::{
             Direct3D11::{
                 ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
@@ -63,7 +63,7 @@ use windows::{
             IMFMediaType, IMFSample, IMFTransform, MFCreateDXGIDeviceManager,
             MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
             MFShutdown, MFStartup, MFTEnumEx, CODECAPI_AVEncCommonMeanBitRate,
-            CODECAPI_AVEncVideoForceKeyFrame, METransformHaveOutput, METransformNeedInput,
+            CODECAPI_AVEncVideoForceKeyFrame, MEError, METransformHaveOutput, METransformNeedInput,
             MFMediaType_Video, MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER,
             MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
             MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH,
@@ -82,6 +82,7 @@ use windows::{
 
 const ASYNC_EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 const ASYNC_POLL_SLEEP: Duration = Duration::from_millis(1);
+const NV12_RING_LEN: usize = 8;
 
 fn codec_to_mf_subtype(codec: MfHwCodec) -> GUID {
     match codec {
@@ -242,13 +243,17 @@ fn enumerate_raw_hw_mft_activates(codec: MfHwCodec) -> Result<Vec<IMFActivate>, 
 }
 
 /// GPU-side BGRA -> NV12 D3D11 Video Processor pipeline for zero-copy MFT encoding.
+///
+/// Uses a ring of `NV12_RING_LEN` output textures so pipelined / lookahead hardware
+/// MFTs retaining prior `IMFSample` references never race with the next frame's
+/// `VideoProcessorBlt`.
 struct D3d11Nv12Converter {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
-    nv12_texture: ID3D11Texture2D,
-    output_view: ID3D11VideoProcessorOutputView,
+    ring: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
+    next_slot: usize,
     frame_index: u32,
 }
 
@@ -285,6 +290,10 @@ impl D3d11Nv12Converter {
             .map_err(|e| VideoError::Encoder(format!("CreateVideoProcessorEnumerator failed: {e}")))?;
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .map_err(|e| VideoError::Encoder(format!("CreateVideoProcessor failed: {e}")))?;
+        // Disable driver auto-processing filters to avoid unwanted sharpening/denoise or temporal state.
+        unsafe {
+            video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
+        }
 
         let nv12_desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -301,42 +310,48 @@ impl D3d11Nv12Converter {
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        let mut nv12_texture: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&nv12_desc, None, Some(&mut nv12_texture)) }
-            .map_err(|e| VideoError::Encoder(format!("CreateTexture2D(NV12) failed: {e}")))?;
-        let nv12_texture = nv12_texture
-            .ok_or_else(|| VideoError::Encoder("CreateTexture2D(NV12) returned null".into()))?;
-
-        let out_res: ID3D11Resource = nv12_texture
-            .cast()
-            .map_err(|e| VideoError::Encoder(format!("NV12 texture cast to ID3D11Resource failed: {e}")))?;
         let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
                 Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
             },
         };
-        let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
-        unsafe {
-            video_device.CreateVideoProcessorOutputView(
-                &out_res,
-                &enumerator,
-                &out_desc,
-                Some(&mut output_view),
-            )
+        let mut ring = Vec::with_capacity(NV12_RING_LEN);
+        for _ in 0..NV12_RING_LEN {
+            let mut nv12_texture: Option<ID3D11Texture2D> = None;
+            unsafe { device.CreateTexture2D(&nv12_desc, None, Some(&mut nv12_texture)) }
+                .map_err(|e| VideoError::Encoder(format!("CreateTexture2D(NV12) failed: {e}")))?;
+            let nv12_texture = nv12_texture
+                .ok_or_else(|| VideoError::Encoder("CreateTexture2D(NV12) returned null".into()))?;
+
+            let out_res: ID3D11Resource = nv12_texture.cast().map_err(|e| {
+                VideoError::Encoder(format!("NV12 texture cast to ID3D11Resource failed: {e}"))
+            })?;
+            let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
+            unsafe {
+                video_device.CreateVideoProcessorOutputView(
+                    &out_res,
+                    &enumerator,
+                    &out_desc,
+                    Some(&mut output_view),
+                )
+            }
+            .map_err(|e| {
+                VideoError::Encoder(format!("CreateVideoProcessorOutputView failed: {e}"))
+            })?;
+            let output_view = output_view.ok_or_else(|| {
+                VideoError::Encoder("CreateVideoProcessorOutputView returned null".into())
+            })?;
+            ring.push((nv12_texture, output_view));
         }
-        .map_err(|e| VideoError::Encoder(format!("CreateVideoProcessorOutputView failed: {e}")))?;
-        let output_view = output_view.ok_or_else(|| {
-            VideoError::Encoder("CreateVideoProcessorOutputView returned null".into())
-        })?;
 
         Ok(Self {
             video_device,
             video_context,
             enumerator,
             processor,
-            nv12_texture,
-            output_view,
+            ring,
+            next_slot: 0,
             frame_index: 0,
         })
     }
@@ -382,11 +397,12 @@ impl D3d11Nv12Converter {
             pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
             ppFutureSurfacesRight: ptr::null_mut(),
         };
+        let slot_idx = self.next_slot;
         let mut streams = [stream];
         let blt_res = unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
-                &self.output_view,
+                &self.ring[slot_idx].1,
                 self.frame_index,
                 &streams,
             )
@@ -396,8 +412,9 @@ impl D3d11Nv12Converter {
         let _input_view_r =
             unsafe { std::mem::ManuallyDrop::take(&mut streams[0].pInputSurfaceRight) };
         blt_res.map_err(|e| VideoError::Encoder(format!("VideoProcessorBlt(BGRA->NV12) failed: {e}")))?;
+        self.next_slot = (slot_idx + 1) % self.ring.len();
         self.frame_index = self.frame_index.wrapping_add(1);
-        Ok(self.nv12_texture.clone())
+        Ok(self.ring[slot_idx].0.clone())
     }
 }
 
@@ -443,6 +460,8 @@ pub struct WinMfHardwareEncoder {
     activate: IMFActivate,
     state_machine: MfHwEncoderStateMachine,
     force_next_idr: bool,
+    need_input_credits: u32,
+    logged_missing_codec_api: bool,
     // Declared LAST so Rust drops all COM/MF objects before MFShutdown & CoUninitialize!
     _mf_guard: MfRuntimeGuard,
     _com_guard: ComMtaGuard,
@@ -476,6 +495,8 @@ impl WinMfHardwareEncoder {
             activate: built.activate,
             state_machine,
             force_next_idr: true,
+            need_input_credits: 0,
+            logged_missing_codec_api: false,
             _mf_guard: mf_guard,
             _com_guard: com_guard,
         })
@@ -688,10 +709,25 @@ impl WinMfHardwareEncoder {
         Ok(())
     }
 
-    fn apply_force_idr_codec_api(&self) -> Result<(), VideoError> {
-        let codec_api: ICodecAPI = self.transform.cast().map_err(|e| {
-            VideoError::Encoder(format!("QueryInterface(ICodecAPI) for force-IDR failed: {e}"))
-        })?;
+    fn apply_force_idr_codec_api(&mut self) -> Result<(), VideoError> {
+        let codec_api: ICodecAPI = match self.transform.cast() {
+            Ok(api) => api,
+            Err(e) if e.code() == E_NOINTERFACE => {
+                if !self.logged_missing_codec_api {
+                    self.logged_missing_codec_api = true;
+                    eprintln!(
+                        "[zerodesk][win_mf] hardware MFT '{}' does not expose ICodecAPI (E_NOINTERFACE); skipping force-IDR request",
+                        self.state_machine.mft_name()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(VideoError::Encoder(format!(
+                    "QueryInterface(ICodecAPI) for force-IDR failed: {e}"
+                )));
+            }
+        };
         let val_bool = VARIANT::from(true);
         if unsafe { codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &val_bool) }.is_ok() {
             return Ok(());
@@ -705,6 +741,7 @@ impl WinMfHardwareEncoder {
     }
 
     fn shutdown_current_mft(&mut self) {
+        self.need_input_credits = 0;
         unsafe {
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             let _ = self
@@ -726,6 +763,8 @@ impl WinMfHardwareEncoder {
                         self.dxgi_manager = built.dxgi_manager;
                         self.nv12_converter = built.nv12_converter;
                         self.force_next_idr = true;
+                        self.need_input_credits = 0;
+                        self.logged_missing_codec_api = false;
                         if let Err(e) = self.state_machine.on_reinit_succeeded() {
                             return e;
                         }
@@ -848,23 +887,37 @@ impl WinMfHardwareEncoder {
 
         let mut packets = Vec::new();
         if let Some(eg) = self.event_gen.clone() {
-            // Asynchronous hardware MFT path: pump METransformNeedInput / METransformHaveOutput
-            // with a strict bounded deadline so we never block indefinitely.
+            // Asynchronous hardware MFT path: bank every METransformNeedInput into
+            // `need_input_credits` (never dropping credits when input_fed == true),
+            // handle MEError explicitly, and pump METransformHaveOutput with a bounded deadline.
             let deadline = Instant::now() + ASYNC_EVENT_TIMEOUT;
             let mut input_fed = false;
             loop {
+                if !input_fed && self.need_input_credits > 0 {
+                    if let Err(err) = unsafe { self.transform.ProcessInput(0, sample, 0) } {
+                        return Err(self.handle_midstream_failure(format!(
+                            "async ProcessInput failed: {err}"
+                        )));
+                    }
+                    self.need_input_credits -= 1;
+                    input_fed = true;
+                }
+
                 match unsafe { eg.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                     Ok(ev) => {
                         let ev_type = unsafe { ev.GetType() }.map_err(|e| {
                             self.handle_midstream_failure(format!("IMFMediaEvent::GetType failed: {e}"))
                         })?;
-                        if ev_type == METransformNeedInput.0 as u32 && !input_fed {
-                            if let Err(err) = unsafe { self.transform.ProcessInput(0, sample, 0) } {
-                                return Err(self.handle_midstream_failure(format!(
-                                    "async ProcessInput failed: {err}"
-                                )));
-                            }
-                            input_fed = true;
+                        if ev_type == MEError.0 as u32 {
+                            let status_desc = match unsafe { ev.GetStatus() } {
+                                Ok(hr) => format!("{hr:?}"),
+                                Err(e) => format!("GetStatus failed: {e}"),
+                            };
+                            return Err(self.handle_midstream_failure(format!(
+                                "async MF hardware MFT emitted MEError ({status_desc})"
+                            )));
+                        } else if ev_type == METransformNeedInput.0 as u32 {
+                            self.need_input_credits = self.need_input_credits.saturating_add(1);
                         } else if ev_type == METransformHaveOutput.0 as u32 {
                             if let Some(pkt) = self.pull_one_output_packet(pts_us)? {
                                 packets.push(pkt);
@@ -1168,6 +1221,8 @@ impl HardwareVideoEncoder for WinMfHardwareEncoder {
         self.dxgi_manager = built.dxgi_manager;
         self.nv12_converter = built.nv12_converter;
         self.force_next_idr = true;
+        self.need_input_credits = 0;
+        self.logged_missing_codec_api = false;
         let mut fresh_sm = MfHwEncoderStateMachine::new(self.cfg.codec, built.mft_name);
         fresh_sm.on_initialized()?;
         fresh_sm.on_streaming_started()?;
