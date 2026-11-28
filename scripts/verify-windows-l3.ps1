@@ -8,11 +8,12 @@
 #     NEVER initiates network connections, and NEVER dumps process environment variables.
 #   - All emitted JSON strings pass through Scrub-Text() to strip local user/host/repo paths,
 #     and hardware adapter LUIDs are hashed to the first 8 lowercase hex chars of SHA-256.
-#   - Anti-forgery redline: `-Mode ci` is code-level forbidden from emitting status `PASS`.
+#   - Anti-forgery redline: `-Mode ci` and CI runners (`CI=true|1`, `GITHUB_ACTIONS=true|1`) are
+#     code-level forbidden from emitting status `PASS`.
 #
 # Exit Codes:
 #   0  = CI mode with 0 FAIL | -DryRun on non-Windows | strict-l3 with 12/12 PASS
-#   10 = strict-l3 mode with 0 FAIL and >=1 non-PASS item (e.g. PENDING_PHYSICAL_L3)
+#   10 = strict-l3 mode with 0 FAIL and >=1 non-PASS item (e.g. L2_NATIVE_PASS / PENDING_PHYSICAL_L3)
 #   20 = At least one item reported FAIL
 #   30 = Script/runtime error, invalid arguments, or CI anti-forgery invariant violation
 #   40 = Unsupported platform (non-Windows host without -DryRun)
@@ -22,6 +23,7 @@ param(
     [string]$Mode = 'ci',
     [string]$Output = 'zerodesk-windows-l3-report.json',
     [string]$DiagBin = '',
+    [string]$WatchdogBin = '',
     [switch]$DryRun,
     [switch]$Help
 )
@@ -31,12 +33,16 @@ $ErrorActionPreference = 'Stop'
 
 function Show-Usage {
     @"
-Usage: verify-windows-l3.ps1 [-Mode ci|strict-l3] [-Output <path|->] [-DiagBin <path>] [-DryRun] [-Help]
+Usage: verify-windows-l3.ps1 [-Mode ci|strict-l3] [-Output <path|->] [-DiagBin <path>] [-WatchdogBin <path>] [-DryRun] [-Help]
 
 Options:
-  -Mode <ci|strict-l3>  Verification mode (default: ci). CI mode NEVER emits PASS.
+  -Mode <ci|strict-l3>  Verification mode (default: ci). CI mode and CI runners NEVER emit PASS.
+                        Automated strict-l3 preserves L2_NATIVE_PASS on headless Win32 probes and
+                        exits 10 whenever physical GPU/DXGI/MF items remain PENDING_PHYSICAL_L3
+                        until verified on real NVIDIA/AMD/Intel Windows hardware.
   -Output <path|->      Output JSON report path (default: zerodesk-windows-l3-report.json; '-' = stdout).
   -DiagBin <path>       Optional path to zerodesk-win-diag.exe.
+  -WatchdogBin <path>   Optional path to zerodesk-hid-watchdog.exe.
   -DryRun               Emit schema-valid SKIPPED_UNSUPPORTED_PLATFORM report on non-Windows hosts (exit 0).
   -Help                 Show this help message and exit 0.
 
@@ -59,11 +65,39 @@ if ($Mode -ne 'ci' -and $Mode -ne 'strict-l3') {
     exit 30
 }
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Split-Path -Parent $ScriptDir
+$RepoRoot = ''
 $StartedAtUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-$IsCiRunner = ($env:CI -eq 'true' -or $env:GITHUB_ACTIONS -eq 'true')
+$CiEnvVal = if ($null -ne $env:CI) { $env:CI.Trim().ToLowerInvariant() } else { '' }
+$GhEnvVal = if ($null -ne $env:GITHUB_ACTIONS) { $env:GITHUB_ACTIONS.Trim().ToLowerInvariant() } else { '' }
+$IsCiRunner = ($CiEnvVal -eq 'true' -or $CiEnvVal -eq '1' -or $GhEnvVal -eq 'true' -or $GhEnvVal -eq '1')
 $IsWindowsHost = ($env:OS -eq 'Windows_NT') -or ($PSVersionTable.Platform -eq 'Win32NT')
+
+function Get-SafeProp {
+    param(
+        [object]$Obj,
+        [string]$Name,
+        [object]$Default = $null
+    )
+    if ($null -eq $Obj) {
+        return $Default
+    }
+    $prop = $Obj.PSObject.Properties[$Name]
+    if ($null -eq $prop) {
+        return $Default
+    }
+    return $prop.Value
+}
+
+function Test-HasProp {
+    param(
+        [object]$Obj,
+        [string]$Name
+    )
+    if ($null -eq $Obj) {
+        return $false
+    }
+    return ($null -ne $Obj.PSObject.Properties[$Name])
+}
 
 function Get-ShortSha256 {
     param([string]$InputText)
@@ -88,15 +122,37 @@ function Scrub-Text {
     }
     $s = $Text
     if (-not [string]::IsNullOrEmpty($RepoRoot)) {
-        $s = $s.Replace($RepoRoot, '<REPO>')
-        $s = $s.Replace(($RepoRoot -replace '\\', '/'), '<REPO>')
+        $s = [System.Text.RegularExpressions.Regex]::Replace(
+            $s,
+            '(?i)' + [System.Text.RegularExpressions.Regex]::Escape($RepoRoot),
+            '<REPO>'
+        )
+        $repoSlash = $RepoRoot -replace '\\', '/'
+        $s = [System.Text.RegularExpressions.Regex]::Replace(
+            $s,
+            '(?i)' + [System.Text.RegularExpressions.Regex]::Escape($repoSlash),
+            '<REPO>'
+        )
     }
     if (-not [string]::IsNullOrEmpty($env:USERPROFILE)) {
-        $s = $s.Replace($env:USERPROFILE, '<HOME>')
-        $s = $s.Replace(($env:USERPROFILE -replace '\\', '/'), '<HOME>')
+        $s = [System.Text.RegularExpressions.Regex]::Replace(
+            $s,
+            '(?i)' + [System.Text.RegularExpressions.Regex]::Escape($env:USERPROFILE),
+            '<HOME>'
+        )
+        $profSlash = $env:USERPROFILE -replace '\\', '/'
+        $s = [System.Text.RegularExpressions.Regex]::Replace(
+            $s,
+            '(?i)' + [System.Text.RegularExpressions.Regex]::Escape($profSlash),
+            '<HOME>'
+        )
     }
     if (-not [string]::IsNullOrEmpty($env:HOME)) {
-        $s = $s.Replace($env:HOME, '<HOME>')
+        $s = [System.Text.RegularExpressions.Regex]::Replace(
+            $s,
+            '(?i)' + [System.Text.RegularExpressions.Regex]::Escape($env:HOME),
+            '<HOME>'
+        )
     }
     $macUsersPrefix = '/Us' + 'ers/'
     $s = [System.Text.RegularExpressions.Regex]::Replace($s, '(?i)[A-Z]:\\Users\\[^\\\s"''/]+', '<HOME>')
@@ -118,6 +174,42 @@ function Scrub-Text {
         )
     }
     return $s
+}
+
+function Resolve-TargetBinary {
+    param(
+        [string]$ExplicitPath,
+        [string]$BinaryName
+    )
+    if (-not [string]::IsNullOrEmpty($ExplicitPath)) {
+        return $ExplicitPath
+    }
+    $roots = @()
+    if (-not [string]::IsNullOrEmpty($env:CARGO_TARGET_DIR)) {
+        $roots += $env:CARGO_TARGET_DIR
+    }
+    if (-not [string]::IsNullOrEmpty($env:RUNNER_TEMP)) {
+        $roots += (Join-Path $env:RUNNER_TEMP 'target')
+    }
+    if (-not [string]::IsNullOrEmpty($RepoRoot)) {
+        $roots += (Join-Path $RepoRoot 'libs\zerodesk_core\target')
+        $roots += (Join-Path $RepoRoot 'target')
+    }
+    $relDirs = @(
+        'release',
+        'debug',
+        'x86_64-pc-windows-msvc\release',
+        'x86_64-pc-windows-msvc\debug'
+    )
+    foreach ($root in $roots) {
+        foreach ($rel in $relDirs) {
+            $cand = Join-Path (Join-Path $root $rel) $BinaryName
+            if (Test-Path -LiteralPath $cand) {
+                return $cand
+            }
+        }
+    }
+    return ''
 }
 
 $Checklist = @(
@@ -154,8 +246,8 @@ function New-ReportItem {
     if ($validStatuses -notcontains $Status) {
         throw "Invalid status '$Status' for $($Spec.id)"
     }
-    if ($Mode -eq 'ci' -and $Status -eq 'PASS') {
-        throw "ANTI-FORGERY VIOLATION: -Mode ci forbids emitting status PASS (item=$($Spec.id))"
+    if (($Mode -eq 'ci' -or $IsCiRunner) -and $Status -eq 'PASS') {
+        throw "ANTI-FORGERY VIOLATION: ci mode / CI runner forbids emitting status PASS (item=$($Spec.id))"
     }
     if ($Status -eq 'PASS' -and ([string]::IsNullOrEmpty($HardwareFingerprint) -or $HardwareFingerprint -notmatch '^[0-9a-f]{8}$')) {
         throw "ANTI-FORGERY VIOLATION: status PASS requires an 8-hex-char hardware_fingerprint (item=$($Spec.id))"
@@ -181,7 +273,7 @@ function Write-ReportAtomic {
         [string]$TargetPath
     )
     # Final anti-forgery gate prior to emission
-    if ($ReportObj['mode'] -eq 'ci') {
+    if ($ReportObj['mode'] -eq 'ci' -or $ReportObj['ci_runner']) {
         if ($ReportObj['summary']['pass'] -ne 0) {
             throw "ANTI-FORGERY VIOLATION: CI report summary.pass must be 0"
         }
@@ -242,6 +334,9 @@ function Build-Summary {
 }
 
 try {
+    $ScriptDir = Split-Path -Parent $PSCommandPath
+    $RepoRoot = Split-Path -Parent $ScriptDir
+
     if (-not $IsWindowsHost) {
         if (-not $DryRun) {
             [Console]::Error.WriteLine("ERROR: verify-windows-l3.ps1 requires Windows (pass -DryRun for cross-platform schema dry-run)")
@@ -360,58 +455,102 @@ public static class ZeroDeskWin32Probes {
 }
 "@ -Language CSharp
 
-    # Locate zerodesk-win-diag.exe if not explicitly provided
-    if ([string]::IsNullOrEmpty($DiagBin)) {
-        $candidates = @(
-            (Join-Path $RepoRoot 'libs\zerodesk_core\target\release\zerodesk-win-diag.exe'),
-            (Join-Path $RepoRoot 'libs\zerodesk_core\target\debug\zerodesk-win-diag.exe')
-        )
-        foreach ($cand in $candidates) {
-            if (Test-Path -LiteralPath $cand) {
-                $DiagBin = $cand
-                break
-            }
-        }
-    }
+    $DiagBin = Resolve-TargetBinary -ExplicitPath $DiagBin -BinaryName 'zerodesk-win-diag.exe'
+    $WatchdogBin = Resolve-TargetBinary -ExplicitPath $WatchdogBin -BinaryName 'zerodesk-hid-watchdog.exe'
 
-    # Probe 1: Run zerodesk-win-diag.exe (non-destructive)
+    # Probe 1: Run zerodesk-win-diag.exe (non-destructive, PS 5.1 stderr-safe)
     $swDiag = [System.Diagnostics.Stopwatch]::StartNew()
     $diagParsed = $null
     $diagError = $null
     $diagExitCode = -1
     if (-not [string]::IsNullOrEmpty($DiagBin) -and (Test-Path -LiteralPath $DiagBin)) {
+        $prevEap = $ErrorActionPreference
         try {
+            $ErrorActionPreference = 'Continue'
             $rawOut = & $DiagBin 2>$null
             $diagExitCode = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
             $jsonText = (@($rawOut) | ForEach-Object { $_.ToString() }) -join "`n"
-            $diagParsed = $jsonText | ConvertFrom-Json
-            if ($diagParsed.schema_version -ne 1 -or $diagParsed.windows_host_required -ne $false) {
-                $diagError = "unexpected zerodesk-win-diag schema_version=$($diagParsed.schema_version) windows_host_required=$($diagParsed.windows_host_required)"
+            $candidate = $jsonText | ConvertFrom-Json
+            $schemaVer = Get-SafeProp $candidate 'schema_version' $null
+            $winHostReq = Get-SafeProp $candidate 'windows_host_required' $null
+            $hasAllSections = (Test-HasProp $candidate 'dxgi') -and (Test-HasProp $candidate 'media_foundation') -and (Test-HasProp $candidate 'input') -and (Test-HasProp $candidate 'watchdog')
+            $schemaVerOk = (($schemaVer -is [int]) -or ($schemaVer -is [long])) -and ($schemaVer -eq 1)
+            $winHostReqOk = ($winHostReq -is [bool]) -and ($winHostReq -eq $false)
+            if (-not $schemaVerOk -or -not $winHostReqOk -or -not $hasAllSections) {
+                $diagError = "invalid zerodesk-win-diag schema (schema_version=$schemaVer, windows_host_required=$winHostReq, has_all_sections=$hasAllSections)"
                 $diagParsed = $null
+            } else {
+                $diagParsed = $candidate
             }
         } catch {
             $diagError = "zerodesk-win-diag execution/parse failed: $($_.Exception.Message)"
             $diagParsed = $null
+        } finally {
+            $ErrorActionPreference = $prevEap
         }
     } else {
         $diagError = 'zerodesk-win-diag.exe not found (pass -DiagBin or build zerodesk_core)'
     }
     $swDiag.Stop()
 
+    # Probe 1b: Non-destructive zerodesk-hid-watchdog.exe fail-closed invocation check
+    $watchdogBinOk = $false
+    $watchdogBinDetail = 'zerodesk-hid-watchdog.exe not found (pass -WatchdogBin or build zerodesk_core)'
+    if (-not [string]::IsNullOrEmpty($WatchdogBin) -and (Test-Path -LiteralPath $WatchdogBin)) {
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $null = & $WatchdogBin 2>$null
+            $wdRc = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            if ($wdRc -ne 0) {
+                $watchdogBinOk = $true
+                $watchdogBinDetail = "zerodesk-hid-watchdog.exe verified (fail-closed on missing args, rc=$wdRc)"
+            } else {
+                $watchdogBinDetail = 'zerodesk-hid-watchdog.exe unexpectedly exited 0 with no args'
+            }
+        } catch {
+            $watchdogBinDetail = "zerodesk-hid-watchdog.exe probe error: $($_.Exception.Message)"
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+
+    # Safely extract diagnostic sections under Set-StrictMode
+    $dxgiSec = Get-SafeProp $diagParsed 'dxgi' $null
+    $mfSec = Get-SafeProp $diagParsed 'media_foundation' $null
+    $inputSec = Get-SafeProp $diagParsed 'input' $null
+    $wdSec = Get-SafeProp $diagParsed 'watchdog' $null
+
+    $dxgiOk = [bool](Get-SafeProp $dxgiSec 'ok' $false)
+    $dxgiOutputsRaw = Get-SafeProp $dxgiSec 'outputs' $null
+    $dxgiOutputs = if ($null -ne $dxgiOutputsRaw) { @($dxgiOutputsRaw) } else { @() }
+    $primaryLuid = Get-SafeProp $dxgiSec 'primary_adapter_luid' $null
+
+    $mfOk = [bool](Get-SafeProp $mfSec 'ok' $false)
+    $mfAny = [bool](Get-SafeProp $mfSec 'any_hw_mft_found' $false)
+
+    $inputDesktopAccessible = [bool](Get-SafeProp $inputSec 'input_desktop_accessible' $false)
+    $inputElevated = Get-SafeProp $inputSec 'uipi_elevated' $null
+    $inputLocalSystem = [bool](Get-SafeProp $inputSec 'is_local_system' $false)
+
+    $wdOk = [bool](Get-SafeProp $wdSec 'ok' $false)
+    $wdSpawnOk = [bool](Get-SafeProp $wdSec 'spawn_ok' $false)
+    $wdHeartbeatOk = [bool](Get-SafeProp $wdSec 'heartbeat_ok' $false)
+    $wdEmptyBatchOk = [bool](Get-SafeProp $wdSec 'empty_batch_release_ok' $false)
+    $wdErrVal = Get-SafeProp $wdSec 'error' 'none'
+
     # Compute hashed hardware fingerprint from primary DXGI adapter LUID if available
     $hwFingerprint = $null
     $hasPhysicalGpu = $false
-    $dxgiOutputs = @()
-    if ($null -ne $diagParsed -and $null -ne $diagParsed.dxgi) {
-        if ($null -ne $diagParsed.dxgi.outputs) {
-            $dxgiOutputs = @($diagParsed.dxgi.outputs)
-        }
-        if ($null -ne $diagParsed.dxgi.primary_adapter_luid) {
-            $luid = $diagParsed.dxgi.primary_adapter_luid
-            $luidStr = "$($luid.high_part):$($luid.low_part)"
-            $hwFingerprint = Get-ShortSha256 -InputText $luidStr
+    if ($null -ne $primaryLuid) {
+        $luidHi = Get-SafeProp $primaryLuid 'high_part' $null
+        $luidLo = Get-SafeProp $primaryLuid 'low_part' $null
+        if ($null -ne $luidHi -and $null -ne $luidLo) {
+            $hwFingerprint = Get-ShortSha256 -InputText "${luidHi}:${luidLo}"
             if ($dxgiOutputs.Count -gt 0) {
-                $adapterName = [string]$dxgiOutputs[0].adapter_name
+                $adapterName = [string](Get-SafeProp $dxgiOutputs[0] 'adapter_name' '')
                 if (-not [string]::IsNullOrWhiteSpace($adapterName) -and $adapterName -notmatch 'Microsoft Basic Render') {
                     $hasPhysicalGpu = $true
                 }
@@ -474,15 +613,17 @@ public static class ZeroDeskWin32Probes {
     $items = @()
 
     # WIN-L3-01: Single-Command Diagnostics (zerodesk-win-diag)
+    # Headless-verifiable invariants (schema v1 + watchdog.ok + empty_batch_release_ok) MUST succeed;
+    # otherwise emit FAIL rather than masking broken probes as L2_NATIVE_PASS.
     if ($null -eq $diagParsed) {
         $items += (New-ReportItem -Spec $Checklist[0] -Status 'FAIL' -Evidence "zerodesk-win-diag failed: $diagError" -DurationMs $swDiag.ElapsedMilliseconds)
-    } elseif ($Mode -eq 'strict-l3' -and $diagExitCode -eq 0 -and $diagParsed.dxgi.ok -and $diagParsed.media_foundation.ok -and $diagParsed.input.input_desktop_accessible -and $diagParsed.watchdog.ok -and $hasPhysicalGpu -and $null -ne $hwFingerprint) {
+    } elseif (-not ($wdOk -and $wdEmptyBatchOk)) {
+        $items += (New-ReportItem -Spec $Checklist[0] -Status 'FAIL' -Evidence "zerodesk-win-diag headless watchdog/empty-batch invariant failed (watchdog.ok=$wdOk, empty_batch_release_ok=$wdEmptyBatchOk, err=$wdErrVal)" -DurationMs $swDiag.ElapsedMilliseconds -HardwareFingerprint $hwFingerprint)
+    } elseif ($Mode -eq 'strict-l3' -and -not $IsCiRunner -and $diagExitCode -eq 0 -and $dxgiOk -and $mfOk -and $inputDesktopAccessible -and $hasPhysicalGpu -and $null -ne $hwFingerprint) {
         $items += (New-ReportItem -Spec $Checklist[0] -Status 'PASS' -Evidence "zerodesk-win-diag exit=0; all 4 sections ok on physical GPU (luid_sha8=$hwFingerprint, outputs=$($dxgiOutputs.Count))" -DurationMs $swDiag.ElapsedMilliseconds -HardwareFingerprint $hwFingerprint)
-    } elseif ($Mode -eq 'strict-l3') {
-        $items += (New-ReportItem -Spec $Checklist[0] -Status 'PENDING_PHYSICAL_L3' -Evidence "zerodesk-win-diag schema_v1 valid (exit=$diagExitCode, dxgi.ok=$($diagParsed.dxgi.ok), mf.ok=$($diagParsed.media_foundation.ok), watchdog.ok=$($diagParsed.watchdog.ok), physical_gpu=$hasPhysicalGpu); requires physical NVIDIA/AMD/Intel GPU host for PASS" -DurationMs $swDiag.ElapsedMilliseconds -HardwareFingerprint $hwFingerprint)
     } else {
         $luidTag = if ($null -ne $hwFingerprint) { $hwFingerprint } else { 'none' }
-        $items += (New-ReportItem -Spec $Checklist[0] -Status 'L2_NATIVE_PASS' -Evidence "zerodesk-win-diag schema_v1 verified on Windows runner (exit=$diagExitCode, dxgi.outputs=$($dxgiOutputs.Count), luid_sha8=$luidTag, mf.any_hw=$($diagParsed.media_foundation.any_hw_mft_found), watchdog.ok=$($diagParsed.watchdog.ok)); full GPU L3 PASS requires physical host" -DurationMs $swDiag.ElapsedMilliseconds -HardwareFingerprint $hwFingerprint)
+        $items += (New-ReportItem -Spec $Checklist[0] -Status 'L2_NATIVE_PASS' -Evidence "zerodesk-win-diag schema_v1 & watchdog verified (exit=$diagExitCode, dxgi.ok=$dxgiOk, dxgi.outputs=$($dxgiOutputs.Count), luid_sha8=$luidTag, mf.ok=$mfOk, mf.any_hw=$mfAny, watchdog.ok=$wdOk, physical_gpu=$hasPhysicalGpu); physical NVIDIA/AMD/Intel GPU host required for L3 PASS" -DurationMs $swDiag.ElapsedMilliseconds -HardwareFingerprint $hwFingerprint)
     }
 
     # WIN-L3-02: DXGI Multi-Monitor Capture, Cursor & Mode/DPI Switch
@@ -490,15 +631,13 @@ public static class ZeroDeskWin32Probes {
     if (-not $d3d11Loaded -or -not $dxgiLoaded) {
         $items += (New-ReportItem -Spec $Checklist[1] -Status 'FAIL' -Evidence "System32 DLL load failed: d3d11.dll=$d3d11Loaded(err=$d3dErr) dxgi.dll=$dxgiLoaded(err=$dxgiErr)" -DurationMs 1)
     } else {
-        $items += (New-ReportItem -Spec $Checklist[1] -Status 'PENDING_PHYSICAL_L3' -Evidence "d3d11.dll & dxgi.dll loaded from System32 (dxgi.outputs=$dxgiCount); physical multi-monitor DPI/cursor/DXGI first-frame capture requires real display hardware" -DurationMs 1 -HardwareFingerprint $hwFingerprint)
+        $items += (New-ReportItem -Spec $Checklist[1] -Status 'PENDING_PHYSICAL_L3' -Evidence "d3d11.dll & dxgi.dll loaded from System32 (dxgi.ok=$dxgiOk, dxgi.outputs=$dxgiCount); physical multi-monitor DPI/cursor/DXGI first-frame capture requires real display hardware" -DurationMs 1 -HardwareFingerprint $hwFingerprint)
     }
 
     # WIN-L3-03: UAC / Lock Screen Pause & Resume
     $items += (New-ReportItem -Spec $Checklist[2] -Status 'PENDING_PHYSICAL_L3' -Evidence 'UAC prompt & Win+L lock screen DesktopPaused/resume requires physical interactive Windows session (never triggers UAC in probe)' -DurationMs 0)
 
     # WIN-L3-04: Media Foundation HW MFT LUID-Bound D3D11 NV12 Zero-Copy + First-IDR Gate
-    $mfAny = if ($null -ne $diagParsed -and $null -ne $diagParsed.media_foundation) { [bool]$diagParsed.media_foundation.any_hw_mft_found } else { $false }
-    $mfOk  = if ($null -ne $diagParsed -and $null -ne $diagParsed.media_foundation) { [bool]$diagParsed.media_foundation.ok } else { $false }
     if (-not $mfplatLoaded) {
         $items += (New-ReportItem -Spec $Checklist[3] -Status 'FAIL' -Evidence "System32 mfplat.dll load failed (err=$mfErr)" -DurationMs 1)
     } else {
@@ -512,38 +651,35 @@ public static class ZeroDeskWin32Probes {
     $items += (New-ReportItem -Spec $Checklist[5] -Status 'PENDING_PHYSICAL_L3' -Evidence 'Physical ANSI/ISO SendInput keyboard & 5-button mouse round-trip requires interactive Windows desktop session' -DurationMs 0)
 
     # WIN-L3-07: Watchdog PROC_THREAD_ATTRIBUTE_HANDLE_LIST Grandchild-Spawn EOF
-    $wdSpawnOk = ($null -ne $diagParsed -and $null -ne $diagParsed.watchdog -and $diagParsed.watchdog.spawn_ok -and $diagParsed.watchdog.heartbeat_ok)
     if (-not $lockFileOk) {
         $items += (New-ReportItem -Spec $Checklist[6] -Status 'FAIL' -Evidence "Win32 LockFileEx probe failed: $lockFileDetail" -DurationMs $swLock.ElapsedMilliseconds)
-    } elseif ($null -ne $diagParsed -and -not $wdSpawnOk) {
-        $wdErrVal = if ($null -ne $diagParsed.watchdog.PSObject.Properties['error']) { $diagParsed.watchdog.error } else { 'none' }
-        $items += (New-ReportItem -Spec $Checklist[6] -Status 'FAIL' -Evidence "zerodesk-win-diag watchdog spawn/heartbeat failed (spawn_ok=$($diagParsed.watchdog.spawn_ok), heartbeat_ok=$($diagParsed.watchdog.heartbeat_ok), err=$wdErrVal)" -DurationMs $swLock.ElapsedMilliseconds)
-    } elseif ($Mode -eq 'strict-l3') {
-        $items += (New-ReportItem -Spec $Checklist[6] -Status 'PENDING_PHYSICAL_L3' -Evidence "$lockFileDetail; watchdog spawn+heartbeat ok; full grandchild-spawn TerminateProcess EOF torture required for strict-l3 PASS" -DurationMs $swLock.ElapsedMilliseconds)
+    } elseif ($null -eq $diagParsed -or -not ($wdSpawnOk -and $wdHeartbeatOk)) {
+        $items += (New-ReportItem -Spec $Checklist[6] -Status 'FAIL' -Evidence "zerodesk-win-diag watchdog spawn/heartbeat failed (spawn_ok=$wdSpawnOk, heartbeat_ok=$wdHeartbeatOk, err=$wdErrVal)" -DurationMs $swLock.ElapsedMilliseconds)
+    } elseif (-not $watchdogBinOk) {
+        $items += (New-ReportItem -Spec $Checklist[6] -Status 'FAIL' -Evidence "Watchdog binary probe failed: $watchdogBinDetail" -DurationMs $swLock.ElapsedMilliseconds)
     } else {
-        $items += (New-ReportItem -Spec $Checklist[6] -Status 'L2_NATIVE_PASS' -Evidence "$lockFileDetail; zerodesk-win-diag watchdog spawn_ok=$wdSpawnOk heartbeat_ok=$wdSpawnOk (full grandchild-spawn TerminateProcess test deferred to physical L3)" -DurationMs $swLock.ElapsedMilliseconds)
+        $items += (New-ReportItem -Spec $Checklist[6] -Status 'L2_NATIVE_PASS' -Evidence "$lockFileDetail; zerodesk-win-diag watchdog spawn_ok=$wdSpawnOk heartbeat_ok=$wdHeartbeatOk; $watchdogBinDetail (full grandchild-spawn TerminateProcess EOF torture required for physical L3 PASS)" -DurationMs $swLock.ElapsedMilliseconds)
     }
 
     # WIN-L3-08: Watchdog WaitForMultipleObjects + GetProcessTimes PID-Reuse Guard + Single-Batch Torture Test
-    $wdEmptyBatchOk = ($null -ne $diagParsed -and $null -ne $diagParsed.watchdog -and $diagParsed.watchdog.empty_batch_release_ok)
     if (-not $procTimesOk) {
         $items += (New-ReportItem -Spec $Checklist[7] -Status 'FAIL' -Evidence "Win32 GetProcessTimes probe failed (err=$timesErr)" -DurationMs $swTimes.ElapsedMilliseconds)
-    } elseif ($Mode -eq 'strict-l3') {
-        $items += (New-ReportItem -Spec $Checklist[7] -Status 'PENDING_PHYSICAL_L3' -Evidence "GetProcessTimes creation_time_100ns>0 verified (empty_batch_release_ok=$wdEmptyBatchOk); interactive single-batch stuck-key torture required for strict-l3 PASS" -DurationMs $swTimes.ElapsedMilliseconds)
+    } elseif ($null -eq $diagParsed -or -not $wdEmptyBatchOk) {
+        $items += (New-ReportItem -Spec $Checklist[7] -Status 'FAIL' -Evidence "Watchdog empty_batch_release_ok probe failed (diag_ok=$($null -ne $diagParsed), empty_batch_release_ok=$wdEmptyBatchOk, err=$wdErrVal)" -DurationMs $swTimes.ElapsedMilliseconds)
     } else {
-        $items += (New-ReportItem -Spec $Checklist[7] -Status 'L2_NATIVE_PASS' -Evidence "GetProcessTimes PID-reuse creation timestamp verified (>0); watchdog empty_batch_release_ok=$wdEmptyBatchOk (interactive multi-key torture deferred to physical L3)" -DurationMs $swTimes.ElapsedMilliseconds)
+        $items += (New-ReportItem -Spec $Checklist[7] -Status 'L2_NATIVE_PASS' -Evidence "GetProcessTimes PID-reuse creation timestamp verified (>0); watchdog empty_batch_release_ok=$wdEmptyBatchOk (interactive multi-key single-batch torture required for physical L3 PASS)" -DurationMs $swTimes.ElapsedMilliseconds)
     }
 
     # WIN-L3-09: Watchdog Heartbeat-Timeout Release on Frozen Host
     $items += (New-ReportItem -Spec $Checklist[8] -Status 'PENDING_PHYSICAL_L3' -Evidence 'Frozen-host SuspendThread heartbeat-timeout emergency release requires interactive Windows L3 harness' -DurationMs 0)
 
     # WIN-L3-10: OpenInputDesktop / SetThreadDesktop & UIPI Elevated-Window Negative Test
-    if ($null -eq $diagParsed -or $null -eq $diagParsed.input) {
+    if ($null -eq $diagParsed -or $null -eq $inputSec) {
         $items += (New-ReportItem -Spec $Checklist[9] -Status 'FAIL' -Evidence "UIPI/OpenInputDesktop section missing from zerodesk-win-diag (direct OpenInputDesktop=$desktopProbeOk err=$desktopErr)" -DurationMs $swDesktop.ElapsedMilliseconds)
-    } elseif ($Mode -eq 'strict-l3') {
-        $items += (New-ReportItem -Spec $Checklist[9] -Status 'PENDING_PHYSICAL_L3' -Evidence "UIPI probe ok (uipi_elevated=$($diagParsed.input.uipi_elevated), is_local_system=$($diagParsed.input.is_local_system), input_desktop_accessible=$($diagParsed.input.input_desktop_accessible), direct_open_input_desktop=$desktopProbeOk); elevated-window negative SendInput test required for strict-l3 PASS" -DurationMs $swDesktop.ElapsedMilliseconds)
+    } elseif (-not ($desktopProbeOk -and $inputDesktopAccessible)) {
+        $items += (New-ReportItem -Spec $Checklist[9] -Status 'FAIL' -Evidence "OpenInputDesktop probe failed (diag.input_desktop_accessible=$inputDesktopAccessible, direct_open_input_desktop=$desktopProbeOk, err=$desktopErr)" -DurationMs $swDesktop.ElapsedMilliseconds)
     } else {
-        $items += (New-ReportItem -Spec $Checklist[9] -Status 'L2_NATIVE_PASS' -Evidence "Read-only UIPI & OpenInputDesktop probe completed (uipi_elevated=$($diagParsed.input.uipi_elevated), is_local_system=$($diagParsed.input.is_local_system), input_desktop_accessible=$($diagParsed.input.input_desktop_accessible), direct_open_input_desktop=$desktopProbeOk); interactive elevated-window negative test deferred to physical L3" -DurationMs $swDesktop.ElapsedMilliseconds)
+        $items += (New-ReportItem -Spec $Checklist[9] -Status 'L2_NATIVE_PASS' -Evidence "Read-only UIPI & OpenInputDesktop probe verified (uipi_elevated=$inputElevated, is_local_system=$inputLocalSystem, input_desktop_accessible=$inputDesktopAccessible, direct_open_input_desktop=$desktopProbeOk; interactive elevated-window negative SendInput test required for physical L3 PASS)" -DurationMs $swDesktop.ElapsedMilliseconds)
     }
 
     # WIN-L3-11: Cross-OS E2E Session

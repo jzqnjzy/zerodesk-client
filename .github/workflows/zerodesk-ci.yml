@@ -90,9 +90,10 @@ jobs:
           fi
           echo "SODIUM_USE_PKG_CONFIG=1" >> "$GITHUB_ENV"
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install Rust toolchain (1.90.0)
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: "1.90.0"
           components: clippy
 
       - name: Cache Cargo artifacts
@@ -185,6 +186,8 @@ jobs:
               assert it["duration_ms"] >= 0
           assert report["summary"]["pass"] == 0
           assert report["summary"]["fail"] == 0
+          assert report["summary"]["l2_native_pass"] >= 3, f"too few L2 native passes: {report['summary']}"
+          assert report["ci_runner"] is True
           assert sum(report["summary"].values()) == 12
           raw = json.dumps(report).lower()
           assert "/home/" not in raw and "/root/" not in raw
@@ -213,9 +216,10 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install Rust toolchain (1.90.0)
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: "1.90.0"
           components: clippy
 
       - name: Cache Cargo artifacts
@@ -243,10 +247,12 @@ jobs:
           git checkout --force "$env:VCPKG_PINNED_COMMIT"
           .\bootstrap-vcpkg.bat -disableMetrics
           Pop-Location
-          & "$env:VCPKG_ROOT\vcpkg.exe" install `
-            --overlay-ports=".\res\vcpkg" `
-            --triplet x64-windows-static `
-            libvpx aom libyuv opus libsodium
+          $vcpkgArgs = @('install', '--triplet', 'x64-windows-static')
+          if (Test-Path '.\res\vcpkg') {
+            $vcpkgArgs += '--overlay-ports=.\res\vcpkg'
+          }
+          $vcpkgArgs += @('libvpx', 'aom', 'libyuv', 'opus', 'libsodium')
+          & "$env:VCPKG_ROOT\vcpkg.exe" @vcpkgArgs
 
       - name: Configure Windows static codec & libclang environment
         shell: pwsh
@@ -268,7 +274,7 @@ jobs:
       - name: Test zerodesk_core (Windows native MSVC)
         shell: pwsh
         run: |
-          cargo test --manifest-path libs/zerodesk_core/Cargo.toml --locked
+          cargo test --manifest-path libs/zerodesk_core/Cargo.toml --all-targets --locked
 
       - name: Build zerodesk-win-diag and zerodesk-hid-watchdog
         shell: pwsh
@@ -282,7 +288,8 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-l3.ps1 `
             -Mode ci `
             -Output "$env:RUNNER_TEMP\windows-l3-report.json" `
-            -DiagBin "libs\zerodesk_core\target\release\zerodesk-win-diag.exe"
+            -DiagBin "libs\zerodesk_core\target\release\zerodesk-win-diag.exe" `
+            -WatchdogBin "libs\zerodesk_core\target\release\zerodesk-hid-watchdog.exe"
 
       - name: Validate Windows L2/L3 JSON report against schema
         shell: pwsh
@@ -309,6 +316,8 @@ jobs:
               assert it["duration_ms"] >= 0
           assert report["summary"]["pass"] == 0
           assert report["summary"]["fail"] == 0
+          assert report["summary"]["l2_native_pass"] >= 3, f"too few L2 native passes: {report['summary']}"
+          assert report["ci_runner"] is True
           assert sum(report["summary"].values()) == 12
           raw = json.dumps(report).lower()
           assert "c:\\\\users\\\\" not in raw and "c:/users/" not in raw
@@ -332,17 +341,20 @@ jobs:
     timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
-      ZERODESK_LIBYUV_PREFIX: ${{ runner.temp }}/zerodesk-libyuv
     steps:
+      - name: Configure macOS libyuv prefix
+        run: echo "ZERODESK_LIBYUV_PREFIX=$RUNNER_TEMP/zerodesk-libyuv" >> "$GITHUB_ENV"
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install Rust toolchain (1.90.0)
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: "1.90.0"
           components: clippy
 
       - name: Cache Cargo artifacts
@@ -475,24 +487,33 @@ jobs:
           win_rep = load_summary("zerodesk-windows-l2-report/windows-l3-report.json")
           mac_rep = load_summary("zerodesk-macos-summary/macos-verification-summary.json")
 
+          def md_cell(val):
+              s = str(val)
+              return s.replace("\\", "\\\\").replace("|", "\\|").replace("`", "\\`").replace("\r", " ").replace("\n", " ")
+
           def fmt_counts(rep):
               if not rep or "summary" not in rep:
                   return "report unavailable"
               s = rep["summary"]
-              return (
+              return md_cell(
                   f"L2_NATIVE_PASS={s['l2_native_pass']}, "
                   f"PENDING_PHYSICAL_L3={s['pending_physical_l3']}, "
                   f"FAIL={s['fail']}, PASS={s['pass']} (CI-forbids-PASS)"
               )
+
+          mac_detail = md_cell(
+              f"app_bundle_built={mac_rep.get('app_bundle_built') if mac_rep else 'n/a'}, "
+              f"swift_tsan_passed={mac_rep.get('swift_tsan_passed') if mac_rep else 'n/a'}"
+          )
 
           lines = [
               "## ZeroDesk 3-Platform CI & Honest L2/L3 Verification Summary",
               "",
               "| Job | Result | Verification Details |",
               "|---|---|---|",
-              f"| `compliance-linux` | `{linux_res}` | {fmt_counts(lin_rep)} |",
-              f"| `windows-native` | `{win_res}` | {fmt_counts(win_rep)} |",
-              f"| `macos-native` | `{mac_res}` | app_bundle_built={mac_rep.get('app_bundle_built') if mac_rep else 'n/a'}, swift_tsan_passed={mac_rep.get('swift_tsan_passed') if mac_rep else 'n/a'} |",
+              f"| `compliance-linux` | `{md_cell(linux_res)}` | {fmt_counts(lin_rep)} |",
+              f"| `windows-native` | `{md_cell(win_res)}` | {fmt_counts(win_rep)} |",
+              f"| `macos-native` | `{md_cell(mac_res)}` | {mac_detail} |",
               "",
               "> **Release Gate Reminder**: Headless CI runners only validate L2 native probes (`L2_NATIVE_PASS`). Physical GPU/display/input L3 acceptance (`--strict-l3` 12/12 `PASS`) remains mandatory before any Windows or Linux release.",
           ]

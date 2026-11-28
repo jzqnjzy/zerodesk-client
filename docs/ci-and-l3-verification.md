@@ -32,7 +32,7 @@ Every external GitHub Action and native C++ source dependency in `.github/workfl
 | `actions/upload-artifact` | `v7.0.2` | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` |
 | `actions/download-artifact` | `v8.0.2` | `9000827ccba6bdab643e8b6fd33ac0654aef8333` |
 | `actions/cache` | `v6.1.0` | `55cc8345863c7cc4c66a329aec7e433d2d1c52a9` |
-| `dtolnay/rust-toolchain` | `stable` (`refs/heads/stable`) | `39008827e6b4319a349e9a42dfc90579dd25f1ca` |
+| `dtolnay/rust-toolchain` | `master` (`toolchain: "1.90.0"`) | `df2a88e9fe4098bad09cb42c3dec7187f15861fc` |
 | `Swatinem/rust-cache` | `v2.9.3` (`v2.9.3^{}`) | `d1527c8f67ef9af357290475d4af4b0fab8f12e0` |
 | `microsoft/vcpkg` (Windows static libs) | `vcpkg.json` baseline | `9e593bb18ea69cc5095e012465dcd675a822ed0d` |
 | `chromium/libyuv` (macOS static `libyuv.a`) | `res/vcpkg/libyuv/portfile.cmake` | `0faf8dd0e004520a61a603a4d2996d5ecc80dc3f` |
@@ -45,8 +45,8 @@ Headless GitHub Actions runners lack physical GPUs, multi-monitor displays, inte
 
 | Status | Meaning | Allowed in `--mode ci`? |
 |---|---|---|
-| `PASS` | Full physical hardware / interactive L3 verification succeeded with an 8-hex-char SHA-256 `hardware_fingerprint`. | **FORBIDDEN** (code-level abort exit `30` + schema rejection) |
-| `L2_NATIVE_PASS` | Deterministic headless native OS probe succeeded on a real Windows/Linux runner (does **not** satisfy L3 release gate). | Yes |
+| `PASS` | Full physical hardware / interactive L3 verification succeeded with an 8-hex-char SHA-256 `hardware_fingerprint` derived from real GPU hardware (`ci_runner == false`). | **FORBIDDEN** (code-level abort exit `30` + schema enforces both `mode == "ci"` and `ci_runner == true` => `pass == 0`) |
+| `L2_NATIVE_PASS` | Deterministic headless native OS probe succeeded on a real Windows/Linux host (truthfully preserved in both `ci` and `strict-l3` modes; CI enforces `l2_native_pass >= 3` so an all-SKIPPED silent green is impossible; does **not** satisfy L3 release gate). | Yes |
 | `PENDING_PHYSICAL_L3` | Requires physical GPU, real display, interactive session, or sustained soak on real hardware. | Yes |
 | `SKIPPED_NO_HARDWARE` | Hardware-gated check skipped on a machine lacking the target device. | Yes |
 | `SKIPPED_UNSUPPORTED_PLATFORM` | Cross-platform `--dry-run` / `-DryRun` on a non-target OS (e.g., macOS). | Yes |
@@ -73,7 +73,7 @@ Both [`scripts/verify-windows-l3.ps1`](../scripts/verify-windows-l3.ps1) and [`s
 
 | IDs | Headless CI (`--mode ci`) | Physical Machine (`--mode strict-l3`) |
 |---|---|---|
-| `WIN-L3-01`, `07`, `08`, `10` | **`L2_NATIVE_PASS`** — Runs `zerodesk-win-diag.exe` schema v1 audit, Win32 `LockFileEx`, `GetProcessTimes`, `OpenInputDesktop` / UIPI read-only probes. | Physical GPU LUID `ExactLuidZeroCopy` (`WIN-L3-01` upgrades to `PASS` on physical GPU); `07`/`08`/`10` interactive torture & elevated-window tests required for `PASS`. |
+| `WIN-L3-01`, `07`, `08`, `10` | **`L2_NATIVE_PASS`** — Runs `zerodesk-win-diag.exe` schema v1 + watchdog/empty-batch audit, `zerodesk-hid-watchdog.exe` fail-closed binary check, Win32 `LockFileEx`, `GetProcessTimes`, and `OpenInputDesktop` / UIPI read-only probes (any broken probe emits `FAIL`). | Preserves `L2_NATIVE_PASS` on headless-verified probes (`WIN-L3-01` auto-upgrades to `PASS` on physical non-software GPU with `ExactLuidZeroCopy`); `07`/`08`/`10` interactive torture & elevated-window tests required for `PASS`. |
 | `WIN-L3-02..06`, `09`, `11`, `12` | **`PENDING_PHYSICAL_L3`** — Verifies `d3d11.dll`, `dxgi.dll`, and `mfplat.dll` System32 loadability (`02`, `04`), defers DXGI first-frame, NVENC/QSV/AMF IDR, UAC/Win+L, physical SendInput, frozen-host, cross-OS, and 30m soak. | Executed on physical NVIDIA, AMD, and Intel Windows 10/11 hosts. |
 | `LIN-L3-08`, `09`, `10`, `11` | **`L2_NATIVE_PASS`** — Runs `zerodesk-linux-diag --json`, verifies `/dev/uinput` is `disabled_by_default`, exercises `zerodesk-hid-watchdog` lifecycle, `pidfd_open`, `PR_GET_PDEATHSIG`, `/proc/self/stat` field 22, and `/proc/self/fd` zero-leak audit (`leaked_fds_detected == 0`). | Physical udev ACL negative/warning test (`08`), physical `EV_KEY=0` + `SYN_REPORT` `<= 500ms` `SIGKILL` (`09`), escape hotkey (`10`), and multi-fd inheritance (`11`). |
 | `LIN-L3-01..07`, `12` | **`PENDING_PHYSICAL_L3`** — Verifies `zerodesk-linux-diag --json` schema v1 (`12`), defers Wayland portal ScreenCast/PipeWire, X11 XShm/XRandR/XFixes, Intel iHD / AMD radeonsi VA-API IDR & QoE, physical key injection, and 30m soak. | Executed on physical Intel (`iHD`/`i965`) and AMD (`Mesa radeonsi`) Wayland + X11 hosts (`LIN-L3-03` auto-upgrades to `PASS` when an allowlisted open-source VA-API encoder is verified with a hardware fingerprint). |
@@ -96,14 +96,15 @@ This validates `.github/workflows/zerodesk-ci.yml` (YAML parse, 40-char SHA pinn
    ```powershell
    cargo build --manifest-path libs/zerodesk_core/Cargo.toml --release --bin zerodesk-win-diag --bin zerodesk-hid-watchdog --locked
    ```
-2. Run the non-destructive diagnostic and L3 verification harness:
+2. Run the non-destructive diagnostic and L3 verification harness (passing explicit `-DiagBin` and `-WatchdogBin`):
    ```powershell
    pwsh -NoProfile -File scripts/verify-windows-l3.ps1 `
      -Mode strict-l3 `
      -Output .\windows-strict-l3-report.json `
-     -DiagBin .\libs\zerodesk_core\target\release\zerodesk-win-diag.exe
+     -DiagBin .\libs\zerodesk_core\target\release\zerodesk-win-diag.exe `
+     -WatchdogBin .\libs\zerodesk_core\target\release\zerodesk-hid-watchdog.exe
    ```
-3. Inspect `windows-strict-l3-report.json`. Exit code `10` indicates automated checks succeeded without failures while manual physical/interactive items remain `PENDING_PHYSICAL_L3`; complete each checklist item in [`docs/windows-platform-support.md`](windows-platform-support.md) before any Windows release.
+3. Inspect `windows-strict-l3-report.json`. Automated `strict-l3` truthfully preserves `L2_NATIVE_PASS` on headless-verifiable probes and exits `10` whenever physical GPU/DXGI/MF/interactive items remain `PENDING_PHYSICAL_L3`; complete each checklist item in [`docs/windows-platform-support.md`](windows-platform-support.md) on real NVIDIA/AMD/Intel hardware before any Windows release.
 
 ### Physical Linux Host (`--strict-l3`)
 
@@ -121,4 +122,4 @@ This validates `.github/workflows/zerodesk-ci.yml` (YAML parse, 40-char SHA pinn
      --diag-bin ./libs/zerodesk_core/target/release/zerodesk-linux-diag \
      --watchdog-bin ./libs/zerodesk_core/target/release/zerodesk-hid-watchdog
    ```
-3. Inspect `linux-strict-l3-report.json`. Complete all 12 items in [`docs/linux-platform-support.md`](linux-platform-support.md) on physical hardware before any Linux release.
+3. Inspect `linux-strict-l3-report.json`. Automated `strict-l3` truthfully preserves `L2_NATIVE_PASS` on kernel probes (`LIN-L3-08..11`), upgrades `LIN-L3-03` to `PASS` only when a real open-source GPU vendor fingerprint is present, and exits `10` whenever physical GPU/Wayland/X11 items remain `PENDING_PHYSICAL_L3`; complete all 12 items in [`docs/linux-platform-support.md`](linux-platform-support.md) on physical hardware before any Linux release.

@@ -77,6 +77,32 @@
     {
       "if": {
         "properties": {
+          "ci_runner": { "const": true }
+        },
+        "required": ["ci_runner"]
+      },
+      "then": {
+        "properties": {
+          "summary": {
+            "properties": {
+              "pass": { "const": 0 }
+            }
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "status": {
+                  "not": { "const": "PASS" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "platform": { "const": "windows" }
         },
         "required": ["platform"]

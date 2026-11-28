@@ -105,9 +105,22 @@ collect_needs = jobs["collect-artifacts"].get("needs") or []
 if set(collect_needs) != {"compliance-linux", "windows-native", "macos-native"}:
     sys.exit(f"FAIL: collect-artifacts needs mismatch: {collect_needs}")
 
+# Forbid ${{ runner.* }} inside top-level or job-level env: blocks (GitHub Actions parse-time error).
+runner_ctx_re = re.compile(r"\$\{\{\s*runner\.", re.IGNORECASE)
+top_env = doc.get("env") or {}
+if isinstance(top_env, dict):
+    for ek, ev in top_env.items():
+        if runner_ctx_re.search(str(ev)):
+            sys.exit(f"FAIL: forbidden runner.* context in top-level env.{ek}: {ev}")
+
 uses_count = 0
 sha_re = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$")
 for job_name, job in jobs.items():
+    job_env = job.get("env") or {}
+    if isinstance(job_env, dict):
+        for ek, ev in job_env.items():
+            if runner_ctx_re.search(str(ev)):
+                sys.exit(f"FAIL: forbidden runner.* context in jobs.{job_name}.env.{ek}: {ev}")
     if "permissions" in job:
         jperms = job["permissions"]
         if isinstance(jperms, dict) and any(str(v).lower() == "write" for v in jperms.values()):
@@ -135,8 +148,17 @@ if re.search(r"^\s*[a-z-]+:\s*write\b", raw, re.MULTILINE):
 print(f"  OK: {uses_count} Action references 100% 40-hex SHA pinned; least-privilege & branch rules verified.")
 PYEOF
 
+# Verify workflow-referenced Cargo feature & vcpkg overlay directory exist in repo.
+grep -q 'linux-pkg-config' libs/scrap/Cargo.toml \
+  || { echo "FAIL: libs/scrap/Cargo.toml missing linux-pkg-config feature referenced by $WORKFLOW" >&2; exit 1; }
+test -d res/vcpkg \
+  || { echo "FAIL: res/vcpkg overlay directory missing (referenced by $WORKFLOW)" >&2; exit 1; }
+echo "  OK: libs/scrap/Cargo.toml defines linux-pkg-config and res/vcpkg exists."
+
 echo "[2/5] Checking Bash syntax, SPDX headers, and verify-linux-l3.sh dry-run + exit-code 40..."
-bash -n "$LIN_SCRIPT" scripts/check-ci-local.sh
+for f in "$LIN_SCRIPT" scripts/check-ci-local.sh; do
+  bash -n "$f"
+done
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck "$LIN_SCRIPT" scripts/check-ci-local.sh
   echo "  OK: shellcheck passed."
@@ -205,6 +227,11 @@ echo "[3/5] Auditing $WIN_SCRIPT (SPDX, PowerShell syntax/dry-run, PROBE-NOT-PAT
 head -n 3 "$WIN_SCRIPT" | grep -q "SPDX-License-Identifier: AGPL-3.0-only" \
   || { echo "FAIL: $WIN_SCRIPT missing SPDX header" >&2; exit 1; }
 
+case "$HOST_OS" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
+  *) IS_WINDOWS=0 ;;
+esac
+
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -Command '
     $tokens = $null; $errors = $null
@@ -214,7 +241,7 @@ if command -v pwsh >/dev/null 2>&1; then
       exit 1
     }
   ' "$WIN_SCRIPT"
-  if [ "$HOST_OS" != "Windows_NT" ]; then
+  if [ "$IS_WINDOWS" -ne 1 ]; then
     rc=0
     pwsh -NoProfile -File "$WIN_SCRIPT" -Mode ci -Output "$TMP_DIR/win-fail.json" >/dev/null 2>&1 || rc=$?
     if [ "$rc" -ne 40 ]; then
@@ -223,13 +250,41 @@ if command -v pwsh >/dev/null 2>&1; then
     fi
     WIN_DRY_OUT="$TMP_DIR/win-dry-run.json"
     pwsh -NoProfile -File "$WIN_SCRIPT" -DryRun -Mode ci -Output "$WIN_DRY_OUT"
-    python3 - "$WIN_DRY_OUT" <<'PYEOF'
-import json, sys
-rep = json.load(open(sys.argv[1], encoding="utf-8"))
-assert rep["schema_version"] == 1 and rep["platform"] == "windows"
-assert rep["summary"]["skipped_unsupported_platform"] == 12
-assert rep["summary"]["pass"] == 0
-print("  OK: pwsh AST parse, exit=40, and -DryRun JSON verified.")
+    python3 - "$SCHEMA" "$WIN_DRY_OUT" <<'PYEOF'
+import json, re, socket, sys
+
+schema = json.load(open(sys.argv[1], encoding="utf-8"))
+rep = json.load(open(sys.argv[2], encoding="utf-8"))
+valid = set(schema["$defs"]["verificationStatus"]["enum"])
+
+assert rep["schema_version"] == 1
+assert rep["mode"] == "ci"
+assert rep["platform"] == "windows"
+assert isinstance(rep["ci_runner"], bool)
+assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", rep["started_at_utc"])
+items = rep["items"]
+assert len(items) == 12
+assert [it["id"] for it in items] == [f"WIN-L3-{i:02d}" for i in range(1, 13)]
+for it in items:
+    assert it["status"] in valid
+    assert it["status"] == "SKIPPED_UNSUPPORTED_PLATFORM"
+    assert it["duration_ms"] >= 0
+assert rep["summary"] == {
+    "pass": 0,
+    "l2_native_pass": 0,
+    "pending_physical_l3": 0,
+    "skipped_no_hardware": 0,
+    "skipped_unsupported_platform": 12,
+    "fail": 0,
+}
+raw = json.dumps(rep)
+mac_prefix = "/Us" + "ers/"
+assert mac_prefix.lower() not in raw.lower(), "unredacted macOS user path in Windows dry-run JSON"
+assert "/home/" not in raw.lower(), "unredacted Linux home path in Windows dry-run JSON"
+host = socket.gethostname()
+if host and len(host) >= 4:
+    assert host.lower() not in raw.lower(), "unredacted hostname in Windows dry-run JSON"
+print("  OK: pwsh AST parse, exit=40, and -DryRun scrubbed JSON (12/12 SKIPPED_UNSUPPORTED_PLATFORM) verified.")
 PYEOF
   fi
 else
@@ -248,15 +303,16 @@ required_ps1_tokens = [
     "PASS", "FAIL", "L2_NATIVE_PASS", "PENDING_PHYSICAL_L3",
     "SKIPPED_NO_HARDWARE", "SKIPPED_UNSUPPORTED_PLATFORM",
     "Scrub-Text", "Get-ShortSha256", "Write-ReportAtomic",
-    "ANTI-FORGERY VIOLATION", "Move-Item",
+    "WatchdogBin", "ANTI-FORGERY VIOLATION", "Move-Item",
     "exit 0", "exit 10", "exit 20", "exit 30", "exit 40",
 ]
 for tok in required_ps1_tokens:
     if tok not in win_src:
         sys.exit(f"FAIL: {sys.argv[1]} missing required token: {tok}")
 
-# Verify balanced braces/parens in PS1 (stripping single-line comments)
-no_comments = re.sub(r"(?m)^\s*#.*$", "", win_src)
+# Strip PowerShell block comments (<# ... #>) and full-line # comments accurately
+no_block_comments = re.sub(r"<#.*?#>", "", win_src, flags=re.DOTALL)
+no_comments = re.sub(r"(?m)^\s*#.*$", "", no_block_comments)
 if no_comments.count("{") != no_comments.count("}"):
     sys.exit(f"FAIL: unbalanced braces in {sys.argv[1]}: {{={no_comments.count('{')} }}={no_comments.count('}')}")
 if no_comments.count("(") != no_comments.count(")"):
@@ -265,8 +321,21 @@ if no_comments.count("(") != no_comments.count(")"):
 # PROBE-NOT-PATCH forbidden mutating/network/elevation commands
 win_forbidden = [
     r"Set-ItemProperty\b[^\n]*HKLM",
+    r"\bNew-ItemProperty\b",
+    r"\bRemove-ItemProperty\b",
+    r"\breg\s+add\b",
+    r"\breg\.exe\b",
     r"\bNew-Service\b",
+    r"\bSet-Service\b",
+    r"\bStop-Service\b",
+    r"\bStart-Service\b",
     r"\bsc\.exe\s+create\b",
+    r"\bschtasks\b",
+    r"\bnetsh\b",
+    r"\bbcdedit\b",
+    r"\bDISM\b",
+    r"\bEnable-WindowsOptionalFeature\b",
+    r"\bSet-CimInstance\b",
     r"-Verb\s+RunAs\b",
     r"\bInvoke-WebRequest\b",
     r"\bInvoke-RestMethod\b",
@@ -279,11 +348,17 @@ for pat in win_forbidden:
 lin_no_comments = re.sub(r"(?m)^\s*#.*$", "", lin_src)
 lin_forbidden = [
     r"\bmodprobe\b",
-    r"\bsystemctl\s+enable\b",
+    r"\bsystemctl\s+(enable|start|stop|mask)\b",
     r"\bsudo\b",
     r"\bpkexec\b",
     r"\bcurl\s+",
     r"\bwget\s+",
+    r"\bapt-get\b",
+    r"\bdpkg\s+-i\b",
+    r"\bsysctl\s+-w\b",
+    r"\biptables\b",
+    r"\bnft\s+",
+    r"\bumount\b",
 ]
 for pat in lin_forbidden:
     if re.search(pat, lin_no_comments):
@@ -312,6 +387,16 @@ expected_statuses = [
     "SKIPPED_UNSUPPORTED_PLATFORM",
 ]
 assert schema["$defs"]["verificationStatus"]["enum"] == expected_statuses
+all_of = schema.get("allOf") or []
+has_mode_ci_guard = any(
+    ((rule.get("if") or {}).get("properties") or {}).get("mode") == {"const": "ci"}
+    for rule in all_of
+)
+has_ci_runner_guard = any(
+    ((rule.get("if") or {}).get("properties") or {}).get("ci_runner") == {"const": True}
+    for rule in all_of
+)
+assert has_mode_ci_guard and has_ci_runner_guard, "schema missing mode==ci or ci_runner==true anti-forgery allOf guards"
 
 want_win = [f"WIN-L3-{i:02d}" for i in range(1, 13)]
 want_lin = [f"LIN-L3-{i:02d}" for i in range(1, 13)]
@@ -357,8 +442,8 @@ for name, want in EXPECTED.items():
     got = hashlib.sha256(raw).hexdigest()
     assert got == want, f"golden SHA-256 mismatch for {name}: got {got}, want {want}"
 
-diff_out = subprocess.check_output(["git", "diff", "--", golden_dir], text=True)
-assert diff_out == "", f"unexpected working-tree diff in {golden_dir}:\n{diff_out}"
+diff_out = subprocess.check_output(["git", "diff", "HEAD", "--", golden_dir], text=True)
+assert diff_out == "", f"unexpected diff vs HEAD in {golden_dir}:\n{diff_out}"
 print("  OK: 11 Phase 8A ABI golden snapshots verified (0-byte diff, exact SHA-256 match).")
 PYEOF
 

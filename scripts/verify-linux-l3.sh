@@ -34,7 +34,10 @@ usage() {
 Usage: verify-linux-l3.sh [options]
 
 Options:
-  --mode <ci|strict-l3>    Verification mode (default: ci). CI mode NEVER emits PASS.
+  --mode <ci|strict-l3>    Verification mode (default: ci). CI mode and CI runners NEVER emit PASS.
+                           Automated strict-l3 preserves L2_NATIVE_PASS on headless kernel probes and
+                           exits 10 whenever physical GPU/desktop items remain PENDING_PHYSICAL_L3
+                           until verified on real Intel/AMD Wayland and X11 hardware.
   --output <path|->        Output JSON report path (default: zerodesk-linux-l3-report.json; '-' = stdout).
   --diag-bin <path>        Optional path to zerodesk-linux-diag binary.
   --watchdog-bin <path>    Optional path to zerodesk-hid-watchdog binary.
@@ -162,8 +165,8 @@ repo_root = sys.argv[6]
 host_os = sys.argv[7]
 
 started_at_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-ci_runner = (os.environ.get("CI", "").lower() == "true") or (
-    os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+ci_runner = (os.environ.get("CI", "").strip().lower() in ("true", "1")) or (
+    os.environ.get("GITHUB_ACTIONS", "").strip().lower() in ("true", "1")
 )
 
 VALID_STATUSES = {
@@ -231,8 +234,10 @@ def make_item(spec, status, evidence, duration_ms, hw_fp=None):
     item_id, title, req_hw, req_elev = spec
     if status not in VALID_STATUSES:
         raise RuntimeError(f"Invalid status '{status}' for {item_id}")
-    if mode == "ci" and status == "PASS":
-        raise RuntimeError(f"ANTI-FORGERY VIOLATION: --mode ci forbids PASS (item={item_id})")
+    if (mode == "ci" or ci_runner) and status == "PASS":
+        raise RuntimeError(
+            f"ANTI-FORGERY VIOLATION: ci mode / CI runner forbids PASS (item={item_id}, mode={mode}, ci_runner={ci_runner})"
+        )
     if status == "PASS" and (not hw_fp or not re.fullmatch(r"[0-9a-f]{8}", hw_fp)):
         raise RuntimeError(
             f"ANTI-FORGERY VIOLATION: status PASS requires 8-hex hardware_fingerprint (item={item_id})"
@@ -275,7 +280,7 @@ def build_summary(items):
 
 def write_report_atomic(report, target):
     # Final anti-forgery gate before serialization
-    if report["mode"] == "ci":
+    if report["mode"] == "ci" or report["ci_runner"]:
         if report["summary"]["pass"] != 0:
             raise RuntimeError("ANTI-FORGERY VIOLATION: CI report summary.pass must be 0")
         for it in report["items"]:
@@ -317,7 +322,9 @@ def probe_pidfd_open():
     # Fallback syscall lookup for x86_64/aarch64 Linux (SYS_pidfd_open = 434)
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        fd = libc.syscall(434, os.getpid(), 0)
+        libc.syscall.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_uint]
+        libc.syscall.restype = ctypes.c_long
+        fd = int(libc.syscall(434, os.getpid(), 0))
         if fd >= 0:
             os.close(fd)
             return True, "syscall(SYS_pidfd_open=434) succeeded", int((time.monotonic() - t0) * 1000)
@@ -331,8 +338,16 @@ def probe_pr_set_pdeathsig_readonly():
     # PR_GET_PDEATHSIG = 2 (strictly read-only query of kernel prctl support)
     try:
         libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        libc.prctl.restype = ctypes.c_int
         out_sig = ctypes.c_int(-1)
-        rc = libc.prctl(2, ctypes.byref(out_sig), 0, 0, 0)
+        rc = int(libc.prctl(2, ctypes.byref(out_sig), 0, 0, 0))
         if rc == 0:
             return True, f"prctl(PR_GET_PDEATHSIG) ok (current_sig={out_sig.value})"
         return False, f"prctl(PR_GET_PDEATHSIG) rc={rc} errno={ctypes.get_errno()}"
@@ -418,13 +433,19 @@ def main():
         diag_err = "zerodesk-linux-diag binary not found (pass --diag-bin or build zerodesk_core)"
     diag_ms = int((time.monotonic() - t_diag0) * 1000)
 
-    # Read-only hardware fingerprint from DRM render node / VA-API vendor (never raw serials)
+    # Read-only hardware fingerprint from DRM render node / VA-API vendor (never raw serials).
+    # Only a non-empty real GPU vendor_string from VA-API qualifies as hw_fp_strong for strict-l3 PASS;
+    # arch-only render-node fallback hashes are informational only and NEVER authorize PASS.
     render_nodes = sorted(glob.glob("/dev/dri/renderD*"))
     hw_fp = None
+    hw_fp_strong = False
     if diag_parsed and diag_parsed.get("vaapi"):
         va = diag_parsed["vaapi"]
-        if va.get("render_node") and va.get("vendor_string"):
-            hw_fp = short_sha256(f"{va['render_node']}|{va['vendor_string']}|{va.get('driver_class', '')}")
+        vendor_str = (va.get("vendor_string") or "").strip()
+        render_node = (va.get("render_node") or "").strip()
+        if render_node and vendor_str:
+            hw_fp = short_sha256(f"{render_node}|{vendor_str}|{va.get('driver_class', '')}")
+            hw_fp_strong = True
     if hw_fp is None and render_nodes:
         hw_fp = short_sha256(f"{render_nodes[0]}|{platform.machine()}")
 
@@ -492,7 +513,15 @@ def main():
     va_driver = vaapi_sec.get("driver_class", "unprobed")
     va_allowed = bool(vaapi_sec.get("allowed_open_source_hw", False))
     va_codecs = vaapi_sec.get("supported_encode_codecs", [])
-    if mode == "strict-l3" and diag_parsed and vaapi_sec.get("ok") and va_allowed and hw_fp:
+    if (
+        mode == "strict-l3"
+        and not ci_runner
+        and diag_parsed
+        and vaapi_sec.get("ok")
+        and va_allowed
+        and hw_fp_strong
+        and hw_fp
+    ):
         items.append(
             make_item(
                 CHECKLIST[2],
@@ -507,7 +536,7 @@ def main():
             make_item(
                 CHECKLIST[2],
                 "PENDING_PHYSICAL_L3",
-                f"VA-API probe result: driver_class={va_driver}, allowed_open_source_hw={va_allowed}, drm_render_nodes={len(render_nodes)}; physical Intel iHD/i965 or AMD Mesa radeonsi GPU required for L3 PASS",
+                f"VA-API probe result: driver_class={va_driver}, allowed_open_source_hw={va_allowed}, strong_gpu_fp={hw_fp_strong}, drm_render_nodes={len(render_nodes)}; physical Intel iHD/i965 or AMD Mesa radeonsi GPU required for L3 PASS",
                 0,
                 hw_fp,
             )
@@ -577,21 +606,12 @@ def main():
                 diag_ms,
             )
         )
-    elif mode == "strict-l3":
-        items.append(
-            make_item(
-                CHECKLIST[7],
-                "PENDING_PHYSICAL_L3",
-                f"/dev/uinput default-off verified (exists={uinput_exists}, writable={uinput_writable}, uinput_status={uinput_status}); explicit --opt-in-uinput udev ACL negative & warning tests required for strict-l3 PASS",
-                diag_ms,
-            )
-        )
     else:
         items.append(
             make_item(
                 CHECKLIST[7],
                 "L2_NATIVE_PASS",
-                f"Read-only /dev/uinput probe verified default-off invariant (uinput_exists={uinput_exists}, uinput_writable={uinput_writable}, evdev_nodes={evdev_count}, diag.uinput_status={uinput_status})",
+                f"Read-only /dev/uinput probe verified default-off invariant (uinput_exists={uinput_exists}, uinput_writable={uinput_writable}, evdev_nodes={evdev_count}, diag.uinput_status={uinput_status}; explicit --opt-in-uinput udev ACL negative & warning tests required for physical L3 PASS)",
                 diag_ms,
             )
         )
@@ -618,21 +638,12 @@ def main():
                 diag_ms + pidfd_ms,
             )
         )
-    elif mode == "strict-l3":
-        items.append(
-            make_item(
-                CHECKLIST[8],
-                "PENDING_PHYSICAL_L3",
-                f"Watchdog spawn/heartbeat/pidfd verified ({pidfd_detail}; {watchdog_bin_detail}); physical EV_KEY=0 + SYN_REPORT <=500ms SIGKILL torture required for strict-l3 PASS",
-                diag_ms + pidfd_ms,
-            )
-        )
     else:
         items.append(
             make_item(
                 CHECKLIST[8],
                 "L2_NATIVE_PASS",
-                f"Native Linux watchdog lifecycle & pidfd_open verified (wd.ok=true, pidfd_supported=true, {pidfd_detail}; {watchdog_bin_detail}; physical /dev/uinput key-up torture deferred to L3)",
+                f"Native Linux watchdog lifecycle & pidfd_open verified (wd.ok=true, pidfd_supported=true, {pidfd_detail}; {watchdog_bin_detail}; physical EV_KEY=0 + SYN_REPORT <=500ms SIGKILL torture required for physical L3 PASS)",
                 diag_ms + pidfd_ms,
             )
         )
@@ -647,21 +658,12 @@ def main():
                 1,
             )
         )
-    elif mode == "strict-l3":
-        items.append(
-            make_item(
-                CHECKLIST[9],
-                "PENDING_PHYSICAL_L3",
-                f"{procstat_detail}; {pdeath_detail}; interactive Ctrl+Alt+Super+Escape physical hotkey release required for strict-l3 PASS",
-                1,
-            )
-        )
     else:
         items.append(
             make_item(
                 CHECKLIST[9],
                 "L2_NATIVE_PASS",
-                f"Native Linux /proc/self/stat field-22 & PR_SET_PDEATHSIG kernel support verified ({procstat_detail}; {pdeath_detail}; physical escape hotkey deferred to L3)",
+                f"Native Linux /proc/self/stat field-22 & PR_SET_PDEATHSIG kernel support verified ({procstat_detail}; {pdeath_detail}; interactive Ctrl+Alt+Super+Escape physical hotkey release required for physical L3 PASS)",
                 1,
             )
         )
@@ -686,21 +688,12 @@ def main():
                 diag_ms,
             )
         )
-    elif mode == "strict-l3":
-        items.append(
-            make_item(
-                CHECKLIST[10],
-                "PENDING_PHYSICAL_L3",
-                f"Post-watchdog /proc/self/fd audit clean (leaked_fds_detected=0, {pdeath_detail}); physical multi-fd inheritance torture required for strict-l3 PASS",
-                diag_ms,
-            )
-        )
     else:
         items.append(
             make_item(
                 CHECKLIST[10],
                 "L2_NATIVE_PASS",
-                f"Post-watchdog /proc/self/fd zero-leak audit & PR_SET_PDEATHSIG verified (leaked_fds_detected=0, monitor_mode={wd_sec.get('monitor_mode')}, {pdeath_detail})",
+                f"Post-watchdog /proc/self/fd zero-leak audit & PR_SET_PDEATHSIG verified (leaked_fds_detected=0, monitor_mode={wd_sec.get('monitor_mode')}, {pdeath_detail}; physical multi-fd inheritance torture required for physical L3 PASS)",
                 diag_ms,
             )
         )
