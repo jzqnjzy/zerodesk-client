@@ -54,9 +54,11 @@ use zerodesk_core::os::{
         WATCHDOG_REPORT_SCHEMA_VERSION,
     },
 };
+#[cfg(all(unix, not(target_os = "linux")))]
+use zerodesk_core::os::input::emergency_release_real_os_keys;
 #[cfg(unix)]
 use zerodesk_core::os::{
-    input::{emergency_release_real_os_keys, is_accessibility_trusted},
+    input::is_accessibility_trusted,
     watchdog_proto::{bitmap_collect_keys, WatchdogMsgType, WATCHDOG_READY_FLAG_AX_TRUSTED},
 };
 
@@ -69,6 +71,8 @@ struct WatchdogArgs {
     lock_file: PathBuf,
     dry_run_journal: Option<PathBuf>,
     real_os_input: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    uinput_opt_in: bool,
 }
 
 #[cfg(unix)]
@@ -80,6 +84,7 @@ fn parse_args(args: &[String]) -> Result<WatchdogArgs, String> {
     let mut lock_file: Option<PathBuf> = None;
     let mut dry_run_journal: Option<PathBuf> = None;
     let mut real_os_input = false;
+    let mut uinput_opt_in = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -145,6 +150,10 @@ fn parse_args(args: &[String]) -> Result<WatchdogArgs, String> {
                 real_os_input = true;
                 i += 1;
             }
+            "--uinput-opt-in" => {
+                uinput_opt_in = true;
+                i += 1;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -165,6 +174,7 @@ fn parse_args(args: &[String]) -> Result<WatchdogArgs, String> {
         lock_file: lock_file.ok_or_else(|| "missing --lock-file".to_string())?,
         dry_run_journal,
         real_os_input,
+        uinput_opt_in,
     })
 }
 
@@ -429,6 +439,7 @@ mod unix_impl {
 
     /// Executes emergency release and returns `true` iff release completed with zero residuals
     /// and zero errors.
+    #[cfg(not(target_os = "linux"))]
     fn execute_emergency_release(
         trigger: &str,
         args: &WatchdogArgs,
@@ -811,6 +822,68 @@ mod unix_impl {
     }
 
     #[cfg(target_os = "linux")]
+    fn finalize_linux_emergency_release(
+        trigger: &str,
+        args: &WatchdogArgs,
+        state: &TrackedState,
+        real_permit: Option<&RealInputPermit>,
+        steps: &[zerodesk_core::os::linux_watchdog_logic::LinuxReleaseStep],
+    ) -> bool {
+        use zerodesk_core::os::linux_watchdog::execute_watchdog_linux_release;
+
+        let start = Instant::now();
+        let released_keys = bitmap_collect_keys(&state.keys_bitmap);
+        let released_modifiers = ALL_MODIFIER_HID_USAGES.to_vec();
+
+        // Compute the real Linux release result FIRST so journal, ack flag, and exit code
+        // are 100% honest and never report EMERGENCY_OK when real release failed.
+        let (release_ok, release_error) = if real_permit.is_some() {
+            match execute_watchdog_linux_release(None, args.uinput_opt_in, steps) {
+                Ok(rep) if rep.residual_keys == 0 && rep.residual_buttons == 0 => (true, None),
+                Ok(rep) => (
+                    false,
+                    Some(format!(
+                        "residual unreleased Linux HID state: keys={} buttons={}",
+                        rep.residual_keys, rep.residual_buttons
+                    )),
+                ),
+                Err(e) => (false, Some(e.to_string())),
+            }
+        } else {
+            (true, None)
+        };
+
+        let mut overall_ok = release_ok;
+        if let Some(report_path) = &args.dry_run_journal {
+            let report = WatchdogReleaseReport {
+                schema_version: WATCHDOG_REPORT_SCHEMA_VERSION,
+                trigger: trigger.to_string(),
+                parent_pid: args.parent_pid,
+                watchdog_pid: std::process::id(),
+                released_keys,
+                released_buttons: state.buttons,
+                released_modifiers,
+                release_ok,
+                release_error,
+                release_elapsed_ms: start.elapsed().as_millis() as u64,
+                timestamp_epoch_ms: now_epoch_ms(),
+            };
+            if write_report_atomic_0600(report_path, &report).is_err() {
+                overall_ok = false;
+            }
+        }
+
+        let ack_flag = if overall_ok {
+            WATCHDOG_RELEASED_FLAG_EMERGENCY_OK
+        } else {
+            WATCHDOG_RELEASED_FLAG_EMERGENCY_FAILED
+        };
+        let ack = WatchdogFrame::released(state.last_seq, ack_flag).encode();
+        write_all_best_effort(args.ack_fd, &ack);
+        overall_ok
+    }
+
+    #[cfg(target_os = "linux")]
     fn run_event_loop(
         args: &WatchdogArgs,
         state: &mut TrackedState,
@@ -819,10 +892,7 @@ mod unix_impl {
     ) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         use zerodesk_core::os::{
-            linux_watchdog::{
-                arm_pdeathsig_and_verify_parent, execute_watchdog_linux_release,
-                LinuxParentMonitor,
-            },
+            linux_watchdog::{arm_pdeathsig_and_verify_parent, LinuxParentMonitor},
             linux_watchdog_logic::{
                 LinuxWatchdogAction, LinuxWatchdogLoopCore, DEFAULT_LINUX_HEARTBEAT_TIMEOUT_MS,
             },
@@ -833,9 +903,23 @@ mod unix_impl {
             SIG_FIRED.store(true, Ordering::Release);
         }
 
+        let _ = set_nonblock(args.ack_fd);
+        let mut core = LinuxWatchdogLoopCore::new(
+            0,
+            DEFAULT_LINUX_HEARTBEAT_TIMEOUT_MS,
+            args.uinput_opt_in,
+        );
+
         // 1. Arm PR_SET_PDEATHSIG + immediately verify getppid() == args.parent_pid
-        //    (defeats fork->prctl race if parent died right after spawn).
-        let _ = arm_pdeathsig_and_verify_parent(args.parent_pid);
+        //    (defeats fork->prctl race if parent died right after spawn). NEVER ignore error!
+        if arm_pdeathsig_and_verify_parent(args.parent_pid).is_err() {
+            if let LinuxWatchdogAction::EmergencyRelease { trigger, steps } =
+                core.on_parent_died("parent_pdeathsig_race")
+            {
+                return finalize_linux_emergency_release(trigger, args, state, real_permit, &steps);
+            }
+            return false;
+        }
 
         unsafe {
             libc::signal(libc::SIGHUP, on_sig as *const () as libc::sighandler_t);
@@ -843,12 +927,23 @@ mod unix_impl {
             libc::signal(libc::SIGINT, on_sig as *const () as libc::sighandler_t);
         }
 
-        // 2. Attach race-free parent monitor (`pidfd_open` preferred; `/proc/<pid>/stat`
-        //    field 22 starttime fallback on pre-5.3 kernels).
+        // 2. Attach race-free parent monitor (`pidfd_open` + ppid verify preferred;
+        //    `/proc/<pid>/stat` field 22 starttime fallback ONLY on ENOSYS).
         let monitor = match LinuxParentMonitor::attach(args.parent_pid) {
             Ok(m) => m,
             Err(_) => {
-                return execute_emergency_release("parent_exit_pidfd", args, state, real_permit);
+                if let LinuxWatchdogAction::EmergencyRelease { trigger, steps } =
+                    core.on_parent_died("parent_exit_pidfd")
+                {
+                    return finalize_linux_emergency_release(
+                        trigger,
+                        args,
+                        state,
+                        real_permit,
+                        &steps,
+                    );
+                }
+                return false;
             }
         };
 
@@ -856,21 +951,9 @@ mod unix_impl {
         write_all_best_effort(args.ack_fd, &ready);
 
         let loop_start = Instant::now();
-        let mut core = LinuxWatchdogLoopCore::new(0, DEFAULT_LINUX_HEARTBEAT_TIMEOUT_MS, false);
         let mut exit_ok = true;
         let mut acc = [0u8; WATCHDOG_FRAME_LEN];
         let mut acc_len = 0usize;
-
-        let run_linux_release = |trigger: &'static str,
-                                 steps: &[zerodesk_core::os::linux_watchdog_logic::LinuxReleaseStep],
-                                 st: &TrackedState|
-         -> bool {
-            let mut ok = true;
-            if real_permit.is_some() && execute_watchdog_linux_release(None, steps).is_err() {
-                ok = false;
-            }
-            execute_emergency_release(trigger, args, st, None) && ok
-        };
 
         loop {
             let mut poll_fds = [
@@ -902,7 +985,13 @@ mod unix_impl {
                         if let LinuxWatchdogAction::EmergencyRelease { trigger, steps } =
                             core.on_frame(&snap, elapsed_ms)
                         {
-                            exit_ok = run_linux_release(trigger, &steps, state);
+                            exit_ok = finalize_linux_emergency_release(
+                                trigger,
+                                args,
+                                state,
+                                real_permit,
+                                &steps,
+                            );
                             break;
                         }
                     }
@@ -913,9 +1002,16 @@ mod unix_impl {
                         break;
                     }
                     DrainOutcome::EmergencyRelease(trigger) => {
-                        let action = core.on_parent_died(trigger);
-                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
-                            exit_ok = run_linux_release(trigger, &steps, state);
+                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } =
+                            core.on_parent_died(trigger)
+                        {
+                            exit_ok = finalize_linux_emergency_release(
+                                trigger,
+                                args,
+                                state,
+                                real_permit,
+                                &steps,
+                            );
                         }
                         break;
                     }
@@ -934,9 +1030,16 @@ mod unix_impl {
                         write_all_best_effort(args.ack_fd, &ack);
                     }
                     DrainOutcome::EmergencyRelease(trigger) => {
-                        let action = core.on_parent_died(trigger);
-                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
-                            exit_ok = run_linux_release(trigger, &steps, state);
+                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } =
+                            core.on_parent_died(trigger)
+                        {
+                            exit_ok = finalize_linux_emergency_release(
+                                trigger,
+                                args,
+                                state,
+                                real_permit,
+                                &steps,
+                            );
                         }
                     }
                     DrainOutcome::Continue => {
@@ -945,9 +1048,16 @@ mod unix_impl {
                         } else {
                             "parent_exit_proc_stat"
                         };
-                        let action = core.on_parent_died(trigger);
-                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
-                            exit_ok = run_linux_release(trigger, &steps, state);
+                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } =
+                            core.on_parent_died(trigger)
+                        {
+                            exit_ok = finalize_linux_emergency_release(
+                                trigger,
+                                args,
+                                state,
+                                real_permit,
+                                &steps,
+                            );
                         }
                     }
                 }
@@ -955,9 +1065,16 @@ mod unix_impl {
             }
 
             if SIG_FIRED.load(Ordering::Acquire) {
-                let action = core.on_parent_died("signal");
-                if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
-                    exit_ok = run_linux_release("signal", &steps, state);
+                if let LinuxWatchdogAction::EmergencyRelease { steps, .. } =
+                    core.on_parent_died("signal")
+                {
+                    exit_ok = finalize_linux_emergency_release(
+                        "signal",
+                        args,
+                        state,
+                        real_permit,
+                        &steps,
+                    );
                 }
                 break;
             }
@@ -965,7 +1082,8 @@ mod unix_impl {
             if let LinuxWatchdogAction::EmergencyRelease { trigger, steps } =
                 core.on_tick(elapsed_ms)
             {
-                exit_ok = run_linux_release(trigger, &steps, state);
+                exit_ok =
+                    finalize_linux_emergency_release(trigger, args, state, real_permit, &steps);
                 break;
             }
         }

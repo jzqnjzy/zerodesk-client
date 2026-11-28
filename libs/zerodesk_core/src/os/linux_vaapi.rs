@@ -8,8 +8,15 @@
 //! - Open-source Intel (`iHD` / `i965`) and AMD Mesa (`radeonsi`) drivers ONLY.
 //! - ZERO proprietary SDKs (no MediaSDK / NVENC), ZERO compile-time `.so` linkage.
 //! - Driven by `VaapiHwEncoderStateMachine`: `HardwareReady` ONLY on first valid IDR,
-//!   30-frame stability window before resetting reinit attempts, and explicit
-//!   `FailedNeedsRenegotiation` on exhaustion (NEVER silent software fallback!).
+//!   30-frame stability window before resetting reinit attempts, monotonic `Instant`
+//!   first-IDR timeout clock, and explicit `FailedNeedsRenegotiation` on exhaustion
+//!   (NEVER silent software fallback!).
+//! - Implementation status: runtime `libva.so.2` DRM render-node probing, open-source
+//!   driver allowlist classification, profile/entrypoint capability querying,
+//!   `vaCreateConfig`, and rate-control/lifecycle state management are live;
+//!   hardware surface/coded-buffer bitstream submission in `encode_frame` /
+//!   `encode_i420` honestly returns `VideoError::HardwareUnavailable` pending
+//!   physical Linux Intel/AMD GPU bringup (`LIN-L3-04..06`) without burning reinit budget.
 
 #![cfg(target_os = "linux")]
 
@@ -17,19 +24,22 @@ use super::{
     linux_dl::DynLib,
     linux_vaapi_logic::{
         clamp_vaapi_bitrate_bps, classify_vaapi_vendor_string, select_vaapi_encode_profile,
-        VaapiCodec, VaapiCodecCapabilities, VaapiDriverClass, VaapiErrorDecision,
-        VaapiHwEncoderStateMachine, VaapiProfileEntrypoint, VA_ENTRYPOINT_ENC_SLICE,
-        VA_ENTRYPOINT_ENC_SLICE_LP, VA_STATUS_ERROR_OPERATION_FAILED, VA_STATUS_SUCCESS,
+        validate_and_clamp_rate_control, VaapiCodec, VaapiCodecCapabilities, VaapiDriverClass,
+        VaapiHwEncoderStateMachine, VaapiProfileEntrypoint, VAAPI_MAX_DIM,
+        VA_ENTRYPOINT_ENC_SLICE, VA_ENTRYPOINT_ENC_SLICE_LP, VA_STATUS_SUCCESS,
     },
     traits::{
         CapturedFrame, HardwareCodec, HardwareCodecEvent, HardwareCodecKind, HardwareCodecState,
         HardwareEncodedPacket, HardwareVideoEncoder,
     },
 };
-use crate::session::video::{I420Frame, VideoCodec, VideoError};
+use crate::{
+    qoe::EncoderTarget,
+    session::video::{I420Frame, VideoError},
+};
 use std::{
     ffi::{c_char, c_int, c_uint, c_void, CStr, CString},
-    time::{SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 type VaDisplay = *mut c_void;
@@ -39,16 +49,10 @@ type VaEntrypoint = c_int;
 type VaConfigId = c_uint;
 type VaContextId = c_uint;
 
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
-}
+/// Hard safety cap on profile/entrypoint counts returned by untrusted VA-API drivers.
+const MAX_VAAPI_ENUM_CAP: usize = 1024;
 
 struct VaApis {
-    _libva: DynLib,
-    _libva_drm: DynLib,
     va_get_display_drm: unsafe extern "C" fn(c_int) -> VaDisplay,
     va_initialize: unsafe extern "C" fn(VaDisplay, *mut c_int, *mut c_int) -> VaStatus,
     va_terminate: unsafe extern "C" fn(VaDisplay) -> VaStatus,
@@ -69,6 +73,9 @@ struct VaApis {
     ) -> VaStatus,
     va_destroy_config: unsafe extern "C" fn(VaDisplay, VaConfigId) -> VaStatus,
     va_destroy_context: unsafe extern "C" fn(VaDisplay, VaContextId) -> VaStatus,
+    // Keep DynLib handles LAST for defense-in-depth drop ordering.
+    _libva_drm: DynLib,
+    _libva: DynLib,
 }
 
 // SAFETY: `VaApis` stores dlopen handles and immutable C function pointers.
@@ -113,8 +120,8 @@ impl VaApis {
                 va_destroy_context: libva
                     .symbol("vaDestroyContext")
                     .map_err(VideoError::HardwareUnavailable)?,
-                _libva: libva,
                 _libva_drm: libva_drm,
+                _libva: libva,
             })
         }
     }
@@ -199,12 +206,15 @@ impl OwnedDrmVaSession {
     }
 
     fn query_capabilities(&self) -> Result<VaapiCodecCapabilities, VideoError> {
-        let max_profiles = unsafe { (self.apis.va_max_num_profiles)(self.display) };
-        let max_entrypoints = unsafe { (self.apis.va_max_num_entrypoints)(self.display) };
-        if max_profiles <= 0 || max_entrypoints <= 0 {
+        let raw_max_profiles = unsafe { (self.apis.va_max_num_profiles)(self.display) };
+        let raw_max_entrypoints = unsafe { (self.apis.va_max_num_entrypoints)(self.display) };
+        if raw_max_profiles <= 0 || raw_max_entrypoints <= 0 {
             return Ok(VaapiCodecCapabilities::default());
         }
-        let mut profiles = vec![0 as VaProfile; max_profiles as usize];
+        let max_profiles = (raw_max_profiles as usize).min(MAX_VAAPI_ENUM_CAP);
+        let max_entrypoints = (raw_max_entrypoints as usize).min(MAX_VAAPI_ENUM_CAP);
+
+        let mut profiles = vec![0 as VaProfile; max_profiles];
         let mut num_profiles: c_int = 0;
         let st = unsafe {
             (self.apis.va_query_config_profiles)(
@@ -214,10 +224,12 @@ impl OwnedDrmVaSession {
             )
         };
         if st != VA_STATUS_SUCCESS || num_profiles <= 0 {
-            return Ok(VaapiCodecCapabilities::default());
+            return Err(VideoError::HardwareUnavailable(format!(
+                "vaQueryConfigProfiles failed with VAStatus {st:#x}"
+            )));
         }
         let mut supported = Vec::new();
-        let mut eps = vec![0 as VaEntrypoint; max_entrypoints as usize];
+        let mut eps = vec![0 as VaEntrypoint; max_entrypoints];
         for &prof in &profiles[..(num_profiles as usize).min(profiles.len())] {
             let mut num_eps: c_int = 0;
             let ep_st = unsafe {
@@ -291,24 +303,44 @@ impl Drop for OwnedDrmVaSession {
 }
 
 /// Scans `/dev/dri/renderD128..renderD135` via runtime-loaded `libva.so.2` +
-/// `libva-drm.so.2` and returns the first initialized VA-API render node with its
-/// open-source driver classification and supported hardware encode codecs.
+/// `libva-drm.so.2` and returns the first render node that satisfies the
+/// open-source hardware driver allowlist AND exposes at least one supported
+/// H.264/HEVC hardware encode entrypoint (continuing across multi-GPU nodes when
+/// an earlier node is rejected or decode-only).
 pub fn probe_vaapi_device() -> Result<VaapiProbeResult, VideoError> {
     let mut last_err = VideoError::HardwareUnavailable(
-        "no accessible DRM render node (/dev/dri/renderD128..135) found".into(),
+        "no accessible open-source hardware VA-API render node (/dev/dri/renderD128..135) found"
+            .into(),
     );
     for idx in 128u32..=135u32 {
         let node = format!("/dev/dri/renderD{idx}");
         match OwnedDrmVaSession::open_render_node(&node) {
             Ok((session, vendor_string, driver_class)) => {
-                let capabilities = session.query_capabilities().unwrap_or_default();
-                let mut supported_encode_codecs = Vec::new();
-                if driver_class.is_allowed_open_source_hw() {
-                    for codec in [VaapiCodec::H264, VaapiCodec::Hevc] {
-                        if select_vaapi_encode_profile(codec, &capabilities).is_ok() {
-                            supported_encode_codecs.push(codec);
-                        }
+                if !driver_class.is_allowed_open_source_hw() {
+                    last_err = VideoError::HardwareUnavailable(format!(
+                        "skipped {node}: driver '{vendor_string}' ({}) rejected by open-source hardware allowlist",
+                        driver_class.as_str()
+                    ));
+                    continue;
+                }
+                let capabilities = match session.query_capabilities() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_err = e;
+                        continue;
                     }
+                };
+                let mut supported_encode_codecs = Vec::new();
+                for codec in [VaapiCodec::H264, VaapiCodec::Hevc] {
+                    if select_vaapi_encode_profile(codec, &capabilities).is_ok() {
+                        supported_encode_codecs.push(codec);
+                    }
+                }
+                if supported_encode_codecs.is_empty() {
+                    last_err = VideoError::HardwareUnavailable(format!(
+                        "skipped {node} ('{vendor_string}'): no supported H.264/HEVC hardware encode entrypoint"
+                    ));
+                    continue;
                 }
                 return Ok(VaapiProbeResult {
                     render_node: node,
@@ -337,6 +369,7 @@ pub struct LinuxVaapiHardwareEncoder {
     selected_profile: VaapiProfileEntrypoint,
     session: OwnedDrmVaSession,
     state: VaapiHwEncoderStateMachine,
+    clock_epoch: Instant,
 }
 
 impl LinuxVaapiHardwareEncoder {
@@ -347,7 +380,19 @@ impl LinuxVaapiHardwareEncoder {
         fps: u32,
         bitrate_bps: u32,
     ) -> Result<Self, VideoError> {
-        let bitrate_bps = clamp_vaapi_bitrate_bps(bitrate_bps)?;
+        let clamped_bps = clamp_vaapi_bitrate_bps(bitrate_bps)?;
+        let raw_target = EncoderTarget {
+            media_bitrate_kbps: clamped_bps / 1_000,
+            fec_budget_kbps: 0,
+            total_bitrate_kbps: clamped_bps / 1_000,
+            width,
+            height,
+            fps_cap: fps,
+            force_idr: true,
+            bitrate_changed: true,
+        };
+        let rc = validate_and_clamp_rate_control(&raw_target, VAAPI_MAX_DIM, VAAPI_MAX_DIM)?;
+
         let probe = probe_vaapi_device()?;
         if !probe.driver_class.is_allowed_open_source_hw() {
             return Err(VideoError::HardwareUnavailable(format!(
@@ -361,21 +406,23 @@ impl LinuxVaapiHardwareEncoder {
             OwnedDrmVaSession::open_render_node(&probe.render_node)?;
         session.create_encode_config(selected_profile)?;
 
+        let clock_epoch = Instant::now();
         let mut state = VaapiHwEncoderStateMachine::new(codec, driver_class)?;
         state.mark_initialized()?;
-        state.begin_waiting_first_idr(now_epoch_ms())?;
+        state.begin_waiting_first_idr(0)?;
 
         Ok(Self {
             render_node: probe.render_node,
             codec,
-            width,
-            height,
-            fps: fps.max(1),
-            bitrate_bps,
+            width: rc.width,
+            height: rc.height,
+            fps: rc.fps_cap,
+            bitrate_bps: rc.bitrate_bps,
             force_idr_pending: true,
             selected_profile,
             session,
             state,
+            clock_epoch,
         })
     }
 
@@ -395,36 +442,8 @@ impl LinuxVaapiHardwareEncoder {
         self.fps
     }
 
-    fn handle_error_decision(&mut self, decision: VaapiErrorDecision) -> VideoError {
-        match decision {
-            VaapiErrorDecision::RetryFrameTransient => VideoError::CodecFailed {
-                codec: VideoCodec::from(self.codec.to_hardware_codec_kind()),
-                reason: "transient VA-API hardware busy status".into(),
-            },
-            VaapiErrorDecision::TriggerReinit { attempt, .. } => {
-                if self.reinit().is_ok() {
-                    VideoError::CodecFailed {
-                        codec: VideoCodec::from(self.codec.to_hardware_codec_kind()),
-                        reason: format!("VA-API hardware reinit attempt {attempt} completed; retry frame"),
-                    }
-                } else {
-                    let _ = self.state.on_va_status_error(
-                        VA_STATUS_ERROR_OPERATION_FAILED,
-                        "VA-API hardware reinit failed",
-                    );
-                    VideoError::CodecFailed {
-                        codec: VideoCodec::from(self.codec.to_hardware_codec_kind()),
-                        reason: "VA-API hardware reinit failed; explicit renegotiation required".into(),
-                    }
-                }
-            }
-            VaapiErrorDecision::FailedNeedsRenegotiation { reason, .. } => {
-                VideoError::CodecFailed {
-                    codec: VideoCodec::from(self.codec.to_hardware_codec_kind()),
-                    reason,
-                }
-            }
-        }
+    fn monotonic_elapsed_ms(&self) -> u64 {
+        self.clock_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 }
 
@@ -466,16 +485,13 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
             )));
         }
         self.force_idr_pending |= force_idr;
-        if let Err(dec) = self.state.on_input_submitted(now_epoch_ms()) {
-            return Err(self.handle_error_decision(dec));
-        }
-        // Real VA-API surface submission & coded-buffer readback executes on Linux GPU hardware
-        // (validated by LIN-L3-04..06); never synthesize fake IDR bytes or fall back to SW.
-        let decision = self.state.on_va_status_error(
-            VA_STATUS_ERROR_OPERATION_FAILED,
-            "VA-API coded-buffer encode pipeline requires active Linux GPU hardware context",
-        );
-        Err(self.handle_error_decision(decision))
+        // Honest L1/L2 boundary: VA-API surface upload + coded-buffer bitstream submission
+        // is pending physical Linux Intel/AMD GPU bringup (LIN-L3-04..06). Return
+        // HardwareUnavailable explicitly without burning reinit budget or falling back to SW.
+        Err(VideoError::HardwareUnavailable(
+            "VA-API bitstream submission pending physical Linux Intel/AMD GPU bringup (LIN-L3-04..06)"
+                .into(),
+        ))
     }
 
     fn encode_i420(
@@ -492,14 +508,10 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
             )));
         }
         self.force_idr_pending |= force_idr;
-        if let Err(dec) = self.state.on_input_submitted(now_epoch_ms()) {
-            return Err(self.handle_error_decision(dec));
-        }
-        let decision = self.state.on_va_status_error(
-            VA_STATUS_ERROR_OPERATION_FAILED,
-            "VA-API I420->NV12 upload & encode pipeline requires active Linux GPU hardware context",
-        );
-        Err(self.handle_error_decision(decision))
+        Err(VideoError::HardwareUnavailable(
+            "VA-API bitstream submission pending physical Linux Intel/AMD GPU bringup (LIN-L3-04..06)"
+                .into(),
+        ))
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), VideoError> {
@@ -524,7 +536,8 @@ impl HardwareVideoEncoder for LinuxVaapiHardwareEncoder {
         fresh_session.create_encode_config(self.selected_profile)?;
         self.session = fresh_session;
         self.force_idr_pending = true;
-        self.state.begin_waiting_first_idr(now_epoch_ms())?;
+        self.state
+            .begin_waiting_first_idr(self.monotonic_elapsed_ms())?;
         Ok(())
     }
 }

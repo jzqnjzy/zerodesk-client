@@ -252,8 +252,74 @@ pub fn copy_shm_frame_rows(
     Ok(dst)
 }
 
+/// Converts packed 32-bit `RGBA8` / `RGBX8` pixels to `BGRA8` in-place (swapping
+/// R and B channels, and setting alpha to `0xFF` for opaque `RGBX8`/`BGRX8`).
+pub fn normalize_packed_to_bgra_in_place(buf: &mut [u8], format: PipeWirePixelFormat) {
+    match format {
+        PipeWirePixelFormat::Rgba8 => {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        PipeWirePixelFormat::Rgbx8 => {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+                px[3] = 0xFF;
+            }
+        }
+        PipeWirePixelFormat::Bgrx8 => {
+            for px in buf.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+        }
+        PipeWirePixelFormat::Bgra8 | PipeWirePixelFormat::Nv12 => {}
+    }
+}
+
+/// Self-describing packed frame queued between PipeWire ingestion and consumer readback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedFrame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: PipeWirePixelFormat,
+    pub pts_us: i64,
+}
+
+impl PackedFrame {
+    /// Verifies that `data.len() >= (height - 1) * stride + width * 4` without overflow.
+    pub fn validate_bgra_bounds(&self) -> Result<(), CaptureError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(CaptureError::ReinitRequired(
+                "PackedFrame has zero width or height".into(),
+            ));
+        }
+        let row_bytes = (self.width as usize)
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::ReinitRequired("PackedFrame row_bytes overflow".into()))?;
+        let stride = self.stride as usize;
+        if stride < row_bytes {
+            return Err(CaptureError::ReinitRequired(format!(
+                "PackedFrame stride {stride} < row_bytes {row_bytes}"
+            )));
+        }
+        let required = ((self.height as usize) - 1)
+            .checked_mul(stride)
+            .and_then(|off| off.checked_add(row_bytes))
+            .ok_or_else(|| CaptureError::ReinitRequired("PackedFrame size overflow".into()))?;
+        if self.data.len() < required {
+            return Err(CaptureError::ReinitRequired(format!(
+                "PackedFrame data len {} < required {required}",
+                self.data.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Bounded ring tracking PipeWire frame arrivals, monotonic sequence numbers,
-/// and dropped/overwritten frames.
+/// out-of-order/duplicate frames, and dropped/overwritten frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeWireFrameArrival {
     pub seq: u64,
@@ -268,6 +334,7 @@ pub struct PipeWireFrameArrivalRing {
     entries: VecDeque<PipeWireFrameArrival>,
     total_received: u64,
     total_dropped: u64,
+    total_out_of_order: u64,
     last_seq: Option<u64>,
 }
 
@@ -279,12 +346,24 @@ impl PipeWireFrameArrivalRing {
             entries: VecDeque::with_capacity(cap),
             total_received: 0,
             total_dropped: 0,
+            total_out_of_order: 0,
             last_seq: None,
         }
     }
 
-    pub fn push(&mut self, arrival: PipeWireFrameArrival) {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Pushes an arrival if `seq` is strictly monotonic.
+    /// Returns `false` (and increments `total_out_of_order` without touching `last_seq`
+    /// or `total_dropped`) when `arrival.seq <= prev`.
+    pub fn push(&mut self, arrival: PipeWireFrameArrival) -> bool {
         if let Some(prev) = self.last_seq {
+            if arrival.seq <= prev {
+                self.total_out_of_order = self.total_out_of_order.saturating_add(1);
+                return false;
+            }
             if arrival.seq > prev.saturating_add(1) {
                 self.total_dropped = self
                     .total_dropped
@@ -298,6 +377,7 @@ impl PipeWireFrameArrivalRing {
         }
         self.entries.push_back(arrival);
         self.total_received = self.total_received.saturating_add(1);
+        true
     }
 
     pub fn pop(&mut self) -> Option<PipeWireFrameArrival> {
@@ -320,8 +400,13 @@ impl PipeWireFrameArrivalRing {
         self.total_dropped
     }
 
+    pub fn total_out_of_order(&self) -> u64 {
+        self.total_out_of_order
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.last_seq = None;
     }
 }
 
@@ -539,13 +624,20 @@ impl WaylandPortalCaptureStateMachine {
             )));
         }
         let _required_bytes = params.validate()?;
+        if self.phase == PortalPhase::Streaming && self.negotiated_stream.as_ref() != Some(&params)
+        {
+            self.frames.clear();
+        }
         self.negotiated_stream = Some(params);
         self.recovery_attempts = 0;
         self.phase = PortalPhase::Streaming;
         Ok(self.phase.clone())
     }
 
-    pub fn on_frame_arrived(&mut self, arrival: PipeWireFrameArrival) -> Result<(), CaptureError> {
+    /// Validates an incoming PipeWire frame against the active negotiated stream and
+    /// enqueues its arrival metadata. Returns `Ok(true)` if accepted, `Ok(false)` if
+    /// ignored as a duplicate/out-of-order sequence number.
+    pub fn on_frame_arrived(&mut self, arrival: PipeWireFrameArrival) -> Result<bool, CaptureError> {
         if self.phase != PortalPhase::Streaming {
             return Err(CaptureError::ReinitRequired(format!(
                 "frame arrived while portal phase is {:?}",
@@ -564,8 +656,7 @@ impl WaylandPortalCaptureStateMachine {
                 arrival.byte_len
             )));
         }
-        self.frames.push(arrival);
-        Ok(())
+        Ok(self.frames.push(arrival))
     }
 
     /// Handles a portal or PipeWire error with bounded recovery for transient stream end /
@@ -673,6 +764,11 @@ pub fn linux_rotate_point(
 }
 
 /// Enumerated XRandR monitor descriptor.
+///
+/// NOTE: `width` and `height` are ALREADY post-rotation effective screen dimensions
+/// as reported directly by `XRRGetMonitors` in root-window coordinates (so callers
+/// must NOT double-swap them). `rotation_degrees` records the output orientation for
+/// diagnostics and raw-surface coordinate transforms (`linux_rotated_dims` / `linux_rotate_point`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct X11OutputDescriptor {
     pub monitor_id: u32,
@@ -686,8 +782,9 @@ pub struct X11OutputDescriptor {
 }
 
 impl X11OutputDescriptor {
-    pub fn effective_dims(&self) -> (u32, u32) {
-        linux_rotated_dims(self.width, self.height, self.rotation_degrees)
+    /// Returns the monitor's post-rotation effective `(width, height)` in X11 root coordinates.
+    pub const fn effective_dims(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     pub fn contains_point(&self, px: i32, py: i32) -> bool {
@@ -1220,7 +1317,8 @@ mod tests {
 
         assert_eq!(topo.virtual_bounds(), Some((0, 0, 3000, 1920)));
         assert_eq!(topo.select_monitor(None).unwrap().name, "DP-1");
-        assert_eq!(topo.select_monitor(Some(1)).unwrap().effective_dims(), (1920, 1080));
+        // X11OutputDescriptor width/height are already post-rotation effective XRRGetMonitors dims.
+        assert_eq!(topo.select_monitor(Some(1)).unwrap().effective_dims(), (1080, 1920));
         assert_eq!(linux_rotated_dims(1920, 1080, 270), (1080, 1920));
         assert_eq!(linux_rotate_point(10, 20, 100, 50, 90), (29, 10));
         assert_eq!(linux_rotate_point(10, 20, 100, 50, 180), (89, 29));
@@ -1311,6 +1409,114 @@ mod tests {
         assert!(matches!(
             sm.on_error(X11CaptureErrorKind::BadMatch, "exhausted"),
             X11CaptureDecision::TerminalFailure(CaptureError::Fatal(_))
+        ));
+    }
+
+    #[test]
+    fn pipewire_ring_rejects_seq_rollback_and_renegotiation_flushes_stale_frames() {
+        let mut sm = WaylandPortalCaptureStateMachine::new(2, 100, 1_000, 4);
+        sm.begin_create_session().unwrap();
+        sm.on_session_created().unwrap();
+        sm.on_sources_selected().unwrap();
+        sm.on_stream_started(7, None, 0).unwrap();
+
+        let p1 = PipeWireStreamParams {
+            node_id: 7,
+            width: 640,
+            height: 480,
+            stride: 640 * 4,
+            format: PipeWirePixelFormat::Rgba8,
+            buffer_kind: PipeWireBufferKind::MemFdShm,
+            drm_modifier: 0,
+        };
+        sm.on_pipewire_negotiated(p1).unwrap();
+
+        assert!(sm
+            .on_frame_arrived(PipeWireFrameArrival {
+                seq: 10,
+                pts_us: 100,
+                byte_len: 640 * 480 * 4,
+                buffer_kind: PipeWireBufferKind::MemFdShm,
+            })
+            .unwrap());
+        // Duplicate or rolled-back seq MUST be ignored without inflating total_dropped or lowering last_seq.
+        assert!(!sm
+            .on_frame_arrived(PipeWireFrameArrival {
+                seq: 10,
+                pts_us: 101,
+                byte_len: 640 * 480 * 4,
+                buffer_kind: PipeWireBufferKind::MemFdShm,
+            })
+            .unwrap());
+        assert!(!sm
+            .on_frame_arrived(PipeWireFrameArrival {
+                seq: 5,
+                pts_us: 102,
+                byte_len: 640 * 480 * 4,
+                buffer_kind: PipeWireBufferKind::MemFdShm,
+            })
+            .unwrap());
+        assert_eq!(sm.frame_ring().total_dropped(), 0);
+        assert_eq!(sm.frame_ring().total_out_of_order(), 2);
+        assert_eq!(sm.frame_ring().len(), 1);
+
+        // Next seq 11 should proceed normally with 0 drops (proving last_seq stayed 10, not 5!).
+        assert!(sm
+            .on_frame_arrived(PipeWireFrameArrival {
+                seq: 11,
+                pts_us: 116,
+                byte_len: 640 * 480 * 4,
+                buffer_kind: PipeWireBufferKind::MemFdShm,
+            })
+            .unwrap());
+        assert_eq!(sm.frame_ring().total_dropped(), 0);
+        assert_eq!(sm.frame_ring().len(), 2);
+
+        // Renegotiating to new geometry MUST clear stale frames from the ring.
+        let p2 = PipeWireStreamParams {
+            node_id: 7,
+            width: 1280,
+            height: 720,
+            stride: 1280 * 4,
+            format: PipeWirePixelFormat::Bgra8,
+            buffer_kind: PipeWireBufferKind::MemFdShm,
+            drm_modifier: 0,
+        };
+        sm.on_pipewire_negotiated(p2).unwrap();
+        assert!(sm.frame_ring().is_empty());
+    }
+
+    #[test]
+    fn packed_frame_bounds_and_rgba_to_bgra_swizzle() {
+        let mut rgba = vec![0x11, 0x22, 0x33, 0x80, 0xAA, 0xBB, 0xCC, 0x00];
+        normalize_packed_to_bgra_in_place(&mut rgba, PipeWirePixelFormat::Rgba8);
+        assert_eq!(rgba, vec![0x33, 0x22, 0x11, 0x80, 0xCC, 0xBB, 0xAA, 0x00]);
+
+        let mut rgbx = vec![0x11, 0x22, 0x33, 0x00];
+        normalize_packed_to_bgra_in_place(&mut rgbx, PipeWirePixelFormat::Rgbx8);
+        assert_eq!(rgbx, vec![0x33, 0x22, 0x11, 0xFF]);
+
+        let valid = PackedFrame {
+            data: vec![0u8; 16],
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: PipeWirePixelFormat::Bgra8,
+            pts_us: 1,
+        };
+        valid.validate_bgra_bounds().unwrap();
+
+        let truncated = PackedFrame {
+            data: vec![0u8; 12],
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: PipeWirePixelFormat::Bgra8,
+            pts_us: 1,
+        };
+        assert!(matches!(
+            truncated.validate_bgra_bounds(),
+            Err(CaptureError::ReinitRequired(_))
         ));
     }
 }

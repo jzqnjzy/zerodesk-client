@@ -153,7 +153,11 @@ impl LinuxDiagReport {
         let serialized =
             serde_json::to_string(self).map_err(|e| format!("serialize failed: {e}"))?;
         let lower = serialized.to_ascii_lowercase();
-        if lower.contains("/home/") || lower.contains("/users/") || lower.contains("c:\\\\users\\\\")
+        if lower.contains("/home/")
+            || lower.contains("/users/")
+            || lower.contains("/root/")
+            || lower.contains("c:\\\\users\\\\")
+            || lower.contains("c:/users/")
         {
             return Err("unredacted local user home path detected in LinuxDiagReport".into());
         }
@@ -326,10 +330,16 @@ mod tests {
         report.vaapi.as_mut().unwrap().driver_class = VaapiDriverClass::RejectedSoftwareRasterizer;
         assert!(report.validate().is_err());
 
-        // Reject unredacted /home/<user>/ path.
+        // Reject unredacted /home/<user>/, /root/, or c:/users/ paths.
         report.vaapi.as_mut().unwrap().allowed_open_source_hw = true;
         report.vaapi.as_mut().unwrap().driver_class = VaapiDriverClass::IntelIhd;
         report.capture.as_mut().unwrap().error = Some("failed reading /home/alice/cfg".into());
+        assert!(report.validate().is_err());
+
+        report.capture.as_mut().unwrap().error = Some("failed reading /root/.config".into());
+        assert!(report.validate().is_err());
+
+        report.capture.as_mut().unwrap().error = Some("failed reading C:/Users/bob/app".into());
         assert!(report.validate().is_err());
     }
 }

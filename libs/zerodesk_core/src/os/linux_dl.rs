@@ -10,7 +10,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{c_void, CStr, CString};
 
 /// RAII handle owning a dynamically loaded shared object via `libc::dlopen`.
 pub struct DynLib {
@@ -27,6 +27,10 @@ impl DynLib {
     pub fn open(soname: &str) -> Result<Self, String> {
         let c_name = CString::new(soname)
             .map_err(|_| format!("invalid shared library name containing NUL: '{soname}'"))?;
+        unsafe {
+            // Clear any stale dlerror state before calling dlopen.
+            let _ = libc::dlerror();
+        }
         let handle = unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             let err = last_dlerror().unwrap_or_else(|| "unknown dlopen error".to_string());
@@ -54,17 +58,18 @@ impl DynLib {
         &self.name
     }
 
-    /// Resolves a raw symbol pointer via `dlsym`.
+    /// Resolves a raw symbol pointer via `dlsym`, clearing `dlerror()` first so
+    /// errors are attributed accurately.
     pub fn symbol_raw(&self, symbol: &str) -> Result<*mut c_void, String> {
         let c_sym = CString::new(symbol)
             .map_err(|_| format!("invalid symbol name containing NUL: '{symbol}'"))?;
+        unsafe {
+            let _ = libc::dlerror();
+        }
         let ptr = unsafe { libc::dlsym(self.handle, c_sym.as_ptr()) };
         if ptr.is_null() {
             let err = last_dlerror().unwrap_or_else(|| "symbol not found".to_string());
-            return Err(format!(
-                "dlsym('{}', '{symbol}') failed: {err}",
-                self.name
-            ));
+            return Err(format!("dlsym('{}', '{symbol}') failed: {err}", self.name));
         }
         Ok(ptr)
     }
@@ -72,9 +77,18 @@ impl DynLib {
     /// Resolves a typed function pointer from this library.
     ///
     /// # Safety
-    /// Caller must ensure `T` matches the exact C ABI signature of `symbol`.
+    /// 1. Caller MUST ensure `T` matches the exact C ABI function pointer signature of `symbol`.
+    /// 2. The returned function pointer is valid **ONLY** while this `DynLib` remains alive
+    ///    (calling it after `DynLib` is dropped invokes `dlclose`'d code -> UB).
     pub unsafe fn symbol<T: Copy>(&self, symbol: &str) -> Result<T, String> {
-        debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
+        if std::mem::size_of::<T>() != std::mem::size_of::<*mut c_void>() {
+            return Err(format!(
+                "dlsym('{}', '{symbol}') target type size {} != pointer size {}",
+                self.name,
+                std::mem::size_of::<T>(),
+                std::mem::size_of::<*mut c_void>()
+            ));
+        }
         let ptr = self.symbol_raw(symbol)?;
         Ok(std::mem::transmute_copy(&ptr))
     }

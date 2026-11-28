@@ -38,6 +38,18 @@ pub const BTN_EXTRA: u16 = 0x0114;
 
 /// Standard XKB `evdev` keycode offset (`x11_keycode = evdev_code + 8`).
 pub const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
+/// Maximum Linux `evdev` code representable in an 8-bit X11 XKB keycode (`247 + 8 = 255`).
+pub const MAX_X11_EVDEV_CODE: u16 = 247;
+
+/// Converts a Linux `evdev` keycode to an X11 XKB keycode (`evdev + 8`), returning
+/// `None` if `evdev_code > 247` would overflow `u8`.
+pub const fn evdev_to_x11_keycode(evdev_code: u16) -> Option<u8> {
+    if evdev_code <= MAX_X11_EVDEV_CODE {
+        Some((evdev_code + X11_EVDEV_KEYCODE_OFFSET) as u8)
+    } else {
+        None
+    }
+}
 
 /// Clean-room Linux `evdev` keyboard constants (`KEY_*`).
 pub const KEY_ESC: u16 = 1;
@@ -158,6 +170,7 @@ pub struct LinuxKeyMapping {
 
 impl LinuxKeyMapping {
     pub const fn new(hid_usage: u16, evdev_code: u16) -> Self {
+        assert!(evdev_code <= MAX_X11_EVDEV_CODE);
         Self {
             hid_usage,
             evdev_code,
@@ -400,6 +413,8 @@ mod tests {
         assert_eq!(LinuxHidKeyMap::all_mappings().len(), 106);
         assert_eq!(LinuxHidKeyMap::hid_to_linux(0x00), None);
         assert_eq!(LinuxHidKeyMap::hid_to_linux(0x66), None); // Power key forbidden
+        assert_eq!(evdev_to_x11_keycode(MAX_X11_EVDEV_CODE), Some(255));
+        assert_eq!(evdev_to_x11_keycode(MAX_X11_EVDEV_CODE + 1), None);
     }
 
     #[test]

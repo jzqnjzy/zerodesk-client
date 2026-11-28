@@ -10,12 +10,13 @@
 //! 3. Capture backend selection & XRandR monitor topology,
 //! 4. VA-API DRM render node + open-source driver allowlist (`iHD`/`i965`/`radeonsi`),
 //! 5. Input 3-tier degradation chain + `/dev/uinput` opt-in & permission status,
-//! 6. Watchdog `pidfd_open` vs `/proc/<pid>/stat` capability & `/proc/self/fd` audit.
+//! 6. Watchdog `pidfd_open` vs `/proc/<pid>/stat` capability & `/proc/self/fd` delta audit.
 //!
 //! On non-Linux hosts (macOS / Windows), emits a clean static non-Linux stub
 //! without linking `zerodesk_core` or platform screen-capture libraries.
 
 use std::{
+    ffi::OsStr,
     io::{self, Write},
     process::ExitCode,
 };
@@ -62,7 +63,7 @@ fn run_linux_diagnostics(
         error: portal_err.map(|e| sanitize_diag_text(&e)),
     };
 
-    // 2. Capture probe
+    // 2. Capture probe (sanitize monitor names before serialization)
     let capture = match session_kind {
         LinuxSessionKind::Wayland => LinuxDiagCaptureSection {
             ok: sc_ok,
@@ -75,12 +76,17 @@ fn run_linux_diagnostics(
             },
         },
         LinuxSessionKind::X11 => match enumerate_x11_monitors() {
-            Ok(monitors) => LinuxDiagCaptureSection {
-                ok: !monitors.is_empty(),
-                selected_backend: "x11_xshm_xrandr_xfixes".into(),
-                monitors,
-                error: None,
-            },
+            Ok(mut monitors) => {
+                for m in &mut monitors {
+                    m.name = sanitize_diag_text(&m.name);
+                }
+                LinuxDiagCaptureSection {
+                    ok: !monitors.is_empty(),
+                    selected_backend: "x11_xshm_xrandr_xfixes".into(),
+                    monitors,
+                    error: None,
+                }
+            }
             Err(e) => LinuxDiagCaptureSection {
                 ok: false,
                 selected_backend: "x11_xshm_xrandr_xfixes".into(),
@@ -109,11 +115,14 @@ fn run_linux_diagnostics(
                     res.driver_class.as_str()
                 ))
             } else {
-                Some("VA-API open-source driver exposes no supported H.264/HEVC encode entrypoint".into())
+                Some(
+                    "VA-API open-source driver exposes no supported H.264/HEVC encode entrypoint"
+                        .into(),
+                )
             };
             LinuxDiagVaapiSection {
                 ok,
-                render_node: Some(res.render_node),
+                render_node: Some(sanitize_diag_text(&res.render_node)),
                 vendor_string: Some(sanitize_diag_text(&res.vendor_string)),
                 driver_class: res.driver_class,
                 allowed_open_source_hw: allowed,
@@ -142,7 +151,7 @@ fn run_linux_diagnostics(
         error: None,
     };
 
-    // 5. Watchdog pidfd + /proc/self/fd + optional spawn self-test
+    // 5. Watchdog pidfd + post-watchdog `/proc/self/fd` delta audit
     let pidfd_supported = probe_pidfd_supported();
     let monitor_mode = if pidfd_supported {
         LinuxParentMonitorMode::PidFd
@@ -156,17 +165,17 @@ fn run_linux_diagnostics(
             start_time_ticks: start_ticks,
         }
     };
-    let leaked_fds_detected = count_unexpected_open_fds(&[0, 1, 2]);
     let watchdog = if skip_watchdog {
         LinuxDiagWatchdogSection {
             tested: false,
             ok: true,
             pidfd_supported,
             monitor_mode,
-            leaked_fds_detected,
+            leaked_fds_detected: 0,
             error: Some("skipped via --skip-watchdog".into()),
         }
     } else {
+        let baseline_fds = count_unexpected_open_fds(&[0, 1, 2]);
         let mut backend = LinuxHidWatchdogBackend::new();
         let cfg = HidWatchdogConfig {
             real_os_input: false,
@@ -176,27 +185,37 @@ fn run_linux_diagnostics(
             Ok(_) => {
                 let hb_ok = backend.heartbeat().is_ok();
                 let _ = backend.shutdown(None);
+                let after_fds = count_unexpected_open_fds(&[0, 1, 2]);
+                let leaked_delta = after_fds.saturating_sub(baseline_fds);
                 LinuxDiagWatchdogSection {
                     tested: true,
-                    ok: hb_ok,
+                    ok: hb_ok && leaked_delta == 0,
                     pidfd_supported,
                     monitor_mode,
-                    leaked_fds_detected,
-                    error: if hb_ok {
-                        None
-                    } else {
+                    leaked_fds_detected: leaked_delta,
+                    error: if !hb_ok {
                         Some("Linux watchdog heartbeat check failed".into())
+                    } else if leaked_delta > 0 {
+                        Some(format!(
+                            "watchdog lifecycle leaked {leaked_delta} open file descriptor(s)"
+                        ))
+                    } else {
+                        None
                     },
                 }
             }
-            Err(e) => LinuxDiagWatchdogSection {
-                tested: true,
-                ok: false,
-                pidfd_supported,
-                monitor_mode,
-                leaked_fds_detected,
-                error: Some(sanitize_diag_text(&e.to_string())),
-            },
+            Err(e) => {
+                let after_fds = count_unexpected_open_fds(&[0, 1, 2]);
+                let leaked_delta = after_fds.saturating_sub(baseline_fds);
+                LinuxDiagWatchdogSection {
+                    tested: true,
+                    ok: false,
+                    pidfd_supported,
+                    monitor_mode,
+                    leaked_fds_detected: leaked_delta,
+                    error: Some(sanitize_diag_text(&e.to_string())),
+                }
+            }
         }
     };
 
@@ -215,15 +234,26 @@ fn run_linux_diagnostics(
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let human_summary = args.iter().any(|a| a == "--summary" || a == "--human");
-    let _json_flag = args.iter().any(|a| a == "--json");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let human_summary = args
+        .iter()
+        .any(|a| a == OsStr::new("--summary") || a == OsStr::new("--human"));
+    let _json_flag = args.iter().any(|a| a == OsStr::new("--json"));
 
     #[cfg(target_os = "linux")]
     {
-        let skip_watchdog = args.iter().any(|a| a == "--skip-watchdog");
-        let opt_in_uinput = args.iter().any(|a| a == "--opt-in-uinput");
+        let skip_watchdog = args.iter().any(|a| a == OsStr::new("--skip-watchdog"));
+        let opt_in_uinput = args.iter().any(|a| a == OsStr::new("--opt-in-uinput"));
         let report = run_linux_diagnostics(skip_watchdog, opt_in_uinput);
+        // Fail closed before emitting anything if schema or redaction validation fails!
+        if let Err(err) = report.validate() {
+            let mut err_out = io::stderr().lock();
+            let _ = writeln!(
+                err_out,
+                "zerodesk-linux-diag: report validation failed (redaction/schema): {err}"
+            );
+            return ExitCode::FAILURE;
+        }
         let all_ok = report.all_sections_ok();
         let rendered = if human_summary {
             Ok(report.format_human_summary())

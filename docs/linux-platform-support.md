@@ -78,6 +78,9 @@ ZeroDesk enforces a strict **3-tier Linux input degradation chain** (`resolve_li
    - Exhausting retries transitions to terminal idempotent `FailedNeedsRenegotiation` emitting `"hardware_encoder_failed_renegotiate_vp9"` — **NEVER** silently switching to software encoding.
 4. **Phase 9A QoE Integration**:
    - `validate_and_clamp_rate_control()` validates and clamps `qoe::EncoderTarget` (`media_bitrate_kbps`, `fps_cap`, even-aligned `width`/`height`, `force_idr`) onto safe VA-API hardware bounds.
+5. **Honest L1/L2 vs L3 Bringup Scope**:
+   - Runtime `libva.so.2` + `libva-drm.so.2` multi-GPU render-node probing (`/dev/dri/renderD128..135`), open-source driver allowlist classification, profile/entrypoint capability querying, `vaCreateConfig`, monotonic-clock first-IDR timeout gating, and 30-frame stability state management are live.
+   - Hardware surface upload and coded-buffer bitstream submission in `LinuxVaapiHardwareEncoder::encode_frame` / `encode_i420` explicitly return `VideoError::HardwareUnavailable` without burning reinit budget or falling back to software, pending physical Linux Intel/AMD GPU bringup (`LIN-L3-04..06`).
 
 ---
 

@@ -567,6 +567,7 @@ pub struct LinuxWatchdogLoopCore {
     last_seq: u64,
     has_uinput_fd: bool,
     heartbeat: WatchdogHeartbeatTracker,
+    emergency_latched: Option<&'static str>,
 }
 
 impl LinuxWatchdogLoopCore {
@@ -576,6 +577,7 @@ impl LinuxWatchdogLoopCore {
             last_seq: 0,
             has_uinput_fd,
             heartbeat: WatchdogHeartbeatTracker::new(start_ms, heartbeat_timeout_ms),
+            emergency_latched: None,
         }
     }
 
@@ -587,7 +589,17 @@ impl LinuxWatchdogLoopCore {
         self.last_seq
     }
 
+    pub fn is_emergency_latched(&self) -> bool {
+        self.emergency_latched.is_some()
+    }
+
     pub fn on_frame(&mut self, frame: &WatchdogFrame, now_ms: u64) -> LinuxWatchdogAction {
+        if let Some(latched) = self.emergency_latched {
+            return LinuxWatchdogAction::EmergencyRelease {
+                trigger: latched,
+                steps: self.shadow.build_dual_layer_release_plan(self.has_uinput_fd),
+            };
+        }
         match frame.msg_type {
             WatchdogMsgType::StateSnapshot => {
                 if frame.seq < self.last_seq {
@@ -606,6 +618,9 @@ impl LinuxWatchdogLoopCore {
                 LinuxWatchdogAction::Continue
             }
             WatchdogMsgType::GracefulExit => {
+                if frame.seq < self.last_seq {
+                    return self.trigger_emergency("malformed_frame_seq_rollback");
+                }
                 self.last_seq = frame.seq;
                 self.shadow.clear();
                 LinuxWatchdogAction::GracefulExit { seq: frame.seq }
@@ -618,23 +633,30 @@ impl LinuxWatchdogLoopCore {
     }
 
     pub fn on_tick(&mut self, now_ms: u64) -> LinuxWatchdogAction {
+        if let Some(latched) = self.emergency_latched {
+            return LinuxWatchdogAction::EmergencyRelease {
+                trigger: latched,
+                steps: self.shadow.build_dual_layer_release_plan(self.has_uinput_fd),
+            };
+        }
         match self.heartbeat.check_timeout(now_ms) {
             HeartbeatStatus::Healthy { .. } => LinuxWatchdogAction::Continue,
             HeartbeatStatus::TimedOut { .. } => self.trigger_emergency("heartbeat_timeout"),
         }
     }
 
-    pub fn on_parent_died(&self, trigger: &'static str) -> LinuxWatchdogAction {
+    pub fn on_parent_died(&mut self, trigger: &'static str) -> LinuxWatchdogAction {
         self.trigger_emergency(trigger)
     }
 
-    pub fn on_emergency_hotkey(&self) -> LinuxWatchdogAction {
+    pub fn on_emergency_hotkey(&mut self) -> LinuxWatchdogAction {
         self.trigger_emergency("emergency_hotkey")
     }
 
-    fn trigger_emergency(&self, trigger: &'static str) -> LinuxWatchdogAction {
+    fn trigger_emergency(&mut self, trigger: &'static str) -> LinuxWatchdogAction {
+        let latched = *self.emergency_latched.get_or_insert(trigger);
         LinuxWatchdogAction::EmergencyRelease {
-            trigger,
+            trigger: latched,
             steps: self.shadow.build_dual_layer_release_plan(self.has_uinput_fd),
         }
     }
@@ -819,8 +841,9 @@ mod tests {
         let snap = WatchdogFrame::state_snapshot(1, bitmap, 0x01, MOD_CTRL);
         assert_eq!(core.on_frame(&snap, 1_100), LinuxWatchdogAction::Continue);
 
+        let mut core_hotkey = core.clone();
         let sigkill_action = core.on_parent_died("parent_exit_pidfd");
-        let hotkey_action = core.on_emergency_hotkey();
+        let hotkey_action = core_hotkey.on_emergency_hotkey();
         match (sigkill_action, hotkey_action) {
             (
                 LinuxWatchdogAction::EmergencyRelease { steps: s1, .. },
@@ -829,15 +852,66 @@ mod tests {
             other => panic!("expected matching EmergencyRelease plans, got {other:?}"),
         }
 
-        // Sending Ctrl+Alt+Super+Escape inside a snapshot triggers immediate release.
+        // Sending Ctrl+Alt+Super+Escape inside a snapshot triggers immediate release and latches!
+        let mut core_esc = LinuxWatchdogLoopCore::new(1_000, 3_000, true);
+        assert_eq!(core_esc.on_frame(&snap, 1_100), LinuxWatchdogAction::Continue);
         bitmap_set_key(&mut bitmap, 0x29); // Escape
         let esc = WatchdogFrame::state_snapshot(2, bitmap, 0, MOD_CTRL | MOD_ALT | MOD_META);
         assert!(matches!(
-            core.on_frame(&esc, 1_200),
+            core_esc.on_frame(&esc, 1_200),
             LinuxWatchdogAction::EmergencyRelease {
                 trigger: "emergency_hotkey",
                 ..
             }
         ));
+        assert!(core_esc.is_emergency_latched());
+        // Once latched, subsequent snapshots/ticks NEVER return Continue!
+        let benign = WatchdogFrame::state_snapshot(3, [0u8; 32], 0, 0);
+        assert!(matches!(
+            core_esc.on_frame(&benign, 1_300),
+            LinuxWatchdogAction::EmergencyRelease {
+                trigger: "emergency_hotkey",
+                ..
+            }
+        ));
+        assert!(matches!(
+            core_esc.on_tick(1_400),
+            LinuxWatchdogAction::EmergencyRelease {
+                trigger: "emergency_hotkey",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn graceful_exit_rejects_seq_rollback_and_proc_stat_rejects_malformed_inputs() {
+        let mut core = LinuxWatchdogLoopCore::new(1_000, 3_000, true);
+        let mut bm = [0u8; 32];
+        bitmap_set_key(&mut bm, 0x04);
+        assert_eq!(
+            core.on_frame(&WatchdogFrame::state_snapshot(5, bm, 0x01, 0), 1_100),
+            LinuxWatchdogAction::Continue
+        );
+        // Replayed GracefulExit with seq < last_seq MUST fail closed via EmergencyRelease
+        // without clearing the shadow set!
+        assert!(matches!(
+            core.on_frame(&WatchdogFrame::graceful_exit(4), 1_150),
+            LinuxWatchdogAction::EmergencyRelease {
+                trigger: "malformed_frame_seq_rollback",
+                ..
+            }
+        ));
+        assert_eq!(core.shadow().pressed_hid_keys(), vec![0x04]);
+
+        // Malformed /proc/<pid>/stat inputs rejected cleanly.
+        assert!(parse_proc_stat("").is_err());
+        assert!(parse_proc_stat("123 no_parens S 1").is_err());
+        assert!(parse_proc_stat("123 )inverted( S 1").is_err());
+        assert!(parse_proc_stat("0 (zero) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 100").is_err());
+        assert!(parse_proc_stat("42 (truncated) S 1 2 3").is_err());
+        assert!(parse_proc_stat(
+            "42 (bad_start) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 not_a_num"
+        )
+        .is_err());
     }
 }

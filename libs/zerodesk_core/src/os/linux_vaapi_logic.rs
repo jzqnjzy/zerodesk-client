@@ -420,6 +420,15 @@ impl VaapiHwEncoderStateMachine {
 
     pub fn mark_initialized(&mut self) -> Result<(), VideoError> {
         self.ensure_not_terminal()?;
+        if matches!(
+            self.state,
+            HardwareCodecState::HardwareReady | HardwareCodecState::WaitingFirstIdr
+        ) {
+            return Err(VideoError::InvalidInput(format!(
+                "cannot downgrade VA-API encoder state from {:?} to Initialized",
+                self.state
+            )));
+        }
         self.state = HardwareCodecState::Initialized;
         Ok(())
     }
@@ -473,10 +482,7 @@ impl VaapiHwEncoderStateMachine {
             return;
         }
         match self.state {
-            HardwareCodecState::WaitingFirstIdr
-            | HardwareCodecState::Initialized
-            | HardwareCodecState::Enumerated
-            | HardwareCodecState::ReinitRetry { .. } => {
+            HardwareCodecState::WaitingFirstIdr | HardwareCodecState::ReinitRetry { .. } => {
                 if is_idr {
                     self.state = HardwareCodecState::HardwareReady;
                     self.frames_since_first_idr_wait = 0;
@@ -487,6 +493,9 @@ impl VaapiHwEncoderStateMachine {
                         backend: format!("linux_vaapi_{}", self.driver_class.as_str()),
                     });
                 }
+            }
+            HardwareCodecState::Enumerated | HardwareCodecState::Initialized => {
+                // Must NOT promote to HardwareReady before entering WaitingFirstIdr.
             }
             HardwareCodecState::HardwareReady => {
                 self.stable_frames_in_ready = self.stable_frames_in_ready.saturating_add(1);
@@ -767,5 +776,25 @@ mod tests {
         assert_eq!(rc.height, 1080);
         assert!(rc.force_idr);
         assert!(clamp_vaapi_bitrate_bps(0).is_err());
+    }
+
+    #[test]
+    fn state_machine_blocks_premature_idr_promotion_and_mark_initialized_downgrade() {
+        let mut sm =
+            VaapiHwEncoderStateMachine::new(VaapiCodec::H264, VaapiDriverClass::IntelIhd).unwrap();
+        // Enumerated -> IDR ignored
+        sm.on_encoded_packet(true, 2048);
+        assert_eq!(sm.state(), HardwareCodecState::Enumerated);
+        // Initialized -> IDR ignored until WaitingFirstIdr
+        sm.mark_initialized().unwrap();
+        sm.on_encoded_packet(true, 2048);
+        assert_eq!(sm.state(), HardwareCodecState::Initialized);
+
+        // WaitingFirstIdr -> IDR promotes to HardwareReady; mark_initialized cannot downgrade!
+        sm.begin_waiting_first_idr(10).unwrap();
+        assert!(sm.mark_initialized().is_err());
+        sm.on_encoded_packet(true, 2048);
+        assert_eq!(sm.state(), HardwareCodecState::HardwareReady);
+        assert!(sm.mark_initialized().is_err());
     }
 }

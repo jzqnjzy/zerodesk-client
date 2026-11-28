@@ -6,27 +6,29 @@
 //! - X11 `XShm` / `XRandR` / `XFixes` (`dlopen("libX11.so.6")` + `libXext.so.6` +
 //!   `libXrandr.so.2` + `libXfixes.so.3`)
 //!
-//! All state transitions, buffer bounds checks, rotation math, and cursor ARGB
-//! validation are delegated to `linux_capture_logic.rs`. ZERO compile-time `.so`
-//! linking is used.
+//! All state transitions, buffer bounds checks, pixel-format normalization, rotation
+//! math, and cursor ARGB validation are delegated to `linux_capture_logic.rs`.
+//! ZERO compile-time `.so` linking is used.
 
 #![cfg(target_os = "linux")]
 
 use super::{
     linux_capture_logic::{
         convert_xfixes_argb_to_cursor_metadata, copy_shm_frame_rows, detect_linux_session_kind,
-        LinuxSessionKind, PipeWireBufferKind, PipeWireFrameArrival, PipeWireStreamParams,
-        WaylandPortalCaptureStateMachine, X11CaptureErrorKind, X11CaptureStateMachine,
-        X11MonitorTopology, X11OutputDescriptor,
+        normalize_packed_to_bgra_in_place, LinuxSessionKind, PackedFrame, PipeWireBufferKind,
+        PipeWireFrameArrival, PipeWireStreamParams, WaylandPortalCaptureStateMachine,
+        X11CaptureDecision, X11CaptureErrorKind, X11CaptureStateMachine, X11MonitorTopology,
+        X11OutputDescriptor, XFixesCursorInput, MAX_XFIXES_CURSOR_DIM,
     },
     linux_dl::DynLib,
     traits::{CaptureError, CapturedFrame, CapturedSurface, CursorMetadata, ScreenCapturer},
-    OsPermission,
 };
 use std::{
-    ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort, c_void, CStr, CString},
+    collections::VecDeque,
+    ffi::{c_char, c_int, c_uint, c_ulong, c_ushort, c_void, CStr},
     path::Path,
     ptr,
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -62,7 +64,10 @@ pub fn probe_portal_availability() -> (bool, bool, bool, Option<String>) {
             false,
             false,
             false,
-            Some("D-Bus session bus not detected (DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR/bus absent)".into()),
+            Some(
+                "D-Bus session bus not detected (DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR/bus absent)"
+                    .into(),
+            ),
         );
     }
 
@@ -99,9 +104,43 @@ type XVisual = c_void;
 type XDrawable = c_ulong;
 type XBool = c_int;
 type XStatus = c_int;
+type XErrorHandler = unsafe extern "C" fn(*mut XDisplay, *mut XErrorEvent) -> c_int;
+type XIOErrorHandler = unsafe extern "C" fn(*mut XDisplay) -> c_int;
 
 const X_ZPIXMAP: c_int = 2;
 const X_ALL_PLANES: c_ulong = !0;
+
+/// Process-wide Xlib error/IO-error latches installed via `XSetErrorHandler` and
+/// `XSetIOErrorHandler` so protocol errors (`BadMatch`) and display disconnects
+/// are observed cleanly instead of triggering Xlib's default `exit(1)`.
+static X11_DISPLAY_DEAD: AtomicBool = AtomicBool::new(false);
+static X11_LAST_ERROR_CODE: AtomicI32 = AtomicI32::new(0);
+
+#[repr(C)]
+struct XErrorEvent {
+    ev_type: c_int,
+    display: *mut XDisplay,
+    resourceid: c_ulong,
+    serial: c_ulong,
+    error_code: u8,
+    request_code: u8,
+    minor_code: u8,
+}
+
+unsafe extern "C" fn zerodesk_x11_error_handler(
+    _display: *mut XDisplay,
+    err: *mut XErrorEvent,
+) -> c_int {
+    if !err.is_null() {
+        X11_LAST_ERROR_CODE.store(i32::from((*err).error_code), Ordering::Release);
+    }
+    0
+}
+
+unsafe extern "C" fn zerodesk_x11_io_error_handler(_display: *mut XDisplay) -> c_int {
+    X11_DISPLAY_DEAD.store(true, Ordering::Release);
+    0
+}
 
 #[repr(C)]
 struct XShmSegmentInfo {
@@ -129,7 +168,6 @@ struct XImage {
     green_mask: c_ulong,
     blue_mask: c_ulong,
     obdata: *mut c_void,
-    // Function table follows in Xlib; we never construct XImage by value.
 }
 
 #[repr(C)]
@@ -162,10 +200,6 @@ struct XFixesCursorImage {
 }
 
 struct X11Apis {
-    _x11: DynLib,
-    _xext: DynLib,
-    _xrandr: Option<DynLib>,
-    _xfixes: Option<DynLib>,
     x_open_display: unsafe extern "C" fn(*const c_char) -> *mut XDisplay,
     x_close_display: unsafe extern "C" fn(*mut XDisplay) -> c_int,
     x_default_screen: unsafe extern "C" fn(*mut XDisplay) -> c_int,
@@ -176,7 +210,9 @@ struct X11Apis {
     x_display_height: unsafe extern "C" fn(*mut XDisplay, c_int) -> c_int,
     x_get_atom_name: unsafe extern "C" fn(*mut XDisplay, XAtom) -> *mut c_char,
     x_free: unsafe extern "C" fn(*mut c_void) -> c_int,
-    x_destroy_image_fallback: unsafe extern "C" fn(*mut XDisplay) -> c_int,
+    x_sync: unsafe extern "C" fn(*mut XDisplay, XBool) -> c_int,
+    x_set_error_handler: unsafe extern "C" fn(Option<XErrorHandler>) -> Option<XErrorHandler>,
+    x_set_io_error_handler: unsafe extern "C" fn(Option<XIOErrorHandler>) -> Option<XIOErrorHandler>,
     x_shm_query_extension: unsafe extern "C" fn(*mut XDisplay) -> XBool,
     x_shm_create_image: unsafe extern "C" fn(
         *mut XDisplay,
@@ -203,6 +239,11 @@ struct X11Apis {
     >,
     xrr_free_monitors: Option<unsafe extern "C" fn(*mut XRRMonitorInfo)>,
     xfixes_get_cursor_image: Option<unsafe extern "C" fn(*mut XDisplay) -> *mut XFixesCursorImage>,
+    // Keep DynLib handles last for defense-in-depth drop ordering.
+    _xfixes: Option<DynLib>,
+    _xrandr: Option<DynLib>,
+    _xext: DynLib,
+    _x11: DynLib,
 }
 
 // SAFETY: X11Apis holds function pointers and process-global dlopen handles; XDisplay access
@@ -227,7 +268,13 @@ impl X11Apis {
             let x_display_height = x11.symbol("XDisplayHeight").map_err(CaptureError::Fatal)?;
             let x_get_atom_name = x11.symbol("XGetAtomName").map_err(CaptureError::Fatal)?;
             let x_free = x11.symbol("XFree").map_err(CaptureError::Fatal)?;
-            let x_destroy_image_fallback = x11.symbol("XSync").map_err(CaptureError::Fatal)?;
+            let x_sync = x11.symbol("XSync").map_err(CaptureError::Fatal)?;
+            let x_set_error_handler = x11
+                .symbol("XSetErrorHandler")
+                .map_err(CaptureError::Fatal)?;
+            let x_set_io_error_handler = x11
+                .symbol("XSetIOErrorHandler")
+                .map_err(CaptureError::Fatal)?;
             let x_shm_query_extension = xext
                 .symbol("XShmQueryExtension")
                 .map_err(CaptureError::Fatal)?;
@@ -250,10 +297,6 @@ impl X11Apis {
                 .and_then(|xf| xf.symbol("XFixesGetCursorImage").ok());
 
             Ok(Self {
-                _x11: x11,
-                _xext: xext,
-                _xrandr: xrandr,
-                _xfixes: xfixes,
                 x_open_display,
                 x_close_display,
                 x_default_screen,
@@ -264,7 +307,9 @@ impl X11Apis {
                 x_display_height,
                 x_get_atom_name,
                 x_free,
-                x_destroy_image_fallback,
+                x_sync,
+                x_set_error_handler,
+                x_set_io_error_handler,
                 x_shm_query_extension,
                 x_shm_create_image,
                 x_shm_attach,
@@ -273,7 +318,20 @@ impl X11Apis {
                 xrr_get_monitors,
                 xrr_free_monitors,
                 xfixes_get_cursor_image,
+                _xfixes: xfixes,
+                _xrandr: xrandr,
+                _xext: xext,
+                _x11: x11,
             })
+        }
+    }
+
+    fn install_error_handlers(&self) {
+        X11_DISPLAY_DEAD.store(false, Ordering::Release);
+        X11_LAST_ERROR_CODE.store(0, Ordering::Release);
+        unsafe {
+            let _ = (self.x_set_error_handler)(Some(zerodesk_x11_error_handler));
+            let _ = (self.x_set_io_error_handler)(Some(zerodesk_x11_io_error_handler));
         }
     }
 }
@@ -282,6 +340,7 @@ impl X11Apis {
 /// dimensions when `libXrandr.so.2` is unavailable).
 pub fn enumerate_x11_monitors() -> Result<Vec<X11OutputDescriptor>, CaptureError> {
     let apis = X11Apis::load()?;
+    apis.install_error_handlers();
     let display = unsafe { (apis.x_open_display)(ptr::null()) };
     if display.is_null() {
         return Err(CaptureError::Fatal(
@@ -399,6 +458,7 @@ unsafe impl Send for X11ShmCapturer {}
 impl X11ShmCapturer {
     pub fn open(requested_monitor_id: Option<u32>) -> Result<Self, CaptureError> {
         let apis = X11Apis::load()?;
+        apis.install_error_handlers();
         let display = unsafe { (apis.x_open_display)(ptr::null()) };
         if display.is_null() {
             return Err(CaptureError::Fatal(
@@ -458,7 +518,11 @@ impl X11ShmCapturer {
         if let Some(mut attached) = self.shm.take() {
             unsafe {
                 let _ = (self.apis.x_shm_detach)(self.display, attached.seg.as_mut());
-                let _ = (self.apis.x_destroy_image_fallback)(self.display);
+                let _ = (self.apis.x_sync)(self.display, 0);
+                // Intentional `XFree(image)` instead of `XDestroyImage`: for MIT-SHM
+                // images, `image->data` points into our `shmat()` segment (which we detach
+                // via `shmdt` below), NOT an Xlib-allocated buffer, so freeing only the
+                // `XImage` descriptor avoids double-freeing the shared memory segment.
                 if !attached.image.is_null() {
                     let _ = (self.apis.x_free)(attached.image.cast());
                 }
@@ -479,6 +543,11 @@ impl X11ShmCapturer {
         let w = self.active_monitor.width;
         let h = self.active_monitor.height;
         let visual = unsafe { (self.apis.x_default_visual)(self.display, self.screen) };
+        if visual.is_null() {
+            return Err(CaptureError::ReinitRequired(
+                "XDefaultVisual returned NULL".into(),
+            ));
+        }
         let depth = unsafe { (self.apis.x_default_depth)(self.display, self.screen) };
         let mut seg = Box::new(XShmSegmentInfo {
             shmseg: 0,
@@ -499,15 +568,36 @@ impl X11ShmCapturer {
             )
         };
         if img.is_null() {
-            return Err(CaptureError::ReinitRequired("XShmCreateImage returned NULL".into()));
+            return Err(CaptureError::ReinitRequired(
+                "XShmCreateImage returned NULL".into(),
+            ));
         }
-        let stride = unsafe { (*img).bytes_per_line };
-        let img_h = unsafe { (*img).height };
+        let (stride, img_h, bpp, red_mask, blue_mask) = unsafe {
+            (
+                (*img).bytes_per_line,
+                (*img).height,
+                (*img).bits_per_pixel,
+                (*img).red_mask,
+                (*img).blue_mask,
+            )
+        };
         if stride <= 0 || img_h <= 0 {
             unsafe {
                 let _ = (self.apis.x_free)(img.cast());
             }
-            return Err(CaptureError::Fatal("XShmCreateImage returned invalid geometry".into()));
+            return Err(CaptureError::Fatal(
+                "XShmCreateImage returned invalid geometry".into(),
+            ));
+        }
+        // Fail closed unless the X11 server delivers 32-bit BGRX/BGRA pixel layout
+        // (R=0x00FF0000, B=0x000000FF on little-endian x86_64/aarch64 Linux).
+        if bpp != 32 || red_mask != 0x00FF_0000 || blue_mask != 0x0000_00FF {
+            unsafe {
+                let _ = (self.apis.x_free)(img.cast());
+            }
+            return Err(CaptureError::ReinitRequired(format!(
+                "unsupported X11 XShm pixel format: bpp={bpp}, red_mask={red_mask:#x}, blue_mask={blue_mask:#x} (expected 32-bit BGRA/BGRX)"
+            )));
         }
         let byte_len = (stride as usize)
             .checked_mul(img_h as usize)
@@ -517,7 +607,9 @@ impl X11ShmCapturer {
             unsafe {
                 let _ = (self.apis.x_free)(img.cast());
             }
-            return Err(CaptureError::ReinitRequired("shmget(IPC_PRIVATE) failed".into()));
+            return Err(CaptureError::ReinitRequired(
+                "shmget(IPC_PRIVATE) failed".into(),
+            ));
         }
         let addr = unsafe { libc::shmat(shmid, ptr::null(), 0) };
         if addr.is_null() || addr == (-1isize as *mut c_void) {
@@ -562,12 +654,19 @@ impl X11ShmCapturer {
         if cur.is_null() {
             return None;
         }
+        // Never use `?` before `XFree(cur)`: guarantee `XFree` executes on EVERY path.
         let result = unsafe {
             let c = &*cur;
-            if c.pixels.is_null() || c.width == 0 || c.height == 0 {
+            let cw = u32::from(c.width);
+            let ch = u32::from(c.height);
+            if c.pixels.is_null()
+                || cw == 0
+                || ch == 0
+                || cw > MAX_XFIXES_CURSOR_DIM
+                || ch > MAX_XFIXES_CURSOR_DIM
+            {
                 None
-            } else {
-                let count = (c.width as usize).checked_mul(c.height as usize)?;
+            } else if let Some(count) = (cw as usize).checked_mul(ch as usize) {
                 let raw_ulongs = std::slice::from_raw_parts(c.pixels, count);
                 let argb_u32: Vec<u32> = raw_ulongs.iter().map(|&v| v as u32).collect();
                 let rel_x = i32::from(c.x) - self.active_monitor.x;
@@ -575,19 +674,19 @@ impl X11ShmCapturer {
                 let visible = self
                     .active_monitor
                     .contains_point(i32::from(c.x), i32::from(c.y));
-                convert_xfixes_argb_to_cursor_metadata(
-                    &super::linux_capture_logic::XFixesCursorInput {
-                        x: rel_x,
-                        y: rel_y,
-                        width: u32::from(c.width),
-                        height: u32::from(c.height),
-                        hotspot_x: u32::from(c.xhot),
-                        hotspot_y: u32::from(c.yhot),
-                        visible,
-                        argb_pixels: &argb_u32,
-                    },
-                )
+                convert_xfixes_argb_to_cursor_metadata(&XFixesCursorInput {
+                    x: rel_x,
+                    y: rel_y,
+                    width: cw,
+                    height: ch,
+                    hotspot_x: u32::from(c.xhot),
+                    hotspot_y: u32::from(c.yhot),
+                    visible,
+                    argb_pixels: &argb_u32,
+                })
                 .ok()
+            } else {
+                None
             }
         };
         unsafe {
@@ -619,6 +718,17 @@ impl ScreenCapturer for X11ShmCapturer {
     }
 
     fn capture_next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        // Check Xlib IO error latch before making any further X11 requests.
+        if X11_DISPLAY_DEAD.load(Ordering::Acquire) {
+            return match self.state.on_error(
+                X11CaptureErrorKind::DisplayDisconnected,
+                "X11 IO error handler observed display disconnect",
+            ) {
+                X11CaptureDecision::TerminalFailure(err) => Err(err),
+                _ => Err(CaptureError::Fatal("X11 display disconnected".into())),
+            };
+        }
+
         // Check if XRandR monitor layout changed before grabbing.
         if let Ok(fresh) = enumerate_x11_monitors_on_display(&self.apis, self.display) {
             if let Ok(new_topo) = X11MonitorTopology::from_outputs(fresh) {
@@ -635,24 +745,37 @@ impl ScreenCapturer for X11ShmCapturer {
                         self.active_monitor = m;
                     }
                     match decision {
-                        super::linux_capture_logic::X11CaptureDecision::RecreateShm { .. } => {
+                        X11CaptureDecision::RecreateShm { .. } => {
                             self.attach_shm_for_active_monitor()?;
                         }
-                        super::linux_capture_logic::X11CaptureDecision::TerminalFailure(err) => {
-                            return Err(err);
-                        }
-                        super::linux_capture_logic::X11CaptureDecision::TimeoutNoChange => {
-                            return Err(CaptureError::Timeout);
-                        }
+                        X11CaptureDecision::TerminalFailure(err) => return Err(err),
+                        X11CaptureDecision::TimeoutNoChange => return Err(CaptureError::Timeout),
                     }
                 }
             }
         }
 
+        // Recoverable SHM re-attach if `self.shm` was previously detached.
+        if self.shm.is_none() {
+            match self.state.on_error(
+                X11CaptureErrorKind::ShmAttachFailed,
+                "XShm segment detached; attempting bounded re-attach",
+            ) {
+                X11CaptureDecision::RecreateShm { .. } => {
+                    self.attach_shm_for_active_monitor()?;
+                }
+                X11CaptureDecision::TerminalFailure(err) => return Err(err),
+                X11CaptureDecision::TimeoutNoChange => return Err(CaptureError::Timeout),
+            }
+        }
+
         let Some(attached) = &self.shm else {
-            return Err(CaptureError::ReinitRequired("XShm segment not attached".into()));
+            return Err(CaptureError::ReinitRequired(
+                "XShm segment unavailable after re-attach".into(),
+            ));
         };
 
+        X11_LAST_ERROR_CODE.store(0, Ordering::Release);
         let ok = unsafe {
             (self.apis.x_shm_get_image)(
                 self.display,
@@ -663,19 +786,30 @@ impl ScreenCapturer for X11ShmCapturer {
                 X_ALL_PLANES,
             )
         };
-        if ok == 0 {
-            let decision = self
-                .state
-                .on_error(X11CaptureErrorKind::BadMatch, "XShmGetImage returned 0");
+        if X11_DISPLAY_DEAD.load(Ordering::Acquire) {
+            return match self.state.on_error(
+                X11CaptureErrorKind::DisplayDisconnected,
+                "X11 display disconnected during XShmGetImage",
+            ) {
+                X11CaptureDecision::TerminalFailure(err) => Err(err),
+                _ => Err(CaptureError::Fatal("X11 display disconnected".into())),
+            };
+        }
+        let proto_err = X11_LAST_ERROR_CODE.load(Ordering::Acquire);
+        if ok == 0 || proto_err != 0 {
+            let decision = self.state.on_error(
+                X11CaptureErrorKind::BadMatch,
+                &format!("XShmGetImage failed (ok={ok}, proto_err={proto_err})"),
+            );
             return match decision {
-                super::linux_capture_logic::X11CaptureDecision::RecreateShm { .. } => {
+                X11CaptureDecision::RecreateShm { .. } => {
                     self.attach_shm_for_active_monitor()?;
-                    Err(CaptureError::ReinitRequired("XShm recreated after BadMatch".into()))
+                    Err(CaptureError::ReinitRequired(
+                        "XShm recreated after BadMatch".into(),
+                    ))
                 }
-                super::linux_capture_logic::X11CaptureDecision::TerminalFailure(e) => Err(e),
-                super::linux_capture_logic::X11CaptureDecision::TimeoutNoChange => {
-                    Err(CaptureError::Timeout)
-                }
+                X11CaptureDecision::TerminalFailure(e) => Err(e),
+                X11CaptureDecision::TimeoutNoChange => Err(CaptureError::Timeout),
             };
         }
 
@@ -715,8 +849,8 @@ impl ScreenCapturer for X11ShmCapturer {
 // ============================================================================
 
 struct PipeWireLib {
-    _lib: DynLib,
     pw_get_library_version: unsafe extern "C" fn() -> *const c_char,
+    _lib: DynLib,
 }
 
 // SAFETY: Process-global shared library function pointer.
@@ -730,8 +864,8 @@ impl PipeWireLib {
                 .map_err(CaptureError::Fatal)?
         };
         Ok(Self {
-            _lib: lib,
             pw_get_library_version,
+            _lib: lib,
         })
     }
 
@@ -751,24 +885,31 @@ impl PipeWireLib {
 pub struct WaylandPipeWireCapturer {
     pw: PipeWireLib,
     state: WaylandPortalCaptureStateMachine,
-    pending_shm_frame: Option<Vec<u8>>,
+    pending_frames: VecDeque<PackedFrame>,
     monitor_id: u32,
 }
 
 impl WaylandPipeWireCapturer {
     pub fn new(monitor_id: u32) -> Result<Self, CaptureError> {
         let (dbus_ok, sc_ok, _, err_note) = probe_portal_availability();
-        if !dbus_ok || !sc_ok {
-            return Err(CaptureError::PermissionDenied(
-                OsPermission::ScreenRecording,
+        if !dbus_ok {
+            return Err(CaptureError::DesktopUnavailable(
+                err_note.unwrap_or_else(|| "D-Bus session bus unavailable".into()),
+            ));
+        }
+        if !sc_ok {
+            return Err(CaptureError::Fatal(
+                err_note.unwrap_or_else(|| {
+                    "Wayland xdg-desktop-portal ScreenCast or libpipewire-0.3.so.0 unavailable"
+                        .into()
+                }),
             ));
         }
         let pw = PipeWireLib::load()?;
-        let _ = err_note;
         Ok(Self {
             pw,
             state: WaylandPortalCaptureStateMachine::default(),
-            pending_shm_frame: None,
+            pending_frames: VecDeque::with_capacity(8),
             monitor_id,
         })
     }
@@ -785,7 +926,23 @@ impl WaylandPipeWireCapturer {
         &mut self.state
     }
 
+    /// Applies PipeWire stream negotiation and synchronously clears any queued
+    /// stale frames from the previous stream geometry.
+    pub fn on_pipewire_negotiated(
+        &mut self,
+        params: PipeWireStreamParams,
+    ) -> Result<(), CaptureError> {
+        let changed = self.state.negotiated_stream() != Some(&params);
+        let _ = self.state.on_pipewire_negotiated(params)?;
+        if changed {
+            self.pending_frames.clear();
+        }
+        Ok(())
+    }
+
     /// Ingests a validated PipeWire MemFd SHM buffer after portal stream negotiation.
+    /// Cross-validates `params` against the active negotiated stream and normalizes
+    /// `Rgba8`/`Rgbx8`/`Bgrx8` into packed `BGRA8`.
     pub fn ingest_memfd_buffer(
         &mut self,
         params: &PipeWireStreamParams,
@@ -793,14 +950,39 @@ impl WaylandPipeWireCapturer {
         seq: u64,
         pts_us: i64,
     ) -> Result<(), CaptureError> {
-        let bpp = params
-            .format
-            .packed_bpp()
-            .ok_or_else(|| CaptureError::Fatal("planar NV12 MemFd ingest requires NV12 path".into()))?;
+        let Some(negotiated) = self.state.negotiated_stream() else {
+            return Err(CaptureError::ReinitRequired(
+                "PipeWire MemFd buffer arrived before stream negotiation".into(),
+            ));
+        };
+        if negotiated.node_id != params.node_id
+            || negotiated.width != params.width
+            || negotiated.height != params.height
+            || negotiated.stride != params.stride
+            || negotiated.format != params.format
+        {
+            return Err(CaptureError::ReinitRequired(format!(
+                "PipeWire buffer params (node={}, {}x{}, stride={}, {:?}) mismatch negotiated stream (node={}, {}x{}, stride={}, {:?})",
+                params.node_id,
+                params.width,
+                params.height,
+                params.stride,
+                params.format,
+                negotiated.node_id,
+                negotiated.width,
+                negotiated.height,
+                negotiated.stride,
+                negotiated.format,
+            )));
+        }
+
+        let bpp = params.format.packed_bpp().ok_or_else(|| {
+            CaptureError::Fatal("planar NV12 MemFd ingest requires NV12 path".into())
+        })?;
         let dst_stride = (params.width as usize)
             .checked_mul(bpp)
             .ok_or_else(|| CaptureError::Fatal("Wayland dst_stride overflow".into()))?;
-        let packed = copy_shm_frame_rows(
+        let mut packed = copy_shm_frame_rows(
             raw_shm,
             params.width,
             params.height,
@@ -808,13 +990,33 @@ impl WaylandPipeWireCapturer {
             bpp,
             dst_stride,
         )?;
-        self.state.on_frame_arrived(PipeWireFrameArrival {
+        normalize_packed_to_bgra_in_place(&mut packed, params.format);
+
+        let accepted = self.state.on_frame_arrived(PipeWireFrameArrival {
             seq,
             pts_us,
             byte_len: raw_shm.len(),
             buffer_kind: PipeWireBufferKind::MemFdShm,
         })?;
-        self.pending_shm_frame = Some(packed);
+        if !accepted {
+            return Ok(());
+        }
+
+        let frame = PackedFrame {
+            data: packed,
+            width: params.width,
+            height: params.height,
+            stride: dst_stride as u32,
+            format: params.format,
+            pts_us,
+        };
+        frame.validate_bgra_bounds()?;
+
+        let cap = self.state.frame_ring().capacity();
+        while self.pending_frames.len() >= cap {
+            let _ = self.pending_frames.pop_front();
+        }
+        self.pending_frames.push_back(frame);
         Ok(())
     }
 }
@@ -832,23 +1034,23 @@ impl ScreenCapturer for WaylandPipeWireCapturer {
     }
 
     fn capture_next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
-        let Some(stream) = self.state.negotiated_stream().cloned() else {
+        if self.state.negotiated_stream().is_none() {
+            self.pending_frames.clear();
             return Err(CaptureError::ReinitRequired(
                 "Wayland PipeWire stream not yet negotiated with xdg-desktop-portal".into(),
             ));
-        };
-        let Some(data) = self.pending_shm_frame.take() else {
+        }
+        let Some(frame) = self.pending_frames.pop_front() else {
             return Err(CaptureError::Timeout);
         };
-        let arrival = self.state.frame_ring_mut().pop();
-        let ts = arrival.map(|a| a.pts_us).unwrap_or_else(now_epoch_us);
-        let stride = stream.width.saturating_mul(4);
+        let _ = self.state.frame_ring_mut().pop();
+        frame.validate_bgra_bounds()?;
         Ok(CapturedFrame {
-            width: stream.width,
-            height: stream.height,
-            stride,
-            surface: CapturedSurface::Bgra8 { data },
-            timestamp_us: ts,
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            surface: CapturedSurface::Bgra8 { data: frame.data },
+            timestamp_us: frame.pts_us,
             monitor_id: self.monitor_id,
             cursor: None,
         })
@@ -901,12 +1103,3 @@ impl ScreenCapturer for LinuxScreenCapturer {
         }
     }
 }
-
-// Unused import suppression for clean-room C string construction if needed by callers.
-#[allow(dead_code)]
-fn _cstr_helper(s: &str) -> Option<CString> {
-    CString::new(s).ok()
-}
-
-#[allow(dead_code)]
-const _C_LONG_CHECK: usize = std::mem::size_of::<c_long>();
