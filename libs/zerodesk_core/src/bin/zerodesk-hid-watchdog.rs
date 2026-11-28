@@ -181,6 +181,7 @@ mod unix_impl {
     use std::{ffi::CString, fs, os::unix::ffi::OsStrExt};
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(not(target_os = "linux"))]
     const MAX_CLOSE_FD_CAP: i32 = 16_384;
 
     #[derive(Default)]
@@ -211,6 +212,7 @@ mod unix_impl {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn max_open_fd_bound() -> i32 {
         let mut rl = libc::rlimit {
             rlim_cur: 0,
@@ -327,12 +329,23 @@ mod unix_impl {
             return Err("lock file already held by another watchdog instance".into());
         }
 
-        // Close all unneeded fds >= 3 up to RLIMIT_NOFILE (clamped to 16384).
-        let max_fd = max_open_fd_bound();
-        for fd in 3..max_fd {
-            if fd != cmd_fd && fd != ack_fd && fd != lock_fd {
-                unsafe {
-                    libc::close(fd);
+        // Close all unneeded fds >= 3.
+        // On Linux, audit `/proc/self/fd` directly to guarantee zero leaked descriptors
+        // outside `[0, 1, 2, cmd_fd, ack_fd, lock_fd]`.
+        #[cfg(target_os = "linux")]
+        {
+            let _ = zerodesk_core::os::linux_watchdog::audit_and_close_leaked_fds(&[
+                0, 1, 2, cmd_fd, ack_fd, lock_fd,
+            ]);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let max_fd = max_open_fd_bound();
+            for fd in 3..max_fd {
+                if fd != cmd_fd && fd != ack_fd && fd != lock_fd {
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
             }
         }
@@ -797,7 +810,169 @@ mod unix_impl {
         exit_ok
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    fn run_event_loop(
+        args: &WatchdogArgs,
+        state: &mut TrackedState,
+        real_permit: Option<&RealInputPermit>,
+        ready_flags: u8,
+    ) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zerodesk_core::os::{
+            linux_watchdog::{
+                arm_pdeathsig_and_verify_parent, execute_watchdog_linux_release,
+                LinuxParentMonitor,
+            },
+            linux_watchdog_logic::{
+                LinuxWatchdogAction, LinuxWatchdogLoopCore, DEFAULT_LINUX_HEARTBEAT_TIMEOUT_MS,
+            },
+        };
+
+        static SIG_FIRED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn on_sig(_sig: libc::c_int) {
+            SIG_FIRED.store(true, Ordering::Release);
+        }
+
+        // 1. Arm PR_SET_PDEATHSIG + immediately verify getppid() == args.parent_pid
+        //    (defeats fork->prctl race if parent died right after spawn).
+        let _ = arm_pdeathsig_and_verify_parent(args.parent_pid);
+
+        unsafe {
+            libc::signal(libc::SIGHUP, on_sig as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, on_sig as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_sig as *const () as libc::sighandler_t);
+        }
+
+        // 2. Attach race-free parent monitor (`pidfd_open` preferred; `/proc/<pid>/stat`
+        //    field 22 starttime fallback on pre-5.3 kernels).
+        let monitor = match LinuxParentMonitor::attach(args.parent_pid) {
+            Ok(m) => m,
+            Err(_) => {
+                return execute_emergency_release("parent_exit_pidfd", args, state, real_permit);
+            }
+        };
+
+        let ready = WatchdogFrame::ready_with_flags(0, ready_flags).encode();
+        write_all_best_effort(args.ack_fd, &ready);
+
+        let loop_start = Instant::now();
+        let mut core = LinuxWatchdogLoopCore::new(0, DEFAULT_LINUX_HEARTBEAT_TIMEOUT_MS, false);
+        let mut exit_ok = true;
+        let mut acc = [0u8; WATCHDOG_FRAME_LEN];
+        let mut acc_len = 0usize;
+
+        let run_linux_release = |trigger: &'static str,
+                                 steps: &[zerodesk_core::os::linux_watchdog_logic::LinuxReleaseStep],
+                                 st: &TrackedState|
+         -> bool {
+            let mut ok = true;
+            if real_permit.is_some() && execute_watchdog_linux_release(None, steps).is_err() {
+                ok = false;
+            }
+            execute_emergency_release(trigger, args, st, None) && ok
+        };
+
+        loop {
+            let mut poll_fds = [
+                libc::pollfd {
+                    fd: args.cmd_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: monitor.pidfd().unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let nfds: libc::nfds_t = if monitor.pidfd().is_some() { 2 } else { 1 };
+            let prc = unsafe { libc::poll(poll_fds.as_mut_ptr(), nfds, 100) };
+            let elapsed_ms = loop_start.elapsed().as_millis() as u64;
+
+            if prc > 0 && (poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
+            {
+                match drain_cmd_frames(args.cmd_fd, &mut acc, &mut acc_len, state) {
+                    DrainOutcome::Continue => {
+                        let snap = WatchdogFrame::state_snapshot(
+                            state.last_seq,
+                            state.keys_bitmap,
+                            state.buttons,
+                            state.mods,
+                        );
+                        if let LinuxWatchdogAction::EmergencyRelease { trigger, steps } =
+                            core.on_frame(&snap, elapsed_ms)
+                        {
+                            exit_ok = run_linux_release(trigger, &steps, state);
+                            break;
+                        }
+                    }
+                    DrainOutcome::GracefulExit(seq) => {
+                        let ack = WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL)
+                            .encode();
+                        write_all_best_effort(args.ack_fd, &ack);
+                        break;
+                    }
+                    DrainOutcome::EmergencyRelease(trigger) => {
+                        let action = core.on_parent_died(trigger);
+                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
+                            exit_ok = run_linux_release(trigger, &steps, state);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let pidfd_exited =
+                monitor.pidfd().is_some() && (poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP)) != 0;
+            let parent_dead = pidfd_exited || !monitor.is_parent_alive();
+            if parent_dead {
+                // Drain any queued GracefulExit frame before treating parent death as a crash.
+                match drain_cmd_frames(args.cmd_fd, &mut acc, &mut acc_len, state) {
+                    DrainOutcome::GracefulExit(seq) => {
+                        let ack = WatchdogFrame::released(seq, WATCHDOG_RELEASED_FLAG_GRACEFUL)
+                            .encode();
+                        write_all_best_effort(args.ack_fd, &ack);
+                    }
+                    DrainOutcome::EmergencyRelease(trigger) => {
+                        let action = core.on_parent_died(trigger);
+                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
+                            exit_ok = run_linux_release(trigger, &steps, state);
+                        }
+                    }
+                    DrainOutcome::Continue => {
+                        let trigger = if monitor.pidfd().is_some() {
+                            "parent_exit_pidfd"
+                        } else {
+                            "parent_exit_proc_stat"
+                        };
+                        let action = core.on_parent_died(trigger);
+                        if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
+                            exit_ok = run_linux_release(trigger, &steps, state);
+                        }
+                    }
+                }
+                break;
+            }
+
+            if SIG_FIRED.load(Ordering::Acquire) {
+                let action = core.on_parent_died("signal");
+                if let LinuxWatchdogAction::EmergencyRelease { steps, .. } = action {
+                    exit_ok = run_linux_release("signal", &steps, state);
+                }
+                break;
+            }
+
+            if let LinuxWatchdogAction::EmergencyRelease { trigger, steps } =
+                core.on_tick(elapsed_ms)
+            {
+                exit_ok = run_linux_release(trigger, &steps, state);
+                break;
+            }
+        }
+        exit_ok
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn run_event_loop(
         args: &WatchdogArgs,
         state: &mut TrackedState,

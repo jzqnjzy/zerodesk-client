@@ -30,6 +30,10 @@ path = "src/bin/zerodesk-hid-watchdog.rs"
 name = "zerodesk-win-diag"
 path = "src/bin/zerodesk-win-diag.rs"
 
+[[bin]]
+name = "zerodesk-linux-diag"
+path = "src/bin/zerodesk-linux-diag.rs"
+
 [features]
 default = ["os-capture", "os-sck", "os-audio", "os-clipboard"]
 os-capture = ["dep:core-graphics", "dep:core-foundation"]

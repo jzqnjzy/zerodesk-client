@@ -258,3 +258,142 @@ fn win_hid_keymap_rejects_unmapped_and_maps_all_five_mouse_buttons() {
     assert_eq!(ups[4].flags, WIN_MOUSEEVENTF_XUP);
     assert_eq!(ups[4].mouse_data, WIN_XBUTTON2);
 }
+
+// ============================================================================
+// Phase 9B: Linux evdev / X11 shared USB HID Usage Page 0x07 Golden Vectors
+// (Existing macOS & Windows assertions above remain strictly untouched.)
+// ============================================================================
+
+/// Hardcoded golden reference vectors `(hid_usage, evdev_code, x11_keycode)`
+/// verifying Linux `evdev` and XKB `evdev + 8` codes independent of the table.
+const GOLDEN_HID_TO_LINUX_VECTORS: &[(u16, u16, u8)] = &[
+    (0x04, 30, 38),   // A -> KEY_A
+    (0x10, 50, 58),   // M -> KEY_M
+    (0x14, 16, 24),   // Q -> KEY_Q
+    (0x1A, 17, 25),   // W -> KEY_W
+    (0x1D, 44, 52),   // Z -> KEY_Z
+    (0x1E, 2, 10),    // 1 -> KEY_1
+    (0x27, 11, 19),   // 0 -> KEY_0
+    (0x28, 28, 36),   // Enter -> KEY_ENTER
+    (0x29, 1, 9),     // Escape -> KEY_ESC
+    (0x2A, 14, 22),   // Backspace -> KEY_BACKSPACE
+    (0x2B, 15, 23),   // Tab -> KEY_TAB
+    (0x2C, 57, 65),   // Space -> KEY_SPACE
+    (0x39, 58, 66),   // CapsLock -> KEY_CAPSLOCK
+    (0x3A, 59, 67),   // F1 -> KEY_F1
+    (0x44, 87, 95),   // F11 -> KEY_F11
+    (0x45, 88, 96),   // F12 -> KEY_F12
+    (0x46, 99, 107),  // PrintScreen -> KEY_SYSRQ
+    (0x47, 70, 78),   // ScrollLock -> KEY_SCROLLLOCK
+    (0x48, 119, 127), // Pause -> KEY_PAUSE
+    (0x49, 110, 118), // Insert -> KEY_INSERT
+    (0x4A, 102, 110), // Home -> KEY_HOME
+    (0x4B, 104, 112), // PageUp -> KEY_PAGEUP
+    (0x4C, 111, 119), // Delete -> KEY_DELETE
+    (0x4D, 107, 115), // End -> KEY_END
+    (0x4E, 109, 117), // PageDown -> KEY_PAGEDOWN
+    (0x4F, 106, 114), // RightArrow -> KEY_RIGHT
+    (0x50, 105, 113), // LeftArrow -> KEY_LEFT
+    (0x51, 108, 116), // DownArrow -> KEY_DOWN
+    (0x52, 103, 111), // UpArrow -> KEY_UP
+    (0x54, 98, 106),  // KeypadDivide -> KEY_KPSLASH
+    (0x58, 96, 104),  // KeypadEnter -> KEY_KPENTER
+    (0x64, 86, 94),   // ISO Backslash -> KEY_102ND
+    (0x65, 127, 135), // Application/Menu -> KEY_COMPOSE
+    (0xE0, 29, 37),   // LeftControl -> KEY_LEFTCTRL
+    (0xE1, 42, 50),   // LeftShift -> KEY_LEFTSHIFT
+    (0xE2, 56, 64),   // LeftAlt -> KEY_LEFTALT
+    (0xE3, 125, 133), // LeftMeta -> KEY_LEFTMETA
+    (0xE4, 97, 105),  // RightControl -> KEY_RIGHTCTRL
+    (0xE5, 54, 62),   // RightShift -> KEY_RIGHTSHIFT
+    (0xE6, 100, 108), // RightAlt -> KEY_RIGHTALT
+    (0xE7, 126, 134), // RightMeta -> KEY_RIGHTMETA
+];
+
+#[test]
+fn linux_hid_keymap_matches_golden_vectors_and_round_trips_bidirectionally() {
+    use zerodesk_core::os::linux_hid_keymap::{
+        mouse_button_bit_to_linux, mouse_buttons_mask_to_linux, LinuxHidKeyMap, BTN_EXTRA,
+        BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, X11_EVDEV_KEYCODE_OFFSET,
+    };
+
+    assert!(GOLDEN_HID_TO_LINUX_VECTORS.len() >= 40);
+    for &(hid, evdev, x11) in GOLDEN_HID_TO_LINUX_VECTORS {
+        let m = LinuxHidKeyMap::hid_to_linux(hid)
+            .unwrap_or_else(|| panic!("missing Linux golden HID {hid:#04x}"));
+        assert_eq!(
+            (m.evdev_code, m.x11_keycode),
+            (evdev, x11),
+            "Linux golden mismatch for HID {hid:#04x}"
+        );
+        assert_eq!(u16::from(m.x11_keycode), m.evdev_code + X11_EVDEV_KEYCODE_OFFSET);
+        assert_eq!(LinuxHidKeyMap::evdev_to_hid(evdev), Some(hid));
+        assert_eq!(LinuxHidKeyMap::x11_keycode_to_hid(x11), Some(hid));
+    }
+
+    let mut seen_evdev = BTreeSet::new();
+    for entry in LinuxHidKeyMap::all_mappings() {
+        assert_eq!(LinuxHidKeyMap::hid_to_linux(entry.hid_usage), Some(*entry));
+        assert_eq!(LinuxHidKeyMap::evdev_to_hid(entry.evdev_code), Some(entry.hid_usage));
+        assert_eq!(
+            LinuxHidKeyMap::x11_keycode_to_hid(entry.x11_keycode),
+            Some(entry.hid_usage)
+        );
+        assert!(seen_evdev.insert(entry.evdev_code));
+    }
+
+    // All 5 standard mouse buttons map cleanly to Linux evdev BTN_* & X11 button indices.
+    let all_btns = mouse_buttons_mask_to_linux(0x1F);
+    assert_eq!(all_btns.len(), 5);
+    assert_eq!(
+        all_btns.iter().map(|b| (b.evdev_code, b.x11_button)).collect::<Vec<_>>(),
+        vec![
+            (BTN_LEFT, 1),
+            (BTN_RIGHT, 3),
+            (BTN_MIDDLE, 2),
+            (BTN_SIDE, 8),
+            (BTN_EXTRA, 9),
+        ]
+    );
+    for bit in ALL_MOUSE_BUTTON_BITS {
+        assert!(mouse_button_bit_to_linux(bit).is_some());
+    }
+}
+
+#[test]
+fn three_platform_hid_keymap_contract_parity_macos_windows_linux() {
+    use zerodesk_core::os::linux_hid_keymap::LinuxHidKeyMap;
+
+    let mac_std_set: BTreeSet<u16> = MAC_HID_KEYMAP_STANDARD_USAGES.iter().copied().collect();
+    let win_set: BTreeSet<u16> = WinHidKeyMap::all_mappings()
+        .iter()
+        .map(|m| m.hid_usage)
+        .collect();
+    let linux_set: BTreeSet<u16> = LinuxHidKeyMap::all_mappings()
+        .iter()
+        .map(|m| m.hid_usage)
+        .collect();
+
+    // 1. Linux covers 100% of macOS standard usages AND matches Windows' full 106-key set identically!
+    assert!(mac_std_set.is_subset(&linux_set));
+    assert_eq!(
+        linux_set, win_set,
+        "LinuxHidKeyMap and WinHidKeyMap must cover the exact same 106 USB HID Usage Page 0x07 keys"
+    );
+
+    // 2. Every Rust macOS allowlist usage maps cleanly across all 3 platforms.
+    for usage in 0u16..=0xFFu16 {
+        if hid_usage_to_macos_keycode(usage).is_some() {
+            assert!(WinHidKeyMap::hid_to_win(usage).is_some());
+            assert!(LinuxHidKeyMap::hid_to_linux(usage).is_some());
+        }
+    }
+
+    // 3. All 8 left/right modifiers remain strictly distinct on macOS, Windows, AND Linux.
+    let mut linux_mods = BTreeSet::new();
+    for &mod_usage in &ALL_MODIFIER_HID_USAGES {
+        let m = LinuxHidKeyMap::hid_to_linux(mod_usage).unwrap();
+        assert!(linux_mods.insert(m.evdev_code));
+    }
+    assert_eq!(linux_mods.len(), 8);
+}

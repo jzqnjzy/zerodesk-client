@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 ZeroDesk Contributors
+
+//! Thin `#[cfg(target_os = "linux")]` independent HID watchdog supervisor &
+//! kernel primitives:
+//! - `O_CLOEXEC` pipes + `pre_exec` setting `prctl(PR_SET_PDEATHSIG, SIGTERM)`
+//!   followed immediately by `getppid() == expected_ppid` race verification;
+//! - `pidfd_open(parent_pid, 0)` + `poll(pidfd)` for race-free, PID-reuse-proof
+//!   parent liveness tracking (with automatic `FallbackLegacyProcStat` parsing
+//!   `/proc/<pid>/stat` field 22 `starttime` on pre-5.3 kernels returning `ENOSYS`);
+//! - `/proc/self/fd` descriptor leak audit & cleanup;
+//! - Implements `HidWatchdogBackend` (`LinuxHidWatchdogBackend`).
+
+#![cfg(target_os = "linux")]
+
+use super::{
+    linux_input::{
+        execute_uinput_dual_layer_release, execute_xtest_release, linux_input_privilege_status,
+        UinputVirtualDevice,
+    },
+    linux_watchdog_logic::{
+        audit_open_fds_for_close, is_same_linux_parent_instance, parse_proc_fd_entries,
+        parse_proc_stat, ForkRaceGuardStateMachine, LinuxParentMonitorMode, LinuxProcStatIdentity,
+        LinuxReleaseStep,
+    },
+    traits::{check_release_report, HidWatchdogBackend, InputPrivilegeStatus},
+    watchdog_supervisor::{HidWatchdogConfig, HidWatchdogSupervisor},
+    EmergencyKeyReleaser, OsError, ReleaseReport,
+};
+use std::{
+    fs,
+    num::NonZeroU32,
+};
+
+// Clean-room Linux UAPI constants (zero copied kernel headers).
+// `PR_SET_PDEATHSIG = 1` across all Linux architectures.
+pub const LINUX_PR_SET_PDEATHSIG: libc::c_int = 1;
+// Linux unified `SYS_pidfd_open = 434` across x86_64, aarch64, arm, riscv64, powerpc, s390x.
+pub const LINUX_SYS_PIDFD_OPEN: libc::c_long = 434;
+
+/// Opens a race-free Linux `pidfd` for `pid` via `syscall(SYS_pidfd_open, pid, 0)`.
+/// Automatically sets `FD_CLOEXEC` (`pidfd_open` creates close-on-exec fds by default).
+pub fn open_pidfd(pid: u32) -> Result<libc::c_int, std::io::Error> {
+    if pid == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let fd = unsafe {
+        libc::syscall(
+            LINUX_SYS_PIDFD_OPEN,
+            pid as libc::pid_t,
+            0 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(fd as libc::c_int)
+    }
+}
+
+/// Probes whether the running Linux kernel supports `pidfd_open` by opening a
+/// `pidfd` on the current process and closing it immediately.
+pub fn probe_pidfd_supported() -> bool {
+    match open_pidfd(std::process::id()) {
+        Ok(fd) => {
+            unsafe {
+                libc::close(fd);
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Reads and parses `/proc/<pid>/stat` into a `LinuxProcStatIdentity` (including
+/// field 22 `starttime` for PID-reuse detection).
+pub fn read_proc_stat_identity(pid: u32) -> Result<LinuxProcStatIdentity, String> {
+    let path = format!("/proc/{pid}/stat");
+    let raw = fs::read_to_string(&path).map_err(|e| format!("read {path} failed: {e}"))?;
+    parse_proc_stat(&raw)
+}
+
+/// Arms `prctl(PR_SET_PDEATHSIG, SIGTERM)` and IMMEDIATELY verifies
+/// `getppid() == expected_ppid` via `ForkRaceGuardStateMachine` to close the
+/// `fork() -> prctl()` race window.
+pub fn arm_pdeathsig_and_verify_parent(expected_ppid: u32) -> Result<(), String> {
+    let mut guard = ForkRaceGuardStateMachine::new(expected_ppid)?;
+    let prctl_ok = unsafe { libc::prctl(LINUX_PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) == 0 };
+    guard.on_pdeathsig_armed(prctl_ok)?;
+    let observed_ppid = unsafe { libc::getppid() } as u32;
+    guard.on_verify_ppid(observed_ppid)?;
+    Ok(())
+}
+
+/// Enumerates `/proc/self/fd`, identifies all open descriptors outside `keep_fds`
+/// via `audit_open_fds_for_close`, and closes them deterministically.
+/// Returns the number of leaked descriptors closed.
+pub fn audit_and_close_leaked_fds(keep_fds: &[libc::c_int]) -> usize {
+    let Ok(read_dir) = fs::read_dir("/proc/self/fd") else {
+        return 0;
+    };
+    let mut names = Vec::new();
+    for entry in read_dir.flatten() {
+        if let Some(s) = entry.file_name().to_str() {
+            names.push(s.to_string());
+        }
+    }
+    // Drop `ReadDir` BEFORE closing fds so we never close its own dirfd mid-iteration.
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let open_fds = parse_proc_fd_entries(&name_refs);
+    let to_close = audit_open_fds_for_close(&open_fds, keep_fds);
+    for &fd in &to_close {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    to_close.len()
+}
+
+/// Read-only `/proc/self/fd` leak counter used by `zerodesk-linux-diag`.
+pub fn count_unexpected_open_fds(keep_fds: &[libc::c_int]) -> usize {
+    let Ok(read_dir) = fs::read_dir("/proc/self/fd") else {
+        return 0;
+    };
+    let mut names = Vec::new();
+    for entry in read_dir.flatten() {
+        if let Some(s) = entry.file_name().to_str() {
+            names.push(s.to_string());
+        }
+    }
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let open_fds = parse_proc_fd_entries(&name_refs);
+    audit_open_fds_for_close(&open_fds, keep_fds).len()
+}
+
+/// Opens parent monitor handle for the Linux watchdog child:
+/// - Prefers `pidfd_open(parent_pid, 0)` (immune to PID reuse);
+/// - Falls back explicitly to `FallbackLegacyProcStat` (`getppid()` + `/proc/<pid>/stat`
+///   `starttime`) ONLY if `pidfd_open` is unavailable (e.g. `ENOSYS` on Linux < 5.3).
+pub struct LinuxParentMonitor {
+    mode: LinuxParentMonitorMode,
+    pidfd: Option<libc::c_int>,
+    parent_pid: u32,
+}
+
+impl LinuxParentMonitor {
+    pub fn attach(parent_pid: u32) -> Result<Self, String> {
+        match open_pidfd(parent_pid) {
+            Ok(fd) => Ok(Self {
+                mode: LinuxParentMonitorMode::PidFd,
+                pidfd: Some(fd),
+                parent_pid,
+            }),
+            Err(_) => {
+                let id = read_proc_stat_identity(parent_pid)?;
+                Ok(Self {
+                    mode: LinuxParentMonitorMode::FallbackLegacyProcStat {
+                        parent_pid,
+                        start_time_ticks: id.start_time_ticks,
+                    },
+                    pidfd: None,
+                    parent_pid,
+                })
+            }
+        }
+    }
+
+    pub fn mode(&self) -> LinuxParentMonitorMode {
+        self.mode
+    }
+
+    pub fn pidfd(&self) -> Option<libc::c_int> {
+        self.pidfd
+    }
+
+    /// Checks whether the exact monitored parent instance is still alive (used in
+    /// `FallbackLegacyProcStat` mode or as secondary verification alongside `poll(pidfd)`).
+    pub fn is_parent_alive(&self) -> bool {
+        match self.mode {
+            LinuxParentMonitorMode::PidFd => {
+                let Some(fd) = self.pidfd else {
+                    return false;
+                };
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                rc == 0
+            }
+            LinuxParentMonitorMode::FallbackLegacyProcStat {
+                parent_pid,
+                start_time_ticks,
+            } => {
+                let observed_ppid = unsafe { libc::getppid() } as u32;
+                if observed_ppid != self.parent_pid {
+                    return false;
+                }
+                match read_proc_stat_identity(parent_pid) {
+                    Ok(obs) => is_same_linux_parent_instance(parent_pid, start_time_ticks, &obs),
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LinuxParentMonitor {
+    fn drop(&mut self) {
+        if let Some(fd) = self.pidfd.take() {
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+}
+
+/// Executes emergency dual-layer release on Linux from inside the watchdog child:
+/// - If an opt-in `/dev/uinput` device is supplied, sends explicit `EV_KEY=0` +
+///   `EV_SYN SYN_REPORT` FIRST, then closes the `uinput` fd.
+/// - Otherwise falls back to X11 `XTest` explicit release if an X display is present.
+pub fn execute_watchdog_linux_release(
+    uinput_dev: Option<&mut UinputVirtualDevice>,
+    steps: &[LinuxReleaseStep],
+) -> Result<ReleaseReport, OsError> {
+    if let Some(dev) = uinput_dev {
+        let rep = execute_uinput_dual_layer_release(dev, steps);
+        return check_release_report(rep);
+    }
+    let rep = execute_xtest_release(steps)?;
+    check_release_report(rep)
+}
+
+/// Linux `HidWatchdogBackend` wrapping `HidWatchdogSupervisor` with Linux
+/// `InputPrivilegeStatus` reporting and `pidfd` / `proc/stat` introspection.
+#[derive(Default)]
+pub struct LinuxHidWatchdogBackend {
+    supervisor: Option<HidWatchdogSupervisor>,
+}
+
+impl LinuxHidWatchdogBackend {
+    pub fn new() -> Self {
+        Self { supervisor: None }
+    }
+
+    pub fn supervisor(&self) -> Option<&HidWatchdogSupervisor> {
+        self.supervisor.as_ref()
+    }
+}
+
+impl HidWatchdogBackend for LinuxHidWatchdogBackend {
+    fn spawn(&mut self, cfg: HidWatchdogConfig) -> Result<Option<NonZeroU32>, OsError> {
+        if let Some(old) = self.supervisor.take() {
+            old.shutdown(None);
+        }
+        let sup = HidWatchdogSupervisor::spawn(cfg)?;
+        let pid = sup.child_pid().and_then(NonZeroU32::new);
+        self.supervisor = Some(sup);
+        Ok(pid)
+    }
+
+    fn heartbeat(&self) -> Result<(), OsError> {
+        let Some(sup) = &self.supervisor else {
+            return Err(OsError::Interlocked);
+        };
+        if !sup.is_open() {
+            return Err(OsError::Interlocked);
+        }
+        Ok(())
+    }
+
+    fn release_all(
+        &self,
+        local_releaser: Option<&dyn EmergencyKeyReleaser>,
+    ) -> Result<ReleaseReport, OsError> {
+        let Some(releaser) = local_releaser else {
+            return Err(OsError::InvalidData(
+                "release_all requires a local EmergencyKeyReleaser".into(),
+            ));
+        };
+        check_release_report(releaser.release_all_keys())
+    }
+
+    fn shutdown(
+        &mut self,
+        local_releaser: Option<&dyn EmergencyKeyReleaser>,
+    ) -> Result<ReleaseReport, OsError> {
+        let report = local_releaser.map(EmergencyKeyReleaser::release_all_keys);
+        if let Some(sup) = self.supervisor.take() {
+            sup.shutdown(None);
+        }
+        match report {
+            Some(rep) => check_release_report(rep),
+            None => Ok(ReleaseReport::default()),
+        }
+    }
+
+    fn accessibility_or_uipi_status(&self) -> InputPrivilegeStatus {
+        linux_input_privilege_status()
+    }
+}

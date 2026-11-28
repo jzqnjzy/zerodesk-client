@@ -892,7 +892,11 @@ impl<T: OsHidSink> OsInputInjector for OsHidSinkInjector<T> {
         {
             super::win_input::win_input_privilege_status()
         }
-        #[cfg(not(any(target_os = "macos", windows)))]
+        #[cfg(target_os = "linux")]
+        {
+            super::linux_input::linux_input_privilege_status()
+        }
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
         {
             InputPrivilegeStatus {
                 accessibility_granted: false,
